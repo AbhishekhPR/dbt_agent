@@ -1,0 +1,5 @@
+19:34:02  Runtime Error in model fct_orders (models/fct_orders.sql)
+  column "order_status" does not exist
+  LINE 4: WHERE order_status = 'completed'
+  HINT: Perhaps you meant to reference the column "status"
+19:34:02  1 of 3 ERROR creating table model dbt_prod.fct_orders

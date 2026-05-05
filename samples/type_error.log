@@ -1,0 +1,4 @@
+Runtime Error in model fct_revenue (models/fct_revenue.sql)
+  operator does not exist: integer = character varying
+  LINE 3: WHERE customer_id = 'C1042'
+  HINT: No operator matches the given name and argument types.

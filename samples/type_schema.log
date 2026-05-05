@@ -1,0 +1,4 @@
+stg_orders:
+  - customer_id: integer
+  - order_total: float
+  - created_at: timestamp

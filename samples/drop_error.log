@@ -1,0 +1,3 @@
+Runtime Error in model fct_summary (models/fct_summary.sql)
+  column "discount_amount" does not exist
+  LINE 5: SUM(discount_amount) as total_discounts

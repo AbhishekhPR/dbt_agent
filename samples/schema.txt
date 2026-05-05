@@ -1,0 +1,6 @@
+stg_orders:
+  - order_id: integer
+  - customer_id: integer
+  - order_total: float
+  - status: varchar
+  - created_at: timestamp

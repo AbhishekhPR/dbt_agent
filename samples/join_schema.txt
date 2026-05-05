@@ -1,0 +1,8 @@
+stg_orders:
+  - order_id: integer
+  - customer_id: integer
+  - order_total: float
+
+stg_customers:
+  - id: integer
+  - name: varchar
