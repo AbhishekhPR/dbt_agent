@@ -1,0 +1,26 @@
+{
+  "raw_orders": [
+    {
+      "name": "order_id",
+      "type": "INT"
+    },
+    {
+      "name": "customer_id",
+      "type": "INT"
+    },
+    {
+      "name": "order_status",
+      "type": "TEXT"
+    },
+    {
+      "name": "order_total",
+      "type": "REAL"
+    }
+  ],
+  "my_first_dbt_model": [
+    {
+      "name": "id",
+      "type": ""
+    }
+  ]
+}

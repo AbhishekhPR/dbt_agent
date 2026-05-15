@@ -35,6 +35,7 @@ def run_post_hook(project_path: str):
         model_name = failure["unique_id"].split(".")[-1]
         error_log = failure["message"]
         model_sql = failure["compiled_code"]
+        
 
         # Try to read the actual model SQL file
         model_file = Path(project_path) / "models" / f"{model_name}.sql"
@@ -54,3 +55,7 @@ def run_post_hook(project_path: str):
 
         result = diagnose_failure(error_log, model_sql, upstream_schema)
         print_diagnosis(result)
+
+        # Fire Slack alert
+        from agent.slack import send_slack_alert
+        send_slack_alert(model_name, result)
