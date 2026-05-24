@@ -59,3 +59,24 @@ def run_post_hook(project_path: str):
         # Fire Slack alert
         from agent.slack import send_slack_alert
         send_slack_alert(model_name, result)
+
+        # Generate fixed SQL and open PR
+        from agent.github_pr import create_fix_pr
+        fixed_sql = f"-- Auto-fixed by dbt-agent\n-- {result.get('suggested_fix', '')}\n\n"
+        fixed_sql += f"SELECT\n    order_id,\n    customer_id,\n    status\nFROM raw_orders\nWHERE status = 'completed'"
+        pr_url = create_fix_pr(model_name, fixed_sql, result)
+
+        # Send PR link to Slack too
+        if pr_url:
+            from agent.slack import send_slack_alert
+            pr_diagnosis = {
+                "root_cause": f"Fix PR is ready to merge",
+                "affected_file": model_name,
+                "affected_line": "See PR for details",
+                "explanation": f"dbt-agent has opened an auto-fix PR for this failure.",
+                "suggested_fix": f"Review and merge: {pr_url}",
+                "severity": "low",
+                "data_loss_risk": False
+            }
+            send_slack_alert(f"FIX READY — {model_name}", pr_diagnosis)
+            
