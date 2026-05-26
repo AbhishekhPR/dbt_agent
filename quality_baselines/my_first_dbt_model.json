@@ -1,0 +1,21 @@
+{
+  "table": "my_first_dbt_model",
+  "row_count": 2,
+  "columns": [
+    "id"
+  ],
+  "null_rates": {
+    "id": 50.0
+  },
+  "duplicate_rows": 0,
+  "numeric_stats": {
+    "id": {
+      "min": 1.0,
+      "max": 1.0,
+      "avg": 1.0
+    }
+  },
+  "distinct_counts": {
+    "id": 1
+  }
+}
