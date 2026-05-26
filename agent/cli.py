@@ -138,3 +138,12 @@ def analyze(project):
         print(f"🚨 {critical_count} model(s) have critical/high logic bugs — Slack alerted.\n")
     else:
         print("✅ All models passed logic analysis.\n")
+
+
+@cli.command()
+@click.option('--project', required=True, help='dbt project name')
+@click.option('--db', required=True, help='Path to SQLite database')
+def quality(project, db):
+    """Run data quality checks — catches row drops, null explosions, duplicates"""
+    from agent.quality_checker import run_quality_check
+    run_quality_check(project, db)
