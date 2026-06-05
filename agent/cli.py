@@ -1,5 +1,6 @@
 import click
 from agent.diagnose import diagnose_failure
+from agent.simulator import run_simulation
 
 
 def print_diagnosis(result: dict):
@@ -147,6 +148,40 @@ def quality(project, db):
     """Run data quality checks — catches row drops, null explosions, duplicates"""
     from agent.quality_checker import run_quality_check
     run_quality_check(project, db)
+
+
+@cli.command()
+@click.option('--project', required=True, help='dbt project name')
+@click.option('--db', required=True, help='Path to SQLite database')
+@click.option('--table', required=True, help='Table to simulate an incident on')
+@click.option(
+    '--type',
+    'anomaly_type',
+    required=True,
+    type=click.Choice(
+        [
+            "row_count_drop",
+            "row_count_spike",
+            "null_explosion",
+            "cardinality_explosion",
+            "duplicate_explosion",
+        ]
+    ),
+    help='Simulation type to apply'
+)
+@click.option('--no-restore', is_flag=True, help='Leave simulated DB and baseline changes in place')
+@click.option('--no-sync-baseline', is_flag=True, help='Use existing baseline instead of syncing before simulation')
+def simulate(project, db, table, anomaly_type, no_restore, no_sync_baseline):
+    """Simulate a local data quality incident and run the quality checker"""
+    run_simulation(
+        project,
+        db,
+        table,
+        anomaly_type,
+        restore_after=not no_restore,
+        sync_baseline=not no_sync_baseline,
+    )
+
 
 @cli.command()
 @click.option('--project', required=True, help='Path to your dbt project folder')

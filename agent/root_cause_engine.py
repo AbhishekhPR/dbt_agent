@@ -251,13 +251,16 @@ def _build_signal(anomaly_type: str, anomaly: dict, previous: dict, current: dic
 
 
 def _row_count_signal(anomaly: dict, previous: dict, current: dict) -> dict:
+    anomaly_message = anomaly.get("message")
+    if anomaly_message:
+        message = _message_row_count_signal(anomaly_message)
+        if message:
+            message["reason"] = anomaly_message
+            return message
+
     explicit = _explicit_row_count_signal(anomaly)
     if explicit:
         return explicit
-
-    message = _message_row_count_signal(anomaly.get("message", ""))
-    if message:
-        return message
 
     baseline = previous.get("row_count")
     current_rows = current.get("row_count")
@@ -328,6 +331,13 @@ def _no_evidence_signal() -> dict:
 
 
 def _simple_increase_signal(metric: str, label: str, anomaly: dict, previous: dict, current: dict) -> dict:
+    anomaly_message = anomaly.get("message")
+    if anomaly_message:
+        explicit = _message_increase_signal(label, anomaly_message)
+        if explicit:
+            explicit["reason"] = anomaly_message
+            return explicit
+
     baseline = previous.get(metric)
     current_value = current.get(metric)
     if baseline is not None and current_value is not None:
@@ -338,9 +348,6 @@ def _simple_increase_signal(metric: str, label: str, anomaly: dict, previous: di
             "magnitude": max(0.0, ratio),
             "reason": f"{label} increased from {int(baseline)} to {int(current_value)}",
         }
-    explicit = _message_increase_signal(label, anomaly.get("message", ""))
-    if explicit:
-        return explicit
     return {
         "direction": "spike",
         "magnitude": _pct_from_message(anomaly.get("message", "")) / 100,
@@ -369,6 +376,14 @@ def _message_increase_signal(label: str, message: str) -> dict:
 
 
 def _nested_increase_signal(metric: str, label: str, anomaly: dict, previous: dict, current: dict) -> dict:
+    anomaly_message = anomaly.get("message")
+    if anomaly_message:
+        return {
+            "direction": "spike",
+            "magnitude": _pct_from_message(anomaly_message) / 50,
+            "reason": anomaly_message,
+        }
+
     baseline = previous.get(metric) or {}
     current_values = current.get(metric) or {}
     largest = None

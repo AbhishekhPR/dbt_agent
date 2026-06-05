@@ -13,7 +13,12 @@
     "order_status": 0.0,
     "order_total": 50.0
   },
-  "duplicate_rows": 0,
+  "duplicate_rows": 5,
+  "duplicate_rate": 62.5,
+  "duplicate_check_method": "key:order_id",
+  "duplicate_key_columns": [
+    "order_id"
+  ],
   "numeric_stats": {
     "order_id": {
       "min": 1.0,

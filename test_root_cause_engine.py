@@ -64,7 +64,7 @@ class RootCauseEngineTests(unittest.TestCase):
             {
                 "cause": "upstream ingestion failure",
                 "confidence": 0.95,
-                "reason": "row count dropped by 95%",
+                "reason": "Row count dropped by 95%",
             },
         )
         self.assertEqual(report["direction"], "dropped")
@@ -187,7 +187,7 @@ class RootCauseEngineTests(unittest.TestCase):
         self.assertEqual(report["likely_causes"][0]["cause"], "source column missing")
         self.assertEqual(report["likely_causes"][0]["confidence"], 0.9)
         self.assertIn(
-            "customer_id null rate increased by 45.0 points",
+            "Null rate on customer_id jumped by 45%",
             report["likely_causes"][0]["reason"],
         )
         self.assertIn("Validate join keys", report["recommended_actions"])
@@ -220,9 +220,37 @@ class RootCauseEngineTests(unittest.TestCase):
         )
         self.assertEqual(
             report["likely_causes"][0]["reason"],
-            "duplicate rows increased from 0 to 5",
+            "Duplicate rows increased from 0 to 5",
         )
         self.assertIn("Inspect recent joins for fan-out", report["recommended_actions"])
+
+    def test_duplicate_explosion_message_wins_over_metric_history(self):
+        from agent import metrics_store
+        from agent.root_cause_engine import analyze_root_cause
+
+        conn = sqlite3.connect(self.db_path)
+        metrics_store._init_table_metrics_history(conn)
+        _insert_metric(conn, "raw_orders", 8, duplicate_rows=0, ts="2026-06-01 00:00:00")
+        _insert_metric(conn, "raw_orders", 13, duplicate_rows=5, ts="2026-06-02 00:00:00")
+        conn.commit()
+        conn.close()
+
+        with patch.object(metrics_store, "METADATA_HISTORY_DB", self.db_path), patch(
+            "agent.root_cause_engine.calculate_blast_radius",
+            return_value={"directly_affected": [], "indirectly_affected": [], "total_affected": 0},
+        ):
+            report = analyze_root_cause(
+                {
+                    "type": "duplicate_explosion",
+                    "table": "raw_orders",
+                    "project_path": "unused",
+                    "message": "Duplicate rows increased from 0 to 10",
+                }
+            )
+
+        self.assertTrue(report["likely_causes"])
+        for cause in report["likely_causes"]:
+            self.assertEqual(cause["reason"], "Duplicate rows increased from 0 to 10")
 
     def test_root_cause_cli_accepts_message_and_prints_dropped_report(self):
         from agent.cli import cli
@@ -260,7 +288,7 @@ class RootCauseEngineTests(unittest.TestCase):
         self.assertIn("Change:\n95.0%", result.output)
         self.assertIn("1. upstream ingestion failure", result.output)
         self.assertIn("Confidence: 0.95", result.output)
-        self.assertIn("Reason: row count dropped by 95%", result.output)
+        self.assertIn("Reason: Row count dropped by 95%", result.output)
         self.assertIn("- fct_customer_lifetime_value", result.output)
         self.assertIn("- fct_revenue", result.output)
         self.assertIn("- fct_customer_summary", result.output)

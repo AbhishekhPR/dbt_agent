@@ -181,6 +181,8 @@ def run_schema_diff(project_name: str, db_path: str):
         from agent.blast_radius import calculate_blast_radius, print_blast_radius
         changed_col_names = []
         for change in changes:
+            from agent.metrics_store import record_schema_change
+            record_schema_change(project_name, change["table"], change)
             if change.get("type") in ("column_dropped", "column_renamed"):
                 col = change.get("column") or change.get("old_column", [])
                 if isinstance(col, list):
@@ -202,6 +204,7 @@ def run_schema_diff(project_name: str, db_path: str):
         if change["severity"] in ("critical", "high"):
             diagnosis = {
                 "root_cause": change["message"],
+                "affected_file": f"Table: {change['table']}",
                 "affected_file": f"Table: {change['table']}",
                 "affected_line": change["type"],
                 "explanation": change["risk"],
