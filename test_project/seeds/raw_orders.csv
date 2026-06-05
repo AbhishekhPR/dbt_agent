@@ -1,4 +1,4 @@
-order_id,customer_id,status,order_total
+order_id,customer_id,order_status,order_total
 1,101,completed,250.00
 2,102,pending,89.50
-3,103,completed,420.00
+3,103,completed,420.00d

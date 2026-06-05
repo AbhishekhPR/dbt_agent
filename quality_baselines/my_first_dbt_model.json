@@ -8,6 +8,11 @@
     "id": 50.0
   },
   "duplicate_rows": 0,
+  "duplicate_rate": 0.0,
+  "duplicate_check_method": "key:id",
+  "duplicate_key_columns": [
+    "id"
+  ],
   "numeric_stats": {
     "id": {
       "min": 1.0,

@@ -147,3 +147,167 @@ def quality(project, db):
     """Run data quality checks — catches row drops, null explosions, duplicates"""
     from agent.quality_checker import run_quality_check
     run_quality_check(project, db)
+
+@cli.command()
+@click.option('--project', required=True, help='Path to your dbt project folder')
+@click.option('--dialect', default='sqlite', help='SQL dialect: sqlite, snowflake, bigquery, duckdb')
+def ast(project, dialect):
+    """Deterministic AST analysis — zero false positives, instant results"""
+    from agent.ast_analyzer import analyze_all_models_ast, run_ast_analysis
+    from agent.cli import print_diagnosis
+    from agent.slack import send_slack_alert
+
+    reports = analyze_all_models_ast(project, dialect)
+
+    if not reports:
+        return
+
+    total_bugs = 0
+    for report in reports:
+        bugs = report.get("bugs", [])
+        total_bugs += len(bugs)
+
+        risk_emoji = {
+            "critical": "🔴", "high": "🟠",
+            "medium": "🟡", "low": "🟢", "clean": "✅"
+        }.get(report.get("overall_risk", "low"), "⚪")
+
+        print(f"\n{'━' * 55}")
+        print(f"  Model:  {report.get('model_name')}")
+        print(f"  Risk:   {risk_emoji} {report.get('overall_risk', '').upper()}")
+        print(f"  Source: ⚡ deterministic AST (zero false positives)")
+        print(f"  Safe:   {'✅ Yes' if report.get('safe_to_run') else '❌ NO'}")
+        print(f"{'━' * 55}")
+        print(f"\n📋 {report.get('summary')}")
+
+        if not bugs:
+            print("\n✅ Clean.\n")
+            continue
+
+        print(f"\n🐛 {len(bugs)} issue(s):\n")
+        for i, bug in enumerate(bugs, 1):
+            sev = bug.get("severity", "low")
+            emoji = {"critical":"🔴","high":"🟠","medium":"🟡","low":"🟢"}.get(sev,"⚪")
+            conf = bug.get("confidence", "")
+            conf_str = "✓ high confidence" if conf == "high" else "~ medium confidence"
+
+            print(f"  {i}. {emoji} [{sev.upper()}] {bug.get('category')}")
+            print(f"     Confidence: {conf_str}")
+            print(f"     SQL:    {bug.get('line_reference')}")
+            print(f"     Bug:    {bug.get('description')}")
+            print(f"     Impact: {bug.get('impact')}")
+            print(f"     Fix:    {bug.get('fix')}")
+            print()
+
+        print(f"  Data loss risk: {'⚠️  YES' if report.get('data_loss_risk') else '✅ No'}")
+        print()
+
+        # Slack alert for high/critical
+        for bug in bugs:
+            if bug.get("severity") in ("critical", "high"):
+                diagnosis = {
+                    "root_cause": bug.get("description"),
+                    "affected_file": report.get("model_name"),
+                    "affected_line": bug.get("line_reference"),
+                    "explanation": bug.get("impact"),
+                    "suggested_fix": bug.get("fix"),
+                    "severity": bug.get("severity"),
+                    "data_loss_risk": report.get("data_loss_risk", False)
+                }
+                send_slack_alert(
+                    f"AST BUG — {report.get('model_name')}",
+                    diagnosis
+                )
+
+    print(f"\n{'━'*55}")
+    print(f"  Total bugs found: {total_bugs}")
+    print(f"  Detection method: ⚡ deterministic AST — no LLM, no false positives")
+    print(f"{'━'*55}\n")
+
+@cli.command(name="sql_metadata")
+@click.option('--project', required=True, help='Path to your dbt project folder')
+@click.option('--dialect', default='sqlite', help='SQL dialect: sqlite, snowflake, bigquery, duckdb')
+def sql_metadata(project, dialect):
+    """Extract SQL metadata from dbt models and save it to SQLite."""
+    from agent.sql_metadata_extractor import extract_sql_metadata
+
+    reports = extract_sql_metadata(project, dialect)
+    if not reports:
+        print("⚠️  No SQL models found or metadata extraction produced no output.")
+        return
+
+    print(f"\n📦 SQL metadata extracted for {len(reports)} model(s). Stored in metadata_history.db")
+    for report in reports:
+        print(f"  - {report.get('model_name')} ({len(report.get('source_tables', []))} source tables, {len(report.get('joins', []))} joins)")
+
+@cli.command()
+@click.option('--project', required=True, help='Path to your dbt project folder')
+@click.option('--table', required=True, help='The upstream table that changed')
+@click.option('--columns', default=None, help='Comma-separated list of changed columns (optional)')
+def blast(project, table, columns):
+    """Show which models break when an upstream table changes"""
+    from agent.blast_radius import run_blast_radius
+    run_blast_radius(project, table, columns)
+
+@cli.command(name="root_cause")
+@click.option('--project', required=True, help='Path to your dbt project folder')
+@click.option('--table', required=True, help='Table with the detected anomaly')
+@click.option('--anomaly', required=True, help='Anomaly type from quality_checker.py')
+@click.option('--message', default="", help='Optional anomaly message from quality_checker.py')
+def root_cause(project, table, anomaly, message):
+    """Analyze likely root cause using local metadata only"""
+    from agent.root_cause_engine import run_root_cause
+    run_root_cause(project, table, anomaly, message)
+
+@cli.command()
+@click.option('--project', required=True)
+@click.option('--db', required=True)
+@click.option('--stale-hours', default=6, type=float,
+              help='Hours before table is considered stale')
+@click.option('--critical-hours', default=24, type=float,
+              help='Hours before table is considered critical')
+def freshness(project, db, stale_hours, critical_hours):
+    """Check how recently each table was updated"""
+    from agent.freshness import run_freshness_check
+    thresholds = {
+        "stale": stale_hours,
+        "critical": critical_hours
+    }
+    run_freshness_check(project, db, thresholds)
+
+
+@cli.command()
+@click.option('--project', required=True,
+              help='Project name for metrics lookup')
+@click.option('--table', default=None,
+              help='Specific table (optional)')
+@click.option('--days', default=7, type=int)
+def history(project, table, days):
+    """Show historical metrics for a project or table"""
+    from agent.metrics_store import (
+        get_metric_history, get_schema_change_history,
+        get_freshness_history, get_project_summary
+    )
+
+    summary = get_project_summary(project)
+    print(f"\n📊 Relium — {project} summary\n")
+    print(f"  Tables tracked:        {summary['tables_tracked']}")
+    print(f"  Schema changes (7d):   {summary['schema_changes_7d']}")
+    print(f"  Test failures (7d):    {summary['test_failures_7d']}")
+    print(f"  Stale tables (24h):    {summary['stale_tables_24h']}")
+    print()
+
+    if table:
+        changes = get_schema_change_history(project, table)
+        if changes:
+            print(f"  Schema changes for '{table}':\n")
+            for c in changes[:5]:
+                print(
+                    f"    {c['detected_at'][:10]}  "
+                    f"{c['change_type']}  "
+                    f"{c['severity']}"
+                )
+
+
+if __name__ == '__main__':
+    cli()

@@ -1,8 +1,12 @@
 import json
+import re
 import sqlite3
 from pathlib import Path
 from dotenv import load_dotenv
 from agent.groq_client import call_llm_json
+from agent.incident_reporter import create_incident_report
+from agent.metrics_store import record_table_metrics
+from agent.root_cause_engine import analyze_root_cause
 from agent.slack import send_slack_alert
 
 env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -18,6 +22,50 @@ You always respond with valid JSON only. No explanation outside JSON.
 """
 
 
+def quote_identifier(identifier: str) -> str:
+    """Quote a SQLite identifier without treating it as SQL."""
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _singular_table_name(table_name: str) -> str:
+    name = table_name
+    if name.startswith("raw_"):
+        name = name[4:]
+    if name.endswith("ies"):
+        return name[:-3] + "y"
+    if name.endswith("s") and len(name) > 1:
+        return name[:-1]
+    return name
+
+
+def infer_duplicate_key(columns: list, table_name: str) -> list:
+    """Choose business-key columns for duplicate detection when available."""
+    if "order_id" in columns:
+        return ["order_id"]
+    if "id" in columns:
+        return ["id"]
+
+    singular_id = f"{_singular_table_name(table_name)}_id"
+    if singular_id in columns:
+        return [singular_id]
+
+    return []
+
+
+def _duplicate_count_sql(table_name: str, columns: list) -> str:
+    table = quote_identifier(table_name)
+    distinct_columns = ", ".join(quote_identifier(col) for col in columns)
+    return f"""
+        SELECT
+            (SELECT COUNT(*) FROM {table})
+            -
+            (SELECT COUNT(*) FROM (
+                SELECT DISTINCT {distinct_columns}
+                FROM {table}
+            ))
+    """
+
+
 def get_table_metrics(db_path: str, table_name: str) -> dict:
     """
     Pulls quality metrics from a single table.
@@ -26,47 +74,66 @@ def get_table_metrics(db_path: str, table_name: str) -> dict:
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     metrics = {"table": table_name}
+    quoted_table = quote_identifier(table_name)
 
     try:
         # Row count
-        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+        cursor.execute(f"SELECT COUNT(*) FROM {quoted_table}")
         metrics["row_count"] = cursor.fetchone()[0]
 
         # Get columns
-        cursor.execute(f"PRAGMA table_info({table_name})")
-        columns = [row[1] for row in cursor.fetchall()]
+        cursor.execute(f"PRAGMA table_info({quoted_table})")
+        table_info = cursor.fetchall()
+        columns = [row[1] for row in table_info]
         metrics["columns"] = columns
 
         # Null rates per column
         null_rates = {}
         for col in columns:
+            quoted_col = quote_identifier(col)
             cursor.execute(f"""
                 SELECT 
-                    ROUND(100.0 * SUM(CASE WHEN {col} IS NULL THEN 1 ELSE 0 END) 
+                    ROUND(100.0 * SUM(CASE WHEN {quoted_col} IS NULL THEN 1 ELSE 0 END) 
                     / COUNT(*), 2)
-                FROM {table_name}
+                FROM {quoted_table}
             """)
             null_rates[col] = cursor.fetchone()[0] or 0.0
         metrics["null_rates"] = null_rates
 
-        # Duplicate rate
-        cursor.execute(f"""
-            SELECT COUNT(*) - COUNT(DISTINCT rowid) 
-            FROM {table_name}
-        """)
-        metrics["duplicate_rows"] = cursor.fetchone()[0]
+        # Duplicate rate. Store aggregate counts and method only, never row values.
+        duplicate_key = infer_duplicate_key(columns, table_name)
+        if duplicate_key:
+            duplicate_method = f"key:{','.join(duplicate_key)}"
+        else:
+            pk_columns = [row[1] for row in table_info if row[5]]
+            duplicate_key = pk_columns or columns
+            duplicate_method = f"key:{','.join(duplicate_key)}" if pk_columns else "full_row"
+
+        if duplicate_key:
+            cursor.execute(_duplicate_count_sql(table_name, duplicate_key))
+            duplicate_rows = cursor.fetchone()[0] or 0
+        else:
+            duplicate_rows = 0
+
+        row_count = metrics["row_count"] or 0
+        duplicate_rate = round(100.0 * duplicate_rows / row_count, 2) if row_count else 0.0
+        metrics["duplicate_rows"] = duplicate_rows
+        metrics["duplicate_rate"] = duplicate_rate
+        metrics["duplicate_check_method"] = duplicate_method
+        metrics["duplicate_key_columns"] = duplicate_key
 
         # Numeric column stats
         numeric_stats = {}
         for col in columns:
             try:
+                quoted_col = quote_identifier(col)
                 cursor.execute(f"""
                     SELECT 
-                        MIN(CAST({col} AS REAL)),
-                        MAX(CAST({col} AS REAL)),
-                        AVG(CAST({col} AS REAL))
-                    FROM {table_name}
-                    WHERE {col} IS NOT NULL
+                        MIN(CAST({quoted_col} AS REAL)),
+                        MAX(CAST({quoted_col} AS REAL)),
+                        AVG(CAST({quoted_col} AS REAL))
+                    FROM {quoted_table}
+                    WHERE {quoted_col} IS NOT NULL
                 """)
                 row = cursor.fetchone()
                 if row and row[0] is not None:
@@ -82,7 +149,8 @@ def get_table_metrics(db_path: str, table_name: str) -> dict:
         # Distinct value counts per column
         distinct_counts = {}
         for col in columns:
-            cursor.execute(f"SELECT COUNT(DISTINCT {col}) FROM {table_name}")
+            quoted_col = quote_identifier(col)
+            cursor.execute(f"SELECT COUNT(DISTINCT {quoted_col}) FROM {quoted_table}")
             distinct_counts[col] = cursor.fetchone()[0]
         metrics["distinct_counts"] = distinct_counts
 
@@ -159,15 +227,25 @@ def detect_anomalies(current: dict, baseline: dict) -> list:
     # Duplicate explosion
     current_dupes = current.get("duplicate_rows", 0)
     baseline_dupes = baseline.get("duplicate_rows", 0)
+    duplicate_increase = current_dupes - baseline_dupes
+    current_duplicate_rate = current.get("duplicate_rate", 0)
 
-    if current_dupes > baseline_dupes + 10:
+    if duplicate_increase > 0 and (
+        duplicate_increase >= 10
+        or current_duplicate_rate >= 5.0
+    ):
+        method = current.get("duplicate_check_method", "unknown")
+        if method.startswith("key:"):
+            detail_method = f"key: {method.split(':', 1)[1]}"
+        else:
+            detail_method = method
         anomalies.append({
             "type": "duplicate_explosion",
-            "severity": "high",
+            "severity": "critical" if current_duplicate_rate >= 20.0 or duplicate_increase >= 100 else "high",
             "table": table,
-            "message": f"Duplicate rows jumped from {baseline_dupes} to {current_dupes}",
-            "detail": "Possible fan-out from a bad JOIN upstream",
-            "impact": "Metrics like SUM(revenue) will be inflated"
+            "message": f"Duplicate rows increased from {baseline_dupes} to {current_dupes}",
+            "detail": f"Duplicate rate is {current_duplicate_rate}% using {detail_method}",
+            "impact": "Duplicate records may inflate COUNT, SUM, revenue, and downstream metrics."
         })
 
     # Cardinality explosion — distinct values suddenly way higher
@@ -219,6 +297,35 @@ Analyze these anomalies and return a JSON object with:
     return call_llm_json(prompt=prompt, system=SYSTEM_PROMPT)
 
 
+def print_root_cause_summary(rca_report: dict):
+    """Prints a compact local RCA summary for a detected anomaly."""
+    print("\n  🧠 Root Cause Analysis")
+
+    causes = rca_report.get("likely_causes", [])
+    if causes:
+        print("\n     Likely Causes:")
+        for idx, cause in enumerate(causes[:4], 1):
+            print(f"     {idx}. {cause.get('cause', 'unknown')}")
+            print(f"        Confidence: {cause.get('confidence', 0):.2f}")
+            print(f"        Reason: {cause.get('reason', 'N/A')}")
+    else:
+        print("\n     Likely Causes: No deterministic cause identified")
+
+    affected = rca_report.get("affected_models", [])
+    print("\n     Affected Models:")
+    if affected:
+        for model in affected:
+            print(f"     - {model}")
+    else:
+        print("     - None found")
+
+    actions = rca_report.get("recommended_actions", [])
+    if actions:
+        print("\n     Recommended Actions:")
+        for action in actions:
+            print(f"     - {action}")
+
+
 def run_quality_check(project_name: str, db_path: str):
     """
     Main entry point.
@@ -247,6 +354,7 @@ def run_quality_check(project_name: str, db_path: str):
         if not baseline_metrics:
             print(f"    📸 No baseline for '{table}' — saving current as baseline.")
             save_baseline(table, current_metrics)
+            record_table_metrics(project_name, table, current_metrics)
             continue
 
         anomalies = detect_anomalies(current_metrics, baseline_metrics)
@@ -254,13 +362,28 @@ def run_quality_check(project_name: str, db_path: str):
         if not anomalies:
             print(f"    ✅ {table} — all metrics within normal range.")
             save_baseline(table, current_metrics)
+            record_table_metrics(project_name, table, current_metrics)
             continue
 
         print(f"    🚨 {table} — {len(anomalies)} anomaly/anomalies detected!")
         all_anomalies.extend(anomalies)
 
-        # Ask Claude for deeper analysis
-        claude_analysis = ask_claude_about_anomalies(anomalies, current_metrics)
+        # Local metadata-only RCA. No LLM call.
+        for anomaly in anomalies:
+            rca_report = analyze_root_cause({
+                **anomaly,
+                "type": anomaly.get("type"),
+                "table": table,
+                "project_path": project_name,
+                "message": anomaly.get("message", "")
+            })
+            anomaly["root_cause_analysis"] = rca_report
+            incident_report_path = create_incident_report(
+                project_name,
+                anomaly,
+                anomaly["root_cause_analysis"]
+            )
+            anomaly["incident_report_path"] = incident_report_path
 
         # Print anomalies
         print(f"\n{'━' * 55}")
@@ -278,24 +401,7 @@ def run_quality_check(project_name: str, db_path: str):
             print(f"\n  {severity_emoji} [{anomaly['severity'].upper()}] {anomaly['message']}")
             print(f"     Detail: {anomaly['detail']}")
             print(f"     Impact: {anomaly['impact']}")
-
-        if claude_analysis:
-            print(f"\n  🤖 Claude's Assessment:")
-            print(f"     Hypothesis: {claude_analysis.get('root_cause_hypothesis', 'N/A')}")
-            print(f"     Halt pipeline: {'🛑 YES' if claude_analysis.get('should_halt_pipeline') else '✅ No'}")
-            print(f"     Confidence: {claude_analysis.get('confidence', 'N/A')}")
-
-            actions = claude_analysis.get("immediate_actions", [])
-            if actions:
-                print(f"\n  📋 Immediate Actions:")
-                for action in actions:
-                    print(f"     • {action}")
-
-            queries = claude_analysis.get("queries_to_investigate", [])
-            if queries:
-                print(f"\n  🔍 Queries to Run:")
-                for query in queries:
-                    print(f"     {query}")
+            print_root_cause_summary(anomaly.get("root_cause_analysis", {}))
 
         # Fire Slack alert for critical/high anomalies
         critical_anomalies = [
@@ -304,22 +410,36 @@ def run_quality_check(project_name: str, db_path: str):
         ]
 
         for anomaly in critical_anomalies:
+            rca = anomaly.get("root_cause_analysis", {})
+            top_cause = (rca.get("likely_causes") or [{}])[0]
+            actions = rca.get("recommended_actions", [])
+            affected_models = rca.get("affected_models", [])
+            impact_count = rca.get("impact_count", len(affected_models))
+            report_path = anomaly.get("incident_report_path")
             diagnosis = {
-                "root_cause": anomaly["message"],
-                "affected_file": f"Table: {table}",
+                "root_cause": top_cause.get("cause", anomaly["message"]),
+                "affected_file": table,
                 "affected_line": anomaly["type"],
-                "explanation": anomaly["impact"],
-                "suggested_fix": claude_analysis.get(
-                    "root_cause_hypothesis",
-                    "Investigate upstream pipeline for recent changes"
+                "explanation": (
+                    f"Anomaly: {anomaly['message']}\n"
+                    f"Evidence: {_format_anomaly_evidence(anomaly)}"
+                ),
+                "suggested_fix": (
+                    actions[0]
+                    if actions
+                    else "Investigate upstream pipeline for recent changes"
                 ),
                 "severity": anomaly["severity"],
-                "data_loss_risk": anomaly["severity"] == "critical"
+                "data_loss_risk": anomaly["severity"] == "critical",
+                "impact_count": impact_count,
+                "affected_models": affected_models,
+                "incident_report": report_path
             }
             send_slack_alert(f"DATA QUALITY — {table}", diagnosis)
 
         # Update baseline after alerting
         save_baseline(table, current_metrics)
+        record_table_metrics(project_name, table, current_metrics)
 
     print()
     if all_anomalies:
@@ -327,3 +447,12 @@ def run_quality_check(project_name: str, db_path: str):
     else:
         print("✅ All tables passed quality checks.")
     print()
+
+
+def _format_anomaly_evidence(anomaly: dict) -> str:
+    detail = anomaly.get("detail")
+    if detail:
+        evidence = detail.replace("got", "observed").rstrip(".")
+        evidence = re.sub(r"(observed\s+\d+(?:\.\d+)?)(?!\s+rows?)\b", r"\1 rows", evidence)
+        return evidence + "."
+    return anomaly.get("impact", "No additional metric evidence available.").rstrip(".") + "."

@@ -79,4 +79,74 @@ def run_post_hook(project_path: str):
                 "data_loss_risk": False
             }
             send_slack_alert(f"FIX READY — {model_name}", pr_diagnosis)
+def collect_test_results(
+    project_path: str,
+    project_name: str
+):
+    """
+    Reads dbt test results from run_results.json
+    and stores them in the metrics store.
+    """
+    from agent.metrics_store import record_test_results
+    import json
+    from pathlib import Path
+
+    results_path = (
+        Path(project_path) / "target" / "run_results.json"
+    )
+    if not results_path.exists():
+        return
+
+    with open(results_path) as f:
+        run_results = json.load(f)
+
+    run_id = run_results.get(
+        "metadata", {}
+    ).get("generated_at", "unknown")
+
+    test_records = []
+    for result in run_results.get("results", []):
+        uid = result.get("unique_id", "")
+        if ".test." not in uid:
+            continue
+
+        # Parse test metadata from unique_id
+        # format: test.project.test_name__model_name__col
+        parts = uid.split(".")
+        test_name = parts[-1] if parts else uid
+
+        # Infer test type from name
+        test_type = "custom"
+        for t in [
+            "not_null", "unique",
+            "accepted_values", "relationships"
+        ]:
+            if t in test_name.lower():
+                test_type = t
+                break
+
+        # Get model name from test name
+        model_name = "unknown"
+        name_parts = test_name.split("__")
+        if len(name_parts) >= 2:
+            model_name = name_parts[1]
+
+        test_records.append({
+            "model_name": model_name,
+            "test_name": test_name,
+            "test_type": test_type,
+            "status": result.get("status", "unknown"),
+            "failure_count": result.get(
+                "failures", 0
+            ) or 0
+        })
+
+    if test_records:
+        record_test_results(
+            project_name, run_id, test_records
+        )
+        print(
+            f"  📋 Stored {len(test_records)} "
+            f"test result(s) in metrics history"
+        )
             

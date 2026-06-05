@@ -7,18 +7,15 @@ env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 SYSTEM_PROMPT = """
-You are a senior data engineer with 15 years of experience debugging 
-production SQL pipelines. You have seen every possible way SQL can be 
-technically valid but logically wrong.
+You are an expert analytics engineer reviewing production SQL pipelines.
+You have deep knowledge of how SQL behaves in Snowflake, BigQuery, and Redshift.
 
-Your job is to read SQL models and find bugs that:
-- Won't cause crashes (dbt won't catch them)
-- Will silently corrupt data or return wrong results
-- Would take a human engineer hours to find
-
-You are paranoid, thorough, and you assume nothing is correct until proven.
-You always respond with valid JSON only.
+Your job is to find bugs that are SPECIFIC, VERIFIABLE, and IMPACTFUL.
+You only flag bugs you are highly confident about.
+You never flag patterns that are simply uncommon — only patterns that produce incorrect results.
+You always respond with valid JSON only. No explanation outside JSON.
 """
+
 
 def analyze_sql_logic(model_name: str, sql: str, context: str = "") -> dict:
     """
@@ -27,70 +24,103 @@ def analyze_sql_logic(model_name: str, sql: str, context: str = "") -> dict:
     """
 
     prompt = f"""
-Analyze this dbt SQL model for logic errors, silent failures, and data 
-quality risks. This model is called '{model_name}'.
+You are an expert analytics engineer reviewing production SQL.
+Your job is to find bugs that are SPECIFIC, VERIFIABLE, and IMPACTFUL.
 
-## SQL MODEL
+RULES:
+- Only flag bugs you are highly confident about
+- Every bug must have a specific SQL clause as evidence
+- Never flag a pattern as buggy unless you can explain exactly what wrong data it produces
+- Do not flag patterns that are simply uncommon — only flag patterns that produce incorrect results
+- If you are not sure, do not flag it
+- False positives destroy trust in observability tools — when in doubt, leave it out
+
+## SQL MODEL: {model_name}
 {sql}
 
 ## ADDITIONAL CONTEXT
 {context if context else "No additional context provided."}
 
-Check for ALL of the following categories of bugs:
+Check specifically for these HIGH-VALUE bugs:
 
-1. SILENT DATA LOSS
-   - JOINs that silently drop rows (wrong join type, missing nulls)
-   - Filters that exclude valid data (wrong operators, off-by-one)
-   - DISTINCT that hides duplicates instead of fixing the root cause
+1. LEFT JOIN NULLIFIED BY WHERE CLAUSE
+   Pattern: LEFT JOIN table t ON ... followed by WHERE t.column = value
+   Why dangerous: The WHERE on the right table silently converts LEFT JOIN
+   to INNER JOIN. Unmatched rows are dropped silently. No error thrown.
+   Example bad output: "LEFT JOIN nullified by WHERE c.is_deleted = 0 —
+   customers with no match in raw_customers will be silently excluded."
 
-2. WRONG AGGREGATIONS  
-   - SUM/AVG on columns that might be varchar (returns null silently)
-   - GROUP BY missing columns (non-deterministic results)
-   - COUNT(*) vs COUNT(column) confusion (nulls handled differently)
-   - Integer division truncating decimals
+2. WINDOW FUNCTION OVER AGGREGATED ROWS
+   Pattern: LAG/LEAD/ROW_NUMBER over a query that already GROUP BY'd
+   Why dangerous: If each partition has only one row after grouping,
+   LAG returns NULL for every row. No error. Silent wrong results.
+   Example: LAG(SUM(revenue)) OVER (PARTITION BY customer_id ORDER BY MAX(date))
+   — each customer has one grouped row, so LAG always returns NULL.
 
-3. NULL HANDLING BUGS
-   - WHERE col != 'value' silently excludes NULLs
-   - COALESCE used incorrectly
-   - NULL comparisons using = instead of IS NULL
+3. NULL EXCLUSION VIA != OPERATOR
+   Pattern: WHERE col != 'value'
+   Why dangerous: SQL treats NULL != 'value' as UNKNOWN not TRUE.
+   NULL rows are silently excluded. Never shows in error logs.
 
-4. DATE AND TIME BUGS
-   - Off-by-one date ranges (BETWEEN is inclusive on both ends)
-   - Timezone issues (comparing timestamps across timezones)
-   - Hardcoded dates that will become stale
-   - Date truncation errors (truncating to month vs day)
+4. INTEGER DIVISION TRUNCATION
+   Pattern: integer_col / integer_col without explicit FLOAT cast
+   Why dangerous: 10/3 = 3 not 3.33. Revenue averages silently wrong.
+   Fix: CAST one side to FLOAT or multiply numerator by 1.0
 
-5. WINDOW FUNCTION BUGS
-   - Wrong PARTITION BY (too broad or too narrow)
-   - Missing ORDER BY in window functions that need it
-   - ROW_NUMBER vs RANK vs DENSE_RANK used incorrectly
+5. HARDCODED DATE FILTERS ON LIFETIME METRICS
+   Pattern: WHERE date_col >= '2024-01-01' in a model named "lifetime" or "all_time"
+   Why dangerous: A lifetime value model filtered to a static date is not
+   measuring lifetime. Silent scope reduction that grows worse over time.
 
-6. JOIN LOGIC BUGS
-   - Cartesian products from missing JOIN conditions
-   - Fan-out from one-to-many joins inflating metrics
-   - Wrong join key (joining on non-unique columns)
-   - Self-joins that duplicate data
+6. FAN-OUT FROM NON-UNIQUE JOIN KEY
+   Pattern: JOIN on a column that may not be unique in the right table
+   Why dangerous: One row matches multiple rows, duplicating metrics.
+   SUM(revenue) inflates silently. Classic warehouse bug.
 
-7. BUSINESS LOGIC ERRORS
-   - Revenue calculations that miss edge cases
-   - Status filters that exclude valid states
-   - Percentage calculations that don't handle zero denominators
+7. DIVIDE BY ZERO WITHOUT NULLIF
+   Pattern: SUM(x) / COUNT(y) or any division without NULLIF protection
+   Why dangerous: Returns NULL silently or crashes depending on warehouse.
+   Fix: NULLIF(denominator, 0) to handle zero safely.
 
-Return a JSON object with exactly this structure:
+8. MISLEADING METRIC DENOMINATORS
+   Pattern: total_value / COUNT(DISTINCT days) where days can equal 1
+   Why dangerous: If customer ordered on only 1 day, denominator = 1
+   and avg_daily_revenue equals total lifetime value. Completely misleading.
+   Only flag if you can see the denominator can realistically be 1.
+
+9. AGGREGATE ON POTENTIALLY VARCHAR COLUMN
+   Pattern: SUM() or AVG() on columns whose type is ambiguous
+   Why dangerous: Returns NULL silently in most warehouses. No type error.
+   Only flag if there is real evidence the column could be non-numeric.
+
+10. SLOWLY CHANGING DIMENSION WITHOUT VERSION FILTER
+    Pattern: JOIN to a dimension table without filtering to current/active version
+    Why dangerous: Historical records multiply current facts.
+    Revenue appears inflated. Classic SCD bug.
+
+For each bug you are confident about return exactly:
+{{
+  "category": "exact category name from above list",
+  "severity": "critical | high | medium | low",
+  "confidence": "high | medium",
+  "line_reference": "the exact SQL clause proving this bug exists",
+  "description": "specific and precise — what exact wrong data does this produce",
+  "impact": "concrete business impact — what number is wrong and by how much",
+  "fix": "exact SQL fix, not vague advice"
+}}
+
+CRITICAL RULE: 
+- Only include bugs where confidence is high or medium
+- If confidence would be low, skip the bug entirely
+- Maximum 6 bugs per model — prioritize the most impactful ones
+- Do not include duplicate findings for the same root cause
+
+Return JSON:
 {{
   "model_name": "{model_name}",
   "overall_risk": "critical | high | medium | low | clean",
-  "summary": "one sentence overall assessment",
-  "bugs": [
-    {{
-      "category": "category name from above",
-      "severity": "critical | high | medium | low",
-      "line_reference": "the specific SQL clause or line with the bug",
-      "description": "what the bug is",
-      "impact": "what wrong data this produces in plain English",
-      "fix": "exact SQL fix"
-    }}
-  ],
+  "summary": "one precise sentence describing the most dangerous issue found",
+  "bugs": [...],
   "data_loss_risk": true or false,
   "estimated_rows_affected": "none | some | significant | all",
   "safe_to_run": true or false
@@ -168,7 +198,16 @@ def print_analysis_report(report: dict):
             "low":      "🟢"
         }.get(bug.get("severity", "low"), "⚪")
 
+        # Confidence tag
+        confidence = bug.get("confidence", "")
+        confidence_display = {
+            "high":   "✓ high confidence",
+            "medium": "~ medium confidence",
+        }.get(confidence, "")
+
         print(f"  {i}. {severity_emoji} [{bug.get('severity', '').upper()}] {bug.get('category', '')}")
+        if confidence_display:
+            print(f"     Confidence: {confidence_display}")
         print(f"     SQL:    {bug.get('line_reference', 'N/A')}")
         print(f"     Bug:    {bug.get('description', 'N/A')}")
         print(f"     Impact: {bug.get('impact', 'N/A')}")
