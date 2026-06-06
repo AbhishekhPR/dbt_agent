@@ -279,6 +279,22 @@ def sql_metadata(project, dialect):
     for report in reports:
         print(f"  - {report.get('model_name')} ({len(report.get('source_tables', []))} source tables, {len(report.get('joins', []))} joins)")
 
+@cli.command(name="sql_risks")
+@click.option('--project', required=True, help='Path to your dbt project folder')
+def sql_risks(project):
+    """Scan dbt model SQL for risky transformation logic."""
+    from agent.sql_risk_detector import detect_sql_risks
+
+    print("Scanning SQL models for risky transformation logic...\n")
+    risks = detect_sql_risks(project)
+    print(f"{len(risks)} risk(s) found.\n")
+    for risk in risks:
+        print(f"[{risk['severity'].upper()}] {risk['model']}")
+        print(risk["message"])
+        print(f"Evidence: {risk['evidence']}")
+        print(f"Recommendation: {risk['recommendation']}")
+        print()
+
 @cli.command()
 @click.option('--project', required=True, help='Path to your dbt project folder')
 @click.option('--table', required=True, help='The upstream table that changed')
