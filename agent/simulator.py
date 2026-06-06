@@ -4,7 +4,12 @@ import sqlite3
 from pathlib import Path
 
 from agent import quality_checker
-from agent.quality_checker import get_table_metrics, quote_identifier, run_quality_check
+from agent.quality_checker import (
+    DEFAULT_FRESHNESS_THRESHOLD_MINUTES,
+    get_table_metrics,
+    quote_identifier,
+    run_quality_check,
+)
 
 
 SUPPORTED_ANOMALIES = {
@@ -13,6 +18,10 @@ SUPPORTED_ANOMALIES = {
     "null_explosion",
     "cardinality_explosion",
     "duplicate_explosion",
+    "freshness_anomaly",
+    "schema_drift_added_column",
+    "schema_drift_removed_column",
+    "schema_drift_type_change",
 }
 
 
@@ -75,6 +84,9 @@ def run_simulation(
 
 def ensure_clean_baseline(project_name: str, db_path: str, table: str):
     metrics = get_table_metrics(db_path, table)
+    freshness_minutes = metrics.get("freshness_minutes")
+    if freshness_minutes is not None and freshness_minutes > DEFAULT_FRESHNESS_THRESHOLD_MINUTES:
+        metrics["freshness_threshold_minutes"] = freshness_minutes + 1
     quality_checker.save_baseline(table, metrics)
 
 
@@ -116,6 +128,14 @@ def _apply_simulation(db_path: str, table: str, anomaly_type: str, baseline_file
         _simulate_cardinality_explosion(db_path, table, baseline_file)
     elif anomaly_type == "duplicate_explosion":
         _simulate_duplicate_explosion(db_path, table, baseline_file)
+    elif anomaly_type == "freshness_anomaly":
+        _simulate_freshness_anomaly(db_path, table, baseline_file)
+    elif anomaly_type == "schema_drift_added_column":
+        _simulate_schema_drift_added_column(db_path, table, baseline_file)
+    elif anomaly_type == "schema_drift_removed_column":
+        _simulate_schema_drift_removed_column(db_path, table, baseline_file)
+    elif anomaly_type == "schema_drift_type_change":
+        _simulate_schema_drift_type_change(db_path, table, baseline_file)
 
 
 def _simulate_row_count_drop(db_path: str, table: str, baseline_file: Path):
@@ -203,6 +223,106 @@ def _simulate_duplicate_explosion(db_path: str, table: str, baseline_file: Path)
     baseline["duplicate_rows"] = 0
     baseline["duplicate_rate"] = 0
     _save_baseline(baseline_file, baseline)
+
+
+def _simulate_freshness_anomaly(db_path: str, table: str, baseline_file: Path):
+    current_metrics = get_table_metrics(db_path, table)
+    freshness_column = current_metrics.get("freshness_column")
+    if not freshness_column:
+        freshness_column = "_relium_sim_updated_at"
+        _add_simulation_freshness_column(db_path, table, freshness_column)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            f"UPDATE {quote_identifier(table)} SET {quote_identifier(freshness_column)} = ?",
+            ("2024-01-01 00:00:00",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    baseline = get_table_metrics(db_path, table)
+    baseline["freshness_threshold_minutes"] = 1
+    _save_baseline(baseline_file, baseline)
+
+
+def _add_simulation_freshness_column(db_path: str, table: str, column: str):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            f"ALTER TABLE {quote_identifier(table)} ADD COLUMN {quote_identifier(column)} TEXT"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _simulate_schema_drift_added_column(db_path: str, table: str, baseline_file: Path):
+    baseline = _baseline_for_schema_simulation(db_path, table, baseline_file)
+    _save_baseline(baseline_file, baseline)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            f"ALTER TABLE {quote_identifier(table)} "
+            f"ADD COLUMN {quote_identifier('_relium_sim_new_column')} TEXT"
+        )
+        conn.execute(
+            f"UPDATE {quote_identifier(table)} SET {quote_identifier('_relium_sim_new_column')} = ?",
+            ("simulated",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _simulate_schema_drift_removed_column(db_path: str, table: str, baseline_file: Path):
+    baseline = _baseline_for_schema_simulation(db_path, table, baseline_file)
+    baseline.setdefault("columns", []).append("_relium_removed_column")
+    baseline.setdefault("schema", []).append({
+        "name": "_relium_removed_column",
+        "data_type": "TEXT",
+        "nullable": True,
+        "primary_key": False,
+    })
+    _save_baseline(baseline_file, baseline)
+
+
+def _simulate_schema_drift_type_change(db_path: str, table: str, baseline_file: Path):
+    baseline = _baseline_for_schema_simulation(db_path, table, baseline_file)
+    target = _pick_schema_type_change_column(baseline.get("schema", []))
+    if not target:
+        print(f"No suitable column found for schema_drift_type_change on '{table}'.")
+        return
+
+    current_type = target.get("data_type") or ""
+    simulated_old_type = "TEXT" if current_type.upper() != "TEXT" else "REAL"
+    for col in baseline.get("schema", []):
+        if col["name"] == target["name"]:
+            col["data_type"] = simulated_old_type
+            break
+    _save_baseline(baseline_file, baseline)
+
+
+def _pick_schema_type_change_column(schema: list) -> dict:
+    by_name = {col["name"]: col for col in schema}
+    for name in ("order_total", "revenue"):
+        if name in by_name:
+            return by_name[name]
+    for col in schema:
+        name = col["name"].lower()
+        if name != "id" and not name.endswith("_id"):
+            return col
+    return {}
+
+
+def _baseline_for_schema_simulation(db_path: str, table: str, baseline_file: Path) -> dict:
+    baseline = get_table_metrics(db_path, table)
+    existing = _load_baseline(baseline_file)
+    if "freshness_threshold_minutes" in existing:
+        baseline["freshness_threshold_minutes"] = existing["freshness_threshold_minutes"]
+    return baseline
 
 
 def _load_baseline(path: Path) -> dict:

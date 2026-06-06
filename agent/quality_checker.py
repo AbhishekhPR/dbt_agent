@@ -1,6 +1,8 @@
 import json
 import re
 import sqlite3
+import hashlib
+from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from agent.groq_client import call_llm_json
@@ -14,6 +16,7 @@ load_dotenv(dotenv_path=env_path)
 
 BASELINE_PATH = Path(__file__).resolve().parent.parent / "quality_baselines"
 BASELINE_PATH.mkdir(exist_ok=True)
+DEFAULT_FRESHNESS_THRESHOLD_MINUTES = 24 * 60
 
 SYSTEM_PROMPT = """
 You are a senior data quality engineer. You analyze data pipeline 
@@ -52,6 +55,51 @@ def infer_duplicate_key(columns: list, table_name: str) -> list:
     return []
 
 
+def infer_freshness_column(columns: list) -> str | None:
+    preferred = [
+        "updated_at",
+        "created_at",
+        "ingested_at",
+        "loaded_at",
+        "event_time",
+        "timestamp",
+    ]
+    for name in preferred:
+        if name in columns:
+            return name
+    for col in columns:
+        if col.endswith("_at"):
+            return col
+    for col in columns:
+        if "date" in col.lower():
+            return col
+    return None
+
+
+def _parse_sqlite_datetime(value: str) -> datetime:
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    return datetime.fromisoformat(text)
+
+
+def _schema_from_table_info(table_info: list) -> list:
+    return [
+        {
+            "name": row[1],
+            "data_type": row[2] or "",
+            "nullable": not bool(row[3]),
+            "primary_key": bool(row[5]),
+        }
+        for row in table_info
+    ]
+
+
+def _schema_hash(schema: list) -> str:
+    payload = json.dumps(schema, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _duplicate_count_sql(table_name: str, columns: list) -> str:
     table = quote_identifier(table_name)
     distinct_columns = ", ".join(quote_identifier(col) for col in columns)
@@ -86,6 +134,9 @@ def get_table_metrics(db_path: str, table_name: str) -> dict:
         table_info = cursor.fetchall()
         columns = [row[1] for row in table_info]
         metrics["columns"] = columns
+        schema = _schema_from_table_info(table_info)
+        metrics["schema"] = schema
+        metrics["schema_hash"] = _schema_hash(schema)
 
         # Null rates per column
         null_rates = {}
@@ -99,6 +150,26 @@ def get_table_metrics(db_path: str, table_name: str) -> dict:
             """)
             null_rates[col] = cursor.fetchone()[0] or 0.0
         metrics["null_rates"] = null_rates
+
+        freshness_column = infer_freshness_column(columns)
+        metrics["freshness_column"] = freshness_column
+        metrics["last_updated"] = None
+        metrics["freshness_minutes"] = None
+
+        if freshness_column:
+            try:
+                quoted_freshness_col = quote_identifier(freshness_column)
+                cursor.execute(f"SELECT MAX({quoted_freshness_col}) FROM {quoted_table}")
+                last_updated = cursor.fetchone()[0]
+                metrics["last_updated"] = last_updated
+                if last_updated:
+                    parsed = _parse_sqlite_datetime(last_updated)
+                    now = datetime.utcnow()
+                    if parsed.tzinfo is not None:
+                        parsed = parsed.replace(tzinfo=None)
+                    metrics["freshness_minutes"] = round((now - parsed).total_seconds() / 60, 2)
+            except Exception as exc:
+                metrics["freshness_error"] = str(exc)
 
         # Duplicate rate. Store aggregate counts and method only, never row values.
         duplicate_key = infer_duplicate_key(columns, table_name)
@@ -189,6 +260,12 @@ def detect_anomalies(current: dict, baseline: dict) -> list:
     if not baseline:
         return anomalies
 
+    # Schema drift — source/table structure changed since the baseline
+    current_schema = current.get("schema") or []
+    baseline_schema = baseline.get("schema") or []
+    if current_schema and baseline_schema:
+        anomalies.extend(_detect_schema_drift(table, current_schema, baseline_schema))
+
     # Row count anomaly — more than 20% change is suspicious
     current_rows = current.get("row_count", 0)
     baseline_rows = baseline.get("row_count", 0)
@@ -248,6 +325,26 @@ def detect_anomalies(current: dict, baseline: dict) -> list:
             "impact": "Duplicate records may inflate COUNT, SUM, revenue, and downstream metrics."
         })
 
+    # Freshness anomaly — latest update timestamp is outside expected window
+    freshness_minutes = current.get("freshness_minutes")
+    freshness_threshold = baseline.get(
+        "freshness_threshold_minutes",
+        DEFAULT_FRESHNESS_THRESHOLD_MINUTES,
+    )
+    if freshness_minutes is not None and freshness_minutes > freshness_threshold:
+        stale_hours = round(freshness_minutes / 60, 1)
+        anomalies.append({
+            "type": "freshness_anomaly",
+            "severity": "critical" if freshness_minutes > 48 * 60 else "high",
+            "table": table,
+            "message": f"Table is stale by {stale_hours} hours",
+            "detail": (
+                f"Latest {current.get('freshness_column')} value is "
+                f"{current.get('last_updated')}"
+            ),
+            "impact": "Downstream models may be using outdated data"
+        })
+
     # Cardinality explosion — distinct values suddenly way higher
     current_distinct = current.get("distinct_counts", {})
     baseline_distinct = baseline.get("distinct_counts", {})
@@ -265,6 +362,89 @@ def detect_anomalies(current: dict, baseline: dict) -> list:
                     "detail": f"Was {baseline_count} distinct values, now {current_count}",
                     "impact": "GROUP BY queries on this column may return unexpected granularity"
                 })
+
+    return anomalies
+
+
+def _detect_schema_drift(table: str, current_schema: list, baseline_schema: list) -> list:
+    anomalies = []
+    current_by_name = {col["name"]: col for col in current_schema}
+    baseline_by_name = {col["name"]: col for col in baseline_schema}
+
+    for column_name, baseline_col in baseline_by_name.items():
+        if column_name not in current_by_name:
+            anomalies.append({
+                "type": "schema_drift",
+                "severity": "critical",
+                "table": table,
+                "message": f"Schema drift detected: column '{column_name}' was removed",
+                "detail": "Column existed in baseline but is missing in current schema",
+                "impact": "Downstream models referencing this column may fail or produce incorrect results",
+                "schema_change": {
+                    "change_type": "removed_column",
+                    "column": column_name
+                }
+            })
+
+    for column_name in current_by_name:
+        if column_name not in baseline_by_name:
+            anomalies.append({
+                "type": "schema_drift",
+                "severity": "medium",
+                "table": table,
+                "message": f"Schema drift detected: column '{column_name}' was added",
+                "detail": "Column did not exist in baseline but exists in current schema",
+                "impact": "Downstream SELECT * models may change shape unexpectedly",
+                "schema_change": {
+                    "change_type": "added_column",
+                    "column": column_name
+                }
+            })
+
+    for column_name, baseline_col in baseline_by_name.items():
+        current_col = current_by_name.get(column_name)
+        if not current_col:
+            continue
+
+        old_type = baseline_col.get("data_type") or ""
+        new_type = current_col.get("data_type") or ""
+        if old_type != new_type:
+            anomalies.append({
+                "type": "schema_drift",
+                "severity": "high",
+                "table": table,
+                "message": (
+                    f"Schema drift detected: column '{column_name}' changed type "
+                    f"from {old_type} to {new_type}"
+                ),
+                "detail": "Column data type changed between baseline and current schema",
+                "impact": "Aggregations, joins, and casts may behave incorrectly",
+                "schema_change": {
+                    "change_type": "type_change",
+                    "column": column_name,
+                    "old_type": old_type,
+                    "new_type": new_type
+                }
+            })
+
+        old_nullable = baseline_col.get("nullable")
+        new_nullable = current_col.get("nullable")
+        if old_nullable is not None and new_nullable is not None and old_nullable != new_nullable:
+            direction = "nullable" if new_nullable else "not nullable"
+            anomalies.append({
+                "type": "schema_drift",
+                "severity": "high" if new_nullable else "medium",
+                "table": table,
+                "message": f"Schema drift detected: column '{column_name}' is now {direction}",
+                "detail": "Column nullability changed between baseline and current schema",
+                "impact": "Downstream assumptions about required values may be incorrect",
+                "schema_change": {
+                    "change_type": "nullable_change",
+                    "column": column_name,
+                    "old_nullable": old_nullable,
+                    "new_nullable": new_nullable
+                }
+            })
 
     return anomalies
 

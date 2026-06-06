@@ -165,6 +165,10 @@ def quality(project, db):
             "null_explosion",
             "cardinality_explosion",
             "duplicate_explosion",
+            "freshness_anomaly",
+            "schema_drift_added_column",
+            "schema_drift_removed_column",
+            "schema_drift_type_change",
         ]
     ),
     help='Simulation type to apply'

@@ -7,12 +7,42 @@
     "order_status",
     "order_total"
   ],
+  "schema": [
+    {
+      "name": "order_id",
+      "data_type": "INT",
+      "nullable": true,
+      "primary_key": false
+    },
+    {
+      "name": "customer_id",
+      "data_type": "INT",
+      "nullable": true,
+      "primary_key": false
+    },
+    {
+      "name": "order_status",
+      "data_type": "TEXT",
+      "nullable": true,
+      "primary_key": false
+    },
+    {
+      "name": "order_total",
+      "data_type": "REAL",
+      "nullable": true,
+      "primary_key": false
+    }
+  ],
+  "schema_hash": "4b66dbb3307cd036b9acd1ed6e1faccf19e16cdafcaff433e0ff5518a8166cd5",
   "null_rates": {
     "order_id": 0.0,
     "customer_id": 0.0,
     "order_status": 0.0,
     "order_total": 50.0
   },
+  "freshness_column": null,
+  "last_updated": null,
+  "freshness_minutes": null,
   "duplicate_rows": 5,
   "duplicate_rate": 62.5,
   "duplicate_check_method": "key:order_id",

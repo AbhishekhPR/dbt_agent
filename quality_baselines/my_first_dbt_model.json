@@ -4,9 +4,21 @@
   "columns": [
     "id"
   ],
+  "schema": [
+    {
+      "name": "id",
+      "data_type": "",
+      "nullable": true,
+      "primary_key": false
+    }
+  ],
+  "schema_hash": "8a042e31a5744a299bb4a3fad61a81b6138d28aeb40bdbcf7caf5320141da88e",
   "null_rates": {
     "id": 50.0
   },
+  "freshness_column": null,
+  "last_updated": null,
+  "freshness_minutes": null,
   "duplicate_rows": 0,
   "duplicate_rate": 0.0,
   "duplicate_check_method": "key:id",

@@ -252,6 +252,76 @@ class RootCauseEngineTests(unittest.TestCase):
         for cause in report["likely_causes"]:
             self.assertEqual(cause["reason"], "Duplicate rows increased from 0 to 10")
 
+    def test_freshness_anomaly_returns_metadata_only_rca(self):
+        from agent.root_cause_engine import analyze_root_cause
+
+        with patch(
+            "agent.root_cause_engine.calculate_blast_radius",
+            return_value={
+                "directly_affected": [{"model": "fct_revenue"}],
+                "indirectly_affected": [{"model": "fct_customer_summary"}],
+                "total_affected": 2,
+            },
+        ):
+            report = analyze_root_cause(
+                {
+                    "type": "freshness_anomaly",
+                    "table": "raw_orders",
+                    "project_path": "test_project",
+                    "message": "Table is stale by 8.0 hours",
+                    "detail": "Latest created_at value is 2026-06-04 02:00:00",
+                }
+            )
+
+        self.assertEqual(report["likely_causes"][0]["cause"], "upstream ingestion delay")
+        self.assertEqual(
+            report["likely_causes"][0]["reason"],
+            "Table is stale by 8.0 hours",
+        )
+        self.assertIn("failed scheduled load", [c["cause"] for c in report["likely_causes"]])
+        self.assertEqual(report["affected_models"], ["fct_revenue", "fct_customer_summary"])
+        self.assertIn(
+            "Check the upstream ingestion or scheduled load for raw_orders",
+            report["recommended_actions"],
+        )
+
+    def test_schema_drift_uses_column_level_blast_radius(self):
+        from agent.root_cause_engine import analyze_root_cause
+
+        with patch(
+            "agent.root_cause_engine.calculate_blast_radius",
+            return_value={
+                "directly_affected": [{"model": "fct_customer_lifetime_value"}],
+                "indirectly_affected": [],
+                "total_affected": 1,
+            },
+        ) as blast:
+            report = analyze_root_cause(
+                {
+                    "type": "schema_drift",
+                    "table": "raw_customers",
+                    "project_path": "test_project",
+                    "message": "Schema drift detected: column 'customer_segment' was removed",
+                    "schema_change": {
+                        "change_type": "removed_column",
+                        "column": "customer_segment",
+                    },
+                }
+            )
+
+        blast.assert_called_once_with(
+            "test_project",
+            "raw_customers",
+            changed_columns=["customer_segment"],
+        )
+        self.assertEqual(report["likely_causes"][0]["cause"], "upstream schema change")
+        self.assertEqual(
+            report["likely_causes"][0]["reason"],
+            "Schema drift detected: column 'customer_segment' was removed",
+        )
+        self.assertEqual(report["affected_models"], ["fct_customer_lifetime_value"])
+        self.assertIn("Check recent upstream schema changes", report["recommended_actions"])
+
     def test_root_cause_cli_accepts_message_and_prints_dropped_report(self):
         from agent.cli import cli
 

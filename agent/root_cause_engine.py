@@ -42,6 +42,22 @@ CARDINALITY_EXPLOSION_ACTIONS = [
     "Check for malformed or newly introduced dimension values",
 ]
 
+FRESHNESS_ANOMALY_ACTIONS = [
+    "Check the upstream ingestion or scheduled load for {table}",
+    "Verify whether the source connector is running",
+    "Compare latest successful load timestamp with expected schedule",
+    "Check orchestration logs for failed or skipped jobs",
+    "Validate whether source data is arriving late",
+]
+
+SCHEMA_DRIFT_ACTIONS = [
+    "Check recent upstream schema changes",
+    "Review source connector schema sync history",
+    "Search downstream SQL models for references to changed columns",
+    "Validate dbt model contracts or tests",
+    "Confirm whether the schema change was intentional",
+]
+
 
 def analyze_root_cause(anomaly: dict) -> dict:
     """
@@ -58,7 +74,8 @@ def analyze_root_cause(anomaly: dict) -> dict:
     signal = _build_signal(anomaly_type, anomaly, previous, current)
 
     likely_causes = _rank_causes(anomaly_type, signal)
-    blast = _safe_blast_radius(project_path, table)
+    changed_columns = _changed_columns_from_anomaly(anomaly) if anomaly_type == "schema_drift" else []
+    blast = _safe_blast_radius(project_path, table, changed_columns)
     affected_models = _affected_model_names(blast)
 
     return {
@@ -247,6 +264,10 @@ def _build_signal(anomaly_type: str, anomaly: dict, previous: dict, current: dic
         return _simple_increase_signal("duplicate_rows", "duplicate rows", anomaly, previous, current)
     if anomaly_type == "cardinality_explosion":
         return _nested_increase_signal("distinct_counts", "distinct values", anomaly, previous, current)
+    if anomaly_type == "freshness_anomaly":
+        return _freshness_signal(anomaly)
+    if anomaly_type == "schema_drift":
+        return _schema_drift_signal(anomaly)
     return {"direction": "unknown", "magnitude": _pct_from_message(anomaly.get("message", ""))}
 
 
@@ -410,6 +431,28 @@ def _nested_increase_signal(metric: str, label: str, anomaly: dict, previous: di
     }
 
 
+def _freshness_signal(anomaly: dict) -> dict:
+    message = anomaly.get("message") or anomaly.get("detail") or (
+        "The table has not received fresh records within the expected freshness window."
+    )
+    return {
+        "direction": "stale",
+        "magnitude": _pct_from_message(message) / 100,
+        "confidence": 0.85,
+        "reason": message,
+    }
+
+
+def _schema_drift_signal(anomaly: dict) -> dict:
+    message = anomaly.get("message") or anomaly.get("detail") or "Schema drift detected"
+    return {
+        "direction": "changed",
+        "magnitude": 0.75,
+        "confidence": 0.85,
+        "reason": message,
+    }
+
+
 def _rank_causes(anomaly_type: str, signal: dict) -> list:
     direction = signal.get("direction")
     confidence = signal.get("confidence", _confidence(signal.get("magnitude", 0)))
@@ -440,6 +483,28 @@ def _rank_causes(anomaly_type: str, signal: dict) -> list:
     if anomaly_type == "cardinality_explosion":
         return _causes(
             ["new dimension introduced", "malformed grouping", "incorrect join logic"],
+            confidence,
+            reason,
+        )
+    if anomaly_type == "freshness_anomaly":
+        return _causes(
+            [
+                "upstream ingestion delay",
+                "failed scheduled load",
+                "source connector paused",
+                "warehouse/job orchestration failure",
+            ],
+            confidence,
+            reason,
+        )
+    if anomaly_type == "schema_drift":
+        return _causes(
+            [
+                "upstream schema change",
+                "source connector schema evolution",
+                "dbt model contract mismatch",
+                "renamed or removed source field",
+            ],
             confidence,
             reason,
         )
@@ -556,15 +621,30 @@ def _recommended_actions(anomaly_type: str, signal: dict, table: str) -> list:
         "null_explosion": NULL_EXPLOSION_ACTIONS,
         "duplicate_explosion": DUPLICATE_EXPLOSION_ACTIONS,
         "cardinality_explosion": CARDINALITY_EXPLOSION_ACTIONS,
+        "freshness_anomaly": [action.format(table=table) for action in FRESHNESS_ANOMALY_ACTIONS],
+        "schema_drift": SCHEMA_DRIFT_ACTIONS,
     }.get(anomaly_type, ROW_SPIKE_ACTIONS)
 
 
-def _safe_blast_radius(project_path: str, table: str) -> dict:
+def _changed_columns_from_anomaly(anomaly: dict) -> list:
+    schema_change = anomaly.get("schema_change") or {}
+    column = schema_change.get("column")
+    return [column] if column else []
+
+
+def _safe_blast_radius(project_path: str, table: str, changed_columns: list = None) -> dict:
     if not table:
         return {"directly_affected": [], "indirectly_affected": [], "total_affected": 0}
     try:
+        if changed_columns:
+            return calculate_blast_radius(project_path, table, changed_columns=changed_columns)
         return calculate_blast_radius(project_path, table)
     except Exception as exc:
+        if changed_columns:
+            try:
+                return calculate_blast_radius(project_path, table)
+            except Exception as fallback_exc:
+                exc = fallback_exc
         return {
             "directly_affected": [],
             "indirectly_affected": [],
