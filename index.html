@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Relium AI - Metadata-only reliability for SQL and dbt</title>
+<meta name="description" content="Relium AI catches silent SQL and dbt pipeline failures before bad data reaches dashboards.">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0c0c0c;--bg2:#111;--white:#efefeb;--red:#d94f3d;--dim:#3a3a3a;--mid:#6c6c68;--soft:#a8a8a2;--mono:"SFMono-Regular",Consolas,"Liberation Mono",monospace;--serif:Georgia,"Times New Roman",serif}
+html{scroll-behavior:smooth}body{background:var(--bg);color:var(--white);font-family:var(--mono);-webkit-font-smoothing:antialiased;overflow-x:hidden}a{color:inherit;text-decoration:none}
+nav{position:fixed;top:0;left:0;right:0;z-index:20;display:flex;align-items:center;justify-content:space-between;height:56px;padding:0 48px;border-bottom:1px solid var(--dim);background:rgba(12,12,12,.95);backdrop-filter:blur(12px)}
+.nav-logo{font-size:14px;font-weight:600;letter-spacing:.08em}.nav-links{display:flex;align-items:center;gap:30px;list-style:none}.nav-links a{color:var(--mid);font-size:13px;letter-spacing:.06em;transition:color .2s,border-color .2s}.nav-links a:hover{color:var(--white)}.nav-demo{padding:7px 14px;border:1px solid var(--dim);border-radius:2px}.nav-demo:hover{border-color:var(--soft)}
+.hero{position:relative;min-height:86vh;display:flex;flex-direction:column;justify-content:flex-end;padding:132px 48px 64px;border-bottom:1px solid var(--dim);overflow:hidden}.hero-bg{position:absolute;inset:0;background:linear-gradient(180deg,transparent 62%,rgba(217,79,61,.035) 100%),repeating-linear-gradient(0deg,transparent,transparent 79px,rgba(255,255,255,.018) 79px,rgba(255,255,255,.018) 80px),repeating-linear-gradient(90deg,transparent,transparent 79px,rgba(255,255,255,.018) 79px,rgba(255,255,255,.018) 80px)}
+.hero-content{position:relative;z-index:1;max-width:920px}.eyebrow,.label{color:var(--mid);font-size:12px;letter-spacing:.16em;text-transform:uppercase}.eyebrow{margin-bottom:30px}.hero-title{max-width:880px;margin-bottom:30px;font-family:var(--serif);font-size:clamp(54px,7vw,104px);font-weight:400;line-height:.98;letter-spacing:-.02em}.hero-title em{color:var(--red);font-style:italic}.hero-copy{max-width:600px;margin-bottom:30px;color:var(--soft);font-size:18px;line-height:1.75}.actions{display:flex;flex-wrap:wrap;gap:12px}
+.btn-primary,.btn-secondary{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:12px 28px;border-radius:2px;font-family:var(--mono);font-size:13px;font-weight:600;letter-spacing:.06em;transition:all .2s}.btn-primary{border:1px solid var(--white);background:var(--white);color:var(--bg)}.btn-primary:hover{border-color:var(--red);background:var(--red);color:var(--white)}.btn-secondary{border:1px solid var(--dim);color:var(--soft)}.btn-secondary:hover{border-color:var(--soft);color:var(--white)}
+.home{max-width:1160px;margin:0 auto;padding:96px 48px}.intro{display:grid;grid-template-columns:260px minmax(0,760px);gap:80px;margin-bottom:76px}.intro h2{font-family:var(--serif);font-size:clamp(36px,4.5vw,60px);font-weight:400;line-height:1.1;letter-spacing:-.02em;margin-bottom:24px}.intro p{color:var(--soft);font-size:19px;line-height:1.85}
+.posts{border-top:1px solid var(--dim)}.post{display:grid;grid-template-columns:220px 1fr auto;gap:42px;align-items:center;padding:32px 0;border-bottom:1px solid var(--dim)}.post small{color:var(--mid);font-size:12px;letter-spacing:.14em;text-transform:uppercase}.post h3{font-family:var(--serif);font-size:32px;font-weight:400;line-height:1.2;margin-bottom:10px}.post p{max-width:620px;color:var(--soft);font-size:16px;line-height:1.7}.post .arrow{color:var(--mid);font-size:22px}
+.cta{border-top:1px solid var(--dim);background:var(--bg2)}.cta-inner{max-width:1160px;margin:0 auto;padding:86px 48px}.cta h2{max-width:720px;margin-bottom:22px;font-family:var(--serif);font-size:clamp(36px,4.4vw,58px);font-weight:400;line-height:1.1}.cta p{max-width:680px;margin-bottom:30px;color:var(--soft);font-size:18px;line-height:1.75}
+footer{max-width:1160px;margin:0 auto;display:flex;justify-content:space-between;gap:24px;padding:34px 48px;color:var(--mid);font-size:13px;line-height:1.7}
+@media(max-width:820px){nav{padding:0 28px}.hero{padding:126px 28px 62px}.home,.cta-inner{padding:76px 28px}.intro{grid-template-columns:1fr;gap:24px}.post{grid-template-columns:1fr;gap:14px}.post .arrow{display:none}}@media(max-width:640px){nav{height:auto;min-height:56px;align-items:flex-start;flex-direction:column;gap:14px;padding:18px 20px}.nav-links{width:100%;flex-wrap:wrap;gap:12px 18px}.nav-links a:not(.nav-demo){display:none}.nav-demo{width:100%;text-align:center}.hero{min-height:auto;padding:150px 20px 56px}.hero-title{font-size:54px}.hero-copy,.intro p{font-size:17px}.home,.cta-inner{padding:66px 20px}.actions,.btn-primary,.btn-secondary{width:100%}footer{flex-direction:column;padding:30px 20px}}
+</style>
+</head>
+<body>
+<nav aria-label="Primary navigation">
+  <a class="nav-logo" href="relium.html">RELIUM AI</a>
+  <ul class="nav-links">
+    <li><a href="relium-why.html">Why</a></li>
+    <li><a href="relium-product.html">Product</a></li>
+    <li><a href="relium-privacy.html">Privacy</a></li>
+    <li><a class="nav-demo" href="mailto:abhishekhrel9@gmail.com?subject=Relium%20AI%20Demo%20Request">Request Demo</a></li>
+  </ul>
+</nav>
+
+<main>
+  <header class="hero">
+    <div class="hero-bg" aria-hidden="true"></div>
+    <div class="hero-content">
+      <p class="eyebrow">Metadata-only reliability for SQL and dbt</p>
+      <h1 class="hero-title">Catch silent <em>dbt failures</em> before dashboards do.</h1>
+      <p class="hero-copy">Relium is a reliability engine for the quiet data failures that pass orchestration checks but still break business trust.</p>
+      <div class="actions">
+        <a class="btn-primary" href="mailto:abhishekhrel9@gmail.com?subject=Relium%20AI%20Demo%20Request">Request a Demo</a>
+        <a class="btn-secondary" href="relium-why.html">Start Reading</a>
+      </div>
+    </div>
+  </header>
+
+  <section class="home">
+    <div class="intro">
+      <p class="label">Field notes</p>
+      <div>
+        <h2>A small journal on SQL reliability, metadata, and pre-dashboard data quality.</h2>
+        <p>Instead of forcing the whole story onto one page, the Relium site is organized like a product blog. Read the motivation, the product approach, the privacy model, and a sample incident report separately.</p>
+      </div>
+    </div>
+
+    <div class="posts">
+      <a class="post" href="relium-why.html">
+        <small>01 / Why</small>
+        <div>
+          <h3>The job passed. The dashboard is still wrong.</h3>
+          <p>Why analytics teams need monitoring for silent failures, not only failed jobs.</p>
+        </div>
+        <span class="arrow">→</span>
+      </a>
+      <a class="post" href="relium-product.html">
+        <small>02 / Product</small>
+        <div>
+          <h3>Metadata, lineage, and SQL structure.</h3>
+          <p>How Relium turns aggregate signals into RCA reports and Slack-ready incidents.</p>
+        </div>
+        <span class="arrow">→</span>
+      </a>
+      <a class="post" href="relium-incident.html">
+        <small>03 / Incident</small>
+        <div>
+          <h3>A raw_orders incident report.</h3>
+          <p>A compact example of anomaly evidence, hypothesis, blast radius, and action.</p>
+        </div>
+        <span class="arrow">→</span>
+      </a>
+      <a class="post" href="relium-privacy.html">
+        <small>04 / Privacy</small>
+        <div>
+          <h3>Designed without raw customer records.</h3>
+          <p>The metadata-first architecture behind Relium's incident evidence.</p>
+        </div>
+        <span class="arrow">→</span>
+      </a>
+    </div>
+  </section>
+
+  <section class="cta">
+    <div class="cta-inner">
+      <h2>Looking for early design partners.</h2>
+      <p>Relium is in early product development for data teams, analytics engineers, and technical investors interested in SQL/dbt reliability.</p>
+      <a class="btn-primary" href="mailto:abhishekhrel9@gmail.com?subject=Relium%20AI%20Demo%20Request">Request a Demo</a>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <p>&copy; 2026 Relium AI. Metadata-only reliability for SQL and dbt pipelines.</p>
+  <p>Built for data teams before bad data reaches dashboards.</p>
+</footer>
+</body>
+</html>
