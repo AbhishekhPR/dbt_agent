@@ -6,13 +6,13 @@ import re
 INCIDENTS_DIR = Path("incidents")
 
 
-def create_incident_report(project_name: str, anomaly: dict, rca_report: dict) -> str:
+def create_incident_report(project_name: str, anomaly: dict, rca_report: dict, table_name: str | None = None) -> str:
     """
     Write a metadata-only RCA incident report and return its path.
     """
     INCIDENTS_DIR.mkdir(exist_ok=True)
 
-    table = anomaly.get("table", "unknown")
+    table = _resolve_table_name(anomaly, rca_report, table_name)
     anomaly_type = anomaly.get("type", anomaly.get("anomaly", "unknown"))
     generated_at = datetime.utcnow()
     timestamp = generated_at.strftime("%Y%m%d_%H%M%S")
@@ -23,20 +23,24 @@ def create_incident_report(project_name: str, anomaly: dict, rca_report: dict) -
     path = INCIDENTS_DIR / filename
 
     path.write_text(
-        _render_report(project_name, anomaly, rca_report, generated_at),
+        _render_report(project_name, anomaly, rca_report, generated_at, table),
         encoding="utf-8",
     )
     return path.as_posix()
 
 
-def _render_report(project_name: str, anomaly: dict, rca_report: dict, generated_at: datetime) -> str:
+def _resolve_table_name(anomaly: dict, rca_report: dict, table_name: str | None = None) -> str:
+    return anomaly.get("table") or rca_report.get("table") or table_name or "unknown"
+
+
+def _render_report(project_name: str, anomaly: dict, rca_report: dict, generated_at: datetime, table_name: str | None = None) -> str:
     causes = rca_report.get("likely_causes") or []
     primary = causes[0] if causes else {}
     alternatives = causes[1:]
     affected_models = rca_report.get("affected_models") or []
     actions = rca_report.get("recommended_actions") or []
     impact_count = rca_report.get("impact_count", len(affected_models))
-    table = anomaly.get("table", "unknown")
+    table = _resolve_table_name(anomaly, rca_report, table_name)
     anomaly_type = anomaly.get("type", anomaly.get("anomaly", "unknown"))
     severity = anomaly.get("severity", "unknown")
     primary_cause = _sentence_case(primary.get("cause", "No strong RCA evidence"))

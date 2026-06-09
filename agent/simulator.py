@@ -1,6 +1,7 @@
 import json
 import shutil
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from agent import quality_checker
@@ -237,11 +238,13 @@ def _simulate_freshness_anomaly(db_path: str, table: str, baseline_file: Path):
         freshness_column = "_relium_sim_updated_at"
         _add_simulation_freshness_column(db_path, table, freshness_column)
 
+    stale_timestamp = (datetime.utcnow() - timedelta(hours=48)).replace(microsecond=0)
+
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
             f"UPDATE {quote_identifier(table)} SET {quote_identifier(freshness_column)} = ?",
-            ("2024-01-01 00:00:00",),
+            (stale_timestamp.strftime("%Y-%m-%d %H:%M:%S"),),
         )
         conn.commit()
     finally:

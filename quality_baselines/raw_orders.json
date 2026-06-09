@@ -54,7 +54,7 @@
       "primary_key": false
     }
   ],
-  "schema_hash": "b1839618d785924a655dc62aaf6cf0f3ffdb38225d777f6408acd4f13f4b2e44",
+  "schema_hash": "d6a6a78bbefe56b66cdf844d94aaa211f081b0cda56c63d54734428027f37d1e",
   "null_rates": {
     "order_id": 0.0,
     "customer_id": 0.0,
@@ -64,15 +64,12 @@
     "created_at": 0.0,
     "updated_at": 0.0
   },
-  "freshness_column": "updated_at",
-  "last_updated": "2026-06-07 09:00:00",
-  "freshness_minutes": 1372.56,
   "duplicate_rows": 0,
   "duplicate_rate": 0.0,
-  "duplicate_check_method": "key:order_id",
   "duplicate_key_columns": [
     "order_id"
   ],
+  "duplicate_check_method": "key:order_id",
   "numeric_stats": {
     "order_id": {
       "min": 1.0,
@@ -100,9 +97,9 @@
       "avg": 235.88
     },
     "created_at": {
-      "min": 2025.0,
-      "max": 2027.0,
-      "avg": 2025.57
+      "min": 2026.0,
+      "max": 2026.0,
+      "avg": 2026.0
     },
     "updated_at": {
       "min": 2026.0,
@@ -116,7 +113,10 @@
     "product_id": 1000,
     "order_status": 4,
     "order_total": 929,
-    "created_at": 100000,
-    "updated_at": 1440
-  }
+    "created_at": 120,
+    "updated_at": 90
+  },
+  "freshness_column": "created_at",
+  "last_updated": "2026-06-09 14:19:03",
+  "freshness_minutes": 60
 }

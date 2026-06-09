@@ -47,7 +47,7 @@
       "primary_key": false
     }
   ],
-  "schema_hash": "7894880e9a631702bd3270c55d2ccffa915080663773306d4489042fabdc7058",
+  "schema_hash": "097026cc894a6d7b00ef330ea1f158714524ef24b9debc05a6d311b34ac0d921",
   "null_rates": {
     "product_id": 0.0,
     "category": 0.0,
@@ -56,15 +56,12 @@
     "is_active": 0.0,
     "updated_at": 0.0
   },
-  "freshness_column": "updated_at",
-  "last_updated": "2026-06-07 09:00:00",
-  "freshness_minutes": 1372.55,
   "duplicate_rows": 0,
   "duplicate_rate": 0.0,
-  "duplicate_check_method": "key:product_id",
   "duplicate_key_columns": [
     "product_id"
   ],
+  "duplicate_check_method": "key:product_id",
   "numeric_stats": {
     "product_id": {
       "min": 1.0,
@@ -103,6 +100,9 @@
     "brand": 40,
     "price": 1000,
     "is_active": 2,
-    "updated_at": 240
-  }
+    "updated_at": 120
+  },
+  "freshness_column": "updated_at",
+  "last_updated": "2026-06-09 14:19:03",
+  "freshness_minutes": 60
 }

@@ -47,7 +47,7 @@
       "primary_key": false
     }
   ],
-  "schema_hash": "4c0f55d50c033b9aa774601a3b38cdec1f35e27ec8274e1f8b51d34025cef6a7",
+  "schema_hash": "f0d5cae05658afb7602a6bfdc98c6d7065e04fb4381e70717d710af831d58169",
   "null_rates": {
     "event_id": 0.0,
     "customer_id": 0.0,
@@ -56,15 +56,12 @@
     "event_time": 0.0,
     "updated_at": 0.0
   },
-  "freshness_column": "updated_at",
-  "last_updated": "2026-09-18 09:00:00",
-  "freshness_minutes": -146947.43,
-  "duplicate_rows": 0,
-  "duplicate_rate": 0.0,
-  "duplicate_check_method": "key:event_id",
+  "duplicate_rows": 290000,
+  "duplicate_rate": 96.67,
   "duplicate_key_columns": [
-    "event_id"
+    "customer_id"
   ],
+  "duplicate_check_method": "key:customer_id",
   "numeric_stats": {
     "event_id": {
       "min": 1.0,
@@ -92,9 +89,9 @@
       "avg": 2026.0
     },
     "updated_at": {
-      "min": 2025.0,
+      "min": 2026.0,
       "max": 2026.0,
-      "avg": 2025.42
+      "avg": 2026.0
     }
   },
   "distinct_counts": {
@@ -102,7 +99,10 @@
     "customer_id": 10000,
     "event_type": 6,
     "session_id": 300000,
-    "event_time": 1440,
-    "updated_at": 300000
-  }
+    "event_time": 120,
+    "updated_at": 90
+  },
+  "freshness_column": "updated_at",
+  "last_updated": "2026-06-09 14:19:03",
+  "freshness_minutes": 60
 }

@@ -54,7 +54,7 @@
       "primary_key": false
     }
   ],
-  "schema_hash": "c95fd05f6af2250538d249986f707c8ef0423fffa96512aef742dd4d8ca974b5",
+  "schema_hash": "a7d7f721cc096d23fa61657c4e3a6fa67920ddfdca14bbf80531d64eb6ddb90a",
   "null_rates": {
     "payment_id": 0.0,
     "order_id": 0.0,
@@ -64,15 +64,12 @@
     "created_at": 0.0,
     "updated_at": 0.0
   },
-  "freshness_column": "updated_at",
-  "last_updated": "2026-06-07 09:00:00",
-  "freshness_minutes": 1372.56,
   "duplicate_rows": 0,
   "duplicate_rate": 0.0,
-  "duplicate_check_method": "key:order_id",
   "duplicate_key_columns": [
     "order_id"
   ],
+  "duplicate_check_method": "key:order_id",
   "numeric_stats": {
     "payment_id": {
       "min": 1.0,
@@ -100,9 +97,9 @@
       "avg": 221.22
     },
     "created_at": {
-      "min": 2025.0,
-      "max": 2027.0,
-      "avg": 2025.57
+      "min": 2026.0,
+      "max": 2026.0,
+      "avg": 2026.0
     },
     "updated_at": {
       "min": 2026.0,
@@ -116,7 +113,10 @@
     "payment_method": 5,
     "payment_status": 3,
     "amount": 3900,
-    "created_at": 100000,
-    "updated_at": 1440
-  }
+    "created_at": 120,
+    "updated_at": 90
+  },
+  "freshness_column": "created_at",
+  "last_updated": "2026-06-09 14:19:03",
+  "freshness_minutes": 60
 }

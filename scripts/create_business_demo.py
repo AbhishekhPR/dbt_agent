@@ -19,7 +19,6 @@ DEFAULT_COUNTS = {
 
 BATCH_SIZE = 10_000
 BASE_DATE = datetime(2025, 1, 1, 9, 0, 0)
-LOAD_DATE = datetime(2026, 6, 7, 9, 0, 0)
 
 CUSTOMER_SEGMENTS = ("consumer", "small_business", "mid_market", "enterprise")
 ACQUISITION_CHANNELS = ("organic", "paid_search", "paid_social", "affiliate", "email", "partner")
@@ -162,6 +161,7 @@ def create_business_demo(base_path: Path | str | None = None, counts: dict | Non
         resolved_counts.update(counts)
 
     _write_models(models_dir)
+    load_date = datetime.utcnow().replace(microsecond=0) - timedelta(hours=1)
 
     db_path = db_dir / "business.db"
     conn = sqlite3.connect(db_path)
@@ -171,11 +171,11 @@ def create_business_demo(base_path: Path | str | None = None, counts: dict | Non
         conn.execute("PRAGMA temp_store = MEMORY")
         _drop_tables(conn)
         _create_tables(conn)
-        _insert_customers(conn, resolved_counts["raw_customers"])
-        _insert_products(conn, resolved_counts["raw_products"])
-        _insert_orders(conn, resolved_counts["raw_orders"], resolved_counts)
-        _insert_payments(conn, resolved_counts["raw_payments"], resolved_counts["raw_orders"])
-        _insert_events(conn, resolved_counts["raw_events"], resolved_counts["raw_customers"])
+        _insert_customers(conn, resolved_counts["raw_customers"], load_date)
+        _insert_products(conn, resolved_counts["raw_products"], load_date)
+        _insert_orders(conn, resolved_counts["raw_orders"], resolved_counts, load_date)
+        _insert_payments(conn, resolved_counts["raw_payments"], resolved_counts["raw_orders"], load_date)
+        _insert_events(conn, resolved_counts["raw_events"], resolved_counts["raw_customers"], load_date)
         _create_indexes(conn)
         conn.commit()
     finally:
@@ -255,11 +255,11 @@ def _create_tables(conn: sqlite3.Connection) -> None:
     )
 
 
-def _insert_customers(conn: sqlite3.Connection, count: int) -> None:
+def _insert_customers(conn: sqlite3.Connection, count: int, load_date: datetime) -> None:
     rows = []
     for customer_id in range(1, count + 1):
         signup_date = BASE_DATE - timedelta(days=customer_id % 730)
-        updated_at = LOAD_DATE - timedelta(minutes=customer_id % 720)
+        updated_at = load_date - timedelta(minutes=customer_id % 120)
         rows.append(
             (
                 customer_id,
@@ -274,11 +274,11 @@ def _insert_customers(conn: sqlite3.Connection, count: int) -> None:
     conn.executemany("INSERT INTO raw_customers VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
 
 
-def _insert_products(conn: sqlite3.Connection, count: int) -> None:
+def _insert_products(conn: sqlite3.Connection, count: int, load_date: datetime) -> None:
     rows = []
     for product_id in range(1, count + 1):
         price = round(8.0 + (product_id % 250) * 1.37 + (product_id % 9) * 0.11, 2)
-        updated_at = LOAD_DATE - timedelta(minutes=product_id % 240)
+        updated_at = load_date - timedelta(minutes=product_id % 120)
         rows.append(
             (
                 product_id,
@@ -292,7 +292,7 @@ def _insert_products(conn: sqlite3.Connection, count: int) -> None:
     conn.executemany("INSERT INTO raw_products VALUES (?, ?, ?, ?, ?, ?)", rows)
 
 
-def _insert_orders(conn: sqlite3.Connection, count: int, counts: dict) -> None:
+def _insert_orders(conn: sqlite3.Connection, count: int, counts: dict, load_date: datetime) -> None:
     product_count = counts["raw_products"]
     customer_count = counts["raw_customers"]
     rows = []
@@ -300,8 +300,8 @@ def _insert_orders(conn: sqlite3.Connection, count: int, counts: dict) -> None:
         customer_id = ((order_id * 17) % customer_count) + 1
         product_id = ((order_id * 23) % product_count) + 1
         status = ORDER_STATUSES[order_id % len(ORDER_STATUSES)]
-        created_at = BASE_DATE + timedelta(minutes=order_id * 11)
-        updated_at = LOAD_DATE - timedelta(minutes=order_id % 1440)
+        created_at = load_date - timedelta(minutes=order_id % 120)
+        updated_at = load_date - timedelta(minutes=order_id % 90)
         base_amount = 12.5 + (product_id % 300) * 1.29 + (customer_id % 11) * 2.15
         order_total = round(base_amount * (1 + (order_id % 5) * 0.08), 2)
         rows.append(
@@ -322,14 +322,14 @@ def _insert_orders(conn: sqlite3.Connection, count: int, counts: dict) -> None:
         conn.executemany("INSERT INTO raw_orders VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
 
 
-def _insert_payments(conn: sqlite3.Connection, count: int, order_count: int) -> None:
+def _insert_payments(conn: sqlite3.Connection, count: int, order_count: int, load_date: datetime) -> None:
     rows = []
     for payment_id in range(1, count + 1):
         order_id = ((payment_id - 1) % order_count) + 1
         method = PAYMENT_METHODS[payment_id % len(PAYMENT_METHODS)]
         status = _payment_status(payment_id)
-        created_at = BASE_DATE + timedelta(minutes=order_id * 11 + 4)
-        updated_at = LOAD_DATE - timedelta(minutes=payment_id % 1440)
+        created_at = load_date - timedelta(minutes=payment_id % 120)
+        updated_at = load_date - timedelta(minutes=payment_id % 90)
         amount = round(15.0 + (order_id % 300) * 1.31 + (payment_id % 13) * 1.75, 2)
         rows.append(
             (
@@ -349,11 +349,11 @@ def _insert_payments(conn: sqlite3.Connection, count: int, order_count: int) -> 
         conn.executemany("INSERT INTO raw_payments VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
 
 
-def _insert_events(conn: sqlite3.Connection, count: int, customer_count: int) -> None:
+def _insert_events(conn: sqlite3.Connection, count: int, customer_count: int, load_date: datetime) -> None:
     rows = []
     for event_id in range(1, count + 1):
         customer_id = ((event_id * 19) % customer_count) + 1
-        event_time = BASE_DATE + timedelta(minutes=event_id * 3)
+        event_time = load_date - timedelta(minutes=event_id % 120)
         session_id = f"s{customer_id:05d}_{event_id // 6:07d}"
         rows.append(
             (
@@ -361,8 +361,8 @@ def _insert_events(conn: sqlite3.Connection, count: int, customer_count: int) ->
                 customer_id,
                 EVENT_TYPES[event_id % len(EVENT_TYPES)],
                 session_id,
-                (LOAD_DATE - timedelta(minutes=event_id % 1440)).strftime("%Y-%m-%d %H:%M:%S"),
                 event_time.strftime("%Y-%m-%d %H:%M:%S"),
+                (load_date - timedelta(minutes=event_id % 90)).strftime("%Y-%m-%d %H:%M:%S"),
             )
         )
         if len(rows) >= BATCH_SIZE:

@@ -1,135 +1,173 @@
+import re
 import json
 from pathlib import Path
-from dotenv import load_dotenv
-from agent.groq_client import call_llm_json
 
 env_path = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(dotenv_path=env_path)
 
-SYSTEM_PROMPT = """
-You are an expert analytics engineer reviewing production SQL pipelines.
-You have deep knowledge of how SQL behaves in Snowflake, BigQuery, and Redshift.
 
-Your job is to find bugs that are SPECIFIC, VERIFIABLE, and IMPACTFUL.
-You only flag bugs you are highly confident about.
-You never flag patterns that are simply uncommon — only patterns that produce incorrect results.
-You always respond with valid JSON only. No explanation outside JSON.
-"""
+def _extract_table_aliases(sql: str) -> dict:
+    """Return mapping of aliases to table names found in JOIN clauses."""
+    aliases = {}
+    # matches: JOIN table_name [AS] alias ON
+    for m in re.finditer(r"join\s+([\w\.\"]+)(?:\s+(?:as\s+)?([\w_]+))?\s+on", sql, re.I):
+        table = m.group(1)
+        alias = m.group(2) or table.split(".")[-1].strip('"')
+        aliases[alias] = table
+    return aliases
+
+
+def _find_select_star(sql: str) -> bool:
+    return bool(re.search(r"\bselect\s+\*", sql, re.I))
+
+
+def _find_missing_join_condition(sql: str) -> bool:
+    # naive: JOIN without ON nearby
+    return bool(re.search(r"\bjoin\b(?![\s\S]{0,120}?on)", sql, re.I))
+
+
+def _find_left_join_nullified(sql: str) -> list:
+    findings = []
+    # find left joins with alias and then WHERE that references alias columns
+    for m in re.finditer(r"left\s+join\s+([\w\.\"]+)(?:\s+(?:as\s+)?([\w_]+))?\s+on\s+([\s\S]{0,200}?)\b", sql, re.I):
+        alias = m.group(2) or m.group(1).split(".")[-1].strip('"')
+        # look for WHERE ... alias.column ... = ...
+        where_match = re.search(r"where\s+([\s\S]+)$", sql, re.I)
+        if where_match and re.search(rf"\b{re.escape(alias)}\.[\w_]+\b", where_match.group(1)):
+            findings.append({"alias": alias})
+    return findings
+
+
+def _find_risky_count_after_join(sql: str) -> bool:
+    return bool(re.search(r"count\s*\(\s*\*\s*\)" , sql, re.I) and re.search(r"\bjoin\b", sql, re.I))
+
+
+def _extract_selected_columns(sql: str) -> list:
+    m = re.search(r"select\s+([\s\S]+?)\s+from\b", sql, re.I)
+    if not m:
+        return []
+    cols = m.group(1)
+    # split on commas not inside parentheses
+    parts = re.split(r",\s*(?![^()]*\))", cols)
+    cleaned = [p.strip() for p in parts if p.strip()]
+    return cleaned
+
+
+def _columns_from_context(context: str) -> set:
+    # context may be a simple newline list or JSON-like. Try simple heuristics.
+    cols = set()
+    try:
+        data = json.loads(context)
+        if isinstance(data, dict):
+            for k in data.keys():
+                cols.add(k)
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, str):
+                    cols.add(item)
+                elif isinstance(item, dict) and "name" in item:
+                    cols.add(item["name"])
+    except Exception:
+        # fall back to regex: find word tokens with possible dot notation
+        for c in re.findall(r"\b[\w_]+\b", context):
+            cols.add(c)
+    return cols
 
 
 def analyze_sql_logic(model_name: str, sql: str, context: str = "") -> dict:
+    """Deterministic, local SQL checks that do not call any external service.
+
+    Returns a report with a list of findings. Each finding contains:
+    - rule_id, severity, title, evidence, why_it_matters, recommendation, confidence
     """
-    Sends SQL to the AI and asks it to find logic errors,
-    not just structural ones. Returns a full analysis report.
-    """
+    findings = []
 
-    prompt = f"""
-You are an expert analytics engineer reviewing production SQL.
-Your job is to find bugs that are SPECIFIC, VERIFIABLE, and IMPACTFUL.
+    if _find_select_star(sql):
+        findings.append({
+            "rule_id": "select_star",
+            "severity": "medium",
+            "title": "SELECT * used",
+            "evidence": "SELECT * present in query",
+            "why_it_matters": "SELECT * can return unexpected columns and hides schema changes",
+            "recommendation": "Specify explicit columns in SELECT to guarantee schema",
+            "confidence": "high"
+        })
 
-RULES:
-- Only flag bugs you are highly confident about
-- Every bug must have a specific SQL clause as evidence
-- Never flag a pattern as buggy unless you can explain exactly what wrong data it produces
-- Do not flag patterns that are simply uncommon — only flag patterns that produce incorrect results
-- If you are not sure, do not flag it
-- False positives destroy trust in observability tools — when in doubt, leave it out
+    if _find_missing_join_condition(sql):
+        findings.append({
+            "rule_id": "missing_join_on",
+            "severity": "critical",
+            "title": "JOIN without ON condition",
+            "evidence": "JOIN found with no nearby ON clause",
+            "why_it_matters": "A JOIN without ON can produce Cartesian products, massively inflating rows",
+            "recommendation": "Add an explicit ON clause or use CROSS JOIN intentionally",
+            "confidence": "high"
+        })
 
-## SQL MODEL: {model_name}
-{sql}
+    lj = _find_left_join_nullified(sql)
+    if lj:
+        findings.append({
+            "rule_id": "left_join_nullified_by_where",
+            "severity": "high",
+            "title": "LEFT JOIN possibly nullified by WHERE",
+            "evidence": f"LEFT JOIN on alias(es) {[x['alias'] for x in lj]} with WHERE referencing those aliases",
+            "why_it_matters": "A WHERE filtering on right-side columns can convert LEFT JOIN to INNER JOIN, dropping rows",
+            "recommendation": "Move filters into the JOIN condition or use IS NOT DISTINCT FROM semantics",
+            "confidence": "medium"
+        })
 
-## ADDITIONAL CONTEXT
-{context if context else "No additional context provided."}
+    if _find_risky_count_after_join(sql):
+        findings.append({
+            "rule_id": "count_after_join",
+            "severity": "high",
+            "title": "COUNT(*) after JOINs may overcount",
+            "evidence": "COUNT(*) used in query that includes JOINs",
+            "why_it_matters": "Joining non-unique keys can inflate aggregate counts",
+            "recommendation": "Consider COUNT(DISTINCT key) or dedup upstream",
+            "confidence": "medium"
+        })
 
-Check specifically for these HIGH-VALUE bugs:
+    # check selected columns against provided schema context for missing/renamed columns
+    ctx_cols = _columns_from_context(context) if context else set()
+    sel_cols = _extract_selected_columns(sql)
+    referenced = set()
+    for col in sel_cols:
+        # pick simple word occurrences as referenced columns
+        for token in re.findall(r"[\w_]+", col):
+            referenced.add(token)
 
-1. LEFT JOIN NULLIFIED BY WHERE CLAUSE
-   Pattern: LEFT JOIN table t ON ... followed by WHERE t.column = value
-   Why dangerous: The WHERE on the right table silently converts LEFT JOIN
-   to INNER JOIN. Unmatched rows are dropped silently. No error thrown.
-   Example bad output: "LEFT JOIN nullified by WHERE c.is_deleted = 0 —
-   customers with no match in raw_customers will be silently excluded."
+    missing = []
+    if ctx_cols:
+        for r in referenced:
+            if r.lower() not in {c.lower() for c in ctx_cols} and r.lower() not in ("select","from","where","count","sum","avg","case"):
+                missing.append(r)
+        if missing:
+            findings.append({
+                "rule_id": "missing_or_renamed_columns",
+                "severity": "high",
+                "title": "Referenced columns missing from schema context",
+                "evidence": f"Columns referenced in SELECT not found in provided schema: {missing}",
+                "why_it_matters": "Renamed or missing columns cause runtime failures or incorrect results",
+                "recommendation": "Verify model upstream schema and update column names or mappings",
+                "confidence": "medium"
+            })
 
-2. WINDOW FUNCTION OVER AGGREGATED ROWS
-   Pattern: LAG/LEAD/ROW_NUMBER over a query that already GROUP BY'd
-   Why dangerous: If each partition has only one row after grouping,
-   LAG returns NULL for every row. No error. Silent wrong results.
-   Example: LAG(SUM(revenue)) OVER (PARTITION BY customer_id ORDER BY MAX(date))
-   — each customer has one grouped row, so LAG always returns NULL.
+    overall_risk = "clean"
+    if any(f["severity"] == "critical" for f in findings):
+        overall_risk = "critical"
+    elif any(f["severity"] == "high" for f in findings):
+        overall_risk = "high"
+    elif findings:
+        overall_risk = "medium"
 
-3. NULL EXCLUSION VIA != OPERATOR
-   Pattern: WHERE col != 'value'
-   Why dangerous: SQL treats NULL != 'value' as UNKNOWN not TRUE.
-   NULL rows are silently excluded. Never shows in error logs.
+    report = {
+        "model_name": model_name,
+        "overall_risk": overall_risk,
+        "summary": f"Found {len(findings)} potential issue(s)",
+        "findings": findings,
+        "safe_to_run": overall_risk in ("low", "clean")
+    }
 
-4. INTEGER DIVISION TRUNCATION
-   Pattern: integer_col / integer_col without explicit FLOAT cast
-   Why dangerous: 10/3 = 3 not 3.33. Revenue averages silently wrong.
-   Fix: CAST one side to FLOAT or multiply numerator by 1.0
-
-5. HARDCODED DATE FILTERS ON LIFETIME METRICS
-   Pattern: WHERE date_col >= '2024-01-01' in a model named "lifetime" or "all_time"
-   Why dangerous: A lifetime value model filtered to a static date is not
-   measuring lifetime. Silent scope reduction that grows worse over time.
-
-6. FAN-OUT FROM NON-UNIQUE JOIN KEY
-   Pattern: JOIN on a column that may not be unique in the right table
-   Why dangerous: One row matches multiple rows, duplicating metrics.
-   SUM(revenue) inflates silently. Classic warehouse bug.
-
-7. DIVIDE BY ZERO WITHOUT NULLIF
-   Pattern: SUM(x) / COUNT(y) or any division without NULLIF protection
-   Why dangerous: Returns NULL silently or crashes depending on warehouse.
-   Fix: NULLIF(denominator, 0) to handle zero safely.
-
-8. MISLEADING METRIC DENOMINATORS
-   Pattern: total_value / COUNT(DISTINCT days) where days can equal 1
-   Why dangerous: If customer ordered on only 1 day, denominator = 1
-   and avg_daily_revenue equals total lifetime value. Completely misleading.
-   Only flag if you can see the denominator can realistically be 1.
-
-9. AGGREGATE ON POTENTIALLY VARCHAR COLUMN
-   Pattern: SUM() or AVG() on columns whose type is ambiguous
-   Why dangerous: Returns NULL silently in most warehouses. No type error.
-   Only flag if there is real evidence the column could be non-numeric.
-
-10. SLOWLY CHANGING DIMENSION WITHOUT VERSION FILTER
-    Pattern: JOIN to a dimension table without filtering to current/active version
-    Why dangerous: Historical records multiply current facts.
-    Revenue appears inflated. Classic SCD bug.
-
-For each bug you are confident about return exactly:
-{{
-  "category": "exact category name from above list",
-  "severity": "critical | high | medium | low",
-  "confidence": "high | medium",
-  "line_reference": "the exact SQL clause proving this bug exists",
-  "description": "specific and precise — what exact wrong data does this produce",
-  "impact": "concrete business impact — what number is wrong and by how much",
-  "fix": "exact SQL fix, not vague advice"
-}}
-
-CRITICAL RULE: 
-- Only include bugs where confidence is high or medium
-- If confidence would be low, skip the bug entirely
-- Maximum 6 bugs per model — prioritize the most impactful ones
-- Do not include duplicate findings for the same root cause
-
-Return JSON:
-{{
-  "model_name": "{model_name}",
-  "overall_risk": "critical | high | medium | low | clean",
-  "summary": "one precise sentence describing the most dangerous issue found",
-  "bugs": [...],
-  "data_loss_risk": true or false,
-  "estimated_rows_affected": "none | some | significant | all",
-  "safe_to_run": true or false
-}}
-
-If no bugs found, return bugs as empty array and overall_risk as "clean".
-"""
-
-    return call_llm_json(prompt=prompt, system=SYSTEM_PROMPT)
+    return report
 
 
 def analyze_all_models(project_path: str) -> list:

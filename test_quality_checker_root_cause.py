@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import sys
 import tempfile
 import unittest
 from datetime import datetime
@@ -37,7 +38,7 @@ class QualityCheckerRootCauseTests(unittest.TestCase):
     def tearDown(self):
         self.tmpdir.cleanup()
 
-    def test_quality_check_uses_local_rca_for_printing_and_slack(self):
+    def test_quality_check_uses_deterministic_rca_for_printing_and_slack(self):
         from agent import quality_checker
 
         rca_report = {
@@ -55,13 +56,12 @@ class QualityCheckerRootCauseTests(unittest.TestCase):
             "impact_count": 2,
         }
 
+        self.assertNotIn("agent.optional_ai_explainer", sys.modules)
+
         with patch.object(quality_checker, "BASELINE_PATH", self.baseline_path), patch(
             "agent.quality_checker.analyze_root_cause",
             return_value=rca_report,
         ) as analyze, patch(
-            "agent.quality_checker.ask_claude_about_anomalies",
-            side_effect=AssertionError("Claude should not be called by default"),
-        ), patch(
             "agent.quality_checker.record_table_metrics",
         ), patch(
             "agent.quality_checker.create_incident_report",
@@ -75,7 +75,7 @@ class QualityCheckerRootCauseTests(unittest.TestCase):
 
         analyze.assert_called_once()
         analyzed_anomaly = analyze.call_args.args[0]
-        self.assertEqual(analyzed_anomaly["type"], "row_count_anomaly")
+        self.assertEqual(analyzed_anomaly["type"], "row_count")
         self.assertEqual(analyzed_anomaly["table"], "raw_orders")
         self.assertEqual(analyzed_anomaly["project_path"], "test_project")
         self.assertEqual(analyzed_anomaly["message"], "Row count dropped by 95.0%")
@@ -92,7 +92,7 @@ class QualityCheckerRootCauseTests(unittest.TestCase):
         diagnosis = send_slack.call_args.args[1]
         self.assertEqual(diagnosis["root_cause"], "upstream ingestion failure")
         self.assertEqual(diagnosis["affected_file"], "raw_orders")
-        self.assertEqual(diagnosis["affected_line"], "row_count_anomaly")
+        self.assertEqual(diagnosis["affected_line"], "row_count")
         self.assertIn("Anomaly: Row count dropped by 95.0%", diagnosis["explanation"])
         self.assertIn("Evidence: Expected ~1000 rows, observed 50 rows.", diagnosis["explanation"])
         self.assertEqual(diagnosis["impact_count"], 2)
@@ -102,6 +102,7 @@ class QualityCheckerRootCauseTests(unittest.TestCase):
             diagnosis["incident_report"],
             "incidents/test_project_raw_orders_row_count_anomaly_20260603_143200.md",
         )
+        self.assertNotIn("agent.optional_ai_explainer", sys.modules)
 
         output = "\n".join(str(call.args[0]) for call in printed.call_args_list if call.args)
         self.assertIn("Root Cause Analysis", output)

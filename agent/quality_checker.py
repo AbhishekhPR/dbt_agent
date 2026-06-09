@@ -1,13 +1,16 @@
 import json
 import re
 import sqlite3
+from datetime import datetime
+import hashlib
 from pathlib import Path
 from dotenv import load_dotenv
-from agent.groq_client import call_llm_json
 from agent.incident_reporter import create_incident_report
 from agent.metrics_store import record_table_metrics
 from agent.root_cause_engine import analyze_root_cause
 from agent.slack import send_slack_alert
+
+DEFAULT_FRESHNESS_THRESHOLD_MINUTES = 24 * 60
 
 env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
@@ -15,11 +18,33 @@ load_dotenv(dotenv_path=env_path)
 BASELINE_PATH = Path(__file__).resolve().parent.parent / "quality_baselines"
 BASELINE_PATH.mkdir(exist_ok=True)
 
-SYSTEM_PROMPT = """
-You are a senior data quality engineer. You analyze data pipeline 
-metrics and identify anomalies that indicate silent data corruption.
-You always respond with valid JSON only. No explanation outside JSON.
-"""
+SYSTEM_PROMPT = None
+
+
+def quote_identifier(identifier: str) -> str:
+    """Safely quote a SQLite identifier such as a table or column name."""
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def infer_freshness_column(columns: list[str]) -> str | None:
+    """Pick the most likely timestamp column for freshness checks."""
+    preferred = [
+        "created_at",
+        "updated_at",
+        "loaded_at",
+        "ingested_at",
+        "_loaded_at",
+        "_relium_sim_updated_at",
+    ]
+    lower_to_original = {column.lower(): column for column in columns}
+    for name in preferred:
+        if name in lower_to_original:
+            return lower_to_original[name]
+    for column in columns:
+        lowered = column.lower()
+        if lowered.endswith("_at") or "timestamp" in lowered or "date" in lowered:
+            return column
+    return None
 
 
 def get_table_metrics(db_path: str, table_name: str) -> dict:
@@ -33,44 +58,66 @@ def get_table_metrics(db_path: str, table_name: str) -> dict:
 
     try:
         # Row count
-        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+        quoted_table = quote_identifier(table_name)
+
+        cursor.execute(f"SELECT COUNT(*) FROM {quoted_table}")
         metrics["row_count"] = cursor.fetchone()[0]
 
         # Get columns
-        cursor.execute(f"PRAGMA table_info({table_name})")
-        columns = [row[1] for row in cursor.fetchall()]
+        cursor.execute(f"PRAGMA table_info({quoted_table})")
+        table_info = cursor.fetchall()
+        columns = [row[1] for row in table_info]
         metrics["columns"] = columns
+        schema = [
+            {
+                "name": row[1],
+                "data_type": row[2],
+                "nullable": not bool(row[3]),
+                "primary_key": bool(row[5]),
+            }
+            for row in table_info
+        ]
+        metrics["schema"] = schema
+        metrics["schema_hash"] = hashlib.sha256(
+            json.dumps(schema, sort_keys=True).encode("utf-8")
+        ).hexdigest()
 
         # Null rates per column
         null_rates = {}
         for col in columns:
+            quoted_col = quote_identifier(col)
             cursor.execute(f"""
                 SELECT 
-                    ROUND(100.0 * SUM(CASE WHEN {col} IS NULL THEN 1 ELSE 0 END) 
+                    ROUND(100.0 * SUM(CASE WHEN {quoted_col} IS NULL THEN 1 ELSE 0 END) 
                     / COUNT(*), 2)
-                FROM {table_name}
+                FROM {quoted_table}
             """)
             null_rates[col] = cursor.fetchone()[0] or 0.0
         metrics["null_rates"] = null_rates
 
-        # Duplicate rate
-        cursor.execute(f"""
-            SELECT COUNT(*) - COUNT(DISTINCT rowid) 
-            FROM {table_name}
-        """)
-        metrics["duplicate_rows"] = cursor.fetchone()[0]
+        duplicate_key_columns = _infer_duplicate_key_columns(columns)
+        duplicate_rows = _count_duplicate_rows(cursor, quoted_table, duplicate_key_columns)
+        metrics["duplicate_rows"] = duplicate_rows
+        metrics["duplicate_rate"] = round(100.0 * duplicate_rows / metrics["row_count"], 2) if metrics["row_count"] else 0.0
+        metrics["duplicate_key_columns"] = duplicate_key_columns
+        metrics["duplicate_check_method"] = (
+            "key:" + ",".join(duplicate_key_columns)
+            if _has_business_key(columns)
+            else "full_row"
+        )
 
         # Numeric column stats
         numeric_stats = {}
         for col in columns:
+            quoted_col = quote_identifier(col)
             try:
                 cursor.execute(f"""
                     SELECT 
-                        MIN(CAST({col} AS REAL)),
-                        MAX(CAST({col} AS REAL)),
-                        AVG(CAST({col} AS REAL))
-                    FROM {table_name}
-                    WHERE {col} IS NOT NULL
+                        MIN(CAST({quoted_col} AS REAL)),
+                        MAX(CAST({quoted_col} AS REAL)),
+                        AVG(CAST({quoted_col} AS REAL))
+                    FROM {quoted_table}
+                    WHERE {quoted_col} IS NOT NULL
                 """)
                 row = cursor.fetchone()
                 if row and row[0] is not None:
@@ -86,9 +133,21 @@ def get_table_metrics(db_path: str, table_name: str) -> dict:
         # Distinct value counts per column
         distinct_counts = {}
         for col in columns:
-            cursor.execute(f"SELECT COUNT(DISTINCT {col}) FROM {table_name}")
+            cursor.execute(f"SELECT COUNT(DISTINCT {quote_identifier(col)}) FROM {quoted_table}")
             distinct_counts[col] = cursor.fetchone()[0]
         metrics["distinct_counts"] = distinct_counts
+
+        freshness_column = infer_freshness_column(columns)
+        if freshness_column:
+            cursor.execute(
+                f"SELECT MAX({quote_identifier(freshness_column)}) FROM {quoted_table}"
+            )
+            last_updated = cursor.fetchone()[0]
+            metrics["freshness_column"] = freshness_column
+            metrics["last_updated"] = last_updated
+            freshness_minutes = _freshness_minutes(last_updated)
+            if freshness_minutes is not None:
+                metrics["freshness_minutes"] = freshness_minutes
 
     except Exception as e:
         metrics["error"] = str(e)
@@ -96,6 +155,68 @@ def get_table_metrics(db_path: str, table_name: str) -> dict:
         conn.close()
 
     return metrics
+
+
+def _has_business_key(columns: list[str]) -> bool:
+    return bool(_business_key_columns(columns))
+
+
+def _infer_duplicate_key_columns(columns: list[str]) -> list[str]:
+    business_keys = _business_key_columns(columns)
+    return business_keys or columns
+
+
+def _business_key_columns(columns: list[str]) -> list[str]:
+    lowered = {column.lower(): column for column in columns}
+    for candidate in ("id", "order_id", "customer_id", "event_id", "product_id"):
+        if candidate in lowered:
+            return [lowered[candidate]]
+    return []
+
+
+def _count_duplicate_rows(cursor, quoted_table: str, columns: list[str]) -> int:
+    if not columns:
+        return 0
+    grouped = ", ".join(quote_identifier(column) for column in columns)
+    cursor.execute(
+        f"""
+        SELECT COALESCE(SUM(group_count - 1), 0)
+        FROM (
+            SELECT COUNT(*) AS group_count
+            FROM {quoted_table}
+            GROUP BY {grouped}
+            HAVING COUNT(*) > 1
+        )
+        """
+    )
+    return cursor.fetchone()[0] or 0
+
+
+def _freshness_minutes(last_updated) -> int | None:
+    parsed = _parse_datetime(last_updated)
+    if parsed is None:
+        return None
+    return int((datetime.utcnow() - parsed).total_seconds() // 60)
+
+
+def _parse_datetime(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    text = str(value).strip()
+    for candidate in (text, text.replace("Z", "+00:00")):
+        try:
+            parsed = datetime.fromisoformat(candidate)
+            return parsed.replace(tzinfo=None)
+        except ValueError:
+            pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            pass
+    return None
 
 
 def load_baseline(table_name: str) -> dict:
@@ -117,7 +238,8 @@ def save_baseline(table_name: str, metrics: dict):
 def detect_anomalies(current: dict, baseline: dict) -> list:
     """
     Compares current metrics against baseline.
-    Returns list of anomalies found.
+    Returns list of deterministic anomaly dicts with keys:
+    metric, current_value, baseline_value, change_percent, severity, explanation, recommendation
     """
     anomalies = []
     table = current.get("table", "unknown")
@@ -130,14 +252,20 @@ def detect_anomalies(current: dict, baseline: dict) -> list:
     baseline_rows = baseline.get("row_count", 0)
 
     if baseline_rows > 0:
-        row_change_pct = abs(current_rows - baseline_rows) / baseline_rows * 100
-        if row_change_pct > 20:
-            direction = "dropped" if current_rows < baseline_rows else "spiked"
+        row_change_pct = (current_rows - baseline_rows) / baseline_rows * 100
+        if abs(row_change_pct) > 20:
+            severity = "critical" if abs(row_change_pct) > 50 else "high"
+            msg = f"Row count {'dropped' if row_change_pct<0 else 'spiked'} by {abs(round(row_change_pct,2))}%"
             anomalies.append({
-                "type": "row_count_anomaly",
-                "severity": "critical" if row_change_pct > 50 else "high",
-                "table": table,
-                "message": f"Row count {direction} by {round(row_change_pct, 1)}%",
+                "metric": "row_count",
+                "type": "row_count",
+                "current_value": current_rows,
+                "baseline_value": baseline_rows,
+                "change_percent": round(row_change_pct, 2),
+                "severity": severity,
+                "explanation": msg,
+                "recommendation": "Investigate recent upstream changes and seeds; compare run histories",
+                "message": msg,
                 "detail": f"Expected ~{baseline_rows} rows, got {current_rows}",
                 "impact": "Possible data loss or duplication in pipeline"
             })
@@ -151,13 +279,20 @@ def detect_anomalies(current: dict, baseline: dict) -> list:
         null_increase = current_null_rate - baseline_null_rate
 
         if null_increase > 10:
+            severity = "critical" if null_increase > 30 else "high"
+            msg = f"Null rate on '{col}' jumped by {round(null_increase,1)} percentage points"
             anomalies.append({
-                "type": "null_explosion",
-                "severity": "critical" if null_increase > 30 else "high",
-                "table": table,
-                "message": f"Null rate on '{col}' jumped by {round(null_increase, 1)}%",
+                "metric": f"null_rate:{col}",
+                "type": "null_rate",
+                "current_value": current_null_rate,
+                "baseline_value": baseline_null_rate,
+                "change_percent": round(null_increase, 2),
+                "severity": severity,
+                "explanation": msg,
+                "recommendation": "Check recent upstream schema/ingestion changes and defaults",
+                "message": msg,
                 "detail": f"Was {baseline_null_rate}% null, now {current_null_rate}% null",
-                "impact": f"Aggregations on '{col}' will return wrong results silently"
+                "impact": f"Aggregations on '{col}' may return incorrect results"
             })
 
     # Duplicate explosion
@@ -165,11 +300,17 @@ def detect_anomalies(current: dict, baseline: dict) -> list:
     baseline_dupes = baseline.get("duplicate_rows", 0)
 
     if current_dupes > baseline_dupes + 10:
+        msg = f"Duplicate rows jumped from {baseline_dupes} to {current_dupes}"
         anomalies.append({
-            "type": "duplicate_explosion",
+            "metric": "duplicate_rows",
+            "type": "duplicate_rows",
+            "current_value": current_dupes,
+            "baseline_value": baseline_dupes,
+            "change_percent": None,
             "severity": "high",
-            "table": table,
-            "message": f"Duplicate rows jumped from {baseline_dupes} to {current_dupes}",
+            "explanation": "Duplicate row count increased significantly",
+            "recommendation": "Investigate recent JOINs or upstream dedup steps",
+            "message": msg,
             "detail": "Possible fan-out from a bad JOIN upstream",
             "impact": "Metrics like SUM(revenue) will be inflated"
         })
@@ -183,44 +324,106 @@ def detect_anomalies(current: dict, baseline: dict) -> list:
         if baseline_count > 0:
             cardinality_change = (current_count - baseline_count) / baseline_count * 100
             if cardinality_change >= 200:
+                msg = f"Distinct values in '{col}' increased by {round(cardinality_change, 1)}%"
                 anomalies.append({
-                    "type": "cardinality_explosion",
+                    "metric": f"distinct_count:{col}",
+                    "type": "distinct_count",
+                    "current_value": current_count,
+                    "baseline_value": baseline_count,
+                    "change_percent": round(cardinality_change, 2),
                     "severity": "medium",
-                    "table": table,
-                    "message": f"Distinct values in '{col}' increased by {round(cardinality_change, 1)}%",
+                    "explanation": "Distinct value count increased dramatically",
+                    "recommendation": "Check for new data sources, bad joins, or format changes",
+                    "message": msg,
                     "detail": f"Was {baseline_count} distinct values, now {current_count}",
                     "impact": "GROUP BY queries on this column may return unexpected granularity"
                 })
 
+    # Freshness anomaly: use a baseline-specific threshold when available,
+    # otherwise default to 24 hours.
+    freshness_minutes = current.get("freshness_minutes")
+    threshold_minutes = baseline.get(
+        "freshness_threshold_minutes",
+        DEFAULT_FRESHNESS_THRESHOLD_MINUTES,
+    )
+    if freshness_minutes is not None and freshness_minutes > threshold_minutes:
+        stale_hours = round(freshness_minutes / 60, 1)
+        msg = f"Table is stale by {stale_hours} hours"
+        anomalies.append({
+            "metric": "freshness",
+            "type": "freshness_anomaly",
+            "current_value": freshness_minutes,
+            "baseline_value": threshold_minutes,
+            "change_percent": None,
+            "severity": "critical" if freshness_minutes > threshold_minutes * 2 else "high",
+            "explanation": msg,
+            "recommendation": "Check ingestion freshness and upstream scheduled jobs",
+            "message": msg,
+            "detail": f"Latest {current.get('freshness_column', 'freshness column')} value is {current.get('last_updated')}",
+            "impact": "Downstream models may be using outdated data",
+        })
+
+    anomalies.extend(_detect_schema_drift(current, baseline))
+
     return anomalies
 
 
-def ask_claude_about_anomalies(anomalies: list, metrics: dict) -> dict:
-    """
-    Sends anomalies to Claude for deeper analysis and recommendations.
-    """
-    if not anomalies:
-        return {}
+def _detect_schema_drift(current: dict, baseline: dict) -> list:
+    current_schema = {column["name"]: column for column in current.get("schema", [])}
+    baseline_schema = {column["name"]: column for column in baseline.get("schema", [])}
+    anomalies = []
 
-    prompt = f"""
-A data quality check found these anomalies in a production table:
+    for name, old_column in baseline_schema.items():
+        if name not in current_schema:
+            anomalies.append(_schema_anomaly("removed_column", name, old_column, None, "critical"))
 
-## ANOMALIES DETECTED
-{json.dumps(anomalies, indent=2)}
+    for name, new_column in current_schema.items():
+        if name not in baseline_schema:
+            anomalies.append(_schema_anomaly("added_column", name, None, new_column, "medium"))
 
-## CURRENT TABLE METRICS
-{json.dumps(metrics, indent=2)}
+    for name, old_column in baseline_schema.items():
+        new_column = current_schema.get(name)
+        if not new_column:
+            continue
+        old_type = (old_column.get("data_type") or "").upper()
+        new_type = (new_column.get("data_type") or "").upper()
+        if old_type != new_type:
+            anomalies.append(_schema_anomaly("type_change", name, old_column, new_column, "high"))
 
-Analyze these anomalies and return a JSON object with:
-{{
-  "root_cause_hypothesis": "most likely cause of these anomalies",
-  "immediate_actions": ["action 1", "action 2", "action 3"],
-  "queries_to_investigate": ["SQL query 1 to run", "SQL query 2 to run"],
-  "should_halt_pipeline": true or false,
-  "confidence": "high | medium | low"
-}}
-"""
-    return call_llm_json(prompt=prompt, system=SYSTEM_PROMPT)
+    return anomalies
+
+
+def _schema_anomaly(change_type: str, column_name: str, old_column: dict | None, new_column: dict | None, severity: str) -> dict:
+    if change_type == "removed_column":
+        message = f"Schema drift detected: column '{column_name}' was removed"
+    elif change_type == "added_column":
+        message = f"Schema drift detected: column '{column_name}' was added"
+    else:
+        message = f"Schema drift detected: column '{column_name}' changed type"
+
+    schema_change = {
+        "change_type": change_type,
+        "column": column_name,
+    }
+    if old_column:
+        schema_change["old_type"] = old_column.get("data_type")
+    if new_column:
+        schema_change["new_type"] = new_column.get("data_type")
+
+    return {
+        "metric": "schema",
+        "type": "schema_drift",
+        "current_value": schema_change.get("new_type"),
+        "baseline_value": schema_change.get("old_type"),
+        "change_percent": None,
+        "severity": severity,
+        "explanation": message,
+        "recommendation": "Review downstream SQL models before deploying this schema change",
+        "message": message,
+        "detail": message,
+        "impact": "Downstream SQL models may fail or silently produce incorrect metrics",
+        "schema_change": schema_change,
+    }
 
 
 def print_root_cause_summary(rca_report: dict):
@@ -292,6 +495,8 @@ def run_quality_check(project_name: str, db_path: str):
             continue
 
         print(f"    🚨 {table} — {len(anomalies)} anomaly/anomalies detected!")
+        for anomaly in anomalies:
+            anomaly["table"] = table
         all_anomalies.extend(anomalies)
 
         # Local metadata-only RCA. No LLM call.
@@ -299,7 +504,6 @@ def run_quality_check(project_name: str, db_path: str):
             rca_report = analyze_root_cause({
                 **anomaly,
                 "type": anomaly.get("type"),
-                "table": table,
                 "project_path": project_name,
                 "message": anomaly.get("message", "")
             })
