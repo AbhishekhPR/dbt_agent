@@ -107,6 +107,75 @@ class IncidentReporterTests(unittest.TestCase):
         self.assertIn("- row counts", content)
         self.assertIn("- dependency graph", content)
 
+    def test_freshness_incident_report_uses_freshness_specific_actions(self):
+        from agent.incident_reporter import create_incident_report
+
+        anomaly = {
+            "type": "freshness_anomaly",
+            "table": "raw_customers",
+            "severity": "critical",
+            "message": "Table is stale by 8.0 hours",
+            "detail": "Latest updated_at value is 2026-06-04 02:00:00",
+            "impact": "Downstream models may be using outdated data",
+        }
+        rca_report = {
+            "likely_causes": [
+                {
+                    "cause": "upstream ingestion delay",
+                    "confidence": 0.85,
+                    "reason": "Table is stale by 8.0 hours",
+                }
+            ],
+            "affected_models": [
+                "fct_customer_lifetime_value",
+                "fct_daily_kpis",
+                "dashboard_executive_metrics",
+            ],
+            "impact_count": 3,
+            "recommended_actions": [
+                "Check whether the scheduled ingestion job for raw_customers ran successfully",
+                "Verify the latest source sync timestamp",
+                "Check whether the source connector is paused or delayed",
+                "Review orchestration logs for failed, skipped, or delayed jobs",
+                "Confirm whether the source system is producing new records",
+                "Validate the expected freshness SLA for this table",
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "agent.incident_reporter.INCIDENTS_DIR",
+            Path(tmpdir) / "incidents",
+        ):
+            path = create_incident_report("business_demo", anomaly, rca_report)
+            content = Path(path).read_text()
+
+        self.assertIn(
+            "If raw_customers is stale, downstream models may be using outdated data.",
+            content,
+        )
+        self.assertIn(
+            "1. Check whether the scheduled ingestion job for raw_customers ran successfully.",
+            content,
+        )
+        self.assertIn("2. Verify the latest source sync timestamp.", content)
+        self.assertIn("6. Validate the expected freshness SLA for this table.", content)
+        self.assertIn(
+            (
+                "First action: Verify whether the scheduled ingestion job for raw_customers "
+                "completed successfully and updated the table within the expected freshness window."
+            ),
+            content,
+        )
+        self.assertIn(
+            (
+                "Investigation priority: Start with ingestion schedule, source connector status, "
+                "and orchestration logs before debugging downstream models."
+            ),
+            content,
+        )
+        self.assertNotIn("Compare the latest raw_customers row count", content)
+        self.assertNotIn("WHERE clause", content)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -43,11 +43,12 @@ CARDINALITY_EXPLOSION_ACTIONS = [
 ]
 
 FRESHNESS_ANOMALY_ACTIONS = [
-    "Check the upstream ingestion or scheduled load for {table}",
-    "Verify whether the source connector is running",
-    "Compare latest successful load timestamp with expected schedule",
-    "Check orchestration logs for failed or skipped jobs",
-    "Validate whether source data is arriving late",
+    "Check whether the scheduled ingestion job for {table} ran successfully",
+    "Verify the latest source sync timestamp",
+    "Check whether the source connector is paused or delayed",
+    "Review orchestration logs for failed, skipped, or delayed jobs",
+    "Confirm whether the source system is producing new records",
+    "Validate the expected freshness SLA for this table",
 ]
 
 SCHEMA_DRIFT_ACTIONS = [

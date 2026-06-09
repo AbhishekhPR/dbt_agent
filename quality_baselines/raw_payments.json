@@ -1,16 +1,22 @@
 {
-  "table": "raw_orders",
+  "table": "raw_payments",
   "row_count": 100000,
   "columns": [
+    "payment_id",
     "order_id",
-    "customer_id",
-    "product_id",
-    "order_status",
-    "order_total",
+    "payment_method",
+    "payment_status",
+    "amount",
     "created_at",
     "updated_at"
   ],
   "schema": [
+    {
+      "name": "payment_id",
+      "data_type": "INTEGER",
+      "nullable": true,
+      "primary_key": true
+    },
     {
       "name": "order_id",
       "data_type": "INTEGER",
@@ -18,25 +24,19 @@
       "primary_key": false
     },
     {
-      "name": "customer_id",
-      "data_type": "INTEGER",
-      "nullable": false,
-      "primary_key": false
-    },
-    {
-      "name": "product_id",
-      "data_type": "INTEGER",
-      "nullable": false,
-      "primary_key": false
-    },
-    {
-      "name": "order_status",
+      "name": "payment_method",
       "data_type": "TEXT",
       "nullable": false,
       "primary_key": false
     },
     {
-      "name": "order_total",
+      "name": "payment_status",
+      "data_type": "TEXT",
+      "nullable": false,
+      "primary_key": false
+    },
+    {
+      "name": "amount",
       "data_type": "REAL",
       "nullable": false,
       "primary_key": false
@@ -54,13 +54,13 @@
       "primary_key": false
     }
   ],
-  "schema_hash": "b1839618d785924a655dc62aaf6cf0f3ffdb38225d777f6408acd4f13f4b2e44",
+  "schema_hash": "c95fd05f6af2250538d249986f707c8ef0423fffa96512aef742dd4d8ca974b5",
   "null_rates": {
+    "payment_id": 0.0,
     "order_id": 0.0,
-    "customer_id": 0.0,
-    "product_id": 0.0,
-    "order_status": 0.0,
-    "order_total": 0.0,
+    "payment_method": 0.0,
+    "payment_status": 0.0,
+    "amount": 0.0,
     "created_at": 0.0,
     "updated_at": 0.0
   },
@@ -74,30 +74,30 @@
     "order_id"
   ],
   "numeric_stats": {
+    "payment_id": {
+      "min": 1.0,
+      "max": 100000.0,
+      "avg": 50000.5
+    },
     "order_id": {
       "min": 1.0,
       "max": 100000.0,
       "avg": 50000.5
     },
-    "customer_id": {
-      "min": 1.0,
-      "max": 10000.0,
-      "avg": 5000.5
-    },
-    "product_id": {
-      "min": 1.0,
-      "max": 1000.0,
-      "avg": 500.5
-    },
-    "order_status": {
+    "payment_method": {
       "min": 0.0,
       "max": 0.0,
       "avg": 0.0
     },
-    "order_total": {
-      "min": 13.79,
-      "max": 552.31,
-      "avg": 235.88
+    "payment_status": {
+      "min": 0.0,
+      "max": 0.0,
+      "avg": 0.0
+    },
+    "amount": {
+      "min": 15.0,
+      "max": 427.69,
+      "avg": 221.22
     },
     "created_at": {
       "min": 2025.0,
@@ -111,11 +111,11 @@
     }
   },
   "distinct_counts": {
+    "payment_id": 100000,
     "order_id": 100000,
-    "customer_id": 10000,
-    "product_id": 1000,
-    "order_status": 4,
-    "order_total": 929,
+    "payment_method": 5,
+    "payment_status": 3,
+    "amount": 3900,
     "created_at": 100000,
     "updated_at": 1440
   }

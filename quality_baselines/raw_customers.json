@@ -1,0 +1,122 @@
+{
+  "table": "raw_customers",
+  "row_count": 10000,
+  "columns": [
+    "customer_id",
+    "customer_segment",
+    "acquisition_channel",
+    "signup_date",
+    "country",
+    "is_deleted",
+    "updated_at"
+  ],
+  "schema": [
+    {
+      "name": "customer_id",
+      "data_type": "INTEGER",
+      "nullable": true,
+      "primary_key": true
+    },
+    {
+      "name": "customer_segment",
+      "data_type": "TEXT",
+      "nullable": false,
+      "primary_key": false
+    },
+    {
+      "name": "acquisition_channel",
+      "data_type": "TEXT",
+      "nullable": false,
+      "primary_key": false
+    },
+    {
+      "name": "signup_date",
+      "data_type": "TEXT",
+      "nullable": false,
+      "primary_key": false
+    },
+    {
+      "name": "country",
+      "data_type": "TEXT",
+      "nullable": false,
+      "primary_key": false
+    },
+    {
+      "name": "is_deleted",
+      "data_type": "INTEGER",
+      "nullable": false,
+      "primary_key": false
+    },
+    {
+      "name": "updated_at",
+      "data_type": "TEXT",
+      "nullable": false,
+      "primary_key": false
+    }
+  ],
+  "schema_hash": "b52547370b49b2331c0f98f8b705fff7e774ce9c3dd5aa8324a13cb536bb6bc2",
+  "null_rates": {
+    "customer_id": 0.0,
+    "customer_segment": 0.0,
+    "acquisition_channel": 0.0,
+    "signup_date": 0.0,
+    "country": 0.0,
+    "is_deleted": 0.0,
+    "updated_at": 0.0
+  },
+  "freshness_column": "updated_at",
+  "last_updated": "2026-06-07 09:00:00",
+  "freshness_minutes": 1372.54,
+  "duplicate_rows": 0,
+  "duplicate_rate": 0.0,
+  "duplicate_check_method": "key:customer_id",
+  "duplicate_key_columns": [
+    "customer_id"
+  ],
+  "numeric_stats": {
+    "customer_id": {
+      "min": 1.0,
+      "max": 10000.0,
+      "avg": 5000.5
+    },
+    "customer_segment": {
+      "min": 0.0,
+      "max": 0.0,
+      "avg": 0.0
+    },
+    "acquisition_channel": {
+      "min": 0.0,
+      "max": 0.0,
+      "avg": 0.0
+    },
+    "signup_date": {
+      "min": 2023.0,
+      "max": 2025.0,
+      "avg": 2023.52
+    },
+    "country": {
+      "min": 0.0,
+      "max": 0.0,
+      "avg": 0.0
+    },
+    "is_deleted": {
+      "min": 0.0,
+      "max": 1.0,
+      "avg": 0.01
+    },
+    "updated_at": {
+      "min": 2026.0,
+      "max": 2026.0,
+      "avg": 2026.0
+    }
+  },
+  "distinct_counts": {
+    "customer_id": 10000,
+    "customer_segment": 4,
+    "acquisition_channel": 2,
+    "signup_date": 730,
+    "country": 10,
+    "is_deleted": 2,
+    "updated_at": 720
+  }
+}

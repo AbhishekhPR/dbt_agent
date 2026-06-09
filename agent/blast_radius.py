@@ -240,24 +240,41 @@ def calculate_blast_radius(
             )
         })
 
-    # Find indirectly affected models
+    # Find all indirectly affected models through recursive downstream traversal.
     indirectly_affected = []
-    for direct_model in directly_affected_names:
-        indirect = dep_graph.get(direct_model, [])
-        for model in indirect:
-            if model not in directly_affected_names:
-                already_listed = any(
-                    i["model"] == model for i in indirectly_affected
-                )
-                if not already_listed:
-                    indirectly_affected.append({
-                        "model": model,
-                        "risk": "medium",
-                        "reason": (
-                            f"Depends on '{direct_model}' "
-                            f"which depends on '{changed_table}'"
-                        )
-                    })
+    direct_model_lowers = {model.lower() for model in directly_affected_names}
+    listed_indirect = set()
+    visited = {changed_table_lower}
+    queue = [
+        (direct_model, [changed_table, direct_model])
+        for direct_model in directly_affected_names
+    ]
+
+    while queue:
+        current_model, path = queue.pop(0)
+        current_lower = current_model.lower()
+        if current_lower in visited:
+            continue
+        visited.add(current_lower)
+
+        for downstream_model in dep_graph.get(current_lower, []):
+            downstream_lower = downstream_model.lower()
+            downstream_path = path + [downstream_model]
+
+            if (
+                downstream_lower not in direct_model_lowers
+                and downstream_lower not in listed_indirect
+            ):
+                indirectly_affected.append({
+                    "model": downstream_model,
+                    "risk": "medium",
+                    "dependency_path": downstream_path,
+                    "reason": _format_dependency_reason(downstream_path),
+                })
+                listed_indirect.add(downstream_lower)
+
+            if downstream_lower not in visited:
+                queue.append((downstream_model, downstream_path))
 
     total = len(directly_affected_names) + len(indirectly_affected)
 
@@ -273,6 +290,16 @@ def calculate_blast_radius(
             f"{len(indirectly_affected)} indirect."
         )
     }
+
+
+def _format_dependency_reason(path: list) -> str:
+    """
+    Formats an upstream-to-downstream path as a readable dependency chain.
+    Example: raw -> model_a -> model_b becomes
+    "Depends on model_a which depends on raw".
+    """
+    chain = list(reversed(path[:-1]))
+    return "Depends on " + " which depends on ".join(chain)
 
 
 # ─────────────────────────────────────────

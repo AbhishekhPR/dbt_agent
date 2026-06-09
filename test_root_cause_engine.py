@@ -281,7 +281,11 @@ class RootCauseEngineTests(unittest.TestCase):
         self.assertIn("failed scheduled load", [c["cause"] for c in report["likely_causes"]])
         self.assertEqual(report["affected_models"], ["fct_revenue", "fct_customer_summary"])
         self.assertIn(
-            "Check the upstream ingestion or scheduled load for raw_orders",
+            "Check whether the scheduled ingestion job for raw_orders ran successfully",
+            report["recommended_actions"],
+        )
+        self.assertIn(
+            "Validate the expected freshness SLA for this table",
             report["recommended_actions"],
         )
 

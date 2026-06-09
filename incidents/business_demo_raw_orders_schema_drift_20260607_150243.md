@@ -1,0 +1,106 @@
+# Relium Incident Report
+
+## Incident Summary
+
+Project: business_demo  
+Table: raw_orders  
+Anomaly Type: schema_drift  
+Severity: medium  
+Data Loss Risk: no  
+Generated At: 2026-06-07 15:02:43  
+
+## Executive Summary
+
+Relium detected a medium schema drift in raw_orders.
+
+The anomaly in raw_orders may affect downstream analytics models that depend on this table.
+
+Primary hypothesis: upstream schema change.
+
+5 downstream model(s) may be affected.
+
+## Metric Evidence
+
+Expected rows: N/A  
+Observed rows: N/A  
+Change: N/A  
+
+Anomaly message:
+Schema drift detected: column 'order_total' is now not nullable
+
+Detail:
+Column nullability changed between baseline and current schema
+
+Impact:
+Downstream assumptions about required values may be incorrect
+
+## Root Cause Analysis
+
+Primary hypothesis:
+Upstream schema change.
+
+Confidence:
+0.85
+
+Status:
+Primary hypothesis based on metadata evidence. Not yet confirmed by source system logs.
+
+Reason:
+Schema drift detected: column 'order_total' is now not nullable.
+
+## Alternative Hypotheses
+
+1. Source connector schema evolution.  
+   Confidence: 0.66  
+   Reason: Schema drift detected: column 'order_total' is now not nullable.
+
+2. Dbt model contract mismatch.  
+   Confidence: 0.57  
+   Reason: Schema drift detected: column 'order_total' is now not nullable.
+
+3. Renamed or removed source field.  
+   Confidence: 0.51  
+   Reason: Schema drift detected: column 'order_total' is now not nullable.
+
+## Blast Radius
+
+Total affected models: 5
+
+Affected models:
+
+- fct_customer_lifetime_value
+- fct_daily_kpis
+- fct_product_performance
+- fct_revenue
+- dashboard_executive_metrics
+
+Interpretation:
+These models either directly or indirectly depend on raw_orders. If raw_orders is incomplete, these downstream models may produce incorrect metrics.
+
+## Recommended Investigation Steps
+
+1. Check the upstream ingestion job for raw_orders.
+2. Compare the latest raw_orders row count with the previous successful run.
+3. Verify whether the source table was partially loaded or truncated.
+4. Review recent WHERE clause or filter changes.
+5. Inspect downstream joins only if raw_orders appears healthy.
+
+## Suggested Owner Action
+
+First action: Verify whether the upstream ingestion job for raw_orders completed successfully and loaded the expected number of rows.
+
+Investigation priority: Start at raw_orders before debugging downstream models, because the affected models appear to inherit the anomaly from the raw table layer.
+
+## Compliance Note
+
+This report was generated using metadata only.
+
+Relium did not access customer records, raw table data, query results, emails, names, or PII.
+
+Only the following metadata was used:
+
+- row counts
+- anomaly details
+- dependency graph
+- SQL structure metadata
+- blast radius metadata

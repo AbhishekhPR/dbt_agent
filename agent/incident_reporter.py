@@ -41,7 +41,7 @@ def _render_report(project_name: str, anomaly: dict, rca_report: dict, generated
     severity = anomaly.get("severity", "unknown")
     primary_cause = _sentence_case(primary.get("cause", "No strong RCA evidence"))
     metric_evidence = _extract_metric_evidence(anomaly)
-    investigation_steps = _investigation_steps(table, actions)
+    investigation_steps = _investigation_steps(table, actions, anomaly_type)
 
     return "\n".join([
         "# Relium Incident Report",
@@ -107,10 +107,7 @@ def _render_report(project_name: str, anomaly: dict, rca_report: dict, generated
         _format_bullets(affected_models) if affected_models else "- None found",
         "",
         "Interpretation:",
-        (
-            f"These models either directly or indirectly depend on {table}. "
-            f"If {table} is incomplete, these downstream models may produce incorrect metrics."
-        ),
+        _blast_radius_interpretation(table, anomaly_type),
         "",
         "## Recommended Investigation Steps",
         "",
@@ -118,15 +115,9 @@ def _render_report(project_name: str, anomaly: dict, rca_report: dict, generated
         "",
         "## Suggested Owner Action",
         "",
-        (
-            f"First action: Verify whether the upstream ingestion job for {table} "
-            "completed successfully and loaded the expected number of rows."
-        ),
+        _owner_first_action(table, anomaly_type),
         "",
-        (
-            f"Investigation priority: Start at {table} before debugging downstream models, "
-            "because the affected models appear to inherit the anomaly from the raw table layer."
-        ),
+        _owner_investigation_priority(table, anomaly_type),
         "",
         "## Compliance Note",
         "",
@@ -240,11 +231,50 @@ def _primary_reason(table: str, anomaly_type: str, primary: dict) -> str:
     return _sentence_case(primary.get("reason", "No deterministic reason available."))
 
 
-def _investigation_steps(table: str, actions: list) -> list:
+def _blast_radius_interpretation(table: str, anomaly_type: str) -> str:
+    if anomaly_type == "freshness_anomaly":
+        return (
+            f"These models either directly or indirectly depend on {table}. "
+            f"If {table} is stale, downstream models may be using outdated data."
+        )
+    return (
+        f"These models either directly or indirectly depend on {table}. "
+        f"If {table} is incomplete, these downstream models may produce incorrect metrics."
+    )
+
+
+def _owner_first_action(table: str, anomaly_type: str) -> str:
+    if anomaly_type == "freshness_anomaly":
+        return (
+            f"First action: Verify whether the scheduled ingestion job for {table} "
+            "completed successfully and updated the table within the expected freshness window."
+        )
+    return (
+        f"First action: Verify whether the upstream ingestion job for {table} "
+        "completed successfully and loaded the expected number of rows."
+    )
+
+
+def _owner_investigation_priority(table: str, anomaly_type: str) -> str:
+    if anomaly_type == "freshness_anomaly":
+        return (
+            "Investigation priority: Start with ingestion schedule, source connector status, "
+            "and orchestration logs before debugging downstream models."
+        )
+    return (
+        f"Investigation priority: Start at {table} before debugging downstream models, "
+        "because the affected models appear to inherit the anomaly from the raw table layer."
+    )
+
+
+def _investigation_steps(table: str, actions: list, anomaly_type: str = "unknown") -> list:
     if actions:
         normalized = [_sentence_case(action) for action in actions]
     else:
         normalized = [f"Investigate upstream pipeline health for {table}."]
+
+    if anomaly_type == "freshness_anomaly":
+        return normalized[:6]
 
     desired = [
         f"Check the upstream ingestion job for {table}.",

@@ -212,7 +212,12 @@ def _simulate_duplicate_explosion(db_path: str, table: str, baseline_file: Path)
     quoted_table = quote_identifier(table)
     conn = sqlite3.connect(db_path)
     try:
-        conn.execute(f"INSERT INTO {quoted_table} SELECT * FROM {quoted_table} LIMIT 5")
+        row_count = conn.execute(f"SELECT COUNT(*) FROM {quoted_table}").fetchone()[0]
+        duplicate_limit = 5 if row_count < 10 else min(row_count, max(10, row_count // 1000))
+        conn.execute(
+            f"INSERT INTO {quoted_table} SELECT * FROM {quoted_table} LIMIT ?",
+            (duplicate_limit,),
+        )
         conn.commit()
     finally:
         conn.close()
