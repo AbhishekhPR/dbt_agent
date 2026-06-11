@@ -1,67 +1,67 @@
 {
   "table": "raw_orders",
-  "row_count": 100000,
+  "row_count": 5000,
   "columns": [
     "order_id",
     "customer_id",
-    "product_id",
     "order_status",
     "order_total",
-    "created_at",
+    "event_time",
+    "ingested_at",
     "updated_at"
   ],
   "schema": [
     {
       "name": "order_id",
       "data_type": "INTEGER",
-      "nullable": false,
-      "primary_key": false
+      "nullable": true,
+      "primary_key": true
     },
     {
       "name": "customer_id",
       "data_type": "INTEGER",
-      "nullable": false,
-      "primary_key": false
-    },
-    {
-      "name": "product_id",
-      "data_type": "INTEGER",
-      "nullable": false,
+      "nullable": true,
       "primary_key": false
     },
     {
       "name": "order_status",
       "data_type": "TEXT",
-      "nullable": false,
+      "nullable": true,
       "primary_key": false
     },
     {
       "name": "order_total",
       "data_type": "REAL",
-      "nullable": false,
+      "nullable": true,
       "primary_key": false
     },
     {
-      "name": "created_at",
+      "name": "event_time",
       "data_type": "TEXT",
-      "nullable": false,
+      "nullable": true,
+      "primary_key": false
+    },
+    {
+      "name": "ingested_at",
+      "data_type": "TEXT",
+      "nullable": true,
       "primary_key": false
     },
     {
       "name": "updated_at",
       "data_type": "TEXT",
-      "nullable": false,
+      "nullable": true,
       "primary_key": false
     }
   ],
-  "schema_hash": "d6a6a78bbefe56b66cdf844d94aaa211f081b0cda56c63d54734428027f37d1e",
+  "schema_hash": "15f3b6f4ea3815da7f9202d6047ed9008cdcd5fd2ff35bc35eebdba14437abf5",
   "null_rates": {
     "order_id": 0.0,
     "customer_id": 0.0,
-    "product_id": 0.0,
     "order_status": 0.0,
     "order_total": 0.0,
-    "created_at": 0.0,
+    "event_time": 0.0,
+    "ingested_at": 0.0,
     "updated_at": 0.0
   },
   "duplicate_rows": 0,
@@ -73,15 +73,10 @@
   "numeric_stats": {
     "order_id": {
       "min": 1.0,
-      "max": 100000.0,
-      "avg": 50000.5
+      "max": 5000.0,
+      "avg": 2500.5
     },
     "customer_id": {
-      "min": 1.0,
-      "max": 10000.0,
-      "avg": 5000.5
-    },
-    "product_id": {
       "min": 1.0,
       "max": 1000.0,
       "avg": 500.5
@@ -92,11 +87,16 @@
       "avg": 0.0
     },
     "order_total": {
-      "min": 13.79,
-      "max": 552.31,
-      "avg": 235.88
+      "min": 25.0,
+      "max": 329.33,
+      "avg": 177.16
     },
-    "created_at": {
+    "event_time": {
+      "min": 2026.0,
+      "max": 2026.0,
+      "avg": 2026.0
+    },
+    "ingested_at": {
       "min": 2026.0,
       "max": 2026.0,
       "avg": 2026.0
@@ -108,15 +108,15 @@
     }
   },
   "distinct_counts": {
-    "order_id": 100000,
-    "customer_id": 10000,
-    "product_id": 1000,
+    "order_id": 5000,
+    "customer_id": 1000,
     "order_status": 4,
-    "order_total": 929,
-    "created_at": 120,
-    "updated_at": 90
+    "order_total": 250,
+    "event_time": 1,
+    "ingested_at": 1,
+    "updated_at": 1
   },
   "freshness_column": "updated_at",
-  "last_updated": "2026-06-11 11:37:22",
-  "freshness_minutes": 60
+  "last_updated": "2026-06-09 11:58:40",
+  "freshness_minutes": 2880
 }

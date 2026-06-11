@@ -295,6 +295,38 @@ def sql_risks(project):
         print(f"Recommendation: {risk['recommendation']}")
         print()
 
+@cli.command(
+    name="pr_guard",
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+)
+@click.option('--project', required=True, help='Path to your dbt project folder')
+@click.option(
+    '--changed-files',
+    multiple=True,
+    help='SQL model file(s) changed in this PR. May also be followed by multiple paths.'
+)
+@click.option(
+    '--fail-on',
+    default='high',
+    type=click.Choice(['info', 'low', 'medium', 'high', 'critical'], case_sensitive=False),
+    help='Minimum severity that should fail the command.'
+)
+@click.option('--output', default='.relium/pr_guard_report.md', help='Markdown report output path')
+@click.pass_context
+def pr_guard(ctx, project, changed_files, fail_on, output):
+    """Run static SQL/dbt PR guard checks and write a Markdown report."""
+    from agent.pr_guard import run_pr_guard, terminal_summary
+
+    selected_files = list(changed_files) + list(ctx.args)
+    report = run_pr_guard(
+        project,
+        changed_files=selected_files or None,
+        fail_on=fail_on,
+        output=output,
+    )
+    click.echo(terminal_summary(report))
+    raise click.exceptions.Exit(report["exit_code"])
+
 @cli.command()
 @click.option('--project', required=True, help='Path to your dbt project folder')
 @click.option('--table', required=True, help='The upstream table that changed')
@@ -353,6 +385,38 @@ def history(project, table, days):
     print()
 
     if table:
+        import json
+
+        metric_history = get_metric_history(project, table, days)
+        if metric_history:
+            latest_metrics = metric_history[-1]
+            print(f"  Latest quality metrics for '{table}':\n")
+            print(f"    Recorded at:     {latest_metrics['recorded_at']}")
+            print(f"    Row count:       {latest_metrics['row_count']}")
+            print(f"    Duplicate rows:  {latest_metrics['duplicate_rows']}")
+
+            null_rates = json.loads(latest_metrics.get("null_rates") or "{}")
+            if null_rates:
+                print("    Null rates:")
+                for column, null_rate in null_rates.items():
+                    print(f"      - {column}: {null_rate}%")
+            print()
+        else:
+            print(f"  No quality metric history found for '{table}'.\n")
+
+        freshness = get_freshness_history(project, table, days)
+        if freshness:
+            latest_freshness = freshness[-1]
+            print(f"  Latest freshness for '{table}':\n")
+            print(f"    Status:          {latest_freshness['status']}")
+            print(f"    Freshness col:   {latest_freshness['freshness_col']}")
+            print(f"    Last updated:    {latest_freshness['last_updated']}")
+            print(
+                f"    Hours since:     "
+                f"{latest_freshness['hours_since_update']}"
+            )
+            print()
+
         changes = get_schema_change_history(project, table)
         if changes:
             print(f"  Schema changes for '{table}':\n")

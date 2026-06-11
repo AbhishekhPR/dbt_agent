@@ -10,7 +10,11 @@ from agent.sql_metadata_extractor import strip_jinja
 Risk = Dict[str, str]
 
 
-def detect_sql_risks(project_path: str, persist: bool = True) -> List[Risk]:
+def detect_sql_risks(
+    project_path: str,
+    persist: bool = True,
+    changed_files: List[str] | None = None,
+) -> List[Risk]:
     """Scan dbt model SQL files for risky static transformation patterns."""
     project = Path(project_path)
     models_path = project / "models"
@@ -20,8 +24,10 @@ def detect_sql_risks(project_path: str, persist: bool = True) -> List[Risk]:
     if not models_path.exists() or not models_path.is_dir():
         raise FileNotFoundError(f"Models path not found: {models_path}")
 
+    sql_files = _sql_files_to_scan(project, models_path, changed_files)
+
     risks: List[Risk] = []
-    for sql_file in sorted(models_path.glob("**/*.sql")):
+    for sql_file in sql_files:
         sql = sql_file.read_text(encoding="utf-8")
         clean_sql = _normalize_sql(strip_jinja(sql))
         model_name = sql_file.stem
@@ -32,6 +38,18 @@ def detect_sql_risks(project_path: str, persist: bool = True) -> List[Risk]:
         _save_sql_risks(project.name, risks)
 
     return risks
+
+
+def sql_files_to_scan(project_path: str, changed_files: List[str] | None = None) -> List[Path]:
+    project = Path(project_path)
+    models_path = project / "models"
+    if project.name == "models":
+        models_path = project
+
+    if not models_path.exists() or not models_path.is_dir():
+        raise FileNotFoundError(f"Models path not found: {models_path}")
+
+    return _sql_files_to_scan(project, models_path, changed_files)
 
 
 def print_sql_risks(risks: List[Risk]) -> None:
@@ -63,6 +81,28 @@ def _detect_risks_for_model(sql: str, model_name: str, file_path: str) -> List[R
     for rule in rules:
         risks.extend(rule(sql, model_name, file_path))
     return risks
+
+
+def _sql_files_to_scan(
+    project: Path,
+    models_path: Path,
+    changed_files: List[str] | None,
+) -> List[Path]:
+    if not changed_files:
+        return sorted(models_path.glob("**/*.sql"))
+
+    sql_files: List[Path] = []
+    for changed_file in changed_files:
+        candidate = Path(changed_file)
+        candidates = [candidate]
+        if not candidate.is_absolute():
+            candidates.extend([project / candidate, models_path / candidate])
+
+        resolved = next((path for path in candidates if path.exists()), None)
+        if resolved and resolved.suffix.lower() == ".sql":
+            sql_files.append(resolved)
+
+    return sorted(dict.fromkeys(sql_files))
 
 
 def _risk(

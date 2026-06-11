@@ -131,6 +131,24 @@ def record_table_metrics(project_name: str, table_name: str, metrics: dict):
     conn.commit()
     conn.close()
 
+    project_conn = get_db(project_name)
+    project_conn.execute("""
+        INSERT INTO table_metrics
+        (recorded_at, table_name, row_count, null_rates,
+         distinct_counts, numeric_stats, duplicate_rows)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        datetime.utcnow().isoformat(),
+        table_name,
+        metrics.get("row_count"),
+        json.dumps(metrics.get("null_rates", {})),
+        json.dumps(metrics.get("distinct_counts", {})),
+        json.dumps(metrics.get("numeric_stats", {})),
+        metrics.get("duplicate_rows"),
+    ))
+    project_conn.commit()
+    project_conn.close()
+
 
 def get_metric_history(project: str, table: str, days: int = 30) -> list:
     """Returns last N days of metrics for a table."""

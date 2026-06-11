@@ -39,7 +39,7 @@ def run_simulation(
         raise ValueError(f"Unsupported simulation type '{anomaly_type}'. Supported: {supported}")
 
     db_file = Path(db_path)
-    baseline_file = quality_checker.BASELINE_PATH / f"{table}.json"
+    baseline_file = _simulation_baseline_file(project_name, table)
     db_backup = Path(str(db_file) + ".sim_backup")
     baseline_backup = baseline_file.with_suffix(baseline_file.suffix + ".sim_backup")
 
@@ -63,6 +63,7 @@ def run_simulation(
 
     try:
         _apply_simulation(db_path, table, anomaly_type, baseline_file)
+        _mirror_baseline_for_quality(project_name, table, baseline_file)
         print("Simulation applied.")
         print("Running quality check...")
         print()
@@ -72,6 +73,7 @@ def run_simulation(
         if restore_after:
             _restore_file(db_backup, db_file)
             _restore_file(baseline_backup, baseline_file)
+            _mirror_baseline_for_quality(project_name, table, baseline_file)
             print("Restored database and baseline.")
             if _verify_restore(db_path, table, baseline_file, pre_simulation_metrics, pre_simulation_baseline):
                 print("Restore verification passed.")
@@ -88,7 +90,24 @@ def ensure_clean_baseline(project_name: str, db_path: str, table: str):
     freshness_minutes = metrics.get("freshness_minutes")
     if freshness_minutes is not None and freshness_minutes > DEFAULT_FRESHNESS_THRESHOLD_MINUTES:
         metrics["freshness_threshold_minutes"] = freshness_minutes + 1
-    quality_checker.save_baseline(table, metrics)
+    quality_checker.save_baseline(table, metrics, project_name)
+    legacy_file = quality_checker.baseline_file_for(table)
+    if legacy_file.exists():
+        _save_baseline(legacy_file, metrics)
+
+
+def _simulation_baseline_file(project_name: str, table: str) -> Path:
+    legacy_file = quality_checker.baseline_file_for(table)
+    if legacy_file.exists():
+        return legacy_file
+    return quality_checker.baseline_file_for(table, project_name)
+
+
+def _mirror_baseline_for_quality(project_name: str, table: str, baseline_file: Path) -> None:
+    project_file = quality_checker.baseline_file_for(table, project_name)
+    if baseline_file == project_file:
+        return
+    project_file.write_text(baseline_file.read_text())
 
 
 def _backup_file(source: Path, destination: Path):

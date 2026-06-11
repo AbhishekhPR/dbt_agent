@@ -29,10 +29,15 @@ def quote_identifier(identifier: str) -> str:
 def infer_freshness_column(columns: list[str]) -> str | None:
     """Pick the most likely timestamp column for freshness checks."""
     preferred = [
-        "created_at",
+        "source_max_updated_at",
+        "source_max_ingested_at",
+        "source_max_event_time",
+        "model_built_at",
         "updated_at",
-        "loaded_at",
         "ingested_at",
+        "loaded_at",
+        "created_at",
+        "event_time",
         "_loaded_at",
         "_relium_sim_updated_at",
     ]
@@ -219,18 +224,26 @@ def _parse_datetime(value) -> datetime | None:
     return None
 
 
-def load_baseline(table_name: str) -> dict:
+def baseline_file_for(table_name: str, project_name: str | None = None) -> Path:
+    if project_name:
+        project_baseline_path = BASELINE_PATH / project_name
+        project_baseline_path.mkdir(exist_ok=True)
+        return project_baseline_path / f"{table_name}.json"
+    return BASELINE_PATH / f"{table_name}.json"
+
+
+def load_baseline(table_name: str, project_name: str | None = None) -> dict:
     """Load saved baseline metrics for a table"""
-    baseline_file = BASELINE_PATH / f"{table_name}.json"
+    baseline_file = baseline_file_for(table_name, project_name)
     if not baseline_file.exists():
         return {}
     with open(baseline_file) as f:
         return json.load(f)
 
 
-def save_baseline(table_name: str, metrics: dict):
+def save_baseline(table_name: str, metrics: dict, project_name: str | None = None):
     """Save current metrics as new baseline"""
-    baseline_file = BASELINE_PATH / f"{table_name}.json"
+    baseline_file = baseline_file_for(table_name, project_name)
     with open(baseline_file, "w") as f:
         json.dump(metrics, f, indent=2)
 
@@ -355,7 +368,7 @@ def detect_anomalies(current: dict, baseline: dict) -> list:
             "current_value": freshness_minutes,
             "baseline_value": threshold_minutes,
             "change_percent": None,
-            "severity": "critical" if freshness_minutes > threshold_minutes * 2 else "high",
+            "severity": "critical" if freshness_minutes >= threshold_minutes * 2 else "high",
             "explanation": msg,
             "recommendation": "Check ingestion freshness and upstream scheduled jobs",
             "message": msg,
@@ -455,6 +468,18 @@ def print_root_cause_summary(rca_report: dict):
             print(f"     - {action}")
 
 
+def print_freshness_metadata(metrics: dict):
+    freshness_column = metrics.get("freshness_column")
+    if not freshness_column:
+        return
+
+    print(f"    Freshness column: {freshness_column}")
+    print(f"    Latest timestamp: {metrics.get('last_updated')}")
+    freshness_minutes = metrics.get("freshness_minutes")
+    if freshness_minutes is not None:
+        print(f"    Freshness age: {round(freshness_minutes / 60, 1)} hours")
+
+
 def run_quality_check(project_name: str, db_path: str):
     """
     Main entry point.
@@ -478,11 +503,12 @@ def run_quality_check(project_name: str, db_path: str):
     for table in tables:
         print(f"  → Checking {table}...")
         current_metrics = get_table_metrics(db_path, table)
-        baseline_metrics = load_baseline(table)
+        print_freshness_metadata(current_metrics)
+        baseline_metrics = load_baseline(table, project_name)
 
         if not baseline_metrics:
             print(f"    📸 No baseline for '{table}' — saving current as baseline.")
-            save_baseline(table, current_metrics)
+            save_baseline(table, current_metrics, project_name)
             record_table_metrics(project_name, table, current_metrics)
             continue
 
@@ -490,7 +516,7 @@ def run_quality_check(project_name: str, db_path: str):
 
         if not anomalies:
             print(f"    ✅ {table} — all metrics within normal range.")
-            save_baseline(table, current_metrics)
+            save_baseline(table, current_metrics, project_name)
             record_table_metrics(project_name, table, current_metrics)
             continue
 
@@ -568,7 +594,7 @@ def run_quality_check(project_name: str, db_path: str):
             send_slack_alert(f"DATA QUALITY — {table}", diagnosis)
 
         # Update baseline after alerting
-        save_baseline(table, current_metrics)
+        save_baseline(table, current_metrics, project_name)
         record_table_metrics(project_name, table, current_metrics)
 
     print()

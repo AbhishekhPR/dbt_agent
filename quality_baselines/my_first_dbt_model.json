@@ -12,19 +12,16 @@
       "primary_key": false
     }
   ],
-  "schema_hash": "8a042e31a5744a299bb4a3fad61a81b6138d28aeb40bdbcf7caf5320141da88e",
+  "schema_hash": "948ff827b10a5af63a00f6c15c78024064895b31bf5747d49f9c05d5f9fcaa57",
   "null_rates": {
     "id": 50.0
   },
-  "freshness_column": null,
-  "last_updated": null,
-  "freshness_minutes": null,
   "duplicate_rows": 0,
   "duplicate_rate": 0.0,
-  "duplicate_check_method": "key:id",
   "duplicate_key_columns": [
     "id"
   ],
+  "duplicate_check_method": "key:id",
   "numeric_stats": {
     "id": {
       "min": 1.0,
