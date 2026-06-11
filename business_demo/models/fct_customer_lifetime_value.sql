@@ -13,3 +13,5 @@ GROUP BY
     o.customer_id,
     c.customer_segment,
     c.acquisition_channel
+
+-- test Relium PR Guard
