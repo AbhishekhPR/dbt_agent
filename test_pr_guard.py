@@ -71,7 +71,14 @@ class PrGuardTests(unittest.TestCase):
             report,
         )
         self.assertIn("Evidence: WHERE c.is_deleted = [NUMBER_LITERAL]", report)
-        self.assertIn("AND c.is_deleted = 0", report)
+        self.assertIn(
+            "```sql\n"
+            "LEFT JOIN raw_customers c\n"
+            "    ON o.customer_id = c.customer_id\n"
+            "   AND c.is_deleted = 0\n"
+            "```",
+            report,
+        )
         self.assertIn("- fct_daily_kpis", report)
 
     def test_pr_guard_changed_files_scans_only_selected_files(self):

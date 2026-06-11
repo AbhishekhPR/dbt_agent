@@ -185,7 +185,7 @@ def _suggested_fix(project: Path, risk: dict) -> str:
     if not join or not condition:
         return "Move the right-table filter into the JOIN condition."
 
-    return f"LEFT JOIN {join['table']} {join['alias']}\nON {join['on']}\nAND {condition}"
+    return f"LEFT JOIN {join['table']} {join['alias']}\n    ON {join['on']}\n   AND {condition}"
 
 
 def _affected_downstream_models(project: Path, model_name: str) -> list[str]:
