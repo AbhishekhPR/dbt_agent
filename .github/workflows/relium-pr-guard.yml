@@ -3,18 +3,96 @@ name: Relium PR Guard
 on:
   pull_request:
 
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
 jobs:
   pr-guard:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
       - name: Install dependencies
-        run: python -m pip install click python-dotenv sqlglot groq
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          else
+            python -m pip install click python-dotenv sqlglot groq
+          fi
+
+      - name: Detect changed SQL files
+        id: changed-sql
+        shell: bash
+        run: |
+          mkdir -p .relium
+          git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" -- '*.sql' > .relium/changed_sql_files.txt
+          if [ -s .relium/changed_sql_files.txt ]; then
+            echo "has_sql=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_sql=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment when no SQL files changed
+        if: steps.changed-sql.outputs.has_sql == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          from agent.github_pr_commenter import MARKER, post_or_update_pr_comment
+
+          body = "\n".join(
+              [
+                  MARKER,
+                  "",
+                  "## Relium PR Guard",
+                  "",
+                  "Safe to merge: YES",
+                  "",
+                  "No SQL/dbt files were changed in this pull request.",
+                  "",
+              ]
+          )
+          output = Path(".relium/pr_guard_comment.md")
+          output.parent.mkdir(parents=True, exist_ok=True)
+          output.write_text(body, encoding="utf-8")
+          status = post_or_update_pr_comment(body)
+          if status.get("posted"):
+              print("GitHub PR comment posted/updated.")
+          else:
+              print(f"GitHub PR comment was not posted: {status.get('reason', 'unknown error')}.")
+          PY
 
       - name: Run Relium PR Guard
-        run: python main.py pr_guard --project business_demo --fail-on high
+        if: steps.changed-sql.outputs.has_sql == 'true'
+        id: pr-guard
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set +e
+          mapfile -t changed_files < .relium/changed_sql_files.txt
+          python main.py pr_guard \
+            --project business_demo \
+            --fail-on high \
+            --github-comment \
+            --changed-files "${changed_files[@]}"
+          exit_code=$?
+          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Fail on PR Guard result
+        if: steps.changed-sql.outputs.has_sql == 'true'
+        shell: bash
+        run: exit "${{ steps.pr-guard.outputs.exit_code }}"

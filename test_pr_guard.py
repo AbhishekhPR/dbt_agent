@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from click.testing import CliRunner
 
@@ -35,6 +36,7 @@ class PrGuardTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.report_path = self.project / ".relium" / "pr_guard_report.md"
+        self.comment_path = self.project / ".relium" / "pr_guard_comment.md"
 
     def tearDown(self):
         self.tmpdir.cleanup()
@@ -101,6 +103,76 @@ class PrGuardTests(unittest.TestCase):
         self.assertIn("Files scanned: 1", result.output)
         self.assertIn("Risks found: 0", result.output)
         self.assertIn("Safe to merge: YES", result.output)
+
+    def test_pr_guard_github_comment_local_mode_writes_comment(self):
+        from agent.cli import cli
+
+        with patch.dict("os.environ", {}, clear=True):
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "pr_guard",
+                    "--project",
+                    str(self.project),
+                    "--output",
+                    str(self.report_path),
+                    "--github-comment",
+                    "--comment-output",
+                    str(self.comment_path),
+                ],
+            )
+
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("GitHub environment not detected. Comment markdown written locally.", result.output)
+        self.assertTrue(self.report_path.exists())
+        self.assertTrue(self.comment_path.exists())
+
+        comment = self.comment_path.read_text(encoding="utf-8")
+        self.assertIn("<!-- relium-pr-guard -->", comment)
+        self.assertIn("## Relium PR Guard", comment)
+        self.assertIn("Safe to merge: NO", comment)
+        self.assertIn("Project: " + str(self.project), comment)
+        self.assertIn("Files scanned: 2", comment)
+        self.assertIn("Risks found: 1", comment)
+        self.assertIn("Highest severity: HIGH", comment)
+        self.assertIn("### High risk transformation logic found", comment)
+        self.assertIn("#### fct_customer_lifetime_value", comment)
+        self.assertIn("`WHERE c.is_deleted = [NUMBER_LITERAL]`", comment)
+        self.assertIn(
+            "```sql\n"
+            "LEFT JOIN raw_customers c\n"
+            "    ON o.customer_id = c.customer_id\n"
+            "   AND c.is_deleted = 0\n"
+            "```",
+            comment,
+        )
+        self.assertIn("* fct_daily_kpis", comment)
+
+    def test_pr_guard_github_comment_respects_critical_fail_threshold(self):
+        from agent.cli import cli
+
+        with patch.dict("os.environ", {}, clear=True):
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "pr_guard",
+                    "--project",
+                    str(self.project),
+                    "--output",
+                    str(self.report_path),
+                    "--fail-on",
+                    "critical",
+                    "--github-comment",
+                    "--comment-output",
+                    str(self.comment_path),
+                ],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertTrue(self.comment_path.exists())
+        comment = self.comment_path.read_text(encoding="utf-8")
+        self.assertIn("Risks found: 1", comment)
+        self.assertIn("Highest severity: HIGH", comment)
 
 
 if __name__ == "__main__":

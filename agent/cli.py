@@ -312,8 +312,10 @@ def sql_risks(project):
     help='Minimum severity that should fail the command.'
 )
 @click.option('--output', default='.relium/pr_guard_report.md', help='Markdown report output path')
+@click.option('--github-comment', is_flag=True, help='Write and post/update a GitHub PR comment when possible')
+@click.option('--comment-output', default='.relium/pr_guard_comment.md', help='GitHub PR comment Markdown output path')
 @click.pass_context
-def pr_guard(ctx, project, changed_files, fail_on, output):
+def pr_guard(ctx, project, changed_files, fail_on, output, github_comment, comment_output):
     """Run static SQL/dbt PR guard checks and write a Markdown report."""
     from agent.pr_guard import run_pr_guard, terminal_summary
 
@@ -323,8 +325,19 @@ def pr_guard(ctx, project, changed_files, fail_on, output):
         changed_files=selected_files or None,
         fail_on=fail_on,
         output=output,
+        github_comment=github_comment,
+        comment_output=comment_output,
     )
     click.echo(terminal_summary(report))
+    if github_comment:
+        status = report.get("github_comment_status", {})
+        if status.get("reason") == "missing_environment":
+            click.echo("GitHub environment not detected. Comment markdown written locally.")
+        elif status.get("posted"):
+            click.echo("GitHub PR comment posted/updated.")
+        else:
+            reason = status.get("reason", "unknown error")
+            click.echo(f"GitHub PR comment was not posted: {reason}. Comment markdown written locally.")
     raise click.exceptions.Exit(report["exit_code"])
 
 @cli.command()

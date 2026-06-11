@@ -59,6 +59,8 @@ def run_pr_guard(
     changed_files: list[str] | None = None,
     fail_on: str = "high",
     output: str = ".relium/pr_guard_report.md",
+    github_comment: bool = False,
+    comment_output: str = ".relium/pr_guard_comment.md",
 ) -> dict:
     project = Path(project_path)
     scanned_files = sql_files_to_scan(project_path, changed_files)
@@ -81,6 +83,13 @@ def run_pr_guard(
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(render_report(report), encoding="utf-8")
+    if github_comment:
+        from agent.github_pr_commenter import post_or_update_pr_comment, render_pr_comment, write_pr_comment
+
+        comment_body = render_pr_comment(report)
+        write_pr_comment(report, comment_output)
+        report["comment_output"] = comment_output
+        report["github_comment_status"] = post_or_update_pr_comment(comment_body)
     return report
 
 
