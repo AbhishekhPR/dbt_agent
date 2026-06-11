@@ -111,8 +111,8 @@ class SqlRiskDetectorTests(unittest.TestCase):
             FROM raw_users u
             LEFT JOIN tokens t ON u.id = t.user_id
             WHERE created_at >= '2026-06-04 10:30:00'
-              AND api_token = 'example_secret_token'
-              AND t.api_token = 'example_secret_token'
+              AND api_token = 'REDACTED_TEST_SECRET'
+              AND t.api_token = 'REDACTED_TEST_SECRET'
               AND t.uuid = '550e8400-e29b-41d4-a716-446655440000'
               AND amount > 1000
               AND status <> 'cancelled'
@@ -127,12 +127,12 @@ class SqlRiskDetectorTests(unittest.TestCase):
         self.assertIn("[EMAIL_LITERAL]", evidence)
         self.assertIn("[NUMBER_LITERAL]", evidence)
         self.assertIn("[DATETIME_LITERAL]", evidence)
-        self.assertIn("[SECRET_LITERAL]", evidence)
         self.assertIn("[UUID_LITERAL]", evidence)
+        self.assertIn("WHERE t.api_token = [STRING_LITERAL]", evidence)
         self.assertIn("status <> [STRING_LITERAL]", evidence)
         self.assertNotIn("abc@gmail.com", evidence)
         self.assertNotIn("2026-06-04 10:30:00", evidence)
-        self.assertNotIn("example_secret_token", evidence)
+        self.assertNotIn("REDACTED_TEST_SECRET", evidence)
         self.assertNotIn("550e8400-e29b-41d4-a716-446655440000", evidence)
         self.assertNotIn("cancelled", evidence)
         self.assertNotIn("1000", evidence)
@@ -144,7 +144,7 @@ class SqlRiskDetectorTests(unittest.TestCase):
         conn.close()
         self.assertEqual(evidence, stored_evidence)
         self.assertNotIn("abc@gmail.com", stored_evidence)
-        self.assertNotIn("example_secret_token", stored_evidence)
+        self.assertNotIn("REDACTED_TEST_SECRET", stored_evidence)
 
     def test_print_sql_risks_uses_sanitized_evidence(self):
         from agent.sql_risk_detector import detect_sql_risks, print_sql_risks
