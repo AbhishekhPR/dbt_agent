@@ -6,3 +6,15 @@ metadata_history.db
 business_demo/db/*.db
 pipeline_demo/db/*.db
 pipeline_timestamp_demo/db/*.db
+
+*.db
+metadata_history.db
+business_demo/db/*.db
+pipeline_demo/db/*.db
+pipeline_timestamp_demo/db/*.db
+
+*.db
+metadata_history.db
+business_demo/db/*.db
+pipeline_demo/db/*.db
+pipeline_timestamp_demo/db/*.db
