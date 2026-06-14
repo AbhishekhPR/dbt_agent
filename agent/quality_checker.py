@@ -1,4 +1,5 @@
 import json
+<<<<<<< HEAD
 import re
 import sqlite3
 from datetime import datetime
@@ -12,12 +13,21 @@ from agent.slack import send_slack_alert
 
 DEFAULT_FRESHNESS_THRESHOLD_MINUTES = 24 * 60
 
+=======
+import sqlite3
+from pathlib import Path
+from dotenv import load_dotenv
+from agent.groq_client import call_llm_json
+from agent.slack import send_slack_alert
+
+>>>>>>> main
 env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 BASELINE_PATH = Path(__file__).resolve().parent.parent / "quality_baselines"
 BASELINE_PATH.mkdir(exist_ok=True)
 
+<<<<<<< HEAD
 SYSTEM_PROMPT = None
 
 
@@ -50,6 +60,13 @@ def infer_freshness_column(columns: list[str]) -> str | None:
         if lowered.endswith("_at") or "timestamp" in lowered or "date" in lowered:
             return column
     return None
+=======
+SYSTEM_PROMPT = """
+You are a senior data quality engineer. You analyze data pipeline 
+metrics and identify anomalies that indicate silent data corruption.
+You always respond with valid JSON only. No explanation outside JSON.
+"""
+>>>>>>> main
 
 
 def get_table_metrics(db_path: str, table_name: str) -> dict:
@@ -63,6 +80,7 @@ def get_table_metrics(db_path: str, table_name: str) -> dict:
 
     try:
         # Row count
+<<<<<<< HEAD
         quoted_table = quote_identifier(table_name)
 
         cursor.execute(f"SELECT COUNT(*) FROM {quoted_table}")
@@ -86,20 +104,38 @@ def get_table_metrics(db_path: str, table_name: str) -> dict:
         metrics["schema_hash"] = hashlib.sha256(
             json.dumps(schema, sort_keys=True).encode("utf-8")
         ).hexdigest()
+=======
+        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+        metrics["row_count"] = cursor.fetchone()[0]
+
+        # Get columns
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        columns = [row[1] for row in cursor.fetchall()]
+        metrics["columns"] = columns
+>>>>>>> main
 
         # Null rates per column
         null_rates = {}
         for col in columns:
+<<<<<<< HEAD
             quoted_col = quote_identifier(col)
             cursor.execute(f"""
                 SELECT 
                     ROUND(100.0 * SUM(CASE WHEN {quoted_col} IS NULL THEN 1 ELSE 0 END) 
                     / COUNT(*), 2)
                 FROM {quoted_table}
+=======
+            cursor.execute(f"""
+                SELECT 
+                    ROUND(100.0 * SUM(CASE WHEN {col} IS NULL THEN 1 ELSE 0 END) 
+                    / COUNT(*), 2)
+                FROM {table_name}
+>>>>>>> main
             """)
             null_rates[col] = cursor.fetchone()[0] or 0.0
         metrics["null_rates"] = null_rates
 
+<<<<<<< HEAD
         duplicate_key_columns = _infer_duplicate_key_columns(columns)
         duplicate_rows = _count_duplicate_rows(cursor, quoted_table, duplicate_key_columns)
         metrics["duplicate_rows"] = duplicate_rows
@@ -110,10 +146,19 @@ def get_table_metrics(db_path: str, table_name: str) -> dict:
             if _has_business_key(columns)
             else "full_row"
         )
+=======
+        # Duplicate rate
+        cursor.execute(f"""
+            SELECT COUNT(*) - COUNT(DISTINCT rowid) 
+            FROM {table_name}
+        """)
+        metrics["duplicate_rows"] = cursor.fetchone()[0]
+>>>>>>> main
 
         # Numeric column stats
         numeric_stats = {}
         for col in columns:
+<<<<<<< HEAD
             quoted_col = quote_identifier(col)
             try:
                 cursor.execute(f"""
@@ -123,6 +168,16 @@ def get_table_metrics(db_path: str, table_name: str) -> dict:
                         AVG(CAST({quoted_col} AS REAL))
                     FROM {quoted_table}
                     WHERE {quoted_col} IS NOT NULL
+=======
+            try:
+                cursor.execute(f"""
+                    SELECT 
+                        MIN(CAST({col} AS REAL)),
+                        MAX(CAST({col} AS REAL)),
+                        AVG(CAST({col} AS REAL))
+                    FROM {table_name}
+                    WHERE {col} IS NOT NULL
+>>>>>>> main
                 """)
                 row = cursor.fetchone()
                 if row and row[0] is not None:
@@ -138,6 +193,7 @@ def get_table_metrics(db_path: str, table_name: str) -> dict:
         # Distinct value counts per column
         distinct_counts = {}
         for col in columns:
+<<<<<<< HEAD
             cursor.execute(f"SELECT COUNT(DISTINCT {quote_identifier(col)}) FROM {quoted_table}")
             distinct_counts[col] = cursor.fetchone()[0]
         metrics["distinct_counts"] = distinct_counts
@@ -154,6 +210,12 @@ def get_table_metrics(db_path: str, table_name: str) -> dict:
             if freshness_minutes is not None:
                 metrics["freshness_minutes"] = freshness_minutes
 
+=======
+            cursor.execute(f"SELECT COUNT(DISTINCT {col}) FROM {table_name}")
+            distinct_counts[col] = cursor.fetchone()[0]
+        metrics["distinct_counts"] = distinct_counts
+
+>>>>>>> main
     except Exception as e:
         metrics["error"] = str(e)
     finally:
@@ -162,6 +224,7 @@ def get_table_metrics(db_path: str, table_name: str) -> dict:
     return metrics
 
 
+<<<<<<< HEAD
 def _has_business_key(columns: list[str]) -> bool:
     return bool(_business_key_columns(columns))
 
@@ -235,15 +298,26 @@ def baseline_file_for(table_name: str, project_name: str | None = None) -> Path:
 def load_baseline(table_name: str, project_name: str | None = None) -> dict:
     """Load saved baseline metrics for a table"""
     baseline_file = baseline_file_for(table_name, project_name)
+=======
+def load_baseline(table_name: str) -> dict:
+    """Load saved baseline metrics for a table"""
+    baseline_file = BASELINE_PATH / f"{table_name}.json"
+>>>>>>> main
     if not baseline_file.exists():
         return {}
     with open(baseline_file) as f:
         return json.load(f)
 
 
+<<<<<<< HEAD
 def save_baseline(table_name: str, metrics: dict, project_name: str | None = None):
     """Save current metrics as new baseline"""
     baseline_file = baseline_file_for(table_name, project_name)
+=======
+def save_baseline(table_name: str, metrics: dict):
+    """Save current metrics as new baseline"""
+    baseline_file = BASELINE_PATH / f"{table_name}.json"
+>>>>>>> main
     with open(baseline_file, "w") as f:
         json.dump(metrics, f, indent=2)
 
@@ -251,8 +325,12 @@ def save_baseline(table_name: str, metrics: dict, project_name: str | None = Non
 def detect_anomalies(current: dict, baseline: dict) -> list:
     """
     Compares current metrics against baseline.
+<<<<<<< HEAD
     Returns list of deterministic anomaly dicts with keys:
     metric, current_value, baseline_value, change_percent, severity, explanation, recommendation
+=======
+    Returns list of anomalies found.
+>>>>>>> main
     """
     anomalies = []
     table = current.get("table", "unknown")
@@ -265,6 +343,7 @@ def detect_anomalies(current: dict, baseline: dict) -> list:
     baseline_rows = baseline.get("row_count", 0)
 
     if baseline_rows > 0:
+<<<<<<< HEAD
         row_change_pct = (current_rows - baseline_rows) / baseline_rows * 100
         if abs(row_change_pct) > 20:
             severity = "critical" if abs(row_change_pct) > 50 else "high"
@@ -279,6 +358,16 @@ def detect_anomalies(current: dict, baseline: dict) -> list:
                 "explanation": msg,
                 "recommendation": "Investigate recent upstream changes and seeds; compare run histories",
                 "message": msg,
+=======
+        row_change_pct = abs(current_rows - baseline_rows) / baseline_rows * 100
+        if row_change_pct > 20:
+            direction = "dropped" if current_rows < baseline_rows else "spiked"
+            anomalies.append({
+                "type": "row_count_anomaly",
+                "severity": "critical" if row_change_pct > 50 else "high",
+                "table": table,
+                "message": f"Row count {direction} by {round(row_change_pct, 1)}%",
+>>>>>>> main
                 "detail": f"Expected ~{baseline_rows} rows, got {current_rows}",
                 "impact": "Possible data loss or duplication in pipeline"
             })
@@ -292,6 +381,7 @@ def detect_anomalies(current: dict, baseline: dict) -> list:
         null_increase = current_null_rate - baseline_null_rate
 
         if null_increase > 10:
+<<<<<<< HEAD
             severity = "critical" if null_increase > 30 else "high"
             msg = f"Null rate on '{col}' jumped by {round(null_increase,1)} percentage points"
             anomalies.append({
@@ -306,6 +396,15 @@ def detect_anomalies(current: dict, baseline: dict) -> list:
                 "message": msg,
                 "detail": f"Was {baseline_null_rate}% null, now {current_null_rate}% null",
                 "impact": f"Aggregations on '{col}' may return incorrect results"
+=======
+            anomalies.append({
+                "type": "null_explosion",
+                "severity": "critical" if null_increase > 30 else "high",
+                "table": table,
+                "message": f"Null rate on '{col}' jumped by {round(null_increase, 1)}%",
+                "detail": f"Was {baseline_null_rate}% null, now {current_null_rate}% null",
+                "impact": f"Aggregations on '{col}' will return wrong results silently"
+>>>>>>> main
             })
 
     # Duplicate explosion
@@ -313,6 +412,7 @@ def detect_anomalies(current: dict, baseline: dict) -> list:
     baseline_dupes = baseline.get("duplicate_rows", 0)
 
     if current_dupes > baseline_dupes + 10:
+<<<<<<< HEAD
         msg = f"Duplicate rows jumped from {baseline_dupes} to {current_dupes}"
         anomalies.append({
             "metric": "duplicate_rows",
@@ -324,6 +424,13 @@ def detect_anomalies(current: dict, baseline: dict) -> list:
             "explanation": "Duplicate row count increased significantly",
             "recommendation": "Investigate recent JOINs or upstream dedup steps",
             "message": msg,
+=======
+        anomalies.append({
+            "type": "duplicate_explosion",
+            "severity": "high",
+            "table": table,
+            "message": f"Duplicate rows jumped from {baseline_dupes} to {current_dupes}",
+>>>>>>> main
             "detail": "Possible fan-out from a bad JOIN upstream",
             "impact": "Metrics like SUM(revenue) will be inflated"
         })
@@ -336,6 +443,7 @@ def detect_anomalies(current: dict, baseline: dict) -> list:
         baseline_count = baseline_distinct.get(col, 0)
         if baseline_count > 0:
             cardinality_change = (current_count - baseline_count) / baseline_count * 100
+<<<<<<< HEAD
             if cardinality_change >= 200:
                 msg = f"Distinct values in '{col}' increased by {round(cardinality_change, 1)}%"
                 anomalies.append({
@@ -348,10 +456,19 @@ def detect_anomalies(current: dict, baseline: dict) -> list:
                     "explanation": "Distinct value count increased dramatically",
                     "recommendation": "Check for new data sources, bad joins, or format changes",
                     "message": msg,
+=======
+            if cardinality_change > 200:
+                anomalies.append({
+                    "type": "cardinality_explosion",
+                    "severity": "medium",
+                    "table": table,
+                    "message": f"Distinct values in '{col}' increased by {round(cardinality_change, 1)}%",
+>>>>>>> main
                     "detail": f"Was {baseline_count} distinct values, now {current_count}",
                     "impact": "GROUP BY queries on this column may return unexpected granularity"
                 })
 
+<<<<<<< HEAD
     # Freshness anomaly: use a baseline-specific threshold when available,
     # otherwise default to 24 hours.
     freshness_minutes = current.get("freshness_minutes")
@@ -478,6 +595,37 @@ def print_freshness_metadata(metrics: dict):
     freshness_minutes = metrics.get("freshness_minutes")
     if freshness_minutes is not None:
         print(f"    Freshness age: {round(freshness_minutes / 60, 1)} hours")
+=======
+    return anomalies
+
+
+def ask_claude_about_anomalies(anomalies: list, metrics: dict) -> dict:
+    """
+    Sends anomalies to Claude for deeper analysis and recommendations.
+    """
+    if not anomalies:
+        return {}
+
+    prompt = f"""
+A data quality check found these anomalies in a production table:
+
+## ANOMALIES DETECTED
+{json.dumps(anomalies, indent=2)}
+
+## CURRENT TABLE METRICS
+{json.dumps(metrics, indent=2)}
+
+Analyze these anomalies and return a JSON object with:
+{{
+  "root_cause_hypothesis": "most likely cause of these anomalies",
+  "immediate_actions": ["action 1", "action 2", "action 3"],
+  "queries_to_investigate": ["SQL query 1 to run", "SQL query 2 to run"],
+  "should_halt_pipeline": true or false,
+  "confidence": "high | medium | low"
+}}
+"""
+    return call_llm_json(prompt=prompt, system=SYSTEM_PROMPT)
+>>>>>>> main
 
 
 def run_quality_check(project_name: str, db_path: str):
@@ -503,6 +651,7 @@ def run_quality_check(project_name: str, db_path: str):
     for table in tables:
         print(f"  → Checking {table}...")
         current_metrics = get_table_metrics(db_path, table)
+<<<<<<< HEAD
         print_freshness_metadata(current_metrics)
         baseline_metrics = load_baseline(table, project_name)
 
@@ -510,12 +659,20 @@ def run_quality_check(project_name: str, db_path: str):
             print(f"    📸 No baseline for '{table}' — saving current as baseline.")
             save_baseline(table, current_metrics, project_name)
             record_table_metrics(project_name, table, current_metrics)
+=======
+        baseline_metrics = load_baseline(table)
+
+        if not baseline_metrics:
+            print(f"    📸 No baseline for '{table}' — saving current as baseline.")
+            save_baseline(table, current_metrics)
+>>>>>>> main
             continue
 
         anomalies = detect_anomalies(current_metrics, baseline_metrics)
 
         if not anomalies:
             print(f"    ✅ {table} — all metrics within normal range.")
+<<<<<<< HEAD
             save_baseline(table, current_metrics, project_name)
             record_table_metrics(project_name, table, current_metrics)
             continue
@@ -540,6 +697,16 @@ def run_quality_check(project_name: str, db_path: str):
                 anomaly["root_cause_analysis"]
             )
             anomaly["incident_report_path"] = incident_report_path
+=======
+            save_baseline(table, current_metrics)
+            continue
+
+        print(f"    🚨 {table} — {len(anomalies)} anomaly/anomalies detected!")
+        all_anomalies.extend(anomalies)
+
+        # Ask Claude for deeper analysis
+        claude_analysis = ask_claude_about_anomalies(anomalies, current_metrics)
+>>>>>>> main
 
         # Print anomalies
         print(f"\n{'━' * 55}")
@@ -557,7 +724,28 @@ def run_quality_check(project_name: str, db_path: str):
             print(f"\n  {severity_emoji} [{anomaly['severity'].upper()}] {anomaly['message']}")
             print(f"     Detail: {anomaly['detail']}")
             print(f"     Impact: {anomaly['impact']}")
+<<<<<<< HEAD
             print_root_cause_summary(anomaly.get("root_cause_analysis", {}))
+=======
+
+        if claude_analysis:
+            print(f"\n  🤖 Claude's Assessment:")
+            print(f"     Hypothesis: {claude_analysis.get('root_cause_hypothesis', 'N/A')}")
+            print(f"     Halt pipeline: {'🛑 YES' if claude_analysis.get('should_halt_pipeline') else '✅ No'}")
+            print(f"     Confidence: {claude_analysis.get('confidence', 'N/A')}")
+
+            actions = claude_analysis.get("immediate_actions", [])
+            if actions:
+                print(f"\n  📋 Immediate Actions:")
+                for action in actions:
+                    print(f"     • {action}")
+
+            queries = claude_analysis.get("queries_to_investigate", [])
+            if queries:
+                print(f"\n  🔍 Queries to Run:")
+                for query in queries:
+                    print(f"     {query}")
+>>>>>>> main
 
         # Fire Slack alert for critical/high anomalies
         critical_anomalies = [
@@ -566,6 +754,7 @@ def run_quality_check(project_name: str, db_path: str):
         ]
 
         for anomaly in critical_anomalies:
+<<<<<<< HEAD
             rca = anomaly.get("root_cause_analysis", {})
             top_cause = (rca.get("likely_causes") or [{}])[0]
             actions = rca.get("recommended_actions", [])
@@ -590,18 +779,36 @@ def run_quality_check(project_name: str, db_path: str):
                 "impact_count": impact_count,
                 "affected_models": affected_models,
                 "incident_report": report_path
+=======
+            diagnosis = {
+                "root_cause": anomaly["message"],
+                "affected_file": f"Table: {table}",
+                "affected_line": anomaly["type"],
+                "explanation": anomaly["impact"],
+                "suggested_fix": claude_analysis.get(
+                    "root_cause_hypothesis",
+                    "Investigate upstream pipeline for recent changes"
+                ),
+                "severity": anomaly["severity"],
+                "data_loss_risk": anomaly["severity"] == "critical"
+>>>>>>> main
             }
             send_slack_alert(f"DATA QUALITY — {table}", diagnosis)
 
         # Update baseline after alerting
+<<<<<<< HEAD
         save_baseline(table, current_metrics, project_name)
         record_table_metrics(project_name, table, current_metrics)
+=======
+        save_baseline(table, current_metrics)
+>>>>>>> main
 
     print()
     if all_anomalies:
         print(f"🚨 Total anomalies found: {len(all_anomalies)} across {len(tables)} tables.")
     else:
         print("✅ All tables passed quality checks.")
+<<<<<<< HEAD
     print()
 
 
@@ -612,3 +819,6 @@ def _format_anomaly_evidence(anomaly: dict) -> str:
         evidence = re.sub(r"(observed\s+\d+(?:\.\d+)?)(?!\s+rows?)\b", r"\1 rows", evidence)
         return evidence + "."
     return anomaly.get("impact", "No additional metric evidence available.").rstrip(".") + "."
+=======
+    print()
+>>>>>>> main

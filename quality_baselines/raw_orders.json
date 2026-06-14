@@ -1,5 +1,6 @@
 {
   "table": "raw_orders",
+<<<<<<< HEAD
   "row_count": 100000,
   "columns": [
     "order_id",
@@ -85,6 +86,32 @@
       "min": 1.0,
       "max": 1000.0,
       "avg": 500.5
+=======
+  "row_count": 8,
+  "columns": [
+    "order_id",
+    "customer_id",
+    "order_status",
+    "order_total"
+  ],
+  "null_rates": {
+    "order_id": 0.0,
+    "customer_id": 0.0,
+    "order_status": 0.0,
+    "order_total": 50.0
+  },
+  "duplicate_rows": 0,
+  "numeric_stats": {
+    "order_id": {
+      "min": 1.0,
+      "max": 3.0,
+      "avg": 1.75
+    },
+    "customer_id": {
+      "min": 101.0,
+      "max": 103.0,
+      "avg": 101.75
+>>>>>>> main
     },
     "order_status": {
       "min": 0.0,
@@ -92,6 +119,7 @@
       "avg": 0.0
     },
     "order_total": {
+<<<<<<< HEAD
       "min": 13.79,
       "max": 552.31,
       "avg": 235.88
@@ -119,4 +147,17 @@
   "freshness_column": "updated_at",
   "last_updated": "2026-06-11 12:08:46",
   "freshness_minutes": 60
+=======
+      "min": 250.0,
+      "max": 250.0,
+      "avg": 250.0
+    }
+  },
+  "distinct_counts": {
+    "order_id": 3,
+    "customer_id": 3,
+    "order_status": 2,
+    "order_total": 1
+  }
+>>>>>>> main
 }

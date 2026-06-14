@@ -97,6 +97,10 @@ def _sql_files_to_scan(
         candidates = [candidate]
         if not candidate.is_absolute():
             candidates.extend([project / candidate, models_path / candidate])
+            parts = candidate.parts
+            if parts and parts[0] == project.name:
+                without_project = Path(*parts[1:])
+                candidates.extend([project / without_project, models_path / without_project])
 
         resolved = next((path for path in candidates if path.exists()), None)
         if resolved and resolved.suffix.lower() == ".sql":
