@@ -17,10 +17,16 @@ SEVERITY_ORDER = {
 
 RISK_CONTEXT = {
     "left_join_filter_risk": {
+        "confidence": 0.95,
         "why": (
             "A LEFT JOIN should preserve rows from the left table. Filtering the "
             "right-side table in the WHERE clause can remove unmatched rows and "
             "silently change the business meaning of the model."
+        ),
+        "business_impact": (
+            "This change may silently remove valid rows from the left-side table. "
+            "Metrics such as customer lifetime value, revenue, order counts, daily "
+            "KPIs, and dashboard totals may become undercounted."
         ),
         "recommendation": (
             "Move the right-table filter into the JOIN condition or explicitly "
@@ -28,27 +34,39 @@ RISK_CONTEXT = {
         ),
     },
     "select_star_risk": {
+        "confidence": 0.85,
         "why": "New upstream columns can silently change downstream schemas.",
+        "business_impact": "Downstream models and dashboards may receive unexpected columns or schema changes.",
         "recommendation": "Select explicit columns.",
     },
     "cross_join_risk": {
+        "confidence": 0.9,
         "why": "Cartesian products can multiply rows and inflate metrics.",
+        "business_impact": "Metrics based on row counts, revenue, orders, or customer activity may be overstated.",
         "recommendation": "Confirm this is intentional or replace it with a keyed join.",
     },
     "join_without_condition_risk": {
+        "confidence": 0.9,
         "why": "A join without ON or USING can multiply rows unexpectedly.",
+        "business_impact": "Metrics can be inflated by unintended row multiplication.",
         "recommendation": "Add an explicit ON or USING condition.",
     },
     "division_by_zero_risk": {
+        "confidence": 0.8,
         "why": "Ratios can return NULLs or fail when the denominator is zero.",
+        "business_impact": "Ratio metrics may fail, disappear, or show misleading blanks in reports.",
         "recommendation": "Use NULLIF around the denominator.",
     },
     "hardcoded_date_filter_risk": {
+        "confidence": 0.8,
         "why": "Fixed date filters can silently exclude valid data over time.",
+        "business_impact": "Time-based metrics may become stale or undercount newer business activity.",
         "recommendation": "Confirm the filter is intentional or parameterize it.",
     },
     "not_equal_filter_risk": {
+        "confidence": 0.8,
         "why": "NOT EQUAL filters exclude NULLs unless NULLs are handled explicitly.",
+        "business_impact": "Rows with unknown or missing values may be silently excluded from metrics.",
         "recommendation": "Confirm NULL handling or use explicit logic.",
     },
 }
@@ -69,12 +87,14 @@ def run_pr_guard(
 
     highest = _highest_severity(enriched)
     safe_to_merge = not _has_blocking_risk(enriched, fail_on)
+    merge_decision = _merge_decision(enriched, fail_on, safe_to_merge)
     report = {
         "project": project_path,
         "files_scanned": len(scanned_files),
         "risks_found": len(enriched),
         "highest_severity": highest,
         "safe_to_merge": safe_to_merge,
+        "merge_decision": merge_decision,
         "risks": enriched,
         "output": output,
         "exit_code": 0 if safe_to_merge else 1,
@@ -105,6 +125,7 @@ def render_report(report: dict) -> str:
         f"* Risks found: {report['risks_found']}",
         f"* Highest severity: {report['highest_severity']}",
         f"* Safe to merge: {safe}",
+        f"* Merge decision: {report['merge_decision']}",
         "",
         "## Risks",
         "",
@@ -122,8 +143,14 @@ def render_report(report: dict) -> str:
                 "",
                 f"File: {risk['file']}",
                 f"Risk: {_sentence(risk['message'])}",
+                f"Confidence: {_format_confidence(risk['confidence'])}",
+                f"Impact Level: {risk['impact_level']}",
+                f"Blast Radius Score: {risk['blast_radius_score']}/10",
                 f"Evidence: {risk['evidence']}",
                 f"Why it matters: {risk['why_it_matters']}",
+                "Business impact:",
+                risk["business_impact"],
+                f"Recommended Action: {risk['recommended_action']}",
                 f"Recommendation: {risk['recommendation']}",
                 "Suggested fix:",
                 "",
@@ -151,6 +178,7 @@ def terminal_summary(report: dict) -> str:
             f"Risks found: {report['risks_found']}",
             f"Highest severity: {report['highest_severity']}",
             f"Safe to merge: {safe}",
+            f"Merge decision: {report['merge_decision']}",
             "",
             f"Report written to {report['output']}",
         ]
@@ -162,16 +190,26 @@ def _enrich_risk(project: Path, risk: dict) -> dict:
     context = RISK_CONTEXT.get(
         risk_type,
         {
+            "confidence": 0.75,
             "why": "This pattern can make SQL transformation behavior harder to review.",
+            "business_impact": "This pattern may affect downstream model correctness and should be reviewed carefully.",
             "recommendation": risk.get("recommendation", "Review this SQL carefully."),
         },
     )
+    affected = _affected_downstream_models(project, risk["model"])
+    blast_radius_score = _blast_radius_score(affected, risk)
+    impact_level = _impact_level(blast_radius_score)
     return {
         **risk,
+        "confidence": context["confidence"],
         "why_it_matters": context["why"],
+        "business_impact": context["business_impact"],
         "recommendation": context["recommendation"],
+        "impact_level": impact_level,
+        "blast_radius_score": blast_radius_score,
+        "recommended_action": _recommended_action(risk, affected),
         "suggested_fix": _suggested_fix(project, risk),
-        "affected_downstream_models": _affected_downstream_models(project, risk["model"]),
+        "affected_downstream_models": affected,
     }
 
 
@@ -220,11 +258,77 @@ def _has_blocking_risk(risks: list[dict], fail_on: str) -> bool:
     return any(SEVERITY_ORDER.get(risk["severity"].lower(), 0) >= threshold for risk in risks)
 
 
+def _merge_decision(risks: list[dict], fail_on: str, safe_to_merge: bool) -> str:
+    threshold = fail_on.lower()
+    if not safe_to_merge:
+        blocking = [
+            risk["severity"].lower()
+            for risk in risks
+            if SEVERITY_ORDER.get(risk["severity"].lower(), 0) >= SEVERITY_ORDER[threshold]
+        ]
+        severity = max(blocking, key=lambda item: SEVERITY_ORDER.get(item, -1)).upper()
+        return f"Blocked because {severity} risk transformation logic was detected."
+
+    if threshold == "critical":
+        return "Allowed because no CRITICAL risks were detected."
+    if threshold == "high":
+        return "Allowed because no HIGH or CRITICAL risks were detected."
+    severity_names = [
+        name.upper()
+        for name, rank in SEVERITY_ORDER.items()
+        if rank >= SEVERITY_ORDER[threshold]
+    ]
+    return f"Allowed because no {'/'.join(severity_names)} risks were detected."
+
+
 def _bullet_lines(items: Iterable[str]) -> list[str]:
     values = list(items)
     if not values:
         return ["- None found"]
     return [f"- {item}" for item in values]
+
+
+def _format_confidence(confidence: float) -> str:
+    return f"{round(confidence * 100)}%"
+
+
+def _impact_level(blast_radius_score: int) -> str:
+    if blast_radius_score <= 3:
+        return "LOW"
+    if blast_radius_score <= 6:
+        return "MEDIUM"
+    if blast_radius_score <= 9:
+        return "HIGH"
+    return "CRITICAL"
+
+
+def _blast_radius_score(downstream_models: list[str], risk: dict) -> int:
+    score = len(downstream_models) * 2
+    lower_models = [model.lower() for model in downstream_models]
+    if any("dashboard" in model for model in lower_models):
+        score += 3
+    if any("executive" in model for model in lower_models):
+        score += 2
+    if score == 0 and risk.get("severity", "").lower() == "high":
+        score = 1
+    return min(score, 10)
+
+
+def _recommended_action(risk: dict, downstream_models: list[str]) -> str:
+    severity = risk.get("severity", "").lower()
+    if severity == "critical":
+        return "Block merge until fixed."
+    if severity == "high" and risk.get("risk_type") == "left_join_filter_risk":
+        if downstream_models:
+            return (
+                "Fix before merge. This risky transformation may silently remove records "
+                "and affect downstream business models."
+            )
+        return (
+            "Review before merge. No downstream models were found, but this SQL pattern can silently "
+            "change row preservation behavior."
+        )
+    return "Review and document if intentional."
 
 
 def _sentence(text: str) -> str:

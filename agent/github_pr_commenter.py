@@ -19,6 +19,9 @@ def render_pr_comment(report: dict) -> str:
         "",
         f"Safe to merge: {safe}",
         "",
+        "Merge decision:",
+        report.get("merge_decision", _default_merge_decision(report)),
+        "",
     ]
 
     if not report["risks"]:
@@ -50,11 +53,26 @@ def render_pr_comment(report: dict) -> str:
                 "Risk:",
                 _sentence(risk["message"]),
                 "",
+                "Confidence:",
+                _format_confidence(risk["confidence"]),
+                "",
+                "Impact Level:",
+                risk["impact_level"],
+                "",
+                "Blast Radius Score:",
+                f"{risk['blast_radius_score']}/10",
+                "",
                 "Evidence:",
                 f"`{risk['evidence']}`",
                 "",
                 "Why it matters:",
                 risk["why_it_matters"],
+                "",
+                "Business impact:",
+                risk["business_impact"],
+                "",
+                "Recommended Action:",
+                risk["recommended_action"],
                 "",
                 "Suggested fix:",
                 "",
@@ -156,3 +174,13 @@ def _asterisk_lines(items: list[str]) -> list[str]:
     if not items:
         return ["* None found"]
     return [f"* {item}" for item in items]
+
+
+def _default_merge_decision(report: dict) -> str:
+    if report.get("safe_to_merge"):
+        return "Allowed because no HIGH or CRITICAL risks were detected."
+    return f"Blocked because {report.get('highest_severity', 'HIGH')} risk transformation logic was detected."
+
+
+def _format_confidence(confidence: float) -> str:
+    return f"{round(confidence * 100)}%"
