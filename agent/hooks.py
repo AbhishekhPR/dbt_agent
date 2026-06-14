@@ -79,6 +79,7 @@ def run_post_hook(project_path: str):
                 "data_loss_risk": False
             }
             send_slack_alert(f"FIX READY — {model_name}", pr_diagnosis)
+<<<<<<< HEAD
 def collect_test_results(
     project_path: str,
     project_name: str
@@ -149,4 +150,6 @@ def collect_test_results(
             f"  📋 Stored {len(test_records)} "
             f"test result(s) in metrics history"
         )
+=======
+>>>>>>> main
             
