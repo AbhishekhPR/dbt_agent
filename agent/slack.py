@@ -22,11 +22,14 @@ def send_slack_alert(model_name: str, diagnosis: dict):
         print("⚠️  No SLACK_WEBHOOK_URL set in .env — skipping Slack alert.")
         return
 
+<<<<<<< HEAD
     if diagnosis.get("incident_report"):
         payload = _build_incident_payload(diagnosis)
         _send_payload(payload)
         return
 
+=======
+>>>>>>> main
     severity_emoji = {
         "critical": "🔴",
         "high":     "🟠",
@@ -102,6 +105,7 @@ def send_slack_alert(model_name: str, diagnosis: dict):
         ]
     }
 
+<<<<<<< HEAD
     _send_payload(payload)
 
 
@@ -213,6 +217,8 @@ def _ensure_period(value: str) -> str:
 
 
 def _send_payload(payload: dict):
+=======
+>>>>>>> main
     # Send using stdlib only
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -228,4 +234,8 @@ def _send_payload(payload: dict):
             else:
                 print(f"⚠️  Slack returned status {response.status}")
     except Exception as e:
+<<<<<<< HEAD
         print(f"❌ Failed to send Slack alert: {e}")
+=======
+        print(f"❌ Failed to send Slack alert: {e}")
+>>>>>>> main
