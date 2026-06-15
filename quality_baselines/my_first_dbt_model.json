@@ -4,7 +4,6 @@
   "columns": [
     "id"
   ],
-<<<<<<< HEAD
   "schema": [
     {
       "name": "id",
@@ -14,20 +13,15 @@
     }
   ],
   "schema_hash": "948ff827b10a5af63a00f6c15c78024064895b31bf5747d49f9c05d5f9fcaa57",
-=======
->>>>>>> main
   "null_rates": {
     "id": 50.0
   },
   "duplicate_rows": 0,
-<<<<<<< HEAD
   "duplicate_rate": 0.0,
   "duplicate_key_columns": [
     "id"
   ],
   "duplicate_check_method": "key:id",
-=======
->>>>>>> main
   "numeric_stats": {
     "id": {
       "min": 1.0,

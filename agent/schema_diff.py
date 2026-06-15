@@ -3,10 +3,7 @@ import os
 import sqlite3
 from pathlib import Path
 from dotenv import load_dotenv
-<<<<<<< HEAD
 from matplotlib import table
-=======
->>>>>>> main
 from agent.slack import send_slack_alert
 
 env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -180,7 +177,6 @@ def run_schema_diff(project_name: str, db_path: str):
         print(f"{severity_emoji} [{change['severity'].upper()}] {change['message']}")
         print(f"   Risk: {change['risk']}\n")
 
-<<<<<<< HEAD
         # Calculate and print blast radius
         from agent.blast_radius import calculate_blast_radius, print_blast_radius
         changed_col_names = []
@@ -204,17 +200,12 @@ def run_schema_diff(project_name: str, db_path: str):
             )
             print_blast_radius(blast_report)
 
-=======
->>>>>>> main
         # Send Slack alert for critical and high changes
         if change["severity"] in ("critical", "high"):
             diagnosis = {
                 "root_cause": change["message"],
                 "affected_file": f"Table: {change['table']}",
-<<<<<<< HEAD
                 "affected_file": f"Table: {change['table']}",
-=======
->>>>>>> main
                 "affected_line": change["type"],
                 "explanation": change["risk"],
                 "suggested_fix": "Review all dbt models referencing this table before next run.",
