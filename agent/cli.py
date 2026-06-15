@@ -147,7 +147,6 @@ def analyze(project):
 def quality(project, db):
     """Run data quality checks — catches row drops, null explosions, duplicates"""
     from agent.quality_checker import run_quality_check
-<<<<<<< HEAD
     run_quality_check(project, db)
 
 
@@ -444,6 +443,3 @@ def history(project, table, days):
 
 if __name__ == '__main__':
     cli()
-=======
-    run_quality_check(project, db)
->>>>>>> main
