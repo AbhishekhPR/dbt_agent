@@ -145,6 +145,52 @@ class DbtProjectScanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "target/compiled or target/run"):
             scan_dbt_project(str(self.project))
 
+    def test_scan_falls_back_to_nested_compiled_path_and_skips_missing_models(self):
+        from agent.dbt_project_scan import scan_dbt_project
+
+        manifest = {
+            "metadata": {"project_name": "jaffle_shop"},
+            "nodes": {
+                "model.jaffle_shop.stg_customers": {
+                    "resource_type": "model",
+                    "name": "stg_customers",
+                    "compiled_path": "target/compiled/jaffle_shop/models/stg_customers.sql",
+                    "path": "models/staging/stg_customers.sql",
+                    "package_name": "jaffle_shop",
+                    "depends_on": {"nodes": []},
+                },
+                "model.jaffle_shop.missing_model": {
+                    "resource_type": "model",
+                    "name": "missing_model",
+                    "compiled_path": "target/compiled/jaffle_shop/models/missing_model.sql",
+                    "path": "models/missing_model.sql",
+                    "package_name": "jaffle_shop",
+                    "depends_on": {"nodes": []},
+                },
+            },
+        }
+        (self.project / "target" / "manifest.json").write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+        nested_model = (
+            self.project
+            / "target"
+            / "compiled"
+            / "jaffle_shop"
+            / "models"
+            / "staging"
+            / "stg_customers.sql"
+        )
+        nested_model.parent.mkdir(parents=True)
+        nested_model.write_text("SELECT customer_id FROM source_customers", encoding="utf-8")
+
+        report = scan_dbt_project(str(self.project))
+
+        self.assertEqual(report["project_name"], "jaffle_shop")
+        self.assertEqual(report["models_scanned"], 1)
+        self.assertEqual(report["risks_found"], 0)
+
     def test_scan_cli_prints_report_and_changed_model(self):
         from agent.cli import cli
 

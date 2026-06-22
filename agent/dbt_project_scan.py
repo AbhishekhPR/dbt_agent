@@ -93,10 +93,8 @@ def _model_artifacts(project: Path, manifest: dict, project_name: str) -> list[t
     run_root = project / "target" / "run"
     if compiled_root.is_dir():
         artifact_root = compiled_root
-        artifact_kind = "compiled"
     elif run_root.is_dir():
         artifact_root = run_root
-        artifact_kind = "run"
     else:
         raise ValueError(
             "No dbt model SQL artifacts found. Run dbt compile or dbt run first "
@@ -107,8 +105,8 @@ def _model_artifacts(project: Path, manifest: dict, project_name: str) -> list[t
     for node in manifest.get("nodes", {}).values():
         if node.get("resource_type") != "model":
             continue
-        sql_path = _artifact_path(project, artifact_root, artifact_kind, project_name, node)
-        if sql_path.is_file():
+        sql_path = _artifact_path(project, artifact_root, project_name, node)
+        if sql_path is not None:
             artifacts.append((node["name"], sql_path))
 
     if not artifacts:
@@ -122,21 +120,33 @@ def _model_artifacts(project: Path, manifest: dict, project_name: str) -> list[t
 def _artifact_path(
     project: Path,
     artifact_root: Path,
-    artifact_kind: str,
     project_name: str,
     node: dict,
-) -> Path:
-    if artifact_kind == "compiled":
-        compiled_path = node.get("compiled_path")
-        if compiled_path:
-            return project / compiled_path
+) -> Path | None:
+    candidates = []
+
+    compiled_path = node.get("compiled_path")
+    if compiled_path:
+        candidates.append(project / _path_value(compiled_path))
 
     package_name = node.get("package_name") or project_name
     node_path = node.get("path")
     if node_path:
-        return artifact_root / package_name / node_path
+        candidates.append(artifact_root / package_name / _path_value(node_path))
 
-    return artifact_root / f"{node['name']}.sql"
+    candidates.append(artifact_root / f"{node['name']}.sql")
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    matches = sorted(artifact_root.rglob(f"{node['name']}.sql"))
+    return matches[0] if matches else None
+
+
+def _path_value(path_value: str) -> Path:
+    """Interpret dbt artifact paths from manifests created on either OS."""
+    return Path(path_value.replace("\\", "/"))
 
 
 def _resolve_changed_model(manifest: dict, changed_model: str | None) -> str | None:
