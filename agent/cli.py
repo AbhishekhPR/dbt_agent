@@ -147,3 +147,16 @@ def quality(project, db):
     """Run data quality checks — catches row drops, null explosions, duplicates"""
     from agent.quality_checker import run_quality_check
     run_quality_check(project, db)
+@cli.command()
+@click.option('--project', required=True, help='Path to a compiled dbt project')
+@click.option('--changed-model', default=None, help='Changed dbt model name (optional)')
+def scan(project, changed_model):
+    """Scan compiled dbt model SQL and report optional downstream impact."""
+    from agent.dbt_project_scan import format_scan_report, scan_dbt_project
+
+    try:
+        report = scan_dbt_project(project, changed_model)
+    except ValueError as error:
+        raise click.ClickException(str(error)) from error
+
+    click.echo(format_scan_report(report))

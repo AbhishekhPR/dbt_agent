@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from click.testing import CliRunner
+
 
 class DbtProjectScanTests(unittest.TestCase):
     def setUp(self):
@@ -142,6 +144,40 @@ class DbtProjectScanTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "target/compiled or target/run"):
             scan_dbt_project(str(self.project))
+
+    def test_scan_cli_prints_report_and_changed_model(self):
+        from agent.cli import cli
+
+        self._write_compiled_models()
+
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--project", str(self.project), "--changed-model", "customers"],
+        )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Relium Scan Report", result.output)
+        self.assertIn("Project: fixture_project", result.output)
+        self.assertIn("Models scanned: 4", result.output)
+        self.assertIn("Risks found: 2", result.output)
+        self.assertIn("Highest severity: HIGH", result.output)
+        self.assertIn("Changed model: customers", result.output)
+        self.assertIn(
+            "Affected downstream models: [orders, customer_orders, fct_customer_lifetime_value]",
+            result.output,
+        )
+        self.assertIn("Safe to merge: NO", result.output)
+
+    def test_scan_cli_without_changed_model_uses_empty_list(self):
+        from agent.cli import cli
+
+        self._write_compiled_models()
+
+        result = CliRunner().invoke(cli, ["scan", "--project", str(self.project)])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Changed model: not provided", result.output)
+        self.assertIn("Affected downstream models: []", result.output)
 
 
 if __name__ == "__main__":
