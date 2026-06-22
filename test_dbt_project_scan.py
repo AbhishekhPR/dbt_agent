@@ -214,6 +214,31 @@ class DbtProjectScanTests(unittest.TestCase):
         )
         self.assertIn("Safe to merge: NO", result.output)
 
+    def test_verbose_report_lists_every_model_with_path_and_risks(self):
+        from agent.dbt_project_scan import (
+            format_verbose_scan_report,
+            scan_dbt_project,
+        )
+
+        self._write_compiled_models()
+
+        output = format_verbose_scan_report(
+            scan_dbt_project(str(self.project), changed_model="customers")
+        )
+
+        self.assertIn("Scanned models:", output)
+        self.assertIn("Model: customers", output)
+        self.assertIn("Model: orders", output)
+        self.assertIn("Model: customer_orders", output)
+        self.assertIn("Model: fct_customer_lifetime_value", output)
+        self.assertIn("Compiled SQL:", output)
+        self.assertIn("[HIGH] LEFT_JOIN_NULLIFIED:", output)
+        self.assertIn("No risks found", output)
+        self.assertIn(
+            "Downstream models: [orders, customer_orders, fct_customer_lifetime_value]",
+            output,
+        )
+
     def test_scan_cli_without_changed_model_uses_empty_list(self):
         from agent.cli import cli
 
@@ -224,6 +249,28 @@ class DbtProjectScanTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("Changed model: not provided", result.output)
         self.assertIn("Affected downstream models: []", result.output)
+        self.assertNotIn("Scanned models:", result.output)
+
+    def test_scan_cli_verbose_prints_model_audit(self):
+        from agent.cli import cli
+
+        self._write_compiled_models()
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                "--project",
+                str(self.project),
+                "--changed-model",
+                "customers",
+                "--verbose",
+            ],
+        )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Scanned models:", result.output)
+        self.assertIn("Compiled SQL:", result.output)
 
 
 if __name__ == "__main__":

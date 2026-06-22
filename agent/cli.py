@@ -150,13 +150,21 @@ def quality(project, db):
 @cli.command()
 @click.option('--project', required=True, help='Path to a compiled dbt project')
 @click.option('--changed-model', default=None, help='Changed dbt model name (optional)')
-def scan(project, changed_model):
+@click.option('--verbose', is_flag=True, help='Include per-model SQL paths and AST findings')
+def scan(project, changed_model, verbose):
     """Scan compiled dbt model SQL and report optional downstream impact."""
-    from agent.dbt_project_scan import format_scan_report, scan_dbt_project
+    from agent.dbt_project_scan import (
+        format_scan_report,
+        format_verbose_scan_report,
+        scan_dbt_project,
+    )
 
     try:
         report = scan_dbt_project(project, changed_model)
     except ValueError as error:
         raise click.ClickException(str(error)) from error
 
-    click.echo(format_scan_report(report))
+    if verbose:
+        click.echo(format_verbose_scan_report(report))
+    else:
+        click.echo(format_scan_report(report))

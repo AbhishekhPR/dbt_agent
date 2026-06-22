@@ -18,10 +18,11 @@ def scan_dbt_project(project_path: str, changed_model: str | None = None) -> dic
     project_name = _project_name(manifest, project)
     artifacts = _model_artifacts(project, manifest, project_name)
 
-    reports = [
-        run_ast_analysis(sql_path.read_text(encoding="utf-8"), model_name)
-        for model_name, sql_path in artifacts
-    ]
+    reports = []
+    for model_name, sql_path in artifacts:
+        report = run_ast_analysis(sql_path.read_text(encoding="utf-8"), model_name)
+        report["compiled_sql_path"] = str(sql_path)
+        reports.append(report)
     risks_found = sum(len(report.get("bugs", [])) for report in reports)
     highest_severity = _highest_severity(reports)
     resolved_changed_model = _resolve_changed_model(manifest, changed_model)
@@ -60,6 +61,38 @@ def format_scan_report(report: dict) -> str:
             f"Safe to merge: {safe_to_merge}",
         ]
     )
+
+
+def format_verbose_scan_report(report: dict) -> str:
+    """Return the compact report followed by a complete model-level audit."""
+    lines = [format_scan_report(report), "", "Scanned models:"]
+
+    for model_report in report["model_reports"]:
+        lines.extend(_format_model_audit(model_report))
+
+    if report["changed_model"]:
+        downstream_models = ", ".join(report["affected_models"])
+        lines.extend(["", f"Downstream models: [{downstream_models}]"])
+
+    return "\n".join(lines)
+
+
+def _format_model_audit(model_report: dict) -> list[str]:
+    lines = [
+        "",
+        f"Model: {model_report['model_name']}",
+        f"Compiled SQL: {model_report['compiled_sql_path']}",
+    ]
+    bugs = model_report.get("bugs", [])
+    if not bugs:
+        lines.append("No risks found")
+        return lines
+
+    for bug in bugs:
+        lines.append(
+            f"[{bug['severity'].upper()}] {bug['rule']}: {bug['description']}"
+        )
+    return lines
 
 
 def _validate_project(project: Path) -> None:
