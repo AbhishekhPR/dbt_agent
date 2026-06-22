@@ -1,0 +1,148 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+
+class DbtProjectScanTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.project = Path(self.tmpdir.name)
+        (self.project / "dbt_project.yml").write_text(
+            "name: fixture_project\n",
+            encoding="utf-8",
+        )
+        self._write_manifest()
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def _write_manifest(self):
+        nodes = {
+            "model.fixture_project.customers": self._model_node(
+                "customers", "models/customers.sql", []
+            ),
+            "model.fixture_project.orders": self._model_node(
+                "orders", "models/orders.sql", ["model.fixture_project.customers"]
+            ),
+            "model.fixture_project.customer_orders": self._model_node(
+                "customer_orders", "models/customer_orders.sql", ["model.fixture_project.customers"]
+            ),
+            "model.fixture_project.fct_customer_lifetime_value": self._model_node(
+                "fct_customer_lifetime_value",
+                "models/fct_customer_lifetime_value.sql",
+                [
+                    "model.fixture_project.orders",
+                    "model.fixture_project.customer_orders",
+                ],
+            ),
+            "test.fixture_project.not_a_model": {
+                "resource_type": "test",
+                "name": "not_a_model",
+                "compiled_path": "target/compiled/fixture_project/models/not_a_model.sql",
+                "depends_on": {"nodes": ["model.fixture_project.customers"]},
+            },
+        }
+        manifest = {
+            "metadata": {"project_name": "fixture_project"},
+            "nodes": nodes,
+        }
+        target = self.project / "target"
+        target.mkdir()
+        (target / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    @staticmethod
+    def _model_node(name, path, dependencies):
+        return {
+            "resource_type": "model",
+            "name": name,
+            "compiled_path": f"target/compiled/fixture_project/{path}",
+            "path": path,
+            "depends_on": {"nodes": dependencies},
+        }
+
+    def _write_compiled_models(self):
+        compiled = self.project / "target" / "compiled" / "fixture_project" / "models"
+        compiled.mkdir(parents=True)
+        (compiled / "customers.sql").write_text("SELECT * FROM raw_customers", encoding="utf-8")
+        (compiled / "orders.sql").write_text(
+            "SELECT c.customer_id FROM customers c "
+            "LEFT JOIN profiles p ON c.profile_id = p.id WHERE p.active = 1",
+            encoding="utf-8",
+        )
+        (compiled / "customer_orders.sql").write_text(
+            "SELECT customer_id FROM customers",
+            encoding="utf-8",
+        )
+        (compiled / "fct_customer_lifetime_value.sql").write_text(
+            "SELECT customer_id FROM customer_orders",
+            encoding="utf-8",
+        )
+        (compiled / "not_a_model.sql").write_text(
+            "SELECT * FROM customers",
+            encoding="utf-8",
+        )
+
+    def test_scan_prefers_compiled_model_artifacts_and_aggregates_risks(self):
+        from agent.dbt_project_scan import scan_dbt_project
+
+        self._write_compiled_models()
+        run_models = self.project / "target" / "run" / "fixture_project" / "models"
+        run_models.mkdir(parents=True)
+        (run_models / "customers.sql").write_text("SELECT * FROM ignored_run_copy", encoding="utf-8")
+
+        report = scan_dbt_project(str(self.project))
+
+        self.assertEqual(report["project_name"], "fixture_project")
+        self.assertEqual(report["models_scanned"], 4)
+        self.assertEqual(report["risks_found"], 2)
+        self.assertEqual(report["highest_severity"], "HIGH")
+        self.assertFalse(report["safe_to_merge"])
+
+    def test_scan_falls_back_to_run_artifacts(self):
+        from agent.dbt_project_scan import scan_dbt_project
+
+        run_models = self.project / "target" / "run" / "fixture_project" / "models"
+        run_models.mkdir(parents=True)
+        for name in ("customers", "orders", "customer_orders", "fct_customer_lifetime_value"):
+            (run_models / f"{name}.sql").write_text("SELECT customer_id FROM source_table", encoding="utf-8")
+
+        report = scan_dbt_project(str(self.project))
+
+        self.assertEqual(report["models_scanned"], 4)
+        self.assertEqual(report["risks_found"], 0)
+        self.assertEqual(report["highest_severity"], "NONE")
+        self.assertTrue(report["safe_to_merge"])
+
+    def test_scan_traverses_manifest_downstream_models_breadth_first(self):
+        from agent.dbt_project_scan import scan_dbt_project
+
+        self._write_compiled_models()
+
+        report = scan_dbt_project(str(self.project), changed_model="CUSTOMERS")
+
+        self.assertEqual(report["changed_model"], "customers")
+        self.assertEqual(
+            report["affected_models"],
+            ["orders", "customer_orders", "fct_customer_lifetime_value"],
+        )
+
+    def test_scan_without_changed_model_has_no_affected_models(self):
+        from agent.dbt_project_scan import scan_dbt_project
+
+        self._write_compiled_models()
+
+        report = scan_dbt_project(str(self.project))
+
+        self.assertIsNone(report["changed_model"])
+        self.assertEqual(report["affected_models"], [])
+
+    def test_scan_errors_when_no_compiled_or_run_artifacts_exist(self):
+        from agent.dbt_project_scan import scan_dbt_project
+
+        with self.assertRaisesRegex(ValueError, "target/compiled or target/run"):
+            scan_dbt_project(str(self.project))
+
+
+if __name__ == "__main__":
+    unittest.main()
