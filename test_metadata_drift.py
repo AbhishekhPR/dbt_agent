@@ -1,10 +1,24 @@
+import io
 import tempfile
 import unittest
 import sqlite3
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 from click.testing import CliRunner
+
+
+def invoke_cli(runner, cli, args):
+    escaped_stdout = io.StringIO()
+    escaped_stderr = io.StringIO()
+    with redirect_stdout(escaped_stdout), redirect_stderr(escaped_stderr):
+        result = runner.invoke(cli, args)
+    output = result.output
+    escaped_output = escaped_stdout.getvalue() + escaped_stderr.getvalue()
+    if escaped_output:
+        output += escaped_output
+    return result, output
 
 
 class MetadataDriftTests(unittest.TestCase):
@@ -137,7 +151,8 @@ class MetadataDriftTests(unittest.TestCase):
         self._seed_two_runs()
 
         runner = CliRunner()
-        result = runner.invoke(
+        result, output = invoke_cli(
+            runner,
             cli,
             [
                 "compare-last-run",
@@ -150,10 +165,10 @@ class MetadataDriftTests(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("Row count change: -50%", result.output)
-        self.assertIn("Duplicate count change: +100%", result.output)
-        self.assertIn("Metadata Drift: HIGH", result.output)
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("Row count change: -50%", output)
+        self.assertIn("Duplicate count change: +100%", output)
+        self.assertIn("Metadata Drift: HIGH", output)
 
     def test_compare_last_run_defaults_to_latest_available_model(self):
         from agent.metadata_drift import compare_last_run
@@ -186,34 +201,36 @@ class MetadataDriftTests(unittest.TestCase):
                 "agent.slack_alerts.send_validation_alert",
                 return_value=False,
             ):
-                first = runner.invoke(cli, ["demo-pipeline"])
-                self.assertEqual(first.exit_code, 0, first.output)
+                first, first_output = invoke_cli(runner, cli, ["demo-pipeline"])
+                self.assertEqual(first.exit_code, 0, first_output)
                 self.db_path = metadata_db
                 self._seed_second_run_for_demo_default_db()
-                result = runner.invoke(cli, ["compare-last-run"])
+                result, output = invoke_cli(runner, cli, ["compare-last-run"])
 
-            self.assertEqual(result.exit_code, 0, result.output)
-            self.assertIn("Metadata Drift:", result.output)
+            self.assertEqual(result.exit_code, 0, output)
+            self.assertIn("Metadata Drift:", output)
 
     def test_compare_last_run_cli_accepts_explicit_db(self):
         from agent.cli import cli
 
         self._seed_two_runs()
         runner = CliRunner()
-        result = runner.invoke(
+        result, output = invoke_cli(
+            runner,
             cli,
             ["compare-last-run", "--db", str(self.db_path)],
         )
 
-        self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("Metadata Drift: HIGH", result.output)
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("Metadata Drift: HIGH", output)
 
     def test_compare_last_run_cli_accepts_explicit_project(self):
         from agent.cli import cli
 
         self._seed_two_runs()
         runner = CliRunner()
-        result = runner.invoke(
+        result, output = invoke_cli(
+            runner,
             cli,
             [
                 "compare-last-run",
@@ -224,15 +241,16 @@ class MetadataDriftTests(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("Metadata Drift: HIGH", result.output)
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("Metadata Drift: HIGH", output)
 
     def test_compare_last_run_cli_accepts_explicit_model(self):
         from agent.cli import cli
 
         self._seed_two_runs()
         runner = CliRunner()
-        result = runner.invoke(
+        result, output = invoke_cli(
+            runner,
             cli,
             [
                 "compare-last-run",
@@ -243,8 +261,8 @@ class MetadataDriftTests(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("Metadata Drift: HIGH", result.output)
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("Metadata Drift: HIGH", output)
 
     def test_demo_pipeline_scenarios_produce_high_drift_and_store_records(self):
         from agent import demo_pipeline
@@ -286,30 +304,36 @@ class MetadataDriftTests(unittest.TestCase):
                     "agent.slack_alerts.send_validation_alert",
                     return_value=False,
                 ):
-                    first = runner.invoke(
+                    first, first_output = invoke_cli(
+                        runner,
                         cli,
                         ["demo-pipeline", "--scenario", "normal"],
                     )
-                    self.assertEqual(first.exit_code, 0, first.output)
+                    self.assertEqual(first.exit_code, 0, first_output)
 
-                    second = runner.invoke(
+                    second, second_output = invoke_cli(
+                        runner,
                         cli,
                         ["demo-pipeline", "--scenario", scenario],
                     )
-                    self.assertEqual(second.exit_code, 0, second.output)
+                    self.assertEqual(second.exit_code, 0, second_output)
 
-                    compare = runner.invoke(cli, ["compare-last-run"])
+                    compare, compare_output = invoke_cli(
+                        runner,
+                        cli,
+                        ["compare-last-run"],
+                    )
 
-                self.assertEqual(compare.exit_code, 0, compare.output)
+                self.assertEqual(compare.exit_code, 0, compare_output)
                 self.assertIn(
                     f"Row count change: {expected['row_count_change']}",
-                    compare.output,
+                    compare_output,
                 )
                 self.assertIn(
                     f"Freshness regression: {expected['freshness_regression']}",
-                    compare.output,
+                    compare_output,
                 )
-                self.assertIn("Metadata Drift: HIGH", compare.output)
+                self.assertIn("Metadata Drift: HIGH", compare_output)
 
                 conn = sqlite3.connect(metadata_db)
                 drift_rows = conn.execute(
