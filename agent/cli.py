@@ -1,5 +1,4 @@
 import click
-from agent.diagnose import diagnose_failure
 
 
 def print_diagnosis(result: dict):
@@ -49,6 +48,8 @@ def cli():
 @click.option('--schema', required=True, help='Path to upstream schema file')
 def diagnose(log, model, schema):
     """Diagnose a failed dbt pipeline run"""
+
+    from agent.diagnose import diagnose_failure
 
     click.echo("\n🔍 Analyzing pipeline failure...\n")
 
@@ -168,3 +169,22 @@ def scan(project, changed_model, verbose):
         click.echo(format_verbose_scan_report(report))
     else:
         click.echo(format_scan_report(report))
+
+@cli.command(name="demo-pipeline")
+@click.option(
+    '--scenario',
+    default='normal',
+    show_default=True,
+    type=click.Choice(
+        ['normal', 'row-drop', 'duplicate-spike', 'freshness-regression'],
+        case_sensitive=False,
+    ),
+    help='Deterministic demo scenario to run.',
+)
+def demo_pipeline(scenario):
+    """Run Relium's local validation demo pipeline end to end."""
+    from agent.demo_pipeline import run_demo_pipeline
+
+    result = run_demo_pipeline(scenario=scenario)
+    click.echo(f"Slack alert sent: {'YES' if result['slack_sent'] else 'NO'}")
+    click.echo(result["report_text"])
