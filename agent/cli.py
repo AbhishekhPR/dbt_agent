@@ -184,8 +184,10 @@ def scan(project, changed_model, verbose):
 def demo_pipeline(scenario):
     """Run Relium's local validation demo pipeline end to end."""
     from agent.demo_pipeline import run_demo_pipeline
+    from agent.pipeline_validation_report import write_pipeline_validation_report
 
     result = run_demo_pipeline(scenario=scenario)
+    write_pipeline_validation_report(result)
     click.echo(f"Slack alert sent: {'YES' if result['slack_sent'] else 'NO'}")
     click.echo(result["report_text"])
 

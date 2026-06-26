@@ -175,10 +175,18 @@ def run_demo_pipeline(
     )
 
     result = {
+        "project_name": PROJECT_NAME,
         "scenario": scenario,
+        "scan_id": scan_id,
         "raw_row_count": raw_row_count,
         "model_name": MODEL_NAME,
+        "changed_model": MODEL_NAME,
         "severity": severity,
+        "static_analysis_text": "Potential LEFT JOIN nullification detected.",
+        "sql_risks": ast_report.get("bugs", []),
+        "affected_models": [],
+        "recommendation": recommendation,
+        "drift_result": drift_result,
         "row_count": metadata_result.row_count,
         "null_count": metadata_result.null_count,
         "duplicate_count": metadata_result.duplicate_count,
@@ -288,9 +296,13 @@ def _build_drift_signal(metadata_db_path: str | Path) -> dict | None:
     current = recent_metrics[0]
     previous = recent_metrics[1]
     row_count_change_pct = _pct_change(previous["row_count"], current["row_count"])
+    null_count_change_pct = _pct_change(previous["null_count"], current["null_count"])
     duplicate_count_change_pct = _pct_change(
         previous["duplicate_count"],
         current["duplicate_count"],
+    )
+    schema_column_count_change = (
+        current["schema_column_count"] - previous["schema_column_count"]
     )
     freshness_regressed = _freshness_regressed(
         previous.get("freshness_timestamp"),
@@ -304,8 +316,12 @@ def _build_drift_signal(metadata_db_path: str | Path) -> dict | None:
         freshness_regressed=freshness_regressed,
     )
     return {
+        "previous_run_timestamp": previous.get("timestamp"),
+        "current_run_timestamp": current.get("timestamp"),
         "row_count_change_pct": row_count_change_pct,
+        "null_count_change_pct": null_count_change_pct,
         "duplicate_count_change_pct": duplicate_count_change_pct,
+        "schema_column_count_change": schema_column_count_change,
         "freshness_regressed": freshness_regressed,
         "drift_level": drift_level,
     }
