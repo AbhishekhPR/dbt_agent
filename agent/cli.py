@@ -188,3 +188,23 @@ def demo_pipeline(scenario):
     result = run_demo_pipeline(scenario=scenario)
     click.echo(f"Slack alert sent: {'YES' if result['slack_sent'] else 'NO'}")
     click.echo(result["report_text"])
+
+@cli.command(name="compare-last-run")
+@click.option('--db', default=None, help='Path to metadata SQLite database')
+@click.option('--project', default=None, help='Project name to compare (optional)')
+@click.option('--model', default=None, help='Model name to compare (optional)')
+def compare_last_run(db, project, model):
+    """Compare the latest model metrics against the previous run."""
+    from agent.metadata_drift import compare_last_run as compare_last_run_metrics
+    from agent.metadata_drift import format_compare_last_run_report
+
+    try:
+        result = compare_last_run_metrics(
+            db_path=db,
+            project_name=project,
+            model_name=model,
+        )
+    except ValueError as error:
+        raise click.ClickException(str(error)) from error
+
+    click.echo(format_compare_last_run_report(result))

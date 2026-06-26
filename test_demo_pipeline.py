@@ -1,11 +1,25 @@
 import json
+import io
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
+
+
+def invoke_cli(runner, cli, args):
+    escaped_stdout = io.StringIO()
+    escaped_stderr = io.StringIO()
+    with redirect_stdout(escaped_stdout), redirect_stderr(escaped_stderr):
+        result = runner.invoke(cli, args)
+    output = result.output
+    escaped_output = escaped_stdout.getvalue() + escaped_stderr.getvalue()
+    if escaped_output:
+        output += escaped_output
+    return result, output
 
 
 class DemoPipelineTests(unittest.TestCase):
@@ -36,20 +50,21 @@ class DemoPipelineTests(unittest.TestCase):
                 "agent.slack_alerts.send_validation_alert",
                 return_value=False,
             ):
-                result = runner.invoke(
+                result, output = invoke_cli(
+                    runner,
                     cli,
                     ["demo-pipeline", "--scenario", "normal"],
                 )
 
-            self.assertEqual(result.exit_code, 0, result.output)
-            self.assertIn("Slack alert sent: NO", result.output)
-            self.assertIn("Relium Demo Pipeline", result.output)
-            self.assertIn("Scenario: normal", result.output)
-            self.assertIn("Raw rows loaded:", result.output)
-            self.assertIn("Model built: fct_customer_lifetime_value", result.output)
-            self.assertIn("AST risk found: HIGH", result.output)
-            self.assertIn("Safe to continue: NO", result.output)
-            self.assertIn("Metadata stored: YES", result.output)
+            self.assertEqual(result.exit_code, 0, output)
+            self.assertIn("Slack alert sent: NO", output)
+            self.assertIn("Relium Demo Pipeline", output)
+            self.assertIn("Scenario: normal", output)
+            self.assertIn("Raw rows loaded:", output)
+            self.assertIn("Model built: fct_customer_lifetime_value", output)
+            self.assertIn("AST risk found: HIGH", output)
+            self.assertIn("Safe to continue: NO", output)
+            self.assertIn("Metadata stored: YES", output)
 
             conn = sqlite3.connect(metadata_db)
             scan_runs = conn.execute(
@@ -107,12 +122,12 @@ class DemoPipelineTests(unittest.TestCase):
                 "agent.slack_alerts.send_validation_alert",
                 return_value=False,
             ), patch("urllib.request.urlopen") as urlopen:
-                result = runner.invoke(cli, ["demo-pipeline"])
+                result, output = invoke_cli(runner, cli, ["demo-pipeline"])
 
-        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(result.exit_code, 0, output)
         urlopen.assert_not_called()
-        self.assertIn("Slack alert sent: NO", result.output)
-        self.assertIn("Relium Demo Pipeline", result.output)
+        self.assertIn("Slack alert sent: NO", output)
+        self.assertIn("Relium Demo Pipeline", output)
 
     def test_demo_pipeline_command_emits_only_through_click_output(self):
         from agent import demo_pipeline
@@ -132,16 +147,17 @@ class DemoPipelineTests(unittest.TestCase):
                 "agent.slack_alerts.send_validation_alert",
                 return_value=False,
             ), patch("builtins.print") as printed:
-                result = runner.invoke(
+                result, output = invoke_cli(
+                    runner,
                     cli,
                     ["demo-pipeline", "--scenario", "normal"],
                 )
 
-        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(result.exit_code, 0, output)
         printed.assert_not_called()
-        self.assertIn("Slack alert sent: NO", result.output)
-        self.assertIn("Relium Demo Pipeline", result.output)
-        self.assertIn("Scenario: normal", result.output)
+        self.assertIn("Slack alert sent: NO", output)
+        self.assertIn("Relium Demo Pipeline", output)
+        self.assertIn("Scenario: normal", output)
 
     def test_demo_pipeline_command_accepts_deterministic_scenarios(self):
         from agent import demo_pipeline
@@ -185,28 +201,29 @@ class DemoPipelineTests(unittest.TestCase):
                     "agent.slack_alerts.send_validation_alert",
                     return_value=False,
                 ):
-                    result = runner.invoke(
+                    result, output = invoke_cli(
+                        runner,
                         cli,
                         ["demo-pipeline", "--scenario", scenario],
                     )
 
-                self.assertEqual(result.exit_code, 0, result.output)
-                self.assertIn("Slack alert sent: NO", result.output)
-                self.assertIn("Relium Demo Pipeline", result.output)
-                self.assertIn(f"Scenario: {scenario}", result.output)
-                self.assertIn("Raw rows loaded:", result.output)
-                self.assertIn("Model built: fct_customer_lifetime_value", result.output)
-                self.assertIn("AST risk found: HIGH", result.output)
-                self.assertIn(f"Row count: {expected['row_count']}", result.output)
+                self.assertEqual(result.exit_code, 0, output)
+                self.assertIn("Slack alert sent: NO", output)
+                self.assertIn("Relium Demo Pipeline", output)
+                self.assertIn(f"Scenario: {scenario}", output)
+                self.assertIn("Raw rows loaded:", output)
+                self.assertIn("Model built: fct_customer_lifetime_value", output)
+                self.assertIn("AST risk found: HIGH", output)
+                self.assertIn(f"Row count: {expected['row_count']}", output)
                 self.assertIn(
                     f"Duplicate customer_id count: {expected['duplicate_count']}",
-                    result.output,
+                    output,
                 )
                 self.assertIn(
                     f"Freshness timestamp: {expected['freshness_timestamp']}",
-                    result.output,
+                    output,
                 )
-                self.assertIn("Metadata stored: YES", result.output)
+                self.assertIn("Metadata stored: YES", output)
 
     def test_duplicate_spike_sends_clear_high_drift_alert_text(self):
         from agent import demo_pipeline
@@ -238,14 +255,19 @@ class DemoPipelineTests(unittest.TestCase):
                 "urllib.request.urlopen",
                 side_effect=capture_payload,
             ):
-                baseline = runner.invoke(cli, ["demo-pipeline", "--scenario", "normal"])
-                self.assertEqual(baseline.exit_code, 0, baseline.output)
-                drift_run = runner.invoke(
+                baseline, baseline_output = invoke_cli(
+                    runner,
+                    cli,
+                    ["demo-pipeline", "--scenario", "normal"],
+                )
+                self.assertEqual(baseline.exit_code, 0, baseline_output)
+                drift_run, drift_output = invoke_cli(
+                    runner,
                     cli,
                     ["demo-pipeline", "--scenario", "duplicate-spike"],
                 )
 
-            self.assertEqual(drift_run.exit_code, 0, drift_run.output)
+            self.assertEqual(drift_run.exit_code, 0, drift_output)
             self.assertEqual(len(sent_payloads), 2)
             alert_text = json.dumps(sent_payloads[-1])
             payload_text = sent_payloads[-1]["text"]
@@ -296,14 +318,19 @@ class DemoPipelineTests(unittest.TestCase):
                 "urllib.request.urlopen",
                 side_effect=capture_payload,
             ):
-                baseline = runner.invoke(cli, ["demo-pipeline", "--scenario", "normal"])
-                self.assertEqual(baseline.exit_code, 0, baseline.output)
-                drift_run = runner.invoke(
+                baseline, baseline_output = invoke_cli(
+                    runner,
+                    cli,
+                    ["demo-pipeline", "--scenario", "normal"],
+                )
+                self.assertEqual(baseline.exit_code, 0, baseline_output)
+                drift_run, drift_output = invoke_cli(
+                    runner,
                     cli,
                     ["demo-pipeline", "--scenario", "freshness-regression"],
                 )
 
-            self.assertEqual(drift_run.exit_code, 0, drift_run.output)
+            self.assertEqual(drift_run.exit_code, 0, drift_output)
             self.assertEqual(len(sent_payloads), 2)
             alert_text = json.dumps(sent_payloads[-1])
             self.assertIn("Relium Pipeline Risk Alert", alert_text)
