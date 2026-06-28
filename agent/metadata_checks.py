@@ -1,5 +1,20 @@
 from dataclasses import dataclass, field
 
+from agent.signals import Signal
+
+
+METADATA_CHECK_SIGNAL_CONFIDENCE = {
+    "HIGH": 95,
+    "MEDIUM": 85,
+    "LOW": 75,
+}
+
+METADATA_CHECK_SIGNAL_SCORES = {
+    "HIGH": -30,
+    "MEDIUM": -15,
+    "LOW": -5,
+}
+
 
 @dataclass
 class MetadataCheckResult:
@@ -92,3 +107,68 @@ def run_metadata_checks(conn, table_name: str, key_columns: list[str]) -> Metada
         schema_column_count=schema_column_count,
         anomalies=anomalies,
     )
+
+
+def to_signal(
+    metadata_result: MetadataCheckResult | dict,
+    *,
+    safe_to_continue: bool | None = None,
+) -> Signal:
+    result = _metadata_result_as_dict(metadata_result)
+    severity = _metadata_signal_severity(result, safe_to_continue)
+
+    return Signal(
+        component="metadata_checks",
+        severity=severity,
+        confidence=METADATA_CHECK_SIGNAL_CONFIDENCE[severity],
+        score=METADATA_CHECK_SIGNAL_SCORES[severity],
+        reasons=_metadata_signal_reasons(result),
+        metadata={
+            "row_count": result.get("row_count"),
+            "null_count": result.get("null_count"),
+            "duplicate_count": result.get("duplicate_count"),
+            "freshness_timestamp": result.get("freshness_timestamp"),
+            "schema_columns": result.get("schema_column_count"),
+            "safe_to_continue": safe_to_continue,
+        },
+    )
+
+
+def _metadata_result_as_dict(metadata_result: MetadataCheckResult | dict) -> dict:
+    if isinstance(metadata_result, dict):
+        return dict(metadata_result)
+    return {
+        "model_name": metadata_result.model_name,
+        "row_count": metadata_result.row_count,
+        "null_count": metadata_result.null_count,
+        "duplicate_count": metadata_result.duplicate_count,
+        "freshness_timestamp": metadata_result.freshness_timestamp,
+        "schema_column_count": metadata_result.schema_column_count,
+        "anomalies": list(metadata_result.anomalies),
+    }
+
+
+def _metadata_signal_severity(
+    result: dict,
+    safe_to_continue: bool | None,
+) -> str:
+    if result.get("severity"):
+        return str(result["severity"]).upper()
+    if safe_to_continue is False or result.get("anomalies"):
+        return "HIGH"
+    return "LOW"
+
+
+def _metadata_signal_reasons(result: dict) -> list[str]:
+    reasons = []
+    if result.get("row_count") == 0:
+        reasons.append("Row count changed unexpectedly")
+    if result.get("null_count", 0) > 0:
+        reasons.append("Null rate increased")
+    if result.get("duplicate_count", 0) > 0:
+        reasons.append("Duplicate count increased")
+    if result.get("freshness_timestamp") is None:
+        reasons.append("Freshness regression detected")
+    if result.get("schema_column_count_change"):
+        reasons.append("Schema column count changed")
+    return reasons or list(result.get("anomalies", []))
