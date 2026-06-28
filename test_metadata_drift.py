@@ -144,6 +144,82 @@ class MetadataDriftTests(unittest.TestCase):
         self.assertIn("Duplicate count change: +100%", result["report_text"])
         self.assertIn("Metadata Drift: HIGH", result["report_text"])
 
+    def test_to_signal_converts_high_drift_to_high_signal(self):
+        from agent.metadata_drift import to_signal
+        from agent.signals import Severity, Signal
+
+        result = {
+            "row_count_change_pct": 200.0,
+            "null_count_change_pct": 0.0,
+            "duplicate_count_change_pct": 400.0,
+            "schema_column_count_change": 0,
+            "freshness_regressed": False,
+            "drift_level": "HIGH",
+            "report_text": (
+                "Row count change: +200%\n"
+                "Duplicate count change: +400%\n"
+                "\n"
+                "Metadata Drift: HIGH"
+            ),
+        }
+
+        signal = to_signal(result)
+
+        self.assertIsInstance(signal, Signal)
+        self.assertEqual(signal.component, "metadata_drift")
+        self.assertEqual(signal.severity, Severity.HIGH)
+        self.assertEqual(signal.confidence, 95)
+        self.assertEqual(signal.score, -35)
+        self.assertIn("Row count change: +200%", signal.reasons)
+        self.assertIn("Duplicate count change: +400%", signal.reasons)
+
+    def test_to_signal_converts_low_drift_to_low_signal(self):
+        from agent.metadata_drift import to_signal
+        from agent.signals import Severity
+
+        result = {
+            "row_count_change_pct": 5.0,
+            "null_count_change_pct": 0.0,
+            "duplicate_count_change_pct": 0.0,
+            "schema_column_count_change": 0,
+            "freshness_regressed": False,
+            "drift_level": "LOW",
+            "report_text": "Metadata Drift: LOW",
+        }
+
+        signal = to_signal(result)
+
+        self.assertEqual(signal.component, "metadata_drift")
+        self.assertEqual(signal.severity, Severity.LOW)
+        self.assertEqual(signal.confidence, 75)
+        self.assertEqual(signal.score, -5)
+
+    def test_to_signal_preserves_metadata_fields(self):
+        from agent.metadata_drift import to_signal
+
+        result = {
+            "row_count_change_pct": -50.0,
+            "null_count_change_pct": 25.0,
+            "duplicate_count_change_pct": 100.0,
+            "schema_column_count_change": 1,
+            "freshness_regressed": True,
+            "drift_level": "HIGH",
+            "report_text": "Metadata Drift: HIGH",
+        }
+
+        signal = to_signal(result)
+
+        self.assertEqual(
+            signal.metadata,
+            {
+                "row_count_change_pct": -50.0,
+                "null_count_change_pct": 25.0,
+                "duplicate_count_change_pct": 100.0,
+                "schema_column_count_change": 1,
+                "freshness_regressed": True,
+            },
+        )
+
     def test_compare_last_run_cli_prints_report(self):
         from agent.cli import cli
         from agent import metadata_drift

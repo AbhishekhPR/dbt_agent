@@ -8,6 +8,28 @@ from agent.metadata_store import (
     fetch_recent_model_metrics,
     insert_metric_drift,
 )
+from agent.signals import Signal
+
+
+DRIFT_SIGNAL_CONFIDENCE = {
+    "HIGH": 95,
+    "MEDIUM": 85,
+    "LOW": 75,
+}
+
+DRIFT_SIGNAL_SCORES = {
+    "HIGH": -35,
+    "MEDIUM": -20,
+    "LOW": -5,
+}
+
+DRIFT_SIGNAL_METADATA_FIELDS = [
+    "row_count_change_pct",
+    "null_count_change_pct",
+    "duplicate_count_change_pct",
+    "schema_column_count_change",
+    "freshness_regressed",
+]
 
 
 def compare_last_run(
@@ -102,6 +124,30 @@ def compare_last_run(
 
 def format_compare_last_run_report(result: dict) -> str:
     return result["report_text"]
+
+
+def to_signal(drift_result: dict) -> Signal:
+    drift_level = str(drift_result.get("drift_level", "LOW")).upper()
+    report_text = drift_result.get("report_text", "")
+    reasons = [
+        line.strip()
+        for line in report_text.splitlines()
+        if line.strip()
+    ]
+    if not reasons:
+        reasons = [f"Metadata Drift: {drift_level}"]
+
+    return Signal(
+        component="metadata_drift",
+        severity=drift_level,
+        confidence=DRIFT_SIGNAL_CONFIDENCE.get(drift_level, 75),
+        score=DRIFT_SIGNAL_SCORES.get(drift_level, -5),
+        reasons=reasons,
+        metadata={
+            field: drift_result.get(field)
+            for field in DRIFT_SIGNAL_METADATA_FIELDS
+        },
+    )
 
 
 def _resolve_model_identity(
