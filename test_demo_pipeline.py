@@ -292,6 +292,126 @@ class DemoPipelineTests(unittest.TestCase):
         self.assertIn("Relium Demo Pipeline", output)
         self.assertIn("Scenario: normal", output)
 
+    def test_demo_pipeline_command_output_is_unchanged_without_decision_flag(self):
+        from agent import demo_pipeline
+        from agent.cli import cli
+
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            metadata_db = tmp_path / "relium_metadata.db"
+            warehouse_db = tmp_path / "demo_warehouse.db"
+
+            with patch.object(
+                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
+            ), patch.object(
+                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
+            ), patch(
+                "agent.slack_alerts.send_validation_alert",
+                return_value=False,
+            ):
+                result, output = invoke_cli(
+                    runner,
+                    cli,
+                    ["demo-pipeline", "--scenario", "normal"],
+                )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertEqual(
+            output,
+            "\n".join(
+                [
+                    "Slack alert sent: NO",
+                    "Relium Demo Pipeline",
+                    "",
+                    "Scenario: normal",
+                    "Raw rows loaded: 7",
+                    "Model built: fct_customer_lifetime_value",
+                    "AST risk found: HIGH",
+                    "Row count: 2",
+                    "Null count: 0",
+                    "Duplicate customer_id count: 1",
+                    "Freshness timestamp: 2026-06-21T12:00:00",
+                    "Schema columns: 6",
+                    "Safe to continue: NO",
+                    "Metadata stored: YES",
+                    "",
+                ]
+            ),
+        )
+        self.assertNotIn("Relium Deployment Decision", output)
+
+    def test_demo_pipeline_command_decision_flag_adds_decision_view(self):
+        from agent import demo_pipeline
+        from agent.cli import cli
+
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            metadata_db = tmp_path / "relium_metadata.db"
+            warehouse_db = tmp_path / "demo_warehouse.db"
+
+            with patch.object(
+                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
+            ), patch.object(
+                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
+            ), patch(
+                "agent.slack_alerts.send_validation_alert",
+                return_value=False,
+            ):
+                result, output = invoke_cli(
+                    runner,
+                    cli,
+                    ["demo-pipeline", "--scenario", "normal", "--decision"],
+                )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("Relium Demo Pipeline", output)
+        self.assertIn("Metadata stored: YES\n\nRelium Deployment Decision", output)
+        self.assertIn("Pipeline Health:", output)
+        self.assertIn("Deployment Decision:", output)
+        self.assertIn("Severity:", output)
+        self.assertIn("Signals Considered:", output)
+        self.assertIn("- ast", output)
+        self.assertIn("- metadata_checks", output)
+
+    def test_demo_pipeline_command_decision_flag_supports_demo_scenarios(self):
+        from agent import demo_pipeline
+        from agent.cli import cli
+
+        runner = CliRunner()
+        scenarios = [
+            "normal",
+            "row-drop",
+            "duplicate-spike",
+            "freshness-regression",
+        ]
+
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                metadata_db = tmp_path / "relium_metadata.db"
+                warehouse_db = tmp_path / "demo_warehouse.db"
+
+                with patch.object(
+                    demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
+                ), patch.object(
+                    demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
+                ), patch(
+                    "agent.slack_alerts.send_validation_alert",
+                    return_value=False,
+                ):
+                    result, output = invoke_cli(
+                        runner,
+                        cli,
+                        ["demo-pipeline", "--scenario", scenario, "--decision"],
+                    )
+
+            self.assertEqual(result.exit_code, 0, output)
+            self.assertIn(f"Scenario: {scenario}", output)
+            self.assertIn("Relium Deployment Decision", output)
+            self.assertIn("Signals Considered:", output)
+
     def test_demo_pipeline_command_accepts_deterministic_scenarios(self):
         from agent import demo_pipeline
         from agent.cli import cli
