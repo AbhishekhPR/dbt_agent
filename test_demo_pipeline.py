@@ -101,6 +101,139 @@ class DemoPipelineTests(unittest.TestCase):
         self.assertEqual(result["scenario"], "normal")
         self.assertIn("Raw rows loaded:", result["report_text"])
 
+    def test_demo_pipeline_result_includes_internal_incident(self):
+        from agent import demo_pipeline
+        from agent.incident import Incident
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            metadata_db = tmp_path / "relium_metadata.db"
+            warehouse_db = tmp_path / "demo_warehouse.db"
+
+            with patch.object(
+                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
+            ), patch.object(
+                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
+            ), patch(
+                "agent.slack_alerts.send_validation_alert",
+                return_value=False,
+            ):
+                result = demo_pipeline.run_demo_pipeline(scenario="normal")
+
+        self.assertIn("incident", result)
+        self.assertIn("incident_summary", result)
+        self.assertIsInstance(result["incident"], Incident)
+
+    def test_demo_pipeline_previous_result_fields_are_unchanged(self):
+        from agent import demo_pipeline
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            metadata_db = tmp_path / "relium_metadata.db"
+            warehouse_db = tmp_path / "demo_warehouse.db"
+
+            with patch.object(
+                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
+            ), patch.object(
+                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
+            ), patch(
+                "agent.slack_alerts.send_validation_alert",
+                return_value=False,
+            ):
+                result = demo_pipeline.run_demo_pipeline(scenario="normal")
+
+        expected = {
+            "project_name": "relium_demo",
+            "scenario": "normal",
+            "raw_row_count": 7,
+            "model_name": "fct_customer_lifetime_value",
+            "changed_model": "fct_customer_lifetime_value",
+            "severity": "HIGH",
+            "static_analysis_text": "Potential LEFT JOIN nullification detected.",
+            "affected_models": [],
+            "row_count": 2,
+            "null_count": 0,
+            "duplicate_count": 1,
+            "freshness_timestamp": "2026-06-21T12:00:00",
+            "schema_column_count": 6,
+            "safe_to_continue": False,
+            "metadata_stored": True,
+            "slack_sent": False,
+        }
+        for key, value in expected.items():
+            self.assertEqual(result[key], value, key)
+
+    def test_demo_pipeline_visible_output_remains_identical(self):
+        from agent import demo_pipeline
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            metadata_db = tmp_path / "relium_metadata.db"
+            warehouse_db = tmp_path / "demo_warehouse.db"
+
+            with patch.object(
+                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
+            ), patch.object(
+                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
+            ), patch(
+                "agent.slack_alerts.send_validation_alert",
+                return_value=False,
+            ):
+                result = demo_pipeline.run_demo_pipeline(scenario="normal")
+
+        self.assertEqual(
+            result["report_text"],
+            "\n".join(
+                [
+                    "Relium Demo Pipeline",
+                    "",
+                    "Scenario: normal",
+                    "Raw rows loaded: 7",
+                    "Model built: fct_customer_lifetime_value",
+                    "AST risk found: HIGH",
+                    "Row count: 2",
+                    "Null count: 0",
+                    "Duplicate customer_id count: 1",
+                    "Freshness timestamp: 2026-06-21T12:00:00",
+                    "Schema columns: 6",
+                    "Safe to continue: NO",
+                    "Metadata stored: YES",
+                ]
+            ),
+        )
+
+    def test_demo_pipeline_incident_contains_all_available_signals(self):
+        from agent import demo_pipeline
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            metadata_db = tmp_path / "relium_metadata.db"
+            warehouse_db = tmp_path / "demo_warehouse.db"
+
+            with patch.object(
+                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
+            ), patch.object(
+                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
+            ), patch(
+                "agent.slack_alerts.send_validation_alert",
+                return_value=False,
+            ):
+                first = demo_pipeline.run_demo_pipeline(scenario="normal")
+                second = demo_pipeline.run_demo_pipeline(scenario="duplicate-spike")
+
+        self.assertEqual(
+            [signal.component for signal in first["incident"].signals],
+            ["ast", "metadata_checks"],
+        )
+        self.assertEqual(
+            [signal.component for signal in second["incident"].signals],
+            ["ast", "metadata_checks", "metadata_drift"],
+        )
+        self.assertEqual(
+            second["incident_summary"]["signal_components"],
+            ["ast", "metadata_checks", "metadata_drift"],
+        )
+
     def test_demo_pipeline_command_does_not_call_webhook_when_slack_is_mocked(self):
         from agent import demo_pipeline
         from agent.cli import cli

@@ -2,7 +2,14 @@ import sqlite3
 from pathlib import Path
 
 from agent.ast_analyzer import run_ast_analysis
+from agent.ast_analyzer import to_signal as ast_to_signal
+from agent.decision_assembly import (
+    assemble_pipeline_incident,
+    summarize_pipeline_incident,
+)
 from agent.metadata_checks import run_metadata_checks
+from agent.metadata_checks import to_signal as metadata_checks_to_signal
+from agent.metadata_drift import to_signal as metadata_drift_to_signal
 from agent.metadata_store import (
     DEFAULT_METADATA_DB_PATH,
     ModelMetricRecord,
@@ -197,6 +204,30 @@ def run_demo_pipeline(
         "slack_sent": slack_sent,
     }
     result["report_text"] = format_demo_pipeline_report(result)
+    ast_signal = ast_to_signal(ast_report)
+    metadata_signal = metadata_checks_to_signal(
+        metadata_result,
+        safe_to_continue=safe_to_continue,
+    )
+    drift_signal = (
+        metadata_drift_to_signal(drift_result)
+        if drift_result is not None
+        else None
+    )
+    incident = assemble_pipeline_incident(
+        ast_signal=ast_signal,
+        metadata_signal=metadata_signal,
+        drift_signal=drift_signal,
+        affected_models=result["affected_models"],
+        metadata={
+            "project_name": PROJECT_NAME,
+            "model_name": MODEL_NAME,
+            "scenario": scenario,
+            "scan_id": scan_id,
+        },
+    )
+    result["incident"] = incident
+    result["incident_summary"] = summarize_pipeline_incident(incident)
     return result
 
 
