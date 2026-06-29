@@ -57,6 +57,22 @@ class PresentationTests(unittest.TestCase):
         self.assertIn("- ast", rendered)
         self.assertIn("- metadata_checks", rendered)
 
+    def test_cli_includes_reasoning_section(self):
+        rendered = render_cli(make_incident())
+
+        self.assertIn("Reasoning:", rendered)
+        self.assertIn("Executive Summary:", rendered)
+        self.assertIn("Deployment BLOCK was blocked", rendered)
+        self.assertIn("Conclusion:", rendered)
+        self.assertIn("Recommendation:", rendered)
+
+    def test_cli_includes_evidence_section(self):
+        rendered = render_cli(make_incident())
+
+        self.assertIn("Evidence:", rendered)
+        self.assertIn("- AST: LEFT JOIN nullification detected", rendered)
+        self.assertIn("- Metadata Checks: Duplicate count increased", rendered)
+
     def test_markdown_contains_every_section(self):
         rendered = render_markdown(make_incident())
 
@@ -74,6 +90,21 @@ class PresentationTests(unittest.TestCase):
         self.assertIn("## Recommendation", rendered)
         self.assertIn("## Signals Considered", rendered)
         self.assertIn("## Affected Models", rendered)
+
+    def test_markdown_includes_reasoning_section(self):
+        rendered = render_markdown(make_incident())
+
+        self.assertIn("## Reasoning", rendered)
+        self.assertIn("### Executive Summary", rendered)
+        self.assertIn("Deployment BLOCK was blocked", rendered)
+        self.assertIn("### Evidence", rendered)
+        self.assertIn("- **AST: LEFT JOIN nullification detected**", rendered)
+        self.assertIn(
+            "- **Metadata Checks: Duplicate count increased**",
+            rendered,
+        )
+        self.assertIn("### Conclusion", rendered)
+        self.assertIn("### Recommendation", rendered)
 
     def test_json_is_fully_serializable(self):
         payload = render_json(make_incident())

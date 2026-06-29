@@ -2,6 +2,7 @@ from enum import Enum
 from typing import Any
 
 from agent.incident import Incident
+from agent.reasoning_engine import build_reasoning_report
 
 
 def _enum_value(value: Any) -> Any:
@@ -36,6 +37,7 @@ def _bullet_list(items: list[str]) -> list[str]:
 
 
 def render_cli(incident: Incident) -> str:
+    reasoning = build_reasoning_report(incident)
     lines = [
         "Relium Deployment Decision",
         "",
@@ -62,10 +64,25 @@ def render_cli(incident: Incident) -> str:
             *_bullet_list(list(incident.affected_models)),
         ])
 
+    lines.extend([
+        "",
+        "Reasoning:",
+        "",
+        f"Executive Summary: {reasoning.executive_summary}",
+        "",
+        "Evidence:",
+        *_format_cli_evidence(reasoning.evidence),
+        "",
+        f"Conclusion: {reasoning.conclusion}",
+        "",
+        f"Recommendation: {reasoning.recommendation}",
+    ])
+
     return "\n".join(lines)
 
 
 def render_markdown(incident: Incident) -> str:
+    reasoning = build_reasoning_report(incident)
     lines = [
         "# Relium Deployment Decision",
         "",
@@ -101,6 +118,23 @@ def render_markdown(incident: Incident) -> str:
             *_bullet_list(list(incident.affected_models)),
         ])
 
+    lines.extend([
+        "",
+        "## Reasoning",
+        "",
+        "### Executive Summary",
+        reasoning.executive_summary,
+        "",
+        "### Evidence",
+        *_format_markdown_evidence(reasoning.evidence),
+        "",
+        "### Conclusion",
+        reasoning.conclusion,
+        "",
+        "### Recommendation",
+        reasoning.recommendation,
+    ])
+
     return "\n".join(lines)
 
 
@@ -121,3 +155,27 @@ def render_json(incident: Incident) -> dict:
         "affected_models": list(incident.affected_models),
         "metadata": _serialize(dict(incident.metadata)),
     }
+
+
+def _format_cli_evidence(evidence) -> list[str]:
+    if not evidence:
+        return ["- None"]
+    return [
+        (
+            f"- {item.title} "
+            f"(severity: {item.severity}, confidence: {item.confidence})"
+        )
+        for item in evidence
+    ]
+
+
+def _format_markdown_evidence(evidence) -> list[str]:
+    if not evidence:
+        return ["- None"]
+    return [
+        (
+            f"- **{item.title}** "
+            f"(severity: {item.severity}, confidence: {item.confidence})"
+        )
+        for item in evidence
+    ]
