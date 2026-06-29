@@ -1,0 +1,145 @@
+import copy
+import json
+import unittest
+
+from agent.decision_engine import DeploymentDecision
+from agent.incident import Incident
+from agent.presentation import render_cli, render_json, render_markdown
+from agent.signals import Severity, Signal
+
+
+def make_incident():
+    return Incident(
+        incident_id="INC-0042",
+        health=62,
+        decision=DeploymentDecision.BLOCK,
+        severity=Severity.HIGH,
+        confidence=91,
+        root_cause="LEFT JOIN nullification detected",
+        recommendation="Move right-side filters into JOIN clauses.",
+        affected_models=["fct_customer_lifetime_value"],
+        signals=[
+            Signal(
+                component="ast",
+                severity=Severity.HIGH,
+                confidence=95,
+                score=-40,
+                reasons=["LEFT JOIN nullification detected"],
+                metadata={"rule": "LEFT_JOIN_WHERE"},
+            ),
+            Signal(
+                component="metadata_checks",
+                severity=Severity.MEDIUM,
+                confidence=85,
+                score=-15,
+                reasons=["Duplicate count increased"],
+                metadata={"duplicate_count": 7},
+            ),
+        ],
+        metadata={"scenario": "duplicate-spike"},
+    )
+
+
+class PresentationTests(unittest.TestCase):
+    def test_cli_contains_every_major_section(self):
+        rendered = render_cli(make_incident())
+
+        self.assertIn("Relium Deployment Decision", rendered)
+        self.assertIn("Pipeline Health: 62", rendered)
+        self.assertIn("Deployment Decision: BLOCK", rendered)
+        self.assertIn("Severity: HIGH", rendered)
+        self.assertIn("Confidence: 91", rendered)
+        self.assertIn("Primary Root Cause:", rendered)
+        self.assertIn("Top Reasons:", rendered)
+        self.assertIn("Recommendation:", rendered)
+        self.assertIn("Signals Considered:", rendered)
+        self.assertIn("Affected Models:", rendered)
+        self.assertIn("- ast", rendered)
+        self.assertIn("- metadata_checks", rendered)
+
+    def test_markdown_contains_every_section(self):
+        rendered = render_markdown(make_incident())
+
+        self.assertIn("# Relium Deployment Decision", rendered)
+        self.assertIn("## Pipeline Health", rendered)
+        self.assertIn("62", rendered)
+        self.assertIn("## Deployment Decision", rendered)
+        self.assertIn("BLOCK", rendered)
+        self.assertIn("## Severity", rendered)
+        self.assertIn("HIGH", rendered)
+        self.assertIn("## Confidence", rendered)
+        self.assertIn("91", rendered)
+        self.assertIn("## Primary Root Cause", rendered)
+        self.assertIn("## Top Reasons", rendered)
+        self.assertIn("## Recommendation", rendered)
+        self.assertIn("## Signals Considered", rendered)
+        self.assertIn("## Affected Models", rendered)
+
+    def test_json_is_fully_serializable(self):
+        payload = render_json(make_incident())
+
+        serialized = json.dumps(payload)
+
+        self.assertIsInstance(serialized, str)
+        self.assertEqual(payload["incident_id"], "INC-0042")
+        self.assertEqual(payload["signal_count"], 2)
+        self.assertEqual(
+            payload["signal_components"],
+            ["ast", "metadata_checks"],
+        )
+        self.assertEqual(
+            payload["top_reasons"],
+            [
+                "LEFT JOIN nullification detected",
+                "Duplicate count increased",
+            ],
+        )
+        self.assertEqual(payload["metadata"], {"scenario": "duplicate-spike"})
+
+    def test_empty_lists_are_handled_gracefully(self):
+        incident = Incident(
+            incident_id="INC-EMPTY",
+            health=100,
+            decision=DeploymentDecision.ALLOW,
+            severity=Severity.LOW,
+            confidence=0,
+            root_cause="",
+            recommendation="",
+        )
+
+        cli = render_cli(incident)
+        markdown = render_markdown(incident)
+        payload = render_json(incident)
+
+        self.assertIn("Top Reasons:", cli)
+        self.assertIn("- None", cli)
+        self.assertIn("Signals Considered:", cli)
+        self.assertNotIn("Affected Models:", cli)
+        self.assertIn("## Top Reasons", markdown)
+        self.assertIn("- None", markdown)
+        self.assertIn("## Signals Considered", markdown)
+        self.assertNotIn("## Affected Models", markdown)
+        self.assertEqual(payload["signal_count"], 0)
+        self.assertEqual(payload["signal_components"], [])
+        self.assertEqual(payload["top_reasons"], [])
+        self.assertEqual(payload["affected_models"], [])
+
+    def test_enum_serialization_uses_values(self):
+        payload = render_json(make_incident())
+
+        self.assertEqual(payload["decision"], "BLOCK")
+        self.assertEqual(payload["severity"], "HIGH")
+
+    def test_rendering_never_mutates_incident(self):
+        incident = make_incident()
+        before = copy.deepcopy(incident)
+
+        render_cli(incident)
+        render_markdown(incident)
+        render_json(incident)
+
+        self.assertEqual(incident, before)
+
+
+if __name__ == "__main__":
+    unittest.main()
