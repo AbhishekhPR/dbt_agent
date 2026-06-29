@@ -75,6 +75,37 @@ class PresentationTests(unittest.TestCase):
         self.assertIn("- AST: LEFT JOIN nullification detected", rendered)
         self.assertIn("- Metadata Checks: Duplicate count increased", rendered)
 
+    def test_cli_reasoning_spacing_separates_joined_words(self):
+        incident = Incident(
+            incident_id="INC-SPACING",
+            health=25,
+            decision=DeploymentDecision.BLOCK,
+            severity=Severity.HIGH,
+            confidence=88,
+            root_cause="Rowswith unexpected duplication.",
+            recommendation="Review rows silently.Rows should not be joined.",
+            signals=[
+                Signal(
+                    component="metadata_checks",
+                    severity=Severity.HIGH,
+                    confidence=88,
+                    score=-30,
+                    reasons=["Rowswith unexpected duplication silently.Rows changed"],
+                )
+            ],
+        )
+
+        rendered = render_cli(incident)
+
+        self.assertNotIn("Rowswith", rendered)
+        self.assertNotIn("silently.Rows", rendered)
+        self.assertIn("Rows with unexpected duplication", rendered)
+        self.assertIn("silently. Rows changed", rendered)
+        self.assertEqual(
+            incident.signals[0].reasons,
+            ["Rowswith unexpected duplication silently.Rows changed"],
+        )
+
     def test_markdown_contains_every_section(self):
         rendered = render_markdown(make_incident())
 

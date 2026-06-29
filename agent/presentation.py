@@ -1,3 +1,4 @@
+import re
 from enum import Enum
 from typing import Any
 
@@ -34,7 +35,7 @@ def _top_reasons(incident: Incident) -> list[str]:
 def _bullet_list(items: list[str]) -> list[str]:
     if not items:
         return ["- None"]
-    return [f"- {item}" for item in items]
+    return [f"- {_display_text(item)}" for item in items]
 
 
 def render_cli(incident: Incident) -> str:
@@ -47,12 +48,12 @@ def render_cli(incident: Incident) -> str:
         f"Severity: {_enum_value(incident.severity)}",
         f"Confidence: {_confidence_text(incident.confidence)}",
         "",
-        f"Primary Root Cause: {incident.root_cause or 'None'}",
+        f"Primary Root Cause: {_display_text(incident.root_cause or 'None')}",
         "",
         "Top Reasons:",
         *_bullet_list(_top_reasons(incident)),
         "",
-        f"Recommendation: {incident.recommendation or 'None'}",
+        f"Recommendation: {_display_text(incident.recommendation or 'None')}",
         "",
         "Signals Considered:",
         *_bullet_list([signal.component for signal in incident.signals]),
@@ -69,14 +70,14 @@ def render_cli(incident: Incident) -> str:
         "",
         "Reasoning:",
         "",
-        f"Executive Summary: {reasoning.executive_summary}",
+        f"Executive Summary: {_display_text(reasoning.executive_summary)}",
         "",
         "Evidence:",
         *_format_cli_evidence(reasoning.evidence),
         "",
-        f"Conclusion: {reasoning.conclusion}",
+        f"Conclusion: {_display_text(reasoning.conclusion)}",
         "",
-        f"Recommendation: {reasoning.recommendation}",
+        f"Recommendation: {_display_text(reasoning.recommendation)}",
     ])
 
     return "\n".join(lines)
@@ -100,13 +101,13 @@ def render_markdown(incident: Incident) -> str:
         _confidence_text(incident.confidence),
         "",
         "## Primary Root Cause",
-        incident.root_cause or "None",
+        _display_text(incident.root_cause or "None"),
         "",
         "## Top Reasons",
         *_bullet_list(_top_reasons(incident)),
         "",
         "## Recommendation",
-        incident.recommendation or "None",
+        _display_text(incident.recommendation or "None"),
         "",
         "## Signals Considered",
         *_bullet_list([signal.component for signal in incident.signals]),
@@ -124,16 +125,16 @@ def render_markdown(incident: Incident) -> str:
         "## Reasoning",
         "",
         "### Executive Summary",
-        reasoning.executive_summary,
+        _display_text(reasoning.executive_summary),
         "",
         "### Evidence",
         *_format_markdown_evidence(reasoning.evidence),
         "",
         "### Conclusion",
-        reasoning.conclusion,
+        _display_text(reasoning.conclusion),
         "",
         "### Recommendation",
-        reasoning.recommendation,
+        _display_text(reasoning.recommendation),
     ])
 
     return "\n".join(lines)
@@ -163,7 +164,7 @@ def _format_cli_evidence(evidence) -> list[str]:
         return ["- None"]
     return [
         (
-            f"- {item.title} "
+            f"- {_display_text(item.title)} "
             f"(severity: {item.severity}, confidence: {item.confidence})"
         )
         for item in evidence
@@ -175,7 +176,7 @@ def _format_markdown_evidence(evidence) -> list[str]:
         return ["- None"]
     return [
         (
-            f"- **{item.title}** "
+            f"- **{_display_text(item.title)}** "
             f"(severity: {item.severity}, confidence: {item.confidence})"
         )
         for item in evidence
@@ -195,3 +196,10 @@ def _decision_label(decision: Any) -> str:
     if value == DeploymentDecision.BLOCK.value:
         return "BLOCK DEPLOYMENT"
     return str(value)
+
+
+def _display_text(value: Any) -> str:
+    text = str(value)
+    text = re.sub(r"(?<=[.!?])(?=[A-Z])", " ", text)
+    text = re.sub(r"(?<=[A-Za-z])(?=with\b)", " ", text)
+    return re.sub(r"[ \t]+", " ", text).strip()
