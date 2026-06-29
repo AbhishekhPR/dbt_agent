@@ -1,6 +1,7 @@
 from enum import Enum
 from typing import Any
 
+from agent.decision_engine import DeploymentDecision
 from agent.incident import Incident
 from agent.reasoning_engine import build_reasoning_report
 
@@ -41,10 +42,10 @@ def render_cli(incident: Incident) -> str:
     lines = [
         "Relium Deployment Decision",
         "",
-        f"Pipeline Health: {incident.health}",
-        f"Deployment Decision: {_enum_value(incident.decision)}",
+        f"Pipeline Health: {_health_text(incident.health)}",
+        f"Deployment Decision: {_decision_label(incident.decision)}",
         f"Severity: {_enum_value(incident.severity)}",
-        f"Confidence: {incident.confidence}",
+        f"Confidence: {_confidence_text(incident.confidence)}",
         "",
         f"Primary Root Cause: {incident.root_cause or 'None'}",
         "",
@@ -87,16 +88,16 @@ def render_markdown(incident: Incident) -> str:
         "# Relium Deployment Decision",
         "",
         "## Pipeline Health",
-        str(incident.health),
+        _health_text(incident.health),
         "",
         "## Deployment Decision",
-        str(_enum_value(incident.decision)),
+        _decision_label(incident.decision),
         "",
         "## Severity",
         str(_enum_value(incident.severity)),
         "",
         "## Confidence",
-        str(incident.confidence),
+        _confidence_text(incident.confidence),
         "",
         "## Primary Root Cause",
         incident.root_cause or "None",
@@ -179,3 +180,18 @@ def _format_markdown_evidence(evidence) -> list[str]:
         )
         for item in evidence
     ]
+
+
+def _health_text(health: int) -> str:
+    return f"{health} / 100"
+
+
+def _confidence_text(confidence: int) -> str:
+    return f"{confidence}%"
+
+
+def _decision_label(decision: Any) -> str:
+    value = _enum_value(decision)
+    if value == DeploymentDecision.BLOCK.value:
+        return "BLOCK DEPLOYMENT"
+    return str(value)

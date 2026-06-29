@@ -45,10 +45,10 @@ class PresentationTests(unittest.TestCase):
         rendered = render_cli(make_incident())
 
         self.assertIn("Relium Deployment Decision", rendered)
-        self.assertIn("Pipeline Health: 62", rendered)
-        self.assertIn("Deployment Decision: BLOCK", rendered)
+        self.assertIn("Pipeline Health: 62 / 100", rendered)
+        self.assertIn("Deployment Decision: BLOCK DEPLOYMENT", rendered)
         self.assertIn("Severity: HIGH", rendered)
-        self.assertIn("Confidence: 91", rendered)
+        self.assertIn("Confidence: 91%", rendered)
         self.assertIn("Primary Root Cause:", rendered)
         self.assertIn("Top Reasons:", rendered)
         self.assertIn("Recommendation:", rendered)
@@ -62,8 +62,10 @@ class PresentationTests(unittest.TestCase):
 
         self.assertIn("Reasoning:", rendered)
         self.assertIn("Executive Summary:", rendered)
-        self.assertIn("Deployment BLOCK was blocked", rendered)
+        self.assertIn("Deployment is blocked because", rendered)
+        self.assertNotIn("Deployment BLOCK was blocked", rendered)
         self.assertIn("Conclusion:", rendered)
+        self.assertIn("multiple reliability signals", rendered)
         self.assertIn("Recommendation:", rendered)
 
     def test_cli_includes_evidence_section(self):
@@ -78,13 +80,13 @@ class PresentationTests(unittest.TestCase):
 
         self.assertIn("# Relium Deployment Decision", rendered)
         self.assertIn("## Pipeline Health", rendered)
-        self.assertIn("62", rendered)
+        self.assertIn("62 / 100", rendered)
         self.assertIn("## Deployment Decision", rendered)
-        self.assertIn("BLOCK", rendered)
+        self.assertIn("BLOCK DEPLOYMENT", rendered)
         self.assertIn("## Severity", rendered)
         self.assertIn("HIGH", rendered)
         self.assertIn("## Confidence", rendered)
-        self.assertIn("91", rendered)
+        self.assertIn("91%", rendered)
         self.assertIn("## Primary Root Cause", rendered)
         self.assertIn("## Top Reasons", rendered)
         self.assertIn("## Recommendation", rendered)
@@ -96,7 +98,8 @@ class PresentationTests(unittest.TestCase):
 
         self.assertIn("## Reasoning", rendered)
         self.assertIn("### Executive Summary", rendered)
-        self.assertIn("Deployment BLOCK was blocked", rendered)
+        self.assertIn("Deployment is blocked because", rendered)
+        self.assertNotIn("Deployment BLOCK was blocked", rendered)
         self.assertIn("### Evidence", rendered)
         self.assertIn("- **AST: LEFT JOIN nullification detected**", rendered)
         self.assertIn(
@@ -104,7 +107,33 @@ class PresentationTests(unittest.TestCase):
             rendered,
         )
         self.assertIn("### Conclusion", rendered)
+        self.assertIn("multiple reliability signals", rendered)
         self.assertIn("### Recommendation", rendered)
+
+    def test_decision_labels_render_for_warn_and_allow(self):
+        warn_incident = Incident(
+            incident_id="INC-WARN",
+            health=88,
+            decision=DeploymentDecision.WARN,
+            severity=Severity.MEDIUM,
+            confidence=88,
+            root_cause="Moderate drift detected",
+            recommendation="Review before deployment.",
+        )
+        allow_incident = Incident(
+            incident_id="INC-ALLOW",
+            health=98,
+            decision=DeploymentDecision.ALLOW,
+            severity=Severity.LOW,
+            confidence=88,
+            root_cause="",
+            recommendation="",
+        )
+
+        self.assertIn("Deployment Decision: WARN", render_cli(warn_incident))
+        self.assertIn("Deployment Decision: ALLOW", render_cli(allow_incident))
+        self.assertIn("Confidence: 88%", render_cli(allow_incident))
+        self.assertIn("98 / 100", render_markdown(allow_incident))
 
     def test_json_is_fully_serializable(self):
         payload = render_json(make_incident())

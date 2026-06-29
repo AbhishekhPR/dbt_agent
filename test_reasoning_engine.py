@@ -52,12 +52,13 @@ class ReasoningEngineTests(unittest.TestCase):
         report = build_reasoning_report(make_incident())
 
         self.assertIsInstance(report, ReasoningReport)
-        self.assertIn("blocked", report.executive_summary.lower())
-        self.assertIn("BLOCK", report.executive_summary)
-        self.assertIn("55", report.executive_summary)
+        self.assertIn("Deployment is blocked because", report.executive_summary)
+        self.assertIn("55 / 100", report.executive_summary)
         self.assertIn("HIGH", report.executive_summary)
-        self.assertIn("BLOCK", report.conclusion)
-        self.assertIn("combined evidence", report.conclusion)
+        self.assertIn("90%", report.executive_summary)
+        self.assertNotIn("Deployment BLOCK was blocked", report.executive_summary)
+        self.assertIn("BLOCK DEPLOYMENT", report.conclusion)
+        self.assertIn("multiple reliability signals", report.conclusion)
 
     def test_warn_decision_executive_summary(self):
         incident = make_incident(
@@ -78,9 +79,9 @@ class ReasoningEngineTests(unittest.TestCase):
 
         report = build_reasoning_report(incident)
 
-        self.assertIn("warning", report.executive_summary.lower())
+        self.assertIn("Deployment should proceed with caution", report.executive_summary)
         self.assertIn("WARN", report.executive_summary)
-        self.assertIn("78", report.conclusion)
+        self.assertIn("78 / 100", report.conclusion)
 
     def test_allow_decision_executive_summary(self):
         incident = make_incident(
@@ -93,7 +94,7 @@ class ReasoningEngineTests(unittest.TestCase):
 
         report = build_reasoning_report(incident)
 
-        self.assertIn("allowed", report.executive_summary.lower())
+        self.assertIn("Deployment is allowed", report.executive_summary)
         self.assertIn("ALLOW", report.executive_summary)
         self.assertEqual(report.evidence, [])
 
@@ -218,9 +219,9 @@ class ReasoningEngineTests(unittest.TestCase):
         report = build_reasoning_report(incident)
 
         self.assertIn("ALLOW", report.executive_summary)
-        self.assertIn("10", report.executive_summary)
+        self.assertIn("10 / 100", report.executive_summary)
         self.assertIn("LOW", report.executive_summary)
-        self.assertIn("12", report.executive_summary)
+        self.assertIn("12%", report.executive_summary)
 
     def test_does_not_mutate_incident(self):
         incident = make_incident()

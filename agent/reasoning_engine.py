@@ -58,15 +58,29 @@ def _evidence_from_signals(incident: Incident) -> list[Evidence]:
 
 def _executive_summary(incident: Incident) -> str:
     decision = _enum_value(incident.decision)
-    disposition = {
-        DeploymentDecision.ALLOW.value: "allowed",
-        DeploymentDecision.WARN.value: "returned a warning",
-        DeploymentDecision.BLOCK.value: "blocked",
-    }.get(decision, "evaluated")
+    context = (
+        f"health {_health_text(incident.health)}, "
+        f"severity {_enum_value(incident.severity)}, "
+        f"and confidence {_confidence_text(incident.confidence)}"
+    )
+    if decision == DeploymentDecision.BLOCK.value:
+        return (
+            "Deployment is blocked because the reliability signals indicate "
+            f"deployment risk (decision BLOCK DEPLOYMENT; {context})."
+        )
+    if decision == DeploymentDecision.WARN.value:
+        return (
+            "Deployment should proceed with caution because the reliability "
+            f"signals need review (decision WARN; {context})."
+        )
+    if decision == DeploymentDecision.ALLOW.value:
+        return (
+            "Deployment is allowed because the reliability signals are within "
+            f"acceptable limits (decision ALLOW; {context})."
+        )
     return (
-        f"Deployment {decision} was {disposition} with health "
-        f"{incident.health}, severity {_enum_value(incident.severity)}, "
-        f"and confidence {incident.confidence}."
+        "Deployment was evaluated from the available reliability signals "
+        f"({context})."
     )
 
 
@@ -75,10 +89,12 @@ def _conclusion(incident: Incident, evidence: list[Evidence]) -> str:
     evidence_count = len(evidence)
     plural = "item" if evidence_count == 1 else "items"
     return (
-        f"The combined evidence ({evidence_count} {plural}) led to "
-        f"deployment decision {decision} at health {incident.health} with "
-        f"severity {_enum_value(incident.severity)} and confidence "
-        f"{incident.confidence}."
+        "The recommendation reflects that multiple reliability signals "
+        f"contributed to the {_decision_label(decision)} outcome: "
+        f"{evidence_count} evidence {plural} were considered with health "
+        f"{_health_text(incident.health)}, severity "
+        f"{_enum_value(incident.severity)}, and confidence "
+        f"{_confidence_text(incident.confidence)}."
     )
 
 
@@ -92,3 +108,18 @@ def _enum_value(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
     return value
+
+
+def _health_text(health: int) -> str:
+    return f"{health} / 100"
+
+
+def _confidence_text(confidence: int) -> str:
+    return f"{confidence}%"
+
+
+def _decision_label(decision: Any) -> str:
+    value = _enum_value(decision)
+    if value == DeploymentDecision.BLOCK.value:
+        return "BLOCK DEPLOYMENT"
+    return str(value)
