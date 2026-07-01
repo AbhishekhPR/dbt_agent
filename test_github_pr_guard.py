@@ -319,6 +319,8 @@ class GithubPrGuardTests(unittest.TestCase):
         self.assertIn("Deployment Decision", output)
         self.assertIn("Pipeline Health", output)
         self.assertIn("Evidence", output)
+        self.assertIn("Business Metrics", output)
+        self.assertIn("failed_pickups", output)
 
     def test_pr_review_demo_output_writes_markdown_file_and_exits_zero(self):
         from click.testing import CliRunner
@@ -349,6 +351,8 @@ class GithubPrGuardTests(unittest.TestCase):
         self.assertIn("Deployment Decision", written)
         self.assertIn("Pipeline Health", written)
         self.assertIn("Evidence", written)
+        self.assertIn("Business Metrics", written)
+        self.assertIn("failed_pickups", written)
 
     def test_github_pr_review_renders_business_metrics(self):
         incident = make_incident(

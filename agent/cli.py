@@ -465,6 +465,31 @@ def pr_review_demo(output):
                     "duplicate_count": 7,
                 },
             ),
+            Signal(
+                "business_metrics",
+                Severity.HIGH,
+                95,
+                -35,
+                reasons=["High severity metric spike detected"],
+                metadata={
+                    "model_name": "fulfillment_operations",
+                    "metrics": {
+                        "failed_pickups": 17,
+                        "mis_sorts": 14,
+                        "overflow_avalanches": 7,
+                    },
+                    "baseline": {
+                        "failed_pickups": 5,
+                        "mis_sorts": 5,
+                        "overflow_avalanches": 4,
+                    },
+                    "spike_percentages": {
+                        "failed_pickups": 240.0,
+                        "mis_sorts": 180.0,
+                        "overflow_avalanches": 75.0,
+                    },
+                },
+            ),
         ],
         metadata={"source": "pr-review-demo"},
     )
