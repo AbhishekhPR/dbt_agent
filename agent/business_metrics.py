@@ -1,7 +1,24 @@
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 from agent.signals import Signal
+
+
+@dataclass(frozen=True)
+class MetricDefinition:
+    name: str
+    description: str
+    event_type: str | None = None
+    expected_field: str | None = None
+    actual_field: str | None = None
+    status_field: str | None = None
+    status_value: str | None = None
+    boolean_field: str | None = None
+    numeric_field: str | None = None
+    numeric_min: int | float | None = None
+    requires_late_delivery: bool = False
+    spike_multiplier: int | float = 3
 
 
 METRIC_FIELDS = [
@@ -12,6 +29,46 @@ METRIC_FIELDS = [
     "overflow_avalanches",
 ]
 REQUIRED_FIELDS = METRIC_FIELDS + ["total_events"]
+
+DEFAULT_OPERATIONAL_METRICS = [
+    MetricDefinition(
+        name="carts_delivered_wrong_staging_area_and_late",
+        description="Carts delivered to the wrong staging area after the due time.",
+        event_type="cart_delivered",
+        expected_field="expected_staging_area",
+        actual_field="actual_staging_area",
+        requires_late_delivery=True,
+    ),
+    MetricDefinition(
+        name="mis_sorts",
+        description="Sort events where the actual location differs from expected.",
+        event_type="sort",
+        expected_field="expected_sort_location",
+        actual_field="actual_sort_location",
+    ),
+    MetricDefinition(
+        name="totes_loaded_in_incorrect_order",
+        description="Totes loaded outside the expected sequence.",
+        event_type="tote_loaded",
+        expected_field="expected_load_sequence",
+        actual_field="actual_load_sequence",
+    ),
+    MetricDefinition(
+        name="failed_pickups",
+        description="Pickup events with failed status.",
+        event_type="pickup",
+        status_field="pickup_status",
+        status_value="failed",
+    ),
+    MetricDefinition(
+        name="overflow_avalanches",
+        description="Overflow events where an avalanche was detected.",
+        event_type="overflow",
+        boolean_field="avalanche_detected",
+        numeric_field="overflow_count",
+        numeric_min=1,
+    ),
+]
 
 
 SEVERITY_CONFIDENCE = {
@@ -27,20 +84,18 @@ SEVERITY_SCORES = {
 
 
 def calculate_operational_metrics(events: list[dict]) -> dict:
-    metrics = {field: 0 for field in METRIC_FIELDS}
+    return calculate_metrics(events, DEFAULT_OPERATIONAL_METRICS)
+
+
+def calculate_metrics(events: list[dict], definitions: list[MetricDefinition]) -> dict:
+    definitions_copy = list(definitions)
+    metrics = {definition.name: 0 for definition in definitions_copy}
     metrics["total_events"] = len(events)
 
     for event in events:
-        if _wrong_staging_area_and_late(event):
-            metrics["carts_delivered_wrong_staging_area_and_late"] += 1
-        if _mismatch(event, "expected_sort_location", "actual_sort_location"):
-            metrics["mis_sorts"] += 1
-        if _mismatch(event, "expected_load_sequence", "actual_load_sequence"):
-            metrics["totes_loaded_in_incorrect_order"] += 1
-        if str(event.get("pickup_status", "")).lower() == "failed":
-            metrics["failed_pickups"] += 1
-        if event.get("avalanche_detected") is True and _number(event.get("overflow_count")) > 0:
-            metrics["overflow_avalanches"] += 1
+        for definition in definitions_copy:
+            if _matches_definition(event, definition):
+                metrics[definition.name] += 1
 
     return metrics
 
@@ -101,14 +156,35 @@ def to_signal(result: dict) -> Signal:
     )
 
 
-def _wrong_staging_area_and_late(event: dict) -> bool:
-    if not _mismatch(event, "expected_staging_area", "actual_staging_area"):
+def _matches_definition(event: dict, definition: MetricDefinition) -> bool:
+    if definition.event_type and event.get("event_type") != definition.event_type:
         return False
+    if definition.expected_field or definition.actual_field:
+        if not (
+            definition.expected_field
+            and definition.actual_field
+            and _mismatch(event, definition.expected_field, definition.actual_field)
+        ):
+            return False
+    if definition.status_field:
+        actual = str(event.get(definition.status_field, "")).lower()
+        expected = str(definition.status_value or "").lower()
+        if actual != expected:
+            return False
+    if definition.boolean_field and event.get(definition.boolean_field) is not True:
+        return False
+    if definition.numeric_field and definition.numeric_min is not None:
+        if _number(event.get(definition.numeric_field)) < definition.numeric_min:
+            return False
+    if definition.requires_late_delivery and not _is_late_delivery(event):
+        return False
+    return True
+
+
+def _is_late_delivery(event: dict) -> bool:
     delivered_at = event.get("delivered_at")
     due_at = event.get("due_at")
-    if not delivered_at or not due_at:
-        return False
-    return _timestamp(delivered_at) > _timestamp(due_at)
+    return bool(delivered_at and due_at and _timestamp(delivered_at) > _timestamp(due_at))
 
 
 def _mismatch(event: dict, expected_field: str, actual_field: str) -> bool:

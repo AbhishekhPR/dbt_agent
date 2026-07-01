@@ -2,6 +2,9 @@ import copy
 import unittest
 
 from agent.business_metrics import (
+    DEFAULT_OPERATIONAL_METRICS,
+    MetricDefinition,
+    calculate_metrics,
     calculate_operational_metrics,
     evaluate_metric_reliability,
     to_signal,
@@ -130,6 +133,88 @@ class BusinessMetricsTests(unittest.TestCase):
                 "total_events": 5,
             },
         )
+
+    def test_custom_metric_definition_works(self):
+        definition = MetricDefinition(
+            name="wrong_route_scans",
+            description="Scans where the actual route differs from expected.",
+            event_type="route_scan",
+            expected_field="expected_route",
+            actual_field="actual_route",
+        )
+
+        metrics = calculate_metrics(
+            [
+                {
+                    "event_type": "route_scan",
+                    "expected_route": "R1",
+                    "actual_route": "R2",
+                },
+                {
+                    "event_type": "route_scan",
+                    "expected_route": "R1",
+                    "actual_route": "R1",
+                },
+                {
+                    "event_type": "pickup",
+                    "expected_route": "R1",
+                    "actual_route": "R2",
+                },
+            ],
+            [definition],
+        )
+
+        self.assertEqual(metrics, {"wrong_route_scans": 1, "total_events": 3})
+
+    def test_default_definitions_match_operational_metrics(self):
+        events = [
+            {
+                "event_type": "cart_delivered",
+                "expected_staging_area": "A",
+                "actual_staging_area": "B",
+                "delivered_at": "2026-07-01T10:05:00",
+                "due_at": "2026-07-01T10:00:00",
+            },
+            {
+                "event_type": "sort",
+                "expected_sort_location": "lane-1",
+                "actual_sort_location": "lane-2",
+            },
+            {"event_type": "pickup", "pickup_status": "failed"},
+        ]
+
+        self.assertEqual(
+            calculate_metrics(events, DEFAULT_OPERATIONAL_METRICS),
+            calculate_operational_metrics(events),
+        )
+
+    def test_metric_definitions_are_not_mutated(self):
+        definitions = [
+            MetricDefinition(
+                name="late_wrong_area",
+                description="Late carts in the wrong staging area.",
+                event_type="cart_delivered",
+                expected_field="expected_staging_area",
+                actual_field="actual_staging_area",
+                requires_late_delivery=True,
+            )
+        ]
+        original = copy.deepcopy(definitions)
+
+        calculate_metrics(
+            [
+                {
+                    "event_type": "cart_delivered",
+                    "expected_staging_area": "A",
+                    "actual_staging_area": "B",
+                    "delivered_at": "2026-07-01T10:05:00",
+                    "due_at": "2026-07-01T10:00:00",
+                }
+            ],
+            definitions,
+        )
+
+        self.assertEqual(definitions, original)
 
     def test_empty_event_volume_is_high_severity(self):
         result = evaluate_metric_reliability({
