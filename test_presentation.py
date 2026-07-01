@@ -40,6 +40,51 @@ def make_incident():
     )
 
 
+def make_business_metric_incident(*, healthy=False):
+    signal = Signal(
+        component="business_metrics",
+        severity=Severity.LOW if healthy else Severity.HIGH,
+        confidence=90 if healthy else 95,
+        score=0 if healthy else -35,
+        reasons=(
+            ["Business metrics within expected range"]
+            if healthy
+            else ["High severity metric spike detected"]
+        ),
+        metadata={
+            "metrics": {
+                "failed_pickups": 17 if not healthy else 0,
+                "mis_sorts": 14 if not healthy else 0,
+                "overflow_avalanches": 7 if not healthy else 0,
+            },
+            "baseline": {
+                "failed_pickups": 5,
+                "mis_sorts": 5,
+                "overflow_avalanches": 4,
+            },
+            "spike_percentages": (
+                {}
+                if healthy
+                else {
+                    "failed_pickups": 240.0,
+                    "mis_sorts": 180.0,
+                    "overflow_avalanches": 75.0,
+                }
+            ),
+        },
+    )
+    return Incident(
+        incident_id="INC-BIZ",
+        health=65 if not healthy else 100,
+        decision=DeploymentDecision.BLOCK if not healthy else DeploymentDecision.ALLOW,
+        severity=Severity.HIGH if not healthy else Severity.LOW,
+        confidence=95 if not healthy else 90,
+        root_cause="High severity metric spike detected" if not healthy else "",
+        recommendation="Review business metric regressions." if not healthy else "",
+        signals=[signal],
+    )
+
+
 class PresentationTests(unittest.TestCase):
     def test_cli_contains_every_major_section(self):
         rendered = render_cli(make_incident())
@@ -230,6 +275,36 @@ class PresentationTests(unittest.TestCase):
         render_json(incident)
 
         self.assertEqual(incident, before)
+
+    def test_cli_renders_business_metrics(self):
+        rendered = render_cli(make_business_metric_incident())
+
+        self.assertIn("Business Metrics", rendered)
+        self.assertIn("- Failed Pickups +240%", rendered)
+        self.assertIn("- Mis-sorts +180%", rendered)
+        self.assertIn("- Overflow Avalanches +75%", rendered)
+
+    def test_markdown_renders_business_metrics(self):
+        rendered = render_markdown(make_business_metric_incident())
+
+        self.assertIn("## Business Metrics", rendered)
+        self.assertIn("- Failed Pickups +240%", rendered)
+        self.assertIn("- Mis-sorts +180%", rendered)
+        self.assertIn("- Overflow Avalanches +75%", rendered)
+
+    def test_healthy_business_metrics_render_healthy(self):
+        cli = render_cli(make_business_metric_incident(healthy=True))
+        markdown = render_markdown(make_business_metric_incident(healthy=True))
+
+        self.assertIn("Business Metrics", cli)
+        self.assertIn("Healthy", cli)
+        self.assertIn("## Business Metrics", markdown)
+        self.assertIn("Healthy", markdown)
+
+    def test_existing_rendering_has_no_business_metrics_without_signal(self):
+        rendered = render_cli(make_incident())
+
+        self.assertNotIn("Business Metrics", rendered)
 
 
 if __name__ == "__main__":

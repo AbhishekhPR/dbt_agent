@@ -350,6 +350,79 @@ class GithubPrGuardTests(unittest.TestCase):
         self.assertIn("Pipeline Health", written)
         self.assertIn("Evidence", written)
 
+    def test_github_pr_review_renders_business_metrics(self):
+        incident = make_incident(
+            signals=[
+                Signal(
+                    "business_metrics",
+                    Severity.HIGH,
+                    95,
+                    -35,
+                    reasons=["High severity metric spike detected"],
+                    metadata={
+                        "metrics": {
+                            "failed_pickups": 17,
+                            "mis_sorts": 14,
+                            "overflow_avalanches": 7,
+                        },
+                        "baseline": {
+                            "failed_pickups": 5,
+                            "mis_sorts": 5,
+                            "overflow_avalanches": 4,
+                        },
+                        "spike_percentages": {
+                            "failed_pickups": 240.0,
+                            "mis_sorts": 180.0,
+                            "overflow_avalanches": 75.0,
+                        },
+                    },
+                )
+            ],
+        )
+
+        review = build_pr_review(incident)
+        markdown = render_pr_review_markdown(review)
+
+        self.assertEqual(
+            review["business_metrics"],
+            [
+                "Failed Pickups +240%",
+                "Mis-sorts +180%",
+                "Overflow Avalanches +75%",
+            ],
+        )
+        self.assertIn("### Business Metrics", markdown)
+        self.assertIn("- Failed Pickups +240%", markdown)
+        self.assertIn("- Mis-sorts +180%", markdown)
+        self.assertIn("- Overflow Avalanches +75%", markdown)
+
+    def test_github_pr_review_renders_healthy_business_metrics(self):
+        incident = make_incident(
+            decision=DeploymentDecision.ALLOW,
+            health=100,
+            severity=Severity.LOW,
+            confidence=90,
+            signals=[
+                Signal(
+                    "business_metrics",
+                    Severity.LOW,
+                    90,
+                    0,
+                    reasons=["Business metrics within expected range"],
+                    metadata={
+                        "metrics": {"failed_pickups": 0},
+                        "baseline": {"failed_pickups": 1},
+                        "spike_percentages": {},
+                    },
+                )
+            ],
+        )
+
+        markdown = render_pr_review_markdown(build_pr_review(incident))
+
+        self.assertIn("### Business Metrics", markdown)
+        self.assertIn("Healthy", markdown)
+
 
 if __name__ == "__main__":
     unittest.main()

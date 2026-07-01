@@ -217,6 +217,30 @@ class DecisionAssemblyTests(unittest.TestCase):
 
         self.assertEqual(incident.health, 15)
 
+    def test_business_metric_signal_participates_in_decision_assembly(self):
+        incident = assemble_decision_incident([
+            Signal("metadata_checks", Severity.LOW, 90, 0),
+            Signal(
+                "business_metrics",
+                Severity.HIGH,
+                95,
+                -35,
+                reasons=["High severity metric spike detected"],
+                metadata={
+                    "metrics": {"failed_pickups": 17},
+                    "baseline": {"failed_pickups": 5},
+                    "spike_percentages": {"failed_pickups": 240.0},
+                },
+            ),
+        ])
+
+        self.assertEqual(incident.health, 65)
+        self.assertEqual(incident.severity, Severity.HIGH)
+        self.assertEqual(
+            incident.signals[1].metadata["spike_percentages"],
+            {"failed_pickups": 240.0},
+        )
+
     def test_pipeline_decision_blocks_when_combined_health_is_low(self):
         incident = assemble_pipeline_incident(
             metadata_signal=Signal("metadata_checks", Severity.HIGH, 95, -30),

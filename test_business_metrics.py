@@ -185,6 +185,7 @@ class BusinessMetricsTests(unittest.TestCase):
         self.assertEqual(result["severity"], "HIGH")
         self.assertIn("High severity metric spike detected", result["reasons"])
         self.assertEqual(result["metadata"]["spike_fields"], ["mis_sorts"])
+        self.assertEqual(result["metadata"]["spike_percentages"]["mis_sorts"], 200.0)
 
     def test_high_severity_spike_becomes_high_signal(self):
         result = evaluate_metric_reliability(

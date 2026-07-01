@@ -56,6 +56,7 @@ def evaluate_metric_reliability(
         if field not in metrics_copy
     ]
     spike_fields = _spike_fields(metrics_copy, baseline_copy)
+    spike_percentages = _spike_percentages(metrics_copy, baseline_copy, spike_fields)
 
     reasons = []
     if missing_fields:
@@ -83,6 +84,7 @@ def evaluate_metric_reliability(
             "baseline": baseline_copy,
             "missing_fields": missing_fields,
             "spike_fields": spike_fields,
+            "spike_percentages": spike_percentages,
             "total_events": metrics_copy.get("total_events", 0),
         },
     }
@@ -133,6 +135,24 @@ def _spike_fields(metrics: dict, baseline: dict | None) -> list[str]:
         elif previous == 0 and current >= 3:
             spike_fields.append(field)
     return spike_fields
+
+
+def _spike_percentages(
+    metrics: dict,
+    baseline: dict | None,
+    spike_fields: list[str],
+) -> dict[str, float]:
+    if not baseline:
+        return {}
+    percentages = {}
+    for field in spike_fields:
+        current = _number(metrics.get(field))
+        previous = _number(baseline.get(field))
+        if previous == 0:
+            percentages[field] = 100.0
+        else:
+            percentages[field] = round(((current - previous) / previous) * 100, 1)
+    return percentages
 
 
 def _severity(

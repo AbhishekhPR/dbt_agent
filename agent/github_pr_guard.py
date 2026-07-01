@@ -11,6 +11,7 @@ REVIEW_TITLE = "Relium AI Deployment Review"
 def build_pr_review(incident: Incident) -> dict[str, Any]:
     reasoning = build_reasoning_report(incident)
     model_names = _model_names(incident)
+    business_metrics = _business_metrics(incident)
 
     return {
         "title": REVIEW_TITLE,
@@ -36,6 +37,7 @@ def build_pr_review(incident: Incident) -> dict[str, Any]:
             for item in reasoning.evidence
         ],
         "recommendation": reasoning.recommendation,
+        "business_metrics": business_metrics,
         "signals_considered": [
             {
                 "component": signal.component,
@@ -73,10 +75,63 @@ def render_pr_review_markdown(review: dict) -> str:
             "### Recommendation",
             _review_text(review, "recommendation", "None"),
             "",
+            *_business_metric_section(review.get("business_metrics", [])),
             "### Signals Considered",
             *_signal_lines(review.get("signals_considered", [])),
         ]
     )
+
+
+def _business_metric_section(lines: list[str]) -> list[str]:
+    if not lines:
+        return []
+    return [
+        "### Business Metrics",
+        *_bullet_lines(lines),
+        "",
+    ]
+
+
+def _bullet_lines(items: list[str]) -> list[str]:
+    if not items:
+        return ["- None"]
+    return [f"- {item}" for item in items]
+
+
+def _business_metrics(incident: Incident) -> list[str]:
+    for signal in incident.signals:
+        if signal.component == "business_metrics":
+            return _business_metric_lines_from_metadata(signal.metadata)
+    return []
+
+
+def _business_metric_lines_from_metadata(metadata: dict) -> list[str]:
+    spike_percentages = metadata.get("spike_percentages") or {}
+    if not spike_percentages:
+        return ["Healthy"]
+    return [
+        f"{_business_metric_label(name)} +{_format_percentage(value)}"
+        for name, value in spike_percentages.items()
+    ]
+
+
+def _business_metric_label(name: str) -> str:
+    labels = {
+        "mis_sorts": "Mis-sorts",
+    }
+    if name in labels:
+        return labels[name]
+    return " ".join(part.capitalize() for part in str(name).split("_"))
+
+
+def _format_percentage(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if number == int(number):
+        return f"{int(number)}%"
+    return f"{number:.1f}%"
 
 
 def _model_names(incident: Incident) -> list[str]:

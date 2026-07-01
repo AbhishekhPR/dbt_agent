@@ -38,8 +38,45 @@ def _bullet_list(items: list[str]) -> list[str]:
     return [f"- {_display_text(item)}" for item in items]
 
 
+def _business_metric_lines(incident: Incident) -> list[str]:
+    for signal in incident.signals:
+        if signal.component == "business_metrics":
+            return _business_metric_lines_from_metadata(signal.metadata)
+    return []
+
+
+def _business_metric_lines_from_metadata(metadata: dict) -> list[str]:
+    spike_percentages = metadata.get("spike_percentages") or {}
+    if not spike_percentages:
+        return ["Healthy"]
+    return [
+        f"{_business_metric_label(name)} +{_format_percentage(value)}"
+        for name, value in spike_percentages.items()
+    ]
+
+
+def _business_metric_label(name: str) -> str:
+    labels = {
+        "mis_sorts": "Mis-sorts",
+    }
+    if name in labels:
+        return labels[name]
+    return " ".join(part.capitalize() for part in str(name).split("_"))
+
+
+def _format_percentage(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if number == int(number):
+        return f"{int(number)}%"
+    return f"{number:.1f}%"
+
+
 def render_cli(incident: Incident) -> str:
     reasoning = build_reasoning_report(incident)
+    business_metric_lines = _business_metric_lines(incident)
     lines = [
         "Relium Deployment Decision",
         "",
@@ -58,6 +95,13 @@ def render_cli(incident: Incident) -> str:
         "Signals Considered:",
         *_bullet_list([signal.component for signal in incident.signals]),
     ]
+
+    if business_metric_lines:
+        lines.extend([
+            "",
+            "Business Metrics",
+            *_bullet_list(business_metric_lines),
+        ])
 
     if incident.affected_models:
         lines.extend([
@@ -85,6 +129,7 @@ def render_cli(incident: Incident) -> str:
 
 def render_markdown(incident: Incident) -> str:
     reasoning = build_reasoning_report(incident)
+    business_metric_lines = _business_metric_lines(incident)
     lines = [
         "# Relium Deployment Decision",
         "",
@@ -112,6 +157,13 @@ def render_markdown(incident: Incident) -> str:
         "## Signals Considered",
         *_bullet_list([signal.component for signal in incident.signals]),
     ]
+
+    if business_metric_lines:
+        lines.extend([
+            "",
+            "## Business Metrics",
+            *_bullet_list(business_metric_lines),
+        ])
 
     if incident.affected_models:
         lines.extend([

@@ -161,6 +161,37 @@ class ReasoningEngineTests(unittest.TestCase):
             {"deployment_count": 20},
         )
 
+    def test_business_metric_signal_appears_in_evidence_and_recommendation(self):
+        incident = make_incident(
+            recommendation="Review business metric regressions.",
+            signals=[
+                Signal(
+                    "business_metrics",
+                    Severity.HIGH,
+                    95,
+                    -35,
+                    reasons=["High severity metric spike detected"],
+                    metadata={
+                        "metrics": {"failed_pickups": 17},
+                        "baseline": {"failed_pickups": 5},
+                        "spike_percentages": {"failed_pickups": 240.0},
+                    },
+                )
+            ],
+        )
+
+        report = build_reasoning_report(incident)
+
+        self.assertEqual(
+            report.evidence[0].title,
+            "Business Metrics: High severity metric spike detected",
+        )
+        self.assertEqual(
+            report.evidence[0].supporting_metadata["spike_percentages"],
+            {"failed_pickups": 240.0},
+        )
+        self.assertEqual(report.recommendation, "Review business metric regressions.")
+
     def test_evidence_order_is_deterministic(self):
         signals = [
             Signal("metadata_checks", Severity.HIGH, 95, -30, reasons=["A", "B"]),
