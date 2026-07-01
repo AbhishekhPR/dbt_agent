@@ -50,6 +50,35 @@ def build_pr_review(incident: Incident) -> dict[str, Any]:
     }
 
 
+def render_pr_review_markdown(review: dict) -> str:
+    return "\n".join(
+        [
+            "## Relium AI Deployment Review",
+            "",
+            f"**Deployment Decision:** {_review_text(review, 'deployment_decision')}",
+            f"**Pipeline Health:** {_review_text(review, 'pipeline_health')}",
+            f"**Confidence:** {_review_text(review, 'confidence')}",
+            f"**Models Reviewed:** {_review_text(review, 'models_reviewed')}",
+            f"**Highest Severity:** {_review_text(review, 'highest_severity')}",
+            "",
+            "### Primary Root Cause",
+            _review_text(review, "primary_root_cause", "None"),
+            "",
+            "### Executive Summary",
+            _review_text(review, "executive_summary", "None"),
+            "",
+            "### Evidence",
+            *_evidence_lines(review.get("evidence", [])),
+            "",
+            "### Recommendation",
+            _review_text(review, "recommendation", "None"),
+            "",
+            "### Signals Considered",
+            *_signal_lines(review.get("signals_considered", [])),
+        ]
+    )
+
+
 def _model_names(incident: Incident) -> list[str]:
     names = []
     for model_name in incident.affected_models:
@@ -57,6 +86,42 @@ def _model_names(incident: Incident) -> list[str]:
     for signal in incident.signals:
         _append_unique(names, signal.metadata.get("model_name"))
     return names
+
+
+def _evidence_lines(evidence: list[dict]) -> list[str]:
+    if not evidence:
+        return ["- None"]
+    return [
+        (
+            f"- **{_text(item.get('title'), 'Evidence')}** "
+            f"(severity: {_text(item.get('severity'))}, "
+            f"confidence: {_text(item.get('confidence'))}%)"
+        )
+        for item in evidence
+    ]
+
+
+def _signal_lines(signals: list[dict]) -> list[str]:
+    if not signals:
+        return ["- None"]
+    return [
+        (
+            f"- **{_text(signal.get('component'), 'signal')}** "
+            f"(severity: {_text(signal.get('severity'))}, "
+            f"confidence: {_text(signal.get('confidence'))}%)"
+        )
+        for signal in signals
+    ]
+
+
+def _review_text(review: dict, key: str, default: str = "") -> str:
+    return _text(review.get(key), default)
+
+
+def _text(value: Any, default: str = "") -> str:
+    if value is None or value == "":
+        return default
+    return str(value)
 
 
 def _append_unique(values: list[str], value: Any) -> None:

@@ -3,7 +3,7 @@ import json
 import unittest
 
 from agent.decision_engine import DeploymentDecision
-from agent.github_pr_guard import build_pr_review
+from agent.github_pr_guard import build_pr_review, render_pr_review_markdown
 from agent.incident import Incident
 from agent.signals import Severity, Signal
 
@@ -197,6 +197,104 @@ class GithubPrGuardTests(unittest.TestCase):
         review["evidence"][0]["supporting_metadata"]["model_name"] = "mutated"
 
         self.assertEqual(incident, before)
+
+    def test_markdown_contains_all_major_sections(self):
+        markdown = render_pr_review_markdown(build_pr_review(make_incident()))
+
+        self.assertIn("## Relium AI Deployment Review", markdown)
+        self.assertIn("**Deployment Decision:** BLOCK", markdown)
+        self.assertIn("**Pipeline Health:** 42 / 100", markdown)
+        self.assertIn("**Confidence:** 91%", markdown)
+        self.assertIn("**Models Reviewed:** 2", markdown)
+        self.assertIn("**Highest Severity:** CRITICAL", markdown)
+        self.assertIn("### Primary Root Cause", markdown)
+        self.assertIn("### Executive Summary", markdown)
+        self.assertIn("### Evidence", markdown)
+        self.assertIn("### Recommendation", markdown)
+        self.assertIn("### Signals Considered", markdown)
+
+    def test_block_review_markdown_renders_clearly(self):
+        markdown = render_pr_review_markdown(build_pr_review(make_incident()))
+
+        self.assertIn("**Deployment Decision:** BLOCK", markdown)
+        self.assertIn("Deployment is blocked because", markdown)
+        self.assertIn("LEFT JOIN nullification detected", markdown)
+        self.assertIn("Move right-side filters into JOIN clauses.", markdown)
+
+    def test_warn_and_allow_markdown_render_correctly(self):
+        warn = render_pr_review_markdown(
+            build_pr_review(
+                make_incident(
+                    decision=DeploymentDecision.WARN,
+                    health=78,
+                    severity=Severity.MEDIUM,
+                    confidence=84,
+                )
+            )
+        )
+        allow = render_pr_review_markdown(
+            build_pr_review(
+                make_incident(
+                    decision=DeploymentDecision.ALLOW,
+                    health=99,
+                    severity=Severity.LOW,
+                    confidence=76,
+                    recommendation="Deploy normally.",
+                    affected_models=["fct_orders"],
+                    signals=[],
+                )
+            )
+        )
+
+        self.assertIn("**Deployment Decision:** WARN", warn)
+        self.assertIn("**Pipeline Health:** 78 / 100", warn)
+        self.assertIn("Deployment should proceed with caution", warn)
+        self.assertIn("**Deployment Decision:** ALLOW", allow)
+        self.assertIn("**Pipeline Health:** 99 / 100", allow)
+        self.assertIn("Deployment is allowed", allow)
+
+    def test_markdown_preserves_evidence_order(self):
+        review = build_pr_review(
+            make_incident(
+                signals=[
+                    Signal("metadata_checks", Severity.HIGH, 95, -30, reasons=["A", "B"]),
+                    Signal("blast_radius", Severity.MEDIUM, 85, -15, reasons=["C"]),
+                ]
+            )
+        )
+
+        markdown = render_pr_review_markdown(review)
+
+        first = markdown.index("Metadata Checks: A")
+        second = markdown.index("Metadata Checks: B")
+        third = markdown.index("Blast Radius: C")
+        self.assertLess(first, second)
+        self.assertLess(second, third)
+
+    def test_empty_evidence_and_signals_are_handled_gracefully(self):
+        markdown = render_pr_review_markdown(
+            build_pr_review(
+                make_incident(
+                    decision=DeploymentDecision.ALLOW,
+                    health=100,
+                    severity=Severity.LOW,
+                    confidence=75,
+                    affected_models=[],
+                    signals=[],
+                )
+            )
+        )
+
+        self.assertIn("### Evidence\n- None", markdown)
+        self.assertIn("### Signals Considered\n- None", markdown)
+
+    def test_markdown_does_not_mutate_review_object(self):
+        review = build_pr_review(make_incident())
+        before = copy.deepcopy(review)
+
+        render_pr_review_markdown(review)
+
+        self.assertEqual(review, before)
 
 
 if __name__ == "__main__":
