@@ -1,6 +1,8 @@
 import copy
+import io
 import json
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 
 from agent.decision_engine import DeploymentDecision
 from agent.github_pr_guard import build_pr_review, render_pr_review_markdown
@@ -295,6 +297,26 @@ class GithubPrGuardTests(unittest.TestCase):
         render_pr_review_markdown(review)
 
         self.assertEqual(review, before)
+
+    def test_pr_review_demo_command_prints_markdown_and_exits_zero(self):
+        from click.testing import CliRunner
+
+        from agent.cli import cli
+
+        escaped_stdout = io.StringIO()
+        escaped_stderr = io.StringIO()
+        with redirect_stdout(escaped_stdout), redirect_stderr(escaped_stderr):
+            result = CliRunner().invoke(cli, ["pr-review-demo"])
+        output = result.output
+        escaped_output = escaped_stdout.getvalue() + escaped_stderr.getvalue()
+        if escaped_output:
+            output += escaped_output
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("Relium AI Deployment Review", output)
+        self.assertIn("Deployment Decision", output)
+        self.assertIn("Pipeline Health", output)
+        self.assertIn("Evidence", output)
 
 
 if __name__ == "__main__":

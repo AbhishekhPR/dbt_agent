@@ -425,6 +425,50 @@ def demo_pipeline(scenario, decision):
         click.echo(render_cli(result["incident"]))
 
 
+@cli.command(name="pr-review-demo")
+def pr_review_demo():
+    """Render a deterministic GitHub PR Guard review locally."""
+    from agent.decision_engine import DeploymentDecision
+    from agent.github_pr_guard import build_pr_review, render_pr_review_markdown
+    from agent.incident import Incident
+    from agent.signals import Severity, Signal
+
+    incident = Incident(
+        incident_id="INC-PR-DEMO",
+        health=42,
+        decision=DeploymentDecision.BLOCK,
+        severity=Severity.CRITICAL,
+        confidence=91,
+        root_cause="Cross join detected in fct_orders.",
+        recommendation="Review the join logic before deployment.",
+        affected_models=["fct_orders", "dashboard_revenue"],
+        signals=[
+            Signal(
+                "ast",
+                Severity.CRITICAL,
+                95,
+                -70,
+                reasons=["Cross join detected"],
+                metadata={"model_name": "fct_orders", "rule": "CROSS_JOIN"},
+            ),
+            Signal(
+                "metadata_checks",
+                Severity.HIGH,
+                85,
+                -30,
+                reasons=["Duplicate count increased"],
+                metadata={
+                    "model_name": "dashboard_revenue",
+                    "duplicate_count": 7,
+                },
+            ),
+        ],
+        metadata={"source": "pr-review-demo"},
+    )
+    review = build_pr_review(incident)
+    click.echo(render_pr_review_markdown(review))
+
+
 @cli.command(name="compare-last-run")
 @click.option('--db', default=None, help='Path to metadata SQLite database')
 @click.option('--project', default=None, help='Project name to compare (optional)')
