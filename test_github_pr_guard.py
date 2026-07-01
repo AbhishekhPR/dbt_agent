@@ -1,8 +1,10 @@
 import copy
 import io
 import json
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 
 from agent.decision_engine import DeploymentDecision
 from agent.github_pr_guard import build_pr_review, render_pr_review_markdown
@@ -317,6 +319,36 @@ class GithubPrGuardTests(unittest.TestCase):
         self.assertIn("Deployment Decision", output)
         self.assertIn("Pipeline Health", output)
         self.assertIn("Evidence", output)
+
+    def test_pr_review_demo_output_writes_markdown_file_and_exits_zero(self):
+        from click.testing import CliRunner
+
+        from agent.cli import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "relium_pr_review.md"
+            escaped_stdout = io.StringIO()
+            escaped_stderr = io.StringIO()
+            with redirect_stdout(escaped_stdout), redirect_stderr(escaped_stderr):
+                result = CliRunner().invoke(
+                    cli,
+                    ["pr-review-demo", "--output", str(output_path)],
+                )
+            output = result.output
+            escaped_output = escaped_stdout.getvalue() + escaped_stderr.getvalue()
+            if escaped_output:
+                output += escaped_output
+
+            self.assertEqual(result.exit_code, 0, output)
+            self.assertTrue(output_path.exists())
+            written = output_path.read_text(encoding="utf-8")
+
+        self.assertIn("PR review written to", output)
+        self.assertIn("relium_pr_review.md", output)
+        self.assertIn("Relium AI Deployment Review", written)
+        self.assertIn("Deployment Decision", written)
+        self.assertIn("Pipeline Health", written)
+        self.assertIn("Evidence", written)
 
 
 if __name__ == "__main__":

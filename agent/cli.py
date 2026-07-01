@@ -426,8 +426,11 @@ def demo_pipeline(scenario, decision):
 
 
 @cli.command(name="pr-review-demo")
-def pr_review_demo():
+@click.option('--output', default=None, help='Write the review Markdown to this file')
+def pr_review_demo(output):
     """Render a deterministic GitHub PR Guard review locally."""
+    from pathlib import Path
+
     from agent.decision_engine import DeploymentDecision
     from agent.github_pr_guard import build_pr_review, render_pr_review_markdown
     from agent.incident import Incident
@@ -466,7 +469,14 @@ def pr_review_demo():
         metadata={"source": "pr-review-demo"},
     )
     review = build_pr_review(incident)
-    click.echo(render_pr_review_markdown(review))
+    markdown = render_pr_review_markdown(review)
+    if output:
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(markdown, encoding="utf-8")
+        click.echo(f"PR review written to {output}")
+        return
+    click.echo(markdown)
 
 
 @cli.command(name="compare-last-run")
