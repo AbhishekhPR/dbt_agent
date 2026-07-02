@@ -1,0 +1,161 @@
+{
+  "metadata": {
+    "project_name": "relium_history_aware_demo",
+    "dbt_version": "1.8.0"
+  },
+  "nodes": {
+    "model.relium_history_aware_demo.stg_orders": {
+      "resource_type": "model",
+      "name": "stg_orders",
+      "unique_id": "model.relium_history_aware_demo.stg_orders",
+      "original_file_path": "models/staging/stg_orders.sql",
+      "columns": {
+        "order_id": {
+          "name": "order_id"
+        },
+        "customer_id": {
+          "name": "customer_id"
+        }
+      },
+      "depends_on": {
+        "nodes": [
+          "source.relium_history_aware_demo.orders"
+        ]
+      },
+      "description": "Clean order records used by revenue models.",
+      "tags": [
+        "orders",
+        "revenue"
+      ],
+      "config": {
+        "materialized": "view"
+      }
+    },
+    "model.relium_history_aware_demo.stg_payments": {
+      "resource_type": "model",
+      "name": "stg_payments",
+      "unique_id": "model.relium_history_aware_demo.stg_payments",
+      "original_file_path": "models/staging/stg_payments.sql",
+      "columns": {
+        "payment_id": {
+          "name": "payment_id"
+        },
+        "order_id": {
+          "name": "order_id"
+        },
+        "payment_amount": {
+          "name": "payment_amount"
+        }
+      },
+      "depends_on": {
+        "nodes": [
+          "source.relium_history_aware_demo.payments"
+        ]
+      },
+      "description": "Completed customer payment events.",
+      "tags": [
+        "payments",
+        "revenue"
+      ],
+      "config": {
+        "materialized": "view"
+      }
+    },
+    "model.relium_history_aware_demo.fct_revenue": {
+      "resource_type": "model",
+      "name": "fct_revenue",
+      "unique_id": "model.relium_history_aware_demo.fct_revenue",
+      "original_file_path": "models/marts/fct_revenue.sql",
+      "columns": {
+        "order_id": {
+          "name": "order_id"
+        },
+        "gross_revenue": {
+          "name": "gross_revenue"
+        },
+        "completed_payment_amount": {
+          "name": "completed_payment_amount"
+        }
+      },
+      "depends_on": {
+        "nodes": [
+          "model.relium_history_aware_demo.stg_orders",
+          "model.relium_history_aware_demo.stg_payments"
+        ]
+      },
+      "refs": [
+        [
+          "stg_orders"
+        ],
+        [
+          "stg_payments"
+        ]
+      ],
+      "description": "Revenue fact table for completed customer payments.",
+      "tags": [
+        "revenue",
+        "payments"
+      ],
+      "config": {
+        "materialized": "table"
+      }
+    }
+  },
+  "sources": {
+    "source.relium_history_aware_demo.orders": {
+      "resource_type": "source",
+      "name": "orders",
+      "unique_id": "source.relium_history_aware_demo.orders",
+      "columns": {
+        "order_id": {
+          "name": "order_id"
+        },
+        "customer_id": {
+          "name": "customer_id"
+        }
+      },
+      "description": "Raw order events."
+    },
+    "source.relium_history_aware_demo.payments": {
+      "resource_type": "source",
+      "name": "payments",
+      "unique_id": "source.relium_history_aware_demo.payments",
+      "columns": {
+        "payment_id": {
+          "name": "payment_id"
+        },
+        "payment_amount": {
+          "name": "payment_amount"
+        }
+      },
+      "description": "Raw payment events."
+    }
+  },
+  "metrics": {
+    "metric.relium_history_aware_demo.revenue": {
+      "resource_type": "metric",
+      "name": "Revenue",
+      "label": "Revenue",
+      "type": "simple",
+      "description": "Represents completed customer payments.",
+      "model": "ref('fct_revenue')"
+    }
+  },
+  "exposures": {
+    "exposure.relium_history_aware_demo.revenue_dashboard": {
+      "resource_type": "exposure",
+      "name": "revenue_dashboard",
+      "type": "dashboard",
+      "depends_on": {
+        "nodes": [
+          "model.relium_history_aware_demo.fct_revenue",
+          "metric.relium_history_aware_demo.revenue"
+        ]
+      },
+      "owner": {
+        "name": "Analytics"
+      },
+      "description": "Dashboard that monitors Revenue."
+    }
+  }
+}

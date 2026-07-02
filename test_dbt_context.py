@@ -11,6 +11,9 @@ from agent.dbt_context import (
 from agent.semantic_context import build_semantic_context
 
 
+DEMO_DIR = Path(__file__).parent / "demo" / "history_aware"
+
+
 class DbtContextTests(unittest.TestCase):
     def test_extracts_model_names(self):
         context = extract_project_context_from_manifest(_manifest())
@@ -156,6 +159,35 @@ class DbtContextTests(unittest.TestCase):
         serialized = json.dumps(context)
 
         self.assertIsInstance(serialized, str)
+
+    def test_history_aware_demo_manifests_load_through_dbt_context(self):
+        previous = load_project_context_from_manifest_path(
+            str(DEMO_DIR / "manifest_previous.json")
+        )
+        current = load_project_context_from_manifest_path(
+            str(DEMO_DIR / "manifest_current.json")
+        )
+
+        self.assertIn("fct_revenue", previous["model_names"])
+        self.assertIn("fct_revenue", current["model_names"])
+        self.assertIn("stg_refunds", current["model_names"])
+        self.assertEqual(previous["metrics"][0]["name"], "Revenue")
+        self.assertEqual(current["metrics"][0]["name"], "Revenue")
+
+    def test_history_aware_demo_current_context_preserves_revenue_kpi_name(self):
+        context = load_project_context_from_manifest_path(
+            str(DEMO_DIR / "manifest_current.json")
+        )
+
+        semantic_context = build_semantic_context(
+            project_context=context,
+            changed_models=["fct_revenue"],
+        )
+
+        self.assertIn(
+            "Revenue",
+            [contract.kpi_name for contract in semantic_context.knowledge_report.contracts],
+        )
 
 
 def _named(items, name):

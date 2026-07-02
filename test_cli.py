@@ -15,6 +15,9 @@ from agent.incident import Incident
 from agent.signals import Severity, Signal
 
 
+DEMO_DIR = Path(__file__).parent / "demo" / "history_aware"
+
+
 class CliTests(unittest.TestCase):
     def test_review_deployment_accepts_dbt_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -445,6 +448,81 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0, output)
         self.assertIn("Relium AI Deployment Review", output)
+
+    def test_history_aware_demo_current_manifest_produces_successful_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "deployment_history.json"
+
+            result, output = _invoke(
+                [
+                    "review-deployment",
+                    "--dbt-manifest",
+                    str(DEMO_DIR / "manifest_current.json"),
+                    "--changed-model",
+                    "fct_revenue",
+                    "--history-path",
+                    str(history_path),
+                    "--deployment-id",
+                    "current_deploy",
+                    "--format",
+                    "markdown",
+                ]
+            )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("Deployment Decision", output)
+        self.assertIn("Pipeline Health", output)
+
+    def test_history_aware_demo_loads_previous_snapshot_and_shows_semantic_diff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "deployment_history.json"
+            history_path.write_text(
+                (DEMO_DIR / ".relium" / "deployment_history.json").read_text(
+                    encoding="utf-8"
+                ),
+                encoding="utf-8",
+            )
+            current_result, current_output = _invoke(
+                [
+                    "review-deployment",
+                    "--dbt-manifest",
+                    str(DEMO_DIR / "manifest_current.json"),
+                    "--changed-model",
+                    "fct_revenue",
+                    "--history-path",
+                    str(history_path),
+                    "--deployment-id",
+                    "current_deploy",
+                    "--format",
+                    "markdown",
+                ]
+            )
+
+        self.assertEqual(current_result.exit_code, 0, current_output)
+        self.assertIn("**Previous Snapshot Loaded:** YES", current_output)
+        self.assertIn("### Historical Semantic Change", current_output)
+        self.assertIn("Revenue gained upstream dependency refunds", current_output)
+
+    def test_history_aware_demo_prebuilt_history_fixture_supports_one_command_review(self):
+        result, output = _invoke(
+            [
+                "review-deployment",
+                "--dbt-manifest",
+                str(DEMO_DIR / "manifest_current.json"),
+                "--changed-model",
+                "fct_revenue",
+                "--history-path",
+                str(DEMO_DIR / ".relium" / "deployment_history.json"),
+                "--deployment-id",
+                "current_deploy",
+                "--format",
+                "markdown",
+            ]
+        )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("**Previous Snapshot Loaded:** YES", output)
+        self.assertIn("Revenue gained upstream dependency refunds", output)
 
 
 def _invoke(args):
