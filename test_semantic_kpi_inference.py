@@ -3,7 +3,8 @@ import unittest
 
 from agent.kpi_discovery import DiscoveredKPI
 from agent.semantic_graph import build_semantic_graph
-from agent.semantic_kpi_inference import ImpactedKPI, KPIImpactReport, infer_impacted_kpis
+from agent.semantic_kpi_inference import ImpactedKPI, KPIImpactReport, infer_impacted_kpis, to_signal
+from agent.signals import Severity
 
 
 class SemanticKPIInferenceTests(unittest.TestCase):
@@ -240,6 +241,72 @@ class SemanticKPIInferenceTests(unittest.TestCase):
         self.assertEqual(lineage, original_lineage)
         self.assertEqual(semantic_graph, original_semantic_graph)
 
+    def test_high_confidence_impacted_kpis_become_high_signal(self):
+        report = _impact_report(confidence=95)
+
+        signal = to_signal(report)
+
+        self.assertEqual(signal.component, "kpi_impact")
+        self.assertEqual(signal.severity, Severity.HIGH)
+        self.assertEqual(signal.confidence, 95)
+        self.assertEqual(signal.score, -30)
+
+    def test_impacted_kpis_below_high_threshold_become_medium_signal(self):
+        report = _impact_report(confidence=85)
+
+        signal = to_signal(report)
+
+        self.assertEqual(signal.severity, Severity.MEDIUM)
+        self.assertEqual(signal.confidence, 85)
+        self.assertEqual(signal.score, -15)
+
+    def test_no_impacted_kpis_becomes_low_signal(self):
+        report = KPIImpactReport(
+            changed_models=["stg_weather"],
+            impacted_kpis=[],
+            unaffected_kpis=[_kpi(name="Revenue", related_models=["fct_orders"])],
+            confidence=0,
+            reasons=[],
+            metadata={"semantic_graph_provided": True},
+        )
+
+        signal = to_signal(report)
+
+        self.assertEqual(signal.severity, Severity.LOW)
+        self.assertEqual(signal.confidence, 0)
+        self.assertEqual(signal.score, 0)
+
+    def test_signal_metadata_preserves_impacted_kpi_names(self):
+        signal = to_signal(_impact_report(confidence=95))
+
+        self.assertEqual(signal.metadata["impacted_kpis"], ["Revenue"])
+        self.assertEqual(signal.metadata["unaffected_kpis"], ["Churn / Retention"])
+
+    def test_signal_metadata_preserves_impact_paths(self):
+        signal = to_signal(_impact_report(confidence=95))
+
+        self.assertEqual(
+            signal.metadata["impact_paths"],
+            [["stg_orders", "fct_orders", "Revenue"]],
+        )
+
+    def test_signal_reasons_include_semantic_path_explanation(self):
+        signal = to_signal(_impact_report(confidence=95))
+
+        self.assertIn("Revenue impacted by stg_orders, fct_orders", signal.reasons)
+        self.assertIn(
+            "Revenue is impacted through stg_orders → fct_orders → Revenue",
+            signal.reasons,
+        )
+
+    def test_to_signal_does_not_mutate_report(self):
+        report = _impact_report(confidence=95)
+        original = copy.deepcopy(report)
+
+        to_signal(report)
+
+        self.assertEqual(report, original)
+
 
 def _kpi(
     *,
@@ -271,6 +338,32 @@ def _semantic_graph():
             "refs": [{"parent": "stg_orders", "child": "fct_orders"}],
             "metrics": [{"name": "Revenue", "model": "fct_orders"}],
         }
+    )
+
+
+def _impact_report(confidence):
+    return KPIImpactReport(
+        changed_models=["stg_orders"],
+        impacted_kpis=[
+            ImpactedKPI(
+                name="Revenue",
+                confidence=confidence,
+                impacted_by_models=["stg_orders", "fct_orders"],
+                related_columns=["gross_revenue"],
+                reasons=[
+                    "Revenue evidence",
+                    "Revenue is impacted through stg_orders → fct_orders → Revenue",
+                ],
+                metadata={
+                    "impact_paths": [["stg_orders", "fct_orders", "Revenue"]],
+                    "source_kpi_confidence": 75,
+                },
+            )
+        ],
+        unaffected_kpis=[_kpi(name="Churn / Retention", related_models=["fct_subscriptions"])],
+        confidence=confidence,
+        reasons=["Revenue impacted by stg_orders, fct_orders"],
+        metadata={"semantic_graph_provided": True, "impacted_count": 1},
     )
 
 

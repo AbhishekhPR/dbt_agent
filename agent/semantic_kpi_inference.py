@@ -4,6 +4,7 @@ from typing import Any
 
 from agent.kpi_discovery import DiscoveredKPI
 from agent.semantic_graph import SemanticGraph, explain_path
+from agent.signals import Signal
 
 
 @dataclass
@@ -68,6 +69,19 @@ def infer_impacted_kpis(
             "impacted_count": len(impacted),
             "unaffected_count": len(unaffected),
         },
+    )
+
+
+def to_signal(report: KPIImpactReport) -> Signal:
+    impacted_kpis = list(report.impacted_kpis or [])
+    severity = _signal_severity(impacted_kpis, report.confidence)
+    return Signal(
+        component="kpi_impact",
+        severity=severity,
+        confidence=report.confidence,
+        score=_signal_score(severity),
+        reasons=_signal_reasons(report),
+        metadata=_signal_metadata(report),
     )
 
 
@@ -222,3 +236,50 @@ def _sort_supporting_matches(matches: list[str]) -> list[str]:
         matches,
         key=lambda match: tuple(match.split(" -> ", 1)),
     )
+
+
+def _signal_severity(impacted_kpis: list[ImpactedKPI], confidence: int) -> str:
+    if impacted_kpis and confidence >= 90:
+        return "HIGH"
+    if impacted_kpis:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _signal_score(severity: str) -> int:
+    return {
+        "HIGH": -30,
+        "MEDIUM": -15,
+        "LOW": 0,
+    }[severity]
+
+
+def _signal_reasons(report: KPIImpactReport) -> list[str]:
+    reasons = list(report.reasons or [])
+    for impact in sorted(report.impacted_kpis or [], key=lambda kpi: kpi.name):
+        for reason in impact.reasons or []:
+            if reason not in reasons:
+                reasons.append(reason)
+    return reasons
+
+
+def _signal_metadata(report: KPIImpactReport) -> dict[str, Any]:
+    impacted = sorted(report.impacted_kpis or [], key=lambda kpi: kpi.name)
+    unaffected = sorted(report.unaffected_kpis or [], key=lambda kpi: kpi.name)
+    return {
+        **dict(report.metadata or {}),
+        "changed_models": list(report.changed_models or []),
+        "impacted_kpis": [impact.name for impact in impacted],
+        "unaffected_kpis": [kpi.name for kpi in unaffected],
+        "impact_paths": _signal_impact_paths(impacted),
+    }
+
+
+def _signal_impact_paths(impacted_kpis: list[ImpactedKPI]) -> list[list[str]]:
+    paths = []
+    for impact in impacted_kpis:
+        for path in (impact.metadata or {}).get("impact_paths", []):
+            copied = list(path)
+            if copied not in paths:
+                paths.append(copied)
+    return sorted(paths, key=lambda path: tuple(path))
