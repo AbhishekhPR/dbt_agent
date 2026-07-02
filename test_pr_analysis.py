@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import sentinel
 
 from agent.decision_engine import DeploymentDecision
+from agent.deployment_snapshot import DeploymentSnapshot
 from agent.pr_analysis import analyze_changed_models
 from agent.signals import Severity, Signal
 
@@ -353,8 +354,189 @@ class PrAnalysisTests(unittest.TestCase):
 
         self.assertEqual(changed_models, original)
 
+    def test_pr_analysis_accepts_previous_snapshot(self):
+        previous_snapshot = _previous_snapshot("previous", [])
+
+        with _patched_detectors(neutral=True):
+            incident = analyze_changed_models(
+                [_semantic_model_spec()],
+                previous_snapshot=previous_snapshot,
+                deployment_id="deploy-current",
+            )
+
+        self.assertEqual(incident.metadata["previous_snapshot_id"], "previous")
+        self.assertEqual(
+            incident.metadata["current_snapshot"]["deployment_id"],
+            "deploy-current",
+        )
+
+    def test_semantic_diff_signal_is_added_when_previous_snapshot_is_provided(self):
+        previous_snapshot = _previous_snapshot("previous", [])
+
+        with _patched_detectors(neutral=True):
+            incident = analyze_changed_models(
+                [_semantic_model_spec()],
+                previous_snapshot=previous_snapshot,
+                deployment_id="deploy-current",
+            )
+
+        self.assertEqual(incident.signals[-1].component, "semantic_diff")
+        self.assertEqual(incident.signals[-1].metadata["added_kpis"], ["Revenue / GMV"])
+
+    def test_semantic_diff_signal_affects_final_health_and_decision(self):
+        previous_snapshot = _previous_snapshot(
+            "previous",
+            [_semantic_contract(related_columns=["gross_revenue"])],
+        )
+
+        with _patched_detectors(neutral=True):
+            incident = analyze_changed_models(
+                [_semantic_model_spec()],
+                previous_snapshot=previous_snapshot,
+                deployment_id="deploy-current",
+            )
+
+        self.assertEqual(incident.signals[-1].component, "semantic_diff")
+        self.assertEqual(incident.signals[-1].score, -20)
+        self.assertEqual(incident.health, 80)
+        self.assertEqual(incident.decision, DeploymentDecision.WARN)
+
+    def test_low_semantic_diff_does_not_reduce_health(self):
+        previous_snapshot = _previous_snapshot(
+            "previous",
+            [_semantic_contract()],
+        )
+
+        with _patched_detectors(neutral=True):
+            incident = analyze_changed_models(
+                [_semantic_model_spec()],
+                previous_snapshot=previous_snapshot,
+                deployment_id="deploy-current",
+            )
+
+        self.assertEqual(incident.signals[-1].component, "semantic_diff")
+        self.assertEqual(incident.signals[-1].severity, Severity.LOW)
+        self.assertEqual(incident.signals[-1].score, 0)
+        self.assertEqual(incident.health, 100)
+        self.assertEqual(incident.decision, DeploymentDecision.ALLOW)
+
+    def test_no_previous_snapshot_keeps_existing_behavior_unchanged(self):
+        with _patched_detectors(neutral=True):
+            incident = analyze_changed_models([_semantic_model_spec()])
+
+        self.assertNotIn("semantic_diff", [signal.component for signal in incident.signals])
+        self.assertNotIn("current_snapshot", incident.metadata)
+        self.assertNotIn("semantic_diff", incident.metadata)
+        self.assertNotIn("previous_snapshot_id", incident.metadata)
+
+    def test_incident_preserves_semantic_diff_metadata(self):
+        previous_snapshot = _previous_snapshot(
+            "previous",
+            [
+                _semantic_contract(
+                    related_columns=["gross_revenue"],
+                    invariants=["never negative"],
+                )
+            ],
+        )
+
+        with _patched_detectors(neutral=True):
+            incident = analyze_changed_models(
+                [_semantic_model_spec()],
+                previous_snapshot=previous_snapshot,
+                deployment_id="deploy-current",
+            )
+
+        semantic_diff = incident.metadata["semantic_diff"]
+        self.assertEqual(semantic_diff["previous_snapshot_id"], "previous")
+        self.assertEqual(incident.metadata["changed_kpis"], ["Revenue / GMV"])
+        self.assertEqual(
+            incident.metadata["dependency_changes"],
+            semantic_diff["dependency_changes"],
+        )
+        self.assertEqual(
+            incident.metadata["contract_changes"],
+            semantic_diff["contract_changes"],
+        )
+        self.assertIn("Revenue / GMV", incident.metadata["contract_changes"])
+
+    def test_current_snapshot_is_stored_in_incident_metadata(self):
+        previous_snapshot = _previous_snapshot("previous", [])
+
+        with _patched_detectors(neutral=True):
+            incident = analyze_changed_models(
+                [_semantic_model_spec()],
+                previous_snapshot=previous_snapshot,
+                deployment_id="deploy-current",
+            )
+
+        current_snapshot = incident.metadata["current_snapshot"]
+        self.assertEqual(current_snapshot["deployment_id"], "deploy-current")
+        self.assertEqual(current_snapshot["changed_models"], ["stg_orders"])
+        self.assertEqual(
+            incident.metadata["current_snapshot_id"],
+            current_snapshot["snapshot_id"],
+        )
+
+    def test_signal_ordering_places_semantic_diff_after_semantic_contract(self):
+        previous_snapshot = _previous_snapshot("previous", [])
+
+        with _patched_detectors(neutral=True):
+            incident = analyze_changed_models(
+                [_semantic_model_spec()],
+                previous_snapshot=previous_snapshot,
+                deployment_id="deploy-current",
+            )
+
+        self.assertEqual(
+            [signal.component for signal in incident.signals],
+            [
+                "ast",
+                "metadata_checks",
+                "metadata_drift",
+                "blast_radius",
+                "historical_reliability",
+                "kpi_impact",
+                "semantic_contract",
+                "semantic_diff",
+            ],
+        )
+
+    def test_previous_snapshot_input_is_not_mutated(self):
+        previous_snapshot = _previous_snapshot(
+            "previous",
+            [_semantic_contract(invariants=["never negative"])],
+        )
+        original = copy.deepcopy(previous_snapshot)
+
+        with _patched_detectors(neutral=True):
+            analyze_changed_models(
+                [_semantic_model_spec()],
+                previous_snapshot=previous_snapshot,
+                deployment_id="deploy-current",
+            )
+
+        self.assertEqual(previous_snapshot, original)
+
+    def test_project_context_input_is_not_mutated_with_previous_snapshot(self):
+        changed_models = [_semantic_model_spec()]
+        previous_snapshot = _previous_snapshot("previous", [])
+        original = copy.deepcopy(changed_models)
+
+        with _patched_detectors(neutral=True):
+            analyze_changed_models(
+                changed_models,
+                previous_snapshot=previous_snapshot,
+                deployment_id="deploy-current",
+            )
+
+        self.assertEqual(changed_models, original)
+
 
 class _patched_detectors:
+    def __init__(self, *, neutral=False):
+        self.neutral = neutral
+
     def __enter__(self):
         from unittest.mock import patch
 
@@ -400,6 +582,8 @@ class _patched_detectors:
         return {"model_name": model_name, "source": "ast"}
 
     def _ast_signal(self, result):
+        if self.neutral:
+            return Signal("ast", Severity.LOW, 90, 0, metadata=dict(result))
         return Signal("ast", Severity.LOW, 75, -5, metadata=dict(result))
 
     def _run_metadata(self, conn, model_name, key_columns):
@@ -407,6 +591,14 @@ class _patched_detectors:
         return {"model_name": model_name}
 
     def _metadata_signal(self, result):
+        if self.neutral:
+            return Signal(
+                "metadata_checks",
+                Severity.LOW,
+                90,
+                0,
+                metadata=dict(result),
+            )
         return Signal(
             "metadata_checks",
             Severity.MEDIUM,
@@ -420,6 +612,14 @@ class _patched_detectors:
         return {"model_name": model_name}
 
     def _drift_signal(self, result):
+        if self.neutral:
+            return Signal(
+                "metadata_drift",
+                Severity.LOW,
+                90,
+                0,
+                metadata=dict(result),
+            )
         return Signal(
             "metadata_drift",
             Severity.HIGH,
@@ -433,6 +633,14 @@ class _patched_detectors:
         return {"changed_model": model_name, "total_affected": 0}
 
     def _blast_signal(self, result):
+        if self.neutral:
+            return Signal(
+                "blast_radius",
+                Severity.LOW,
+                90,
+                0,
+                metadata=dict(result),
+            )
         return Signal(
             "blast_radius",
             Severity.CRITICAL,
@@ -446,6 +654,14 @@ class _patched_detectors:
         return {"severity": "LOW", "confidence": 75, "score": 95, "metadata": dict(history)}
 
     def _history_signal(self, result):
+        if self.neutral:
+            return Signal(
+                "historical_reliability",
+                Severity.LOW,
+                90,
+                0,
+                metadata=dict(result.get("metadata", {})),
+            )
         return Signal(
             "historical_reliability",
             Severity.LOW,
@@ -549,6 +765,20 @@ class _patched_detectors:
 
     def _kpi_impact_signal(self, report):
         self.calls["kpi_impact_signal"].append(report)
+        if self.neutral:
+            return Signal(
+                "kpi_impact",
+                Severity.LOW,
+                90,
+                0,
+                reasons=[],
+                metadata={
+                    "changed_models": ["stg_orders"],
+                    "impacted_kpis": ["Revenue / GMV"],
+                    "unaffected_kpis": [],
+                    "impact_paths": [["stg_orders", "fct_orders", "Revenue / GMV"]],
+                },
+            )
         return Signal(
             "kpi_impact",
             Severity.HIGH,
@@ -565,6 +795,15 @@ class _patched_detectors:
 
     def _semantic_contract_signal(self, result):
         self.calls["semantic_contract_signal"].append(copy.deepcopy(result))
+        if self.neutral:
+            return Signal(
+                "semantic_contract",
+                Severity.LOW,
+                90,
+                0,
+                reasons=[],
+                metadata=dict(result["metadata"]),
+            )
         return Signal(
             "semantic_contract",
             Severity.MEDIUM,
@@ -573,6 +812,62 @@ class _patched_detectors:
             reasons=list(result["reasons"]),
             metadata=dict(result["metadata"]),
         )
+
+
+def _semantic_model_spec():
+    return {
+        "model_name": "stg_orders",
+        "sql": "select 1",
+        "project_context": {
+            "model_names": ["stg_orders"],
+            "column_names": ["gross_revenue"],
+            "models": [{"name": "stg_orders"}],
+            "metrics": [{"name": "Revenue / GMV", "model": "fct_orders"}],
+        },
+    }
+
+
+def _previous_snapshot(snapshot_id, contracts):
+    return DeploymentSnapshot(
+        snapshot_id=snapshot_id,
+        deployment_id=f"deploy-{snapshot_id}",
+        created_at="2026-07-02T00:00:00+00:00",
+        changed_models=["stg_orders"],
+        semantic_context={
+            "discovered_kpis": [{"name": contract["kpi_name"]} for contract in contracts],
+            "knowledge_report": {"contracts": copy.deepcopy(contracts)},
+            "metadata": {"kpi_count": len(contracts)},
+        },
+        decision=None,
+        incident_summary=None,
+        metadata={"source": "unit-test"},
+    )
+
+
+def _semantic_contract(
+    *,
+    kpi_name="Revenue / GMV",
+    related_models=None,
+    related_columns=None,
+    upstream_sources=None,
+    downstream_consumers=None,
+    assumptions=None,
+    invariants=None,
+    business_meaning=None,
+):
+    return {
+        "kpi_name": kpi_name,
+        "description": f"{kpi_name} contract",
+        "business_meaning": business_meaning,
+        "related_models": list(related_models or []),
+        "related_columns": list(related_columns or []),
+        "upstream_sources": list(upstream_sources or []),
+        "downstream_consumers": list(downstream_consumers or []),
+        "assumptions": list(assumptions or []),
+        "invariants": list(invariants or []),
+        "confidence": 80,
+        "metadata": {},
+    }
 
 
 if __name__ == "__main__":

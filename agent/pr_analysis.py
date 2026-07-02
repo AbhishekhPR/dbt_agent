@@ -9,6 +9,7 @@ from agent.business_metrics import calculate_operational_metrics
 from agent.business_metrics import evaluate_metric_reliability
 from agent.business_metrics import to_signal as business_metrics_to_signal
 from agent.decision_assembly import assemble_decision_incident
+from agent.deployment_snapshot import create_deployment_snapshot
 from agent.historical_reliability import evaluate_history
 from agent.historical_reliability import to_signal as historical_reliability_to_signal
 from agent.incident import Incident
@@ -18,11 +19,18 @@ from agent.metadata_drift import compare_last_run
 from agent.metadata_drift import to_signal as metadata_drift_to_signal
 from agent.semantic_context import build_semantic_context
 from agent.semantic_contract_validation import to_signal as semantic_contract_to_signal
+from agent.semantic_diff import compare_semantic_snapshots
+from agent.semantic_diff import to_signal as semantic_diff_to_signal
 from agent.semantic_kpi_inference import to_signal as kpi_impact_to_signal
 from agent.signals import Signal
 
 
-def analyze_changed_models(changed_models) -> Incident:
+def analyze_changed_models(
+    changed_models,
+    *,
+    previous_snapshot=None,
+    deployment_id=None,
+) -> Incident:
     model_specs = list(changed_models)
     signals = []
     affected_models = []
@@ -52,9 +60,27 @@ def analyze_changed_models(changed_models) -> Incident:
     }
     semantic_context = _semantic_context(model_specs, affected_models, metadata)
     semantic_signals = _semantic_signals(semantic_context)
+    current_snapshot = None
+    semantic_diff = None
+    if previous_snapshot is not None:
+        current_snapshot = _current_snapshot(
+            deployment_id,
+            affected_models,
+            semantic_context,
+            metadata,
+        )
+        semantic_diff = compare_semantic_snapshots(previous_snapshot, current_snapshot)
+        semantic_signals.append(_source_signal(semantic_diff_to_signal(semantic_diff)))
+
     signals.extend(semantic_signals)
     metadata["signal_count"] = len(signals)
-    _add_semantic_metadata(metadata, semantic_context, semantic_signals)
+    _add_semantic_metadata(
+        metadata,
+        semantic_context,
+        semantic_signals,
+        current_snapshot=current_snapshot,
+        semantic_diff=semantic_diff,
+    )
 
     return assemble_decision_incident(
         signals,
@@ -142,37 +168,70 @@ def _semantic_signals(semantic_context) -> list[Signal]:
     return signals
 
 
+def _current_snapshot(
+    deployment_id,
+    affected_models: list[str],
+    semantic_context,
+    metadata: dict[str, Any],
+):
+    return create_deployment_snapshot(
+        deployment_id=deployment_id if deployment_id is not None else "pr-analysis-current",
+        changed_models=list(affected_models),
+        semantic_context=semantic_context,
+        metadata={
+            "source": "pr_analysis",
+            "model_count": metadata.get("model_count", 0),
+            "models": list(metadata.get("models", [])),
+        },
+    )
+
+
 def _add_semantic_metadata(
     metadata: dict[str, Any],
     semantic_context,
     semantic_signals: list[Signal],
+    *,
+    current_snapshot=None,
+    semantic_diff=None,
 ) -> None:
-    if semantic_context is None:
-        return
+    if semantic_context is not None:
+        metadata["semantic_context"] = semantic_context.to_dict()
+        metadata["impacted_kpis"] = list(_signal_metadata_value(semantic_signals, "impacted_kpis", []))
+        metadata["impact_paths"] = [
+            list(path)
+            for path in _signal_metadata_value(semantic_signals, "impact_paths", [])
+        ]
+        metadata["contract_validation"] = dict(
+            (semantic_context.contract_validation_result or {}).get("metadata", {})
+        )
 
-    metadata["semantic_context"] = semantic_context.to_dict()
-    metadata["impacted_kpis"] = list(_signal_metadata_value(semantic_signals, "impacted_kpis", []))
-    metadata["impact_paths"] = [
-        list(path)
-        for path in _signal_metadata_value(semantic_signals, "impact_paths", [])
-    ]
-    metadata["contract_validation"] = dict(
-        (semantic_context.contract_validation_result or {}).get("metadata", {})
-    )
+        kpi_impact_signal = next(
+            (signal for signal in semantic_signals if signal.component == "kpi_impact"),
+            None,
+        )
+        if kpi_impact_signal is not None:
+            metadata["kpi_impact"] = {
+                "changed_models": list(kpi_impact_signal.metadata.get("changed_models", [])),
+                "impacted_kpis": list(kpi_impact_signal.metadata.get("impacted_kpis", [])),
+                "impact_paths": [
+                    list(path)
+                    for path in kpi_impact_signal.metadata.get("impact_paths", [])
+                ],
+            }
 
-    kpi_impact_signal = next(
-        (signal for signal in semantic_signals if signal.component == "kpi_impact"),
-        None,
-    )
-    if kpi_impact_signal is not None:
-        metadata["kpi_impact"] = {
-            "changed_models": list(kpi_impact_signal.metadata.get("changed_models", [])),
-            "impacted_kpis": list(kpi_impact_signal.metadata.get("impacted_kpis", [])),
-            "impact_paths": [
-                list(path)
-                for path in kpi_impact_signal.metadata.get("impact_paths", [])
-            ],
-        }
+    if current_snapshot is not None:
+        current_snapshot_dict = current_snapshot.to_dict()
+        metadata["current_snapshot"] = current_snapshot_dict
+        metadata["current_snapshot_id"] = current_snapshot_dict.get("snapshot_id")
+
+    if semantic_diff is not None:
+        semantic_diff_dict = semantic_diff.to_dict()
+        metadata["semantic_diff"] = semantic_diff_dict
+        metadata["previous_snapshot_id"] = semantic_diff.previous_snapshot_id
+        metadata["current_snapshot_id"] = semantic_diff.current_snapshot_id
+        metadata["changed_kpis"] = list(semantic_diff.changed_kpis or [])
+        metadata["dependency_changes"] = dict(semantic_diff_dict.get("dependency_changes", {}))
+        metadata["contract_changes"] = dict(semantic_diff_dict.get("contract_changes", {}))
 
 
 def _source_signal(signal: Signal) -> Signal:
