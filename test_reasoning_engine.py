@@ -129,8 +129,8 @@ class ReasoningEngineTests(unittest.TestCase):
         self.assertEqual(
             [item.title for item in report.evidence],
             [
-                "AST: LEFT JOIN nullification detected",
-                "AST: Risky WHERE filter detected",
+                "SQL Logic: LEFT JOIN nullification detected",
+                "SQL Logic: Risky WHERE filter detected",
                 "Metadata Drift: Row count changed unexpectedly",
             ],
         )
@@ -261,6 +261,147 @@ class ReasoningEngineTests(unittest.TestCase):
         build_reasoning_report(incident)
 
         self.assertEqual(incident, before)
+
+    def test_semantic_diff_appears_as_historical_semantic_change_evidence(self):
+        incident = make_incident(
+            signals=[
+                Signal(
+                    "semantic_diff",
+                    Severity.HIGH,
+                    92,
+                    -35,
+                    reasons=["Revenue gained upstream dependency refunds"],
+                    metadata={"previous_snapshot_id": "abc123"},
+                )
+            ]
+        )
+
+        report = build_reasoning_report(incident)
+
+        self.assertEqual(
+            report.evidence[0].title,
+            "Historical Semantic Change: Revenue gained upstream dependency refunds",
+        )
+        self.assertEqual(
+            report.evidence[0].explanation,
+            "Historical Semantic Change reported: Revenue gained upstream dependency refunds",
+        )
+
+    def test_semantic_diff_reasons_are_preserved_in_evidence(self):
+        incident = make_incident(
+            signals=[
+                Signal(
+                    "semantic_diff",
+                    Severity.HIGH,
+                    92,
+                    -35,
+                    reasons=[
+                        "Revenue gained upstream dependency refunds",
+                        "Revenue lost invariant never negative",
+                    ],
+                    metadata={"previous_snapshot_id": "abc123"},
+                )
+            ]
+        )
+
+        report = build_reasoning_report(incident)
+
+        self.assertEqual(
+            [item.title for item in report.evidence],
+            [
+                "Historical Semantic Change: Revenue gained upstream dependency refunds",
+                "Historical Semantic Change: Revenue lost invariant never negative",
+            ],
+        )
+
+    def test_existing_reasoning_behavior_unchanged_without_semantic_diff(self):
+        report = build_reasoning_report(make_incident())
+
+        self.assertEqual(
+            report.evidence[0].title,
+            "Metadata Checks: Duplicate count increased",
+        )
+
+    def test_semantic_diff_reasoning_does_not_mutate_incident(self):
+        incident = make_incident(
+            signals=[
+                Signal(
+                    "semantic_diff",
+                    Severity.HIGH,
+                    92,
+                    -35,
+                    reasons=["Revenue gained upstream dependency refunds"],
+                    metadata={"previous_snapshot_id": "abc123"},
+                )
+            ]
+        )
+        before = copy.deepcopy(incident)
+
+        build_reasoning_report(incident)
+
+        self.assertEqual(incident, before)
+
+    def test_evidence_uses_curated_labels_and_filters_low_level_matches(self):
+        incident = make_incident(
+            signals=[
+                Signal(
+                    "kpi_impact",
+                    Severity.HIGH,
+                    94,
+                    -30,
+                    reasons=[
+                        "dbt_metrics value Revenue matched KPI concept Revenue/ GMV",
+                        "Revenue is impacted through stg_orders -> fct_revenue -> Revenue",
+                    ],
+                ),
+                Signal(
+                    "ast",
+                    Severity.HIGH,
+                    90,
+                    -40,
+                    reasons=["LEFT JOIN nullification detected"],
+                ),
+            ]
+        )
+
+        report = build_reasoning_report(incident)
+
+        self.assertEqual(
+            [item.title for item in report.evidence],
+            [
+                "KPI Impact: Revenue is impacted through stg_orders -> fct_revenue -> Revenue",
+                "SQL Logic: LEFT JOIN nullification detected",
+            ],
+        )
+        rendered_evidence = " ".join(item.title for item in report.evidence)
+        self.assertNotIn("matched KPI concept", rendered_evidence)
+        self.assertNotIn("dbt_metrics value", rendered_evidence)
+
+    def test_conclusion_uses_curated_evidence_count(self):
+        low_level_reasons = [
+            f"column_names value metric_{index} matched KPI concept Revenue / GMV"
+            for index in range(20)
+        ]
+        incident = make_incident(
+            signals=[
+                Signal(
+                    "kpi_impact",
+                    Severity.HIGH,
+                    94,
+                    -30,
+                    reasons=[
+                        *low_level_reasons,
+                        "Revenue is impacted through stg_orders -> fct_revenue -> Revenue",
+                    ],
+                )
+            ]
+        )
+
+        report = build_reasoning_report(incident)
+
+        self.assertEqual(len(report.evidence), 1)
+        self.assertIn("1 evidence item", report.conclusion)
+        self.assertNotIn("21 evidence items", report.conclusion)
 
 
 if __name__ == "__main__":

@@ -60,6 +60,42 @@ def make_incident(
     )
 
 
+def make_semantic_diff_signal():
+    return Signal(
+        "semantic_diff",
+        Severity.HIGH,
+        92,
+        -35,
+        reasons=[
+            "Revenue gained upstream dependency refunds",
+            "Revenue lost invariant never negative",
+        ],
+        metadata={
+            "previous_snapshot_id": "abc123",
+            "current_snapshot_id": "def456",
+            "changed_kpis": ["Revenue"],
+            "added_kpis": ["MRR"],
+            "removed_kpis": ["Churn"],
+            "dependency_changes": {
+                "Revenue": {
+                    "upstream_sources": {
+                        "added": ["refunds"],
+                        "removed": [],
+                    },
+                },
+            },
+            "contract_changes": {
+                "Revenue": {
+                    "invariants": {
+                        "added": [],
+                        "removed": ["never negative"],
+                    },
+                },
+            },
+        },
+    )
+
+
 class GithubPrGuardTests(unittest.TestCase):
     def test_block_reviews_render_correctly(self):
         review = build_pr_review(make_incident())
@@ -275,6 +311,37 @@ class GithubPrGuardTests(unittest.TestCase):
         self.assertLess(first, second)
         self.assertLess(second, third)
 
+    def test_markdown_evidence_is_curated(self):
+        incident = make_incident(
+            signals=[
+                Signal(
+                    "kpi_impact",
+                    Severity.HIGH,
+                    94,
+                    -30,
+                    reasons=[
+                        "dbt_metrics value Revenue matched KPI concept Revenue/ GMV",
+                        "Revenue is impacted through stg_orders -> fct_revenue -> Revenue",
+                    ],
+                    metadata={"raw_reason_count": 2},
+                )
+            ]
+        )
+        review = build_pr_review(incident)
+
+        markdown = render_pr_review_markdown(review)
+
+        self.assertIn(
+            "KPI Impact: Revenue is impacted through stg_orders -> fct_revenue -> Revenue",
+            markdown,
+        )
+        self.assertNotIn("matched KPI concept", markdown)
+        self.assertNotIn("dbt_metrics value", markdown)
+        self.assertIn(
+            "dbt_metrics value Revenue matched KPI concept Revenue/ GMV",
+            review["signals_considered"][0]["reasons"],
+        )
+
     def test_empty_evidence_and_signals_are_handled_gracefully(self):
         markdown = render_pr_review_markdown(
             build_pr_review(
@@ -426,6 +493,94 @@ class GithubPrGuardTests(unittest.TestCase):
 
         self.assertIn("### Business Metrics", markdown)
         self.assertIn("Healthy", markdown)
+
+    def test_build_pr_review_includes_historical_semantic_change(self):
+        review = build_pr_review(make_incident(signals=[make_semantic_diff_signal()]))
+
+        self.assertEqual(
+            review["historical_semantic_change"],
+            {
+                "changed_kpis": ["Revenue"],
+                "added_kpis": ["MRR"],
+                "removed_kpis": ["Churn"],
+                "dependency_changes": {
+                    "Revenue": {
+                        "upstream_sources": {
+                            "added": ["refunds"],
+                            "removed": [],
+                        },
+                    },
+                },
+                "contract_changes": {
+                    "Revenue": {
+                        "invariants": {
+                            "added": [],
+                            "removed": ["never negative"],
+                        },
+                    },
+                },
+                "previous_snapshot_id": "abc123",
+                "current_snapshot_id": "def456",
+                "reasons": [
+                    "Revenue gained upstream dependency refunds",
+                    "Revenue lost invariant never negative",
+                ],
+            },
+        )
+
+    def test_pr_review_markdown_renders_historical_semantic_change_section(self):
+        review = build_pr_review(make_incident(signals=[make_semantic_diff_signal()]))
+
+        markdown = render_pr_review_markdown(review)
+
+        self.assertIn("### Historical Semantic Change", markdown)
+        self.assertIn("- Revenue gained upstream dependency refunds", markdown)
+        self.assertIn("- Revenue lost invariant never negative", markdown)
+        self.assertIn("- Changed KPIs: Revenue", markdown)
+        self.assertIn("**Previous Snapshot:** abc123", markdown)
+        self.assertIn("**Current Snapshot:** def456", markdown)
+
+    def test_pr_review_unchanged_when_semantic_diff_is_absent(self):
+        review = build_pr_review(make_incident())
+        markdown = render_pr_review_markdown(review)
+
+        self.assertNotIn("historical_semantic_change", review)
+        self.assertNotIn("Historical Semantic Change", markdown)
+
+    def test_pr_review_markdown_does_not_mutate_review_with_semantic_diff(self):
+        review = build_pr_review(make_incident(signals=[make_semantic_diff_signal()]))
+        before = copy.deepcopy(review)
+
+        render_pr_review_markdown(review)
+
+        self.assertEqual(review, before)
+
+    def test_pr_review_preserves_semantic_diff_dependency_and_contract_changes(self):
+        review = build_pr_review(make_incident(signals=[make_semantic_diff_signal()]))
+        semantic_change = review["historical_semantic_change"]
+
+        self.assertEqual(
+            semantic_change["dependency_changes"],
+            {
+                "Revenue": {
+                    "upstream_sources": {
+                        "added": ["refunds"],
+                        "removed": [],
+                    },
+                },
+            },
+        )
+        self.assertEqual(
+            semantic_change["contract_changes"],
+            {
+                "Revenue": {
+                    "invariants": {
+                        "added": [],
+                        "removed": ["never negative"],
+                    },
+                },
+            },
+        )
 
 
 if __name__ == "__main__":

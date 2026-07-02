@@ -12,8 +12,9 @@ def build_pr_review(incident: Incident) -> dict[str, Any]:
     reasoning = build_reasoning_report(incident)
     model_names = _model_names(incident)
     business_metrics = _business_metrics(incident)
+    historical_semantic_change = _historical_semantic_change(incident)
 
-    return {
+    review = {
         "title": REVIEW_TITLE,
         "incident_id": incident.incident_id,
         "deployment_decision": _enum_value(incident.decision),
@@ -38,6 +39,7 @@ def build_pr_review(incident: Incident) -> dict[str, Any]:
         ],
         "recommendation": reasoning.recommendation,
         "business_metrics": business_metrics,
+        "business_metric_keys": _business_metric_keys(incident),
         "signals_considered": [
             {
                 "component": signal.component,
@@ -50,6 +52,9 @@ def build_pr_review(incident: Incident) -> dict[str, Any]:
             for signal in incident.signals
         ],
     }
+    if historical_semantic_change is not None:
+        review["historical_semantic_change"] = historical_semantic_change
+    return review
 
 
 def render_pr_review_markdown(review: dict) -> str:
@@ -75,21 +80,47 @@ def render_pr_review_markdown(review: dict) -> str:
             "### Recommendation",
             _review_text(review, "recommendation", "None"),
             "",
-            *_business_metric_section(review.get("business_metrics", [])),
+            *_business_metric_section(
+                review.get("business_metrics", []),
+                review.get("business_metric_keys", []),
+            ),
+            *_historical_semantic_change_section(
+                review.get("historical_semantic_change"),
+            ),
             "### Signals Considered",
             *_signal_lines(review.get("signals_considered", [])),
         ]
     )
 
 
-def _business_metric_section(lines: list[str]) -> list[str]:
+def _business_metric_section(lines: list[str], metric_keys: list[str]) -> list[str]:
     if not lines:
         return []
-    return [
+    section = [
         "### Business Metrics",
         *_bullet_lines(lines),
+    ]
+    if metric_keys:
+        section.extend([
+            "",
+            "Metric keys: " + ", ".join(f"`{key}`" for key in metric_keys),
+        ])
+    section.append("")
+    return section
+
+
+def _historical_semantic_change_section(change: dict | None) -> list[str]:
+    if not change:
+        return []
+    section = [
+        "### Historical Semantic Change",
+        *_bullet_lines(_historical_semantic_change_lines(change)),
+        "",
+        f"**Previous Snapshot:** {_text(change.get('previous_snapshot_id'), 'None')}  ",
+        f"**Current Snapshot:** {_text(change.get('current_snapshot_id'), 'None')}",
         "",
     ]
+    return section
 
 
 def _bullet_lines(items: list[str]) -> list[str]:
@@ -102,6 +133,77 @@ def _business_metrics(incident: Incident) -> list[str]:
     for signal in incident.signals:
         if signal.component == "business_metrics":
             return _business_metric_lines_from_metadata(signal.metadata)
+    return []
+
+
+def _historical_semantic_change(incident: Incident) -> dict[str, Any] | None:
+    for signal in incident.signals:
+        if signal.component != "semantic_diff":
+            continue
+        metadata = dict(signal.metadata or {})
+        return {
+            "changed_kpis": _serialize(list(metadata.get("changed_kpis") or [])),
+            "added_kpis": _serialize(list(metadata.get("added_kpis") or [])),
+            "removed_kpis": _serialize(list(metadata.get("removed_kpis") or [])),
+            "dependency_changes": _serialize(dict(metadata.get("dependency_changes") or {})),
+            "contract_changes": _serialize(dict(metadata.get("contract_changes") or {})),
+            "previous_snapshot_id": _serialize(metadata.get("previous_snapshot_id")),
+            "current_snapshot_id": _serialize(metadata.get("current_snapshot_id")),
+            "reasons": list(signal.reasons or []),
+        }
+    return None
+
+
+def _historical_semantic_change_lines(change: dict) -> list[str]:
+    lines = list(change.get("reasons") or [])
+    lines.extend([
+        f"Changed KPIs: {_list_text(change.get('changed_kpis'))}",
+        f"Added KPIs: {_list_text(change.get('added_kpis'))}",
+        f"Removed KPIs: {_list_text(change.get('removed_kpis'))}",
+    ])
+    lines.extend(_change_lines("Dependency Changes", change.get("dependency_changes") or {}))
+    lines.extend(_change_lines("Contract Changes", change.get("contract_changes") or {}))
+    return lines
+
+
+def _list_text(values: Any) -> str:
+    items = [str(value) for value in list(values or [])]
+    if not items:
+        return "None"
+    return ", ".join(items)
+
+
+def _change_lines(label: str, changes: dict) -> list[str]:
+    lines = []
+    for kpi in sorted(changes):
+        fields = changes.get(kpi) or {}
+        for field_name in sorted(fields):
+            detail = fields.get(field_name) or {}
+            if not isinstance(detail, dict):
+                lines.append(f"{label}: {kpi} {field_name} {detail}")
+                continue
+            for value in detail.get("added", []) or []:
+                lines.append(f"{label}: {kpi} {field_name} added {value}")
+            for value in detail.get("removed", []) or []:
+                lines.append(f"{label}: {kpi} {field_name} removed {value}")
+            if "previous" in detail or "current" in detail:
+                lines.append(
+                    f"{label}: {kpi} {field_name} changed from "
+                    f"{_text(detail.get('previous'))} to {_text(detail.get('current'))}"
+                )
+    if not lines:
+        return [f"{label}: None"]
+    return lines
+
+
+def _business_metric_keys(incident: Incident) -> list[str]:
+    for signal in incident.signals:
+        if signal.component == "business_metrics":
+            spike_percentages = signal.metadata.get("spike_percentages") or {}
+            if spike_percentages:
+                return list(spike_percentages)
+            metrics = signal.metadata.get("metrics") or {}
+            return [key for key in metrics if key != "total_events"]
     return []
 
 

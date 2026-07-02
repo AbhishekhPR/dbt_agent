@@ -3,6 +3,7 @@ from enum import Enum
 from typing import Any
 
 from agent.decision_engine import DeploymentDecision
+from agent.evidence_curation import clean_reason, curate_evidence
 from agent.incident import Incident
 
 
@@ -38,22 +39,39 @@ def build_reasoning_report(incident: Incident) -> ReasoningReport:
 
 def _evidence_from_signals(incident: Incident) -> list[Evidence]:
     evidence = []
-    for signal in incident.signals:
-        reasons = signal.reasons or ["Signal detected"]
-        for reason in reasons:
-            evidence.append(
-                Evidence(
-                    title=f"{_component_label(signal.component)}: {reason}",
-                    explanation=(
-                        f"{_component_label(signal.component)} reported: "
-                        f"{reason}"
-                    ),
-                    severity=_enum_value(signal.severity),
-                    confidence=signal.confidence,
-                    supporting_metadata=dict(signal.metadata),
-                )
+    for item in curate_evidence(incident.signals):
+        title = f"{item['label']}: {item['reason']}"
+        evidence.append(
+            Evidence(
+                title=title,
+                explanation=(
+                    f"{item['label']} reported: "
+                    f"{item['reason']}"
+                ),
+                severity=item["severity"],
+                confidence=item["confidence"],
+                supporting_metadata=_supporting_metadata_for_item(
+                    incident.signals,
+                    item,
+                ),
             )
+        )
     return evidence
+
+
+def _supporting_metadata_for_item(signals, item: dict) -> dict[str, Any]:
+    component = item.get("component")
+    reason = item.get("reason")
+    for signal in signals:
+        if signal.component != component:
+            continue
+        signal_reasons = signal.reasons or ["Signal detected"]
+        if any(clean_reason(candidate) == reason for candidate in signal_reasons):
+            return dict(signal.metadata)
+    for signal in signals:
+        if signal.component == component:
+            return dict(signal.metadata)
+    return {}
 
 
 def _executive_summary(incident: Incident) -> str:
@@ -96,12 +114,6 @@ def _conclusion(incident: Incident, evidence: list[Evidence]) -> str:
         f"{_enum_value(incident.severity)}, and confidence "
         f"{_confidence_text(incident.confidence)}."
     )
-
-
-def _component_label(component: str) -> str:
-    if component.lower() == "ast":
-        return "AST"
-    return " ".join(part.capitalize() for part in component.split("_"))
 
 
 def _enum_value(value: Any) -> Any:

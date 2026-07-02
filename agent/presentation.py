@@ -3,6 +3,7 @@ from enum import Enum
 from typing import Any
 
 from agent.decision_engine import DeploymentDecision
+from agent.evidence_curation import curate_reasons
 from agent.incident import Incident
 from agent.reasoning_engine import build_reasoning_report
 
@@ -26,10 +27,7 @@ def _serialize(value: Any) -> Any:
 
 
 def _top_reasons(incident: Incident) -> list[str]:
-    reasons = []
-    for signal in incident.signals:
-        reasons.extend(signal.reasons)
-    return list(reasons)
+    return curate_reasons(incident.signals)
 
 
 def _bullet_list(items: list[str]) -> list[str]:
@@ -43,6 +41,34 @@ def _business_metric_lines(incident: Incident) -> list[str]:
         if signal.component == "business_metrics":
             return _business_metric_lines_from_metadata(signal.metadata)
     return []
+
+
+def _semantic_diff_signal(incident: Incident):
+    for signal in incident.signals:
+        if signal.component == "semantic_diff":
+            return signal
+    return None
+
+
+def _semantic_diff_lines(signal) -> list[str]:
+    metadata = dict(signal.metadata or {})
+    lines = list(signal.reasons or [])
+    lines.extend([
+        f"Changed KPIs: {_list_text(metadata.get('changed_kpis'))}",
+        f"Added KPIs: {_list_text(metadata.get('added_kpis'))}",
+        f"Removed KPIs: {_list_text(metadata.get('removed_kpis'))}",
+    ])
+    lines.extend(_change_lines("Dependency Changes", metadata.get("dependency_changes") or {}))
+    lines.extend(_change_lines("Contract Changes", metadata.get("contract_changes") or {}))
+    return lines
+
+
+def _semantic_diff_snapshot_lines(signal) -> list[str]:
+    metadata = dict(signal.metadata or {})
+    return [
+        f"Previous Snapshot: {_display_text(metadata.get('previous_snapshot_id') or 'None')}",
+        f"Current Snapshot: {_display_text(metadata.get('current_snapshot_id') or 'None')}",
+    ]
 
 
 def _business_metric_lines_from_metadata(metadata: dict) -> list[str]:
@@ -74,9 +100,45 @@ def _format_percentage(value: Any) -> str:
     return f"{number:.1f}%"
 
 
+def _list_text(values: Any) -> str:
+    items = [str(value) for value in list(values or [])]
+    if not items:
+        return "None"
+    return ", ".join(items)
+
+
+def _change_lines(label: str, changes: dict) -> list[str]:
+    lines = []
+    for kpi in sorted(changes):
+        fields = changes.get(kpi) or {}
+        for field_name in sorted(fields):
+            detail = fields.get(field_name) or {}
+            if not isinstance(detail, dict):
+                lines.append(f"{label}: {kpi} {field_name} {_display_text(detail)}")
+                continue
+            for value in detail.get("added", []) or []:
+                lines.append(f"{label}: {kpi} {field_name} added {value}")
+            for value in detail.get("removed", []) or []:
+                lines.append(f"{label}: {kpi} {field_name} removed {value}")
+            if "previous" in detail or "current" in detail:
+                lines.append(
+                    f"{label}: {kpi} {field_name} changed from "
+                    f"{_display_text(detail.get('previous'))} to "
+                    f"{_display_text(detail.get('current'))}"
+                )
+    if not lines:
+        return [f"{label}: None"]
+    return lines
+
+
+def _snapshot_value(line: str) -> str:
+    return _display_text(line.split(": ", 1)[1] if ": " in line else line)
+
+
 def render_cli(incident: Incident) -> str:
     reasoning = build_reasoning_report(incident)
     business_metric_lines = _business_metric_lines(incident)
+    semantic_diff_signal = _semantic_diff_signal(incident)
     lines = [
         "Relium Deployment Decision",
         "",
@@ -101,6 +163,16 @@ def render_cli(incident: Incident) -> str:
             "",
             "Business Metrics",
             *_bullet_list(business_metric_lines),
+        ])
+
+    if semantic_diff_signal is not None:
+        lines.extend([
+            "",
+            "Historical Semantic Change",
+            *_bullet_list([
+                *_semantic_diff_lines(semantic_diff_signal),
+                *_semantic_diff_snapshot_lines(semantic_diff_signal),
+            ]),
         ])
 
     if incident.affected_models:
@@ -130,6 +202,7 @@ def render_cli(incident: Incident) -> str:
 def render_markdown(incident: Incident) -> str:
     reasoning = build_reasoning_report(incident)
     business_metric_lines = _business_metric_lines(incident)
+    semantic_diff_signal = _semantic_diff_signal(incident)
     lines = [
         "# Relium Deployment Decision",
         "",
@@ -163,6 +236,17 @@ def render_markdown(incident: Incident) -> str:
             "",
             "## Business Metrics",
             *_bullet_list(business_metric_lines),
+        ])
+
+    if semantic_diff_signal is not None:
+        previous_snapshot, current_snapshot = _semantic_diff_snapshot_lines(semantic_diff_signal)
+        lines.extend([
+            "",
+            "### Historical Semantic Change",
+            *_bullet_list(_semantic_diff_lines(semantic_diff_signal)),
+            "",
+            f"**Previous Snapshot:** {_snapshot_value(previous_snapshot)}  ",
+            f"**Current Snapshot:** {_snapshot_value(current_snapshot)}",
         ])
 
     if incident.affected_models:

@@ -85,6 +85,78 @@ def make_business_metric_incident(*, healthy=False):
     )
 
 
+def make_semantic_diff_incident():
+    return Incident(
+        incident_id="INC-SEMDIFF",
+        health=65,
+        decision=DeploymentDecision.BLOCK,
+        severity=Severity.HIGH,
+        confidence=92,
+        root_cause="Revenue gained upstream dependency refunds",
+        recommendation="Review historical semantic changes before deployment.",
+        signals=[
+            Signal(
+                component="semantic_diff",
+                severity=Severity.HIGH,
+                confidence=92,
+                score=-35,
+                reasons=[
+                    "Revenue gained upstream dependency refunds",
+                    "Revenue lost invariant never negative",
+                ],
+                metadata={
+                    "previous_snapshot_id": "abc123",
+                    "current_snapshot_id": "def456",
+                    "changed_kpis": ["Revenue"],
+                    "added_kpis": ["MRR"],
+                    "removed_kpis": ["Churn"],
+                    "dependency_changes": {
+                        "Revenue": {
+                            "upstream_sources": {
+                                "added": ["refunds"],
+                                "removed": [],
+                            },
+                        },
+                    },
+                    "contract_changes": {
+                        "Revenue": {
+                            "invariants": {
+                                "added": [],
+                                "removed": ["never negative"],
+                            },
+                        },
+                    },
+                },
+            )
+        ],
+    )
+
+
+def make_noisy_kpi_incident():
+    return Incident(
+        incident_id="INC-NOISY-KPI",
+        health=70,
+        decision=DeploymentDecision.WARN,
+        severity=Severity.MEDIUM,
+        confidence=88,
+        root_cause="Revenue is impacted through stg_orders -> fct_revenue -> Revenue",
+        recommendation="Review impacted KPI owners.",
+        signals=[
+            Signal(
+                component="kpi_impact",
+                severity=Severity.MEDIUM,
+                confidence=88,
+                score=-15,
+                reasons=[
+                    "dbt_metrics value Revenue matched KPI concept Revenue/ GMV",
+                    "business_terms value orders matched KPI concept Revenue/ GMV",
+                    "Revenue is impacted through stg_orders -> fct_revenue -> Revenue",
+                ],
+            )
+        ],
+    )
+
+
 class PresentationTests(unittest.TestCase):
     def test_cli_contains_every_major_section(self):
         rendered = render_cli(make_incident())
@@ -117,7 +189,7 @@ class PresentationTests(unittest.TestCase):
         rendered = render_cli(make_incident())
 
         self.assertIn("Evidence:", rendered)
-        self.assertIn("- AST: LEFT JOIN nullification detected", rendered)
+        self.assertIn("- SQL Logic: LEFT JOIN nullification detected", rendered)
         self.assertIn("- Metadata Checks: Duplicate count increased", rendered)
 
     def test_cli_reasoning_spacing_separates_joined_words(self):
@@ -177,7 +249,7 @@ class PresentationTests(unittest.TestCase):
         self.assertIn("Deployment is blocked because", rendered)
         self.assertNotIn("Deployment BLOCK was blocked", rendered)
         self.assertIn("### Evidence", rendered)
-        self.assertIn("- **AST: LEFT JOIN nullification detected**", rendered)
+        self.assertIn("- **SQL Logic: LEFT JOIN nullification detected**", rendered)
         self.assertIn(
             "- **Metadata Checks: Duplicate count increased**",
             rendered,
@@ -305,6 +377,66 @@ class PresentationTests(unittest.TestCase):
         rendered = render_cli(make_incident())
 
         self.assertNotIn("Business Metrics", rendered)
+
+    def test_cli_renders_historical_semantic_change_when_semantic_diff_exists(self):
+        rendered = render_cli(make_semantic_diff_incident())
+
+        self.assertIn("Historical Semantic Change", rendered)
+        self.assertIn("- Revenue gained upstream dependency refunds", rendered)
+        self.assertIn("- Revenue lost invariant never negative", rendered)
+        self.assertIn("- Changed KPIs: Revenue", rendered)
+        self.assertIn("- Added KPIs: MRR", rendered)
+        self.assertIn("- Removed KPIs: Churn", rendered)
+        self.assertIn("- Dependency Changes: Revenue upstream_sources added refunds", rendered)
+        self.assertIn("- Contract Changes: Revenue invariants removed never negative", rendered)
+
+    def test_markdown_renders_historical_semantic_change_when_semantic_diff_exists(self):
+        rendered = render_markdown(make_semantic_diff_incident())
+
+        self.assertIn("### Historical Semantic Change", rendered)
+        self.assertIn("- Revenue gained upstream dependency refunds", rendered)
+        self.assertIn("- Revenue lost invariant never negative", rendered)
+        self.assertIn("- Changed KPIs: Revenue", rendered)
+        self.assertIn("- Added KPIs: MRR", rendered)
+        self.assertIn("- Removed KPIs: Churn", rendered)
+
+    def test_existing_rendering_has_no_historical_semantic_change_without_signal(self):
+        cli = render_cli(make_incident())
+        markdown = render_markdown(make_incident())
+
+        self.assertNotIn("Historical Semantic Change", cli)
+        self.assertNotIn("Historical Semantic Change", markdown)
+
+    def test_historical_semantic_change_snapshot_ids_are_rendered(self):
+        cli = render_cli(make_semantic_diff_incident())
+        markdown = render_markdown(make_semantic_diff_incident())
+
+        self.assertIn("- Previous Snapshot: abc123", cli)
+        self.assertIn("- Current Snapshot: def456", cli)
+        self.assertIn("**Previous Snapshot:** abc123", markdown)
+        self.assertIn("**Current Snapshot:** def456", markdown)
+
+    def test_historical_semantic_change_reasons_are_rendered(self):
+        rendered = render_markdown(make_semantic_diff_incident())
+
+        self.assertIn("Revenue gained upstream dependency refunds", rendered)
+        self.assertIn("Revenue lost invariant never negative", rendered)
+
+    def test_top_reasons_filter_low_level_kpi_discovery_matches(self):
+        cli = render_cli(make_noisy_kpi_incident())
+        markdown = render_markdown(make_noisy_kpi_incident())
+
+        self.assertIn(
+            "Revenue is impacted through stg_orders -> fct_revenue -> Revenue",
+            cli,
+        )
+        self.assertIn(
+            "Revenue is impacted through stg_orders -> fct_revenue -> Revenue",
+            markdown,
+        )
+        self.assertNotIn("matched KPI concept", cli)
+        self.assertNotIn("dbt_metrics value", cli)
+        self.assertNotIn("business_terms value", markdown)
 
 
 if __name__ == "__main__":
