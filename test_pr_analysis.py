@@ -1,11 +1,14 @@
 import copy
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import sentinel
 
 from agent.decision_engine import DeploymentDecision
+from agent.deployment_history import DeploymentHistoryStore
 from agent.deployment_snapshot import DeploymentSnapshot
-from agent.pr_analysis import analyze_changed_models
+from agent.pr_analysis import analyze_changed_models, analyze_pr_with_history
 from agent.signals import Severity, Signal
 
 
@@ -532,6 +535,144 @@ class PrAnalysisTests(unittest.TestCase):
 
         self.assertEqual(changed_models, original)
 
+    def test_analyze_pr_with_history_loads_latest_snapshot_from_history_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DeploymentHistoryStore(Path(tmp) / "history.json")
+            store.save_snapshot(_previous_snapshot("older", []))
+            latest = _previous_snapshot("latest", [])
+            store.save_snapshot(latest)
+
+            with _patched_detectors(neutral=True):
+                incident = analyze_pr_with_history(
+                    changed_models=[{"model_name": "stg_orders", "sql": "select 1"}],
+                    project_context=_project_context(),
+                    history_store=store,
+                    deployment_id="deploy-current",
+                )
+
+        self.assertEqual(incident.metadata["previous_snapshot_id"], "latest")
+        self.assertTrue(incident.metadata["previous_snapshot_loaded"])
+        self.assertTrue(incident.metadata["history_enabled"])
+
+    def test_analyze_pr_with_history_adds_semantic_diff_signal_when_latest_snapshot_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DeploymentHistoryStore(Path(tmp) / "history.json")
+            store.save_snapshot(_previous_snapshot("latest", []))
+
+            with _patched_detectors(neutral=True):
+                incident = analyze_pr_with_history(
+                    changed_models=[{"model_name": "stg_orders", "sql": "select 1"}],
+                    project_context=_project_context(),
+                    history_store=store,
+                    deployment_id="deploy-current",
+                )
+
+        self.assertEqual(incident.signals[-1].component, "semantic_diff")
+
+    def test_analyze_pr_with_history_empty_store_keeps_behavior_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DeploymentHistoryStore(Path(tmp) / "history.json")
+
+            with _patched_detectors(neutral=True):
+                incident = analyze_pr_with_history(
+                    changed_models=[{"model_name": "stg_orders", "sql": "select 1"}],
+                    project_context=_project_context(),
+                    history_store=store,
+                    deployment_id="deploy-current",
+                )
+
+        self.assertNotIn("semantic_diff", [signal.component for signal in incident.signals])
+        self.assertTrue(incident.metadata["history_enabled"])
+        self.assertFalse(incident.metadata["previous_snapshot_loaded"])
+        self.assertNotIn("previous_snapshot_id", incident.metadata)
+
+    def test_analyze_pr_with_history_without_store_keeps_behavior_unchanged(self):
+        with _patched_detectors(neutral=True):
+            incident = analyze_pr_with_history(
+                changed_models=[{"model_name": "stg_orders", "sql": "select 1"}],
+                project_context=_project_context(),
+                deployment_id="deploy-current",
+            )
+
+        self.assertNotIn("semantic_diff", [signal.component for signal in incident.signals])
+        self.assertFalse(incident.metadata["history_enabled"])
+        self.assertFalse(incident.metadata["previous_snapshot_loaded"])
+
+    def test_analyze_pr_with_history_sets_previous_snapshot_loaded_true_when_loaded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DeploymentHistoryStore(Path(tmp) / "history.json")
+            store.save_snapshot(_previous_snapshot("latest", []))
+
+            with _patched_detectors(neutral=True):
+                incident = analyze_pr_with_history(
+                    changed_models=[{"model_name": "stg_orders", "sql": "select 1"}],
+                    project_context=_project_context(),
+                    history_store=store,
+                    deployment_id="deploy-current",
+                )
+
+        self.assertTrue(incident.metadata["previous_snapshot_loaded"])
+        self.assertEqual(incident.metadata["previous_snapshot_id"], "latest")
+
+    def test_analyze_pr_with_history_sets_previous_snapshot_loaded_false_when_not_loaded(self):
+        with _patched_detectors(neutral=True):
+            incident = analyze_pr_with_history(
+                changed_models=[{"model_name": "stg_orders", "sql": "select 1"}],
+                project_context=_project_context(),
+                deployment_id="deploy-current",
+            )
+
+        self.assertFalse(incident.metadata["previous_snapshot_loaded"])
+
+    def test_analyze_pr_with_history_does_not_save_current_snapshot_automatically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DeploymentHistoryStore(Path(tmp) / "history.json")
+            store.save_snapshot(_previous_snapshot("latest", []))
+
+            with _patched_detectors(neutral=True):
+                analyze_pr_with_history(
+                    changed_models=[{"model_name": "stg_orders", "sql": "select 1"}],
+                    project_context=_project_context(),
+                    history_store=store,
+                    deployment_id="deploy-current",
+                )
+
+            snapshots = store.list_snapshots()
+
+        self.assertEqual([snapshot["snapshot_id"] for snapshot in snapshots], ["latest"])
+
+    def test_analyze_pr_with_history_does_not_mutate_project_context(self):
+        project_context = _project_context()
+        original = copy.deepcopy(project_context)
+
+        with _patched_detectors(neutral=True):
+            analyze_pr_with_history(
+                changed_models=[{"model_name": "stg_orders", "sql": "select 1"}],
+                project_context=project_context,
+                deployment_id="deploy-current",
+            )
+
+        self.assertEqual(project_context, original)
+
+    def test_analyze_pr_with_history_does_not_mutate_loaded_previous_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DeploymentHistoryStore(Path(tmp) / "history.json")
+            previous = _previous_snapshot("latest", [_semantic_contract(invariants=["never negative"])])
+            store.save_snapshot(previous)
+            original = copy.deepcopy(store.load_latest_snapshot())
+
+            with _patched_detectors(neutral=True):
+                analyze_pr_with_history(
+                    changed_models=[{"model_name": "stg_orders", "sql": "select 1"}],
+                    project_context=_project_context(),
+                    history_store=store,
+                    deployment_id="deploy-current",
+                )
+
+            loaded_after = store.load_snapshot("latest")
+
+        self.assertEqual(loaded_after, original)
+
 
 class _patched_detectors:
     def __init__(self, *, neutral=False):
@@ -824,6 +965,15 @@ def _semantic_model_spec():
             "models": [{"name": "stg_orders"}],
             "metrics": [{"name": "Revenue / GMV", "model": "fct_orders"}],
         },
+    }
+
+
+def _project_context():
+    return {
+        "model_names": ["stg_orders"],
+        "column_names": ["gross_revenue"],
+        "models": [{"name": "stg_orders"}],
+        "metrics": [{"name": "Revenue / GMV", "model": "fct_orders"}],
     }
 
 

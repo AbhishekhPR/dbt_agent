@@ -1,3 +1,4 @@
+import copy
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,46 @@ from agent.semantic_diff import compare_semantic_snapshots
 from agent.semantic_diff import to_signal as semantic_diff_to_signal
 from agent.semantic_kpi_inference import to_signal as kpi_impact_to_signal
 from agent.signals import Signal
+
+
+def analyze_pr_with_history(
+    *,
+    changed_models,
+    project_context,
+    history_store=None,
+    deployment_id=None,
+    metadata=None,
+    events=None,
+    **existing_options,
+) -> Incident:
+    history_enabled = history_store is not None
+    previous_snapshot = None
+
+    if history_store is not None:
+        loaded_snapshot = history_store.load_latest_snapshot()
+        if loaded_snapshot is not None:
+            previous_snapshot = copy.deepcopy(loaded_snapshot)
+
+    model_specs = _model_specs_with_pr_context(
+        changed_models,
+        project_context=project_context,
+        events=events,
+    )
+    incident = analyze_changed_models(
+        model_specs,
+        previous_snapshot=previous_snapshot,
+        deployment_id=deployment_id,
+    )
+
+    incident.metadata["history_enabled"] = history_enabled
+    incident.metadata["previous_snapshot_loaded"] = previous_snapshot is not None
+    if previous_snapshot is not None:
+        incident.metadata["previous_snapshot_id"] = _snapshot_id(previous_snapshot)
+    if metadata is not None:
+        incident.metadata["request_metadata"] = copy.deepcopy(metadata)
+    if existing_options:
+        incident.metadata["analysis_options"] = copy.deepcopy(existing_options)
+    return incident
 
 
 def analyze_changed_models(
@@ -87,6 +128,69 @@ def analyze_changed_models(
         affected_models=affected_models,
         metadata=metadata,
     )
+
+
+def _model_specs_with_pr_context(
+    changed_models,
+    *,
+    project_context,
+    events=None,
+) -> list[Any]:
+    specs = []
+    for model_spec in list(changed_models or []):
+        spec = _copy_model_spec(model_spec)
+        _set_model_spec_value(
+            spec,
+            "project_context",
+            _merge_contexts(_value(spec, "project_context"), project_context),
+        )
+        if events is not None and _value(spec, "business_events") is None and _value(spec, "operational_events") is None:
+            _set_model_spec_value(spec, "business_events", copy.deepcopy(events))
+        specs.append(spec)
+    return specs
+
+
+def _copy_model_spec(model_spec: Any):
+    if isinstance(model_spec, dict):
+        return copy.deepcopy(model_spec)
+    if isinstance(model_spec, str):
+        return {
+            "model_name": Path(model_spec).stem,
+            "sql": "",
+        }
+    return copy.deepcopy(model_spec)
+
+
+def _set_model_spec_value(model_spec: Any, key: str, value: Any) -> None:
+    if isinstance(model_spec, dict):
+        model_spec[key] = value
+        return
+    setattr(model_spec, key, value)
+
+
+def _merge_contexts(existing, incoming) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for context in [existing, incoming]:
+        if not isinstance(context, dict):
+            continue
+        for key, value in context.items():
+            if isinstance(value, list):
+                merged.setdefault(key, [])
+                merged[key].extend(_copy_list_items(value))
+            elif isinstance(value, dict):
+                merged.setdefault(key, {})
+                merged[key].update(copy.deepcopy(value))
+            else:
+                merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _snapshot_id(snapshot) -> str | None:
+    if isinstance(snapshot, dict):
+        value = snapshot.get("snapshot_id")
+    else:
+        value = getattr(snapshot, "snapshot_id", None)
+    return str(value) if value else None
 
 
 def _ast_signal(model_spec: Any, model_name: str) -> Signal:
