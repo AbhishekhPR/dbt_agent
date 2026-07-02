@@ -37,6 +37,7 @@ def assemble_pipeline_incident(
     blast_radius_signal: Signal | None = None,
     historical_reliability_signal: Signal | None = None,
     ast_signal: Signal | None = None,
+    kpi_impact_signal: Signal | None = None,
     incident_id: str = "INC-0001",
     affected_models: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
@@ -49,6 +50,7 @@ def assemble_pipeline_incident(
             drift_signal,
             blast_radius_signal,
             historical_reliability_signal,
+            kpi_impact_signal,
         ]
         if signal is not None
     ]

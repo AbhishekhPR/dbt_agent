@@ -241,6 +241,84 @@ class DecisionAssemblyTests(unittest.TestCase):
             {"failed_pickups": 240.0},
         )
 
+    def test_kpi_impact_signal_participates_in_decision_assembly(self):
+        incident = assemble_decision_incident([
+            Signal("metadata_checks", Severity.LOW, 90, 0),
+            Signal(
+                "kpi_impact",
+                Severity.HIGH,
+                95,
+                -30,
+                reasons=["Revenue is impacted through stg_orders → fct_orders → Revenue"],
+                metadata={
+                    "changed_models": ["stg_orders"],
+                    "impacted_kpis": ["Revenue"],
+                    "impact_paths": [["stg_orders", "fct_orders", "Revenue"]],
+                },
+            ),
+        ])
+
+        self.assertEqual(incident.health, 70)
+        self.assertEqual(incident.severity, Severity.HIGH)
+        self.assertEqual(incident.signals[1].component, "kpi_impact")
+
+    def test_kpi_impact_pipeline_health_decreases_appropriately(self):
+        baseline = assemble_decision_incident([
+            Signal("metadata_checks", Severity.LOW, 90, 0),
+        ])
+        with_kpi_impact = assemble_decision_incident([
+            Signal("metadata_checks", Severity.LOW, 90, 0),
+            Signal("kpi_impact", Severity.HIGH, 95, -30),
+        ])
+
+        self.assertEqual(baseline.health, 100)
+        self.assertEqual(with_kpi_impact.health, 70)
+
+    def test_kpi_impact_incident_preserves_metadata(self):
+        incident = assemble_decision_incident([
+            Signal(
+                "kpi_impact",
+                Severity.HIGH,
+                95,
+                -30,
+                metadata={
+                    "changed_models": ["stg_orders"],
+                    "impacted_kpis": ["Revenue"],
+                    "impact_paths": [["stg_orders", "fct_orders", "Revenue"]],
+                },
+            ),
+        ])
+
+        self.assertEqual(
+            incident.signals[0].metadata["impacted_kpis"],
+            ["Revenue"],
+        )
+        self.assertEqual(
+            incident.signals[0].metadata["impact_paths"],
+            [["stg_orders", "fct_orders", "Revenue"]],
+        )
+        self.assertEqual(
+            incident.signals[0].metadata["changed_models"],
+            ["stg_orders"],
+        )
+
+    def test_pipeline_assembly_accepts_kpi_impact_signal_after_existing_detectors(self):
+        ast_signal = Signal("ast", Severity.LOW, 75, -5)
+        metadata_signal = Signal("metadata_checks", Severity.LOW, 90, 0)
+        kpi_signal = Signal("kpi_impact", Severity.HIGH, 95, -30)
+
+        incident = assemble_pipeline_incident(
+            ast_signal=ast_signal,
+            metadata_signal=metadata_signal,
+            kpi_impact_signal=kpi_signal,
+        )
+
+        self.assertEqual(
+            [signal.component for signal in incident.signals],
+            ["ast", "metadata_checks", "kpi_impact"],
+        )
+        self.assertEqual(incident.health, 65)
+
     def test_pipeline_decision_blocks_when_combined_health_is_low(self):
         incident = assemble_pipeline_incident(
             metadata_signal=Signal("metadata_checks", Severity.HIGH, 95, -30),

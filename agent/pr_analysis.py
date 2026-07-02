@@ -12,10 +12,14 @@ from agent.decision_assembly import assemble_decision_incident
 from agent.historical_reliability import evaluate_history
 from agent.historical_reliability import to_signal as historical_reliability_to_signal
 from agent.incident import Incident
+from agent.kpi_discovery import discover_kpis
 from agent.metadata_checks import run_metadata_checks
 from agent.metadata_checks import to_signal as metadata_checks_to_signal
 from agent.metadata_drift import compare_last_run
 from agent.metadata_drift import to_signal as metadata_drift_to_signal
+from agent.semantic_graph import build_semantic_graph
+from agent.semantic_kpi_inference import infer_impacted_kpis
+from agent.semantic_kpi_inference import to_signal as kpi_impact_to_signal
 from agent.signals import Signal
 
 
@@ -43,14 +47,29 @@ def analyze_changed_models(changed_models) -> Incident:
             for signal in model_signals
         )
 
+    kpi_impact_signal = _kpi_impact_signal(model_specs, affected_models)
+    if kpi_impact_signal is not None:
+        signals.append(kpi_impact_signal)
+
+    metadata = {
+        "model_count": len(model_specs),
+        "signal_count": len(signals),
+        "models": list(affected_models),
+    }
+    if kpi_impact_signal is not None:
+        metadata["kpi_impact"] = {
+            "changed_models": list(kpi_impact_signal.metadata.get("changed_models", [])),
+            "impacted_kpis": list(kpi_impact_signal.metadata.get("impacted_kpis", [])),
+            "impact_paths": [
+                list(path)
+                for path in kpi_impact_signal.metadata.get("impact_paths", [])
+            ],
+        }
+
     return assemble_decision_incident(
         signals,
         affected_models=affected_models,
-        metadata={
-            "model_count": len(model_specs),
-            "signal_count": len(signals),
-            "models": list(affected_models),
-        },
+        metadata=metadata,
     )
 
 
@@ -109,6 +128,32 @@ def _business_metric_signal(model_spec: Any) -> Signal | None:
     return business_metrics_to_signal(result)
 
 
+def _kpi_impact_signal(model_specs: list[Any], affected_models: list[str]) -> Signal | None:
+    project_context = _project_context(model_specs)
+    if project_context is None:
+        return None
+
+    discovered_kpis = discover_kpis(project_context)
+    semantic_graph = build_semantic_graph(project_context)
+    report = infer_impacted_kpis(
+        changed_models=list(affected_models),
+        discovered_kpis=discovered_kpis,
+        semantic_graph=semantic_graph,
+    )
+    signal = kpi_impact_to_signal(report)
+    return Signal(
+        component=signal.component,
+        severity=signal.severity,
+        confidence=signal.confidence,
+        score=signal.score,
+        reasons=list(signal.reasons),
+        metadata={
+            **dict(signal.metadata),
+            "source_component": signal.component,
+        },
+    )
+
+
 def _with_model_attribution(signal: Signal, model_name: str) -> Signal:
     metadata = dict(signal.metadata)
     metadata["model_name"] = model_name
@@ -152,3 +197,41 @@ def _value(model_spec: Any, key: str, default: Any = None) -> Any:
     if isinstance(model_spec, dict):
         return model_spec.get(key, default)
     return getattr(model_spec, key, default)
+
+
+def _project_context(model_specs: list[Any]) -> dict[str, Any] | None:
+    contexts = [
+        dict(context)
+        for context in (
+            _value(model_spec, "project_context")
+            for model_spec in model_specs
+        )
+        if isinstance(context, dict)
+    ]
+    if not contexts:
+        return None
+
+    merged: dict[str, Any] = {}
+    for context in contexts:
+        for key, value in context.items():
+            if isinstance(value, list):
+                merged.setdefault(key, [])
+                merged[key].extend(_copy_list_items(value))
+            elif isinstance(value, dict):
+                merged.setdefault(key, {})
+                merged[key].update(dict(value))
+            else:
+                merged[key] = value
+    return merged
+
+
+def _copy_list_items(values: list[Any]) -> list[Any]:
+    copied = []
+    for value in values:
+        if isinstance(value, dict):
+            copied.append(dict(value))
+        elif isinstance(value, list):
+            copied.append(list(value))
+        else:
+            copied.append(value)
+    return copied
