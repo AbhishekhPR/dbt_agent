@@ -5,6 +5,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from agent.decision_engine import DeploymentDecision
+
 
 class DeploymentHistoryStore:
     def __init__(self, path):
@@ -70,12 +72,40 @@ class DeploymentHistoryStore:
         tmp_path.replace(self.path)
 
 
+def record_deployment_snapshot(
+    *,
+    history_store,
+    incident,
+    allow_blocked=False,
+):
+    current_snapshot = (getattr(incident, "metadata", {}) or {}).get("current_snapshot")
+    if current_snapshot is None:
+        return None
+    if _is_blocked(incident) and not allow_blocked:
+        return None
+
+    snapshot_dict = _snapshot_dict(current_snapshot)
+    snapshot_id = snapshot_dict.get("snapshot_id")
+    if not snapshot_id:
+        return None
+
+    history_store.save_snapshot(snapshot_dict)
+    return snapshot_id
+
+
 def _snapshot_dict(snapshot) -> dict[str, Any]:
     if hasattr(snapshot, "to_dict"):
         return copy.deepcopy(snapshot.to_dict())
     if is_dataclass(snapshot):
         return _serializable(snapshot)
     return _serializable(copy.deepcopy(dict(snapshot or {})))
+
+
+def _is_blocked(incident) -> bool:
+    decision = getattr(incident, "decision", None)
+    if isinstance(decision, DeploymentDecision):
+        return decision == DeploymentDecision.BLOCK
+    return str(decision) == DeploymentDecision.BLOCK.value
 
 
 def _serializable(value):
