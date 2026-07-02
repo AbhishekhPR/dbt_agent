@@ -504,6 +504,161 @@ def pr_review_demo(output):
     click.echo(markdown)
 
 
+@cli.command(name="review-deployment")
+@click.option(
+    "--project-context",
+    required=True,
+    help="Path to a JSON file containing project context.",
+)
+@click.option(
+    "--changed-model",
+    "changed_models",
+    multiple=True,
+    help="Changed model name. May be provided more than once.",
+)
+@click.option(
+    "--history-path",
+    default=".relium/deployment_history.json",
+    show_default=True,
+    help="Path to Relium deployment history JSON.",
+)
+@click.option("--deployment-id", default=None, help="Deployment identifier.")
+@click.option("--auto-record", is_flag=True, help="Record accepted snapshots.")
+@click.option(
+    "--allow-blocked-recording",
+    is_flag=True,
+    help="Allow BLOCK deployment snapshots to be recorded.",
+)
+@click.option("--output", default=None, help="Write rendered review to this file.")
+@click.option(
+    "--format",
+    "output_format",
+    default="cli",
+    show_default=True,
+    type=click.Choice(["cli", "markdown", "json"]),
+    help="Rendered output format.",
+)
+def review_deployment_command(
+    project_context,
+    changed_models,
+    history_path,
+    deployment_id,
+    auto_record,
+    allow_blocked_recording,
+    output,
+    output_format,
+):
+    """Run a history-aware Relium deployment review."""
+    import json
+    from pathlib import Path
+
+    from agent.deployment_history import DeploymentHistoryStore
+    from agent.deployment_lifecycle import review_deployment
+
+    if not changed_models:
+        raise click.ClickException("At least one --changed-model is required.")
+
+    context_path = Path(project_context)
+    if not context_path.exists():
+        raise click.ClickException(
+            f"Project context file not found: {project_context}"
+        )
+
+    try:
+        context_payload = json.loads(context_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise click.ClickException(
+            f"Invalid project context JSON: {error}"
+        ) from error
+    except OSError as error:
+        raise click.ClickException(
+            f"Could not read project context file: {error}"
+        ) from error
+
+    if not isinstance(context_payload, dict):
+        raise click.ClickException("Project context JSON must be an object.")
+
+    history_store = DeploymentHistoryStore(history_path)
+    result = review_deployment(
+        changed_models=list(changed_models),
+        project_context=context_payload,
+        history_store=history_store,
+        deployment_id=deployment_id,
+        auto_record=auto_record,
+        allow_blocked_recording=allow_blocked_recording,
+    )
+    rendered = _render_deployment_review_result(result, output_format)
+
+    if output:
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(rendered, encoding="utf-8")
+        click.echo(f"Deployment review written to {output}")
+        return
+
+    click.echo(rendered)
+
+
+def _render_deployment_review_result(result, output_format):
+    import json
+
+    from agent.presentation import render_cli, render_json, render_markdown
+
+    if output_format == "json":
+        payload = render_json(result.incident)
+        payload["deployment_lifecycle"] = _deployment_lifecycle_metadata(result)
+        return json.dumps(payload, indent=2, sort_keys=True)
+
+    if output_format == "markdown":
+        rendered = render_markdown(result.incident)
+        status_lines = _deployment_review_status_lines(result, markdown=True)
+        return f"{rendered}\n\n## Deployment History\n" + "\n".join(status_lines)
+
+    rendered = render_cli(result.incident)
+    status_lines = _deployment_review_status_lines(result, markdown=False)
+    return f"{rendered}\n\nDeployment History\n" + "\n".join(status_lines)
+
+
+def _deployment_lifecycle_metadata(result):
+    return {
+        "previous_snapshot_loaded": bool(result.previous_snapshot_loaded),
+        "previous_snapshot_id": _snapshot_id(result.previous_snapshot),
+        "current_snapshot_id": _snapshot_id(result.current_snapshot),
+        "saved_snapshot_id": result.saved_snapshot_id,
+        "history_enabled": bool((result.metadata or {}).get("history_enabled")),
+    }
+
+
+def _deployment_review_status_lines(result, *, markdown):
+    loaded = "YES" if result.previous_snapshot_loaded else "NO"
+    previous_snapshot_id = _snapshot_id(result.previous_snapshot)
+    lines = []
+    if markdown:
+        lines.append(f"**Previous Snapshot Loaded:** {loaded}")
+        if result.previous_snapshot_loaded:
+            lines.append(f"**Previous Snapshot:** {previous_snapshot_id or 'None'}")
+        if result.saved_snapshot_id:
+            lines.append(f"**Saved Snapshot:** {result.saved_snapshot_id}")
+        return lines
+
+    lines.append(f"Previous Snapshot Loaded: {loaded}")
+    if result.previous_snapshot_loaded:
+        lines.append(f"Previous Snapshot: {previous_snapshot_id or 'None'}")
+    if result.saved_snapshot_id:
+        lines.append(f"Saved Snapshot: {result.saved_snapshot_id}")
+    return lines
+
+
+def _snapshot_id(snapshot):
+    if not snapshot:
+        return None
+    if isinstance(snapshot, dict):
+        value = snapshot.get("snapshot_id")
+    else:
+        value = getattr(snapshot, "snapshot_id", None)
+    return str(value) if value else None
+
+
 @cli.command(name="compare-last-run")
 @click.option('--db', default=None, help='Path to metadata SQLite database')
 @click.option('--project', default=None, help='Project name to compare (optional)')
