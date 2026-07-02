@@ -1,7 +1,9 @@
 from typing import Any
 
 from agent.decision_engine import SEVERITY_RANKS, Decision
+from agent.evidence_curation import clean_reason, is_low_level_reason
 from agent.incident import Incident, create_incident
+from agent.signals import Severity, Signal
 
 
 DEFAULT_RECOMMENDATION = "Review the flagged pipeline signals before deployment."
@@ -54,14 +56,68 @@ def summarize_incident(incident: Incident) -> dict:
 
 
 def _derive_root_cause(decision: Decision) -> str:
-    signals_with_reasons = [
-        signal for signal in decision.signals if signal.reasons
-    ]
+    signals_with_reasons = _signals_with_reportable_reasons(decision.signals)
     if not signals_with_reasons:
         return ""
+
+    for component, allowed_severities in [
+        ("semantic_diff", None),
+        ("semantic_contract", None),
+        ("kpi_impact", None),
+        ("ast", {Severity.HIGH, Severity.CRITICAL}),
+    ]:
+        reason = _prioritized_component_reason(
+            signals_with_reasons,
+            component,
+            allowed_severities,
+        )
+        if reason:
+            return reason
 
     highest_severity_signal = max(
         signals_with_reasons,
         key=lambda signal: SEVERITY_RANKS.get(signal.severity, 0),
     )
-    return highest_severity_signal.reasons[0]
+    return _first_reportable_reason(highest_severity_signal) or ""
+
+
+def _prioritized_component_reason(
+    signals: list[Signal],
+    component: str,
+    allowed_severities: set[Severity] | None,
+) -> str:
+    component_signals = [
+        signal
+        for signal in signals
+        if signal.component == component
+        and (
+            allowed_severities is None
+            or signal.severity in allowed_severities
+        )
+    ]
+    if not component_signals:
+        return ""
+
+    highest_signal = max(
+        component_signals,
+        key=lambda signal: SEVERITY_RANKS.get(signal.severity, 0),
+    )
+    return _first_reportable_reason(highest_signal) or ""
+
+
+def _signals_with_reportable_reasons(signals: list[Signal]) -> list[Signal]:
+    return [
+        signal
+        for signal in signals
+        if _first_reportable_reason(signal)
+    ]
+
+
+def _first_reportable_reason(signal: Signal) -> str:
+    for reason in signal.reasons or []:
+        if is_low_level_reason(reason):
+            continue
+        cleaned = clean_reason(reason)
+        if cleaned:
+            return cleaned
+    return ""

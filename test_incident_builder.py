@@ -1,3 +1,4 @@
+import copy
 import unittest
 
 from agent.decision_engine import DeploymentDecision, evaluate
@@ -54,6 +55,140 @@ class IncidentBuilderTests(unittest.TestCase):
         incident = build_incident(decision)
 
         self.assertEqual(incident.root_cause, "High-risk AST finding")
+
+    def test_semantic_diff_reason_becomes_primary_root_cause_when_present(self):
+        semantic_diff = Signal(
+            component="semantic_diff",
+            severity=Severity.MEDIUM,
+            confidence=92,
+            score=-35,
+            reasons=["Revenue gained upstream dependency refunds"],
+        )
+        generic_kpi = Signal(
+            component="kpi_impact",
+            severity=Severity.CRITICAL,
+            confidence=95,
+            score=-30,
+            reasons=["Revenue is impacted by fct_revenue"],
+        )
+        decision = evaluate([generic_kpi, semantic_diff])
+
+        incident = build_incident(decision)
+
+        self.assertEqual(
+            incident.root_cause,
+            "Revenue gained upstream dependency refunds",
+        )
+
+    def test_semantic_contract_reason_is_chosen_when_semantic_diff_absent(self):
+        semantic_contract = Signal(
+            component="semantic_contract",
+            severity=Severity.MEDIUM,
+            confidence=88,
+            score=-20,
+            reasons=["Revenue violated invariant never negative"],
+        )
+        generic_kpi = Signal(
+            component="kpi_impact",
+            severity=Severity.HIGH,
+            confidence=90,
+            score=-30,
+            reasons=["Revenue is impacted by fct_revenue"],
+        )
+        decision = evaluate([generic_kpi, semantic_contract])
+
+        incident = build_incident(decision)
+
+        self.assertEqual(
+            incident.root_cause,
+            "Revenue violated invariant never negative",
+        )
+
+    def test_kpi_impact_reason_is_chosen_when_higher_semantic_signals_absent(self):
+        generic_kpi = Signal(
+            component="kpi_impact",
+            severity=Severity.MEDIUM,
+            confidence=88,
+            score=-15,
+            reasons=["Revenue is impacted through stg_orders -> fct_revenue -> Revenue"],
+        )
+        ast_signal = Signal(
+            component="ast",
+            severity=Severity.CRITICAL,
+            confidence=95,
+            score=-40,
+            reasons=["Cross join detected"],
+        )
+        decision = evaluate([ast_signal, generic_kpi])
+
+        incident = build_incident(decision)
+
+        self.assertEqual(
+            incident.root_cause,
+            "Revenue is impacted through stg_orders -> fct_revenue -> Revenue",
+        )
+
+    def test_low_level_kpi_discovery_matches_are_never_root_cause(self):
+        generic_kpi = Signal(
+            component="kpi_impact",
+            severity=Severity.HIGH,
+            confidence=88,
+            score=-15,
+            reasons=[
+                "dbt_metrics value Revenue matched KPI concept Revenue/ GMV",
+                "Revenue is impacted through stg_orders -> fct_revenue -> Revenue",
+            ],
+        )
+        decision = evaluate([generic_kpi])
+
+        incident = build_incident(decision)
+
+        self.assertEqual(
+            incident.root_cause,
+            "Revenue is impacted through stg_orders -> fct_revenue -> Revenue",
+        )
+        self.assertNotIn("matched KPI concept", incident.root_cause)
+
+    def test_existing_non_semantic_root_cause_behavior_remains_unchanged(self):
+        metadata_signal = Signal(
+            component="metadata_checks",
+            severity=Severity.MEDIUM,
+            confidence=85,
+            score=-15,
+            reasons=["Duplicate count increased"],
+        )
+        ast_signal = Signal(
+            component="ast",
+            severity=Severity.HIGH,
+            confidence=95,
+            score=-40,
+            reasons=["LEFT JOIN nullification detected"],
+        )
+        decision = evaluate([metadata_signal, ast_signal])
+
+        incident = build_incident(decision)
+
+        self.assertEqual(incident.root_cause, "LEFT JOIN nullification detected")
+
+    def test_root_cause_prioritization_does_not_mutate_input_signals(self):
+        signals = [
+            Signal(
+                component="kpi_impact",
+                severity=Severity.HIGH,
+                confidence=88,
+                score=-15,
+                reasons=[
+                    "dbt_metrics value Revenue matched KPI concept Revenue/ GMV",
+                    "Revenue is impacted through stg_orders -> fct_revenue -> Revenue",
+                ],
+                metadata={"kpi": "Revenue"},
+            )
+        ]
+        before = copy.deepcopy(signals)
+
+        build_incident(evaluate(signals))
+
+        self.assertEqual(signals, before)
 
     def test_uses_fallback_recommendation(self):
         decision = evaluate([
