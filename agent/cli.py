@@ -507,8 +507,12 @@ def pr_review_demo(output):
 @cli.command(name="review-deployment")
 @click.option(
     "--project-context",
-    required=True,
     help="Path to a JSON file containing project context.",
+)
+@click.option(
+    "--dbt-manifest",
+    default=None,
+    help="Path to a dbt manifest.json artifact.",
 )
 @click.option(
     "--changed-model",
@@ -540,6 +544,7 @@ def pr_review_demo(output):
 )
 def review_deployment_command(
     project_context,
+    dbt_manifest,
     changed_models,
     history_path,
     deployment_id,
@@ -549,14 +554,53 @@ def review_deployment_command(
     output_format,
 ):
     """Run a history-aware Relium deployment review."""
-    import json
     from pathlib import Path
 
     from agent.deployment_history import DeploymentHistoryStore
     from agent.deployment_lifecycle import review_deployment
 
+    context_payload = _load_review_project_context(project_context, dbt_manifest)
+
     if not changed_models:
         raise click.ClickException("At least one --changed-model is required.")
+
+    history_store = DeploymentHistoryStore(history_path)
+    result = review_deployment(
+        changed_models=list(changed_models),
+        project_context=context_payload,
+        history_store=history_store,
+        deployment_id=deployment_id,
+        auto_record=auto_record,
+        allow_blocked_recording=allow_blocked_recording,
+    )
+    rendered = _render_deployment_review_result(result, output_format)
+
+    if output:
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(rendered, encoding="utf-8")
+        click.echo(f"Deployment review written to {output}")
+        return
+
+    click.echo(rendered)
+
+
+def _load_review_project_context(project_context, dbt_manifest):
+    if bool(project_context) == bool(dbt_manifest):
+        raise click.ClickException(
+            "Exactly one of --project-context or --dbt-manifest is required."
+        )
+
+    if dbt_manifest:
+        from agent.dbt_context import load_project_context_from_manifest_path
+
+        try:
+            return load_project_context_from_manifest_path(dbt_manifest)
+        except ValueError as error:
+            raise click.ClickException(str(error)) from error
+
+    import json
+    from pathlib import Path
 
     context_path = Path(project_context)
     if not context_path.exists():
@@ -578,25 +622,7 @@ def review_deployment_command(
     if not isinstance(context_payload, dict):
         raise click.ClickException("Project context JSON must be an object.")
 
-    history_store = DeploymentHistoryStore(history_path)
-    result = review_deployment(
-        changed_models=list(changed_models),
-        project_context=context_payload,
-        history_store=history_store,
-        deployment_id=deployment_id,
-        auto_record=auto_record,
-        allow_blocked_recording=allow_blocked_recording,
-    )
-    rendered = _render_deployment_review_result(result, output_format)
-
-    if output:
-        output_path = Path(output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(rendered, encoding="utf-8")
-        click.echo(f"Deployment review written to {output}")
-        return
-
-    click.echo(rendered)
+    return context_payload
 
 
 def _render_deployment_review_result(result, output_format):

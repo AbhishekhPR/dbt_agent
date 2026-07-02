@@ -16,6 +16,61 @@ from agent.signals import Severity, Signal
 
 
 class CliTests(unittest.TestCase):
+    def test_review_deployment_accepts_dbt_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = _write_dbt_manifest(tmp)
+            history_path = Path(tmp) / "history.json"
+            captured = {}
+
+            def analyze(**kwargs):
+                captured["project_context"] = kwargs["project_context"]
+                return _fake_analyzer()(**kwargs)
+
+            with patch(
+                "agent.deployment_lifecycle.analyze_pr_with_history",
+                side_effect=analyze,
+            ):
+                result, output = _invoke(
+                    [
+                        "review-deployment",
+                        "--dbt-manifest",
+                        str(manifest_path),
+                        "--changed-model",
+                        "stg_orders",
+                        "--history-path",
+                        str(history_path),
+                    ]
+                )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("Relium Deployment Decision", output)
+        self.assertEqual(captured["project_context"]["model_names"], ["fct_orders", "stg_orders"])
+        self.assertEqual(captured["project_context"]["metadata"]["source"], "dbt_manifest")
+
+    def test_dbt_manifest_path_produces_successful_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = _write_dbt_manifest(tmp)
+            history_path = Path(tmp) / "history.json"
+
+            with patch(
+                "agent.deployment_lifecycle.analyze_pr_with_history",
+                side_effect=_fake_analyzer(),
+            ):
+                result, output = _invoke(
+                    [
+                        "review-deployment",
+                        "--dbt-manifest",
+                        str(manifest_path),
+                        "--changed-model",
+                        "stg_orders",
+                        "--history-path",
+                        str(history_path),
+                    ]
+                )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("Previous Snapshot Loaded: NO", output)
+
     def test_review_deployment_command_exits_zero_with_valid_project_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             context_path = _write_project_context(tmp)
@@ -284,12 +339,112 @@ class CliTests(unittest.TestCase):
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("At least one --changed-model is required", output)
 
+    def test_missing_manifest_path_exits_nonzero(self):
+        result, output = _invoke(
+            [
+                "review-deployment",
+                "--dbt-manifest",
+                "missing-manifest.json",
+                "--changed-model",
+                "stg_orders",
+            ]
+        )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("Manifest file not found", output)
+
+    def test_invalid_manifest_json_exits_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            manifest_path.write_text("{not json", encoding="utf-8")
+
+            result, output = _invoke(
+                [
+                    "review-deployment",
+                    "--dbt-manifest",
+                    str(manifest_path),
+                    "--changed-model",
+                    "stg_orders",
+                ]
+            )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("Invalid manifest JSON", output)
+
+    def test_neither_project_context_nor_dbt_manifest_exits_nonzero(self):
+        result, output = _invoke(
+            [
+                "review-deployment",
+                "--changed-model",
+                "stg_orders",
+            ]
+        )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("Exactly one of --project-context or --dbt-manifest is required", output)
+
+    def test_both_project_context_and_dbt_manifest_exits_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = _write_project_context(tmp)
+            manifest_path = _write_dbt_manifest(tmp)
+
+            result, output = _invoke(
+                [
+                    "review-deployment",
+                    "--project-context",
+                    str(context_path),
+                    "--dbt-manifest",
+                    str(manifest_path),
+                    "--changed-model",
+                    "stg_orders",
+                ]
+            )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("Exactly one of --project-context or --dbt-manifest is required", output)
+
+    def test_existing_project_context_behavior_still_works(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = _write_project_context(tmp)
+            history_path = Path(tmp) / "history.json"
+            captured = {}
+
+            def analyze(**kwargs):
+                captured["project_context"] = kwargs["project_context"]
+                return _fake_analyzer()(**kwargs)
+
+            with patch(
+                "agent.deployment_lifecycle.analyze_pr_with_history",
+                side_effect=analyze,
+            ):
+                result, output = _invoke(
+                    [
+                        "review-deployment",
+                        "--project-context",
+                        str(context_path),
+                        "--changed-model",
+                        "stg_orders",
+                        "--history-path",
+                        str(history_path),
+                    ]
+                )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertEqual(captured["project_context"]["model_names"], ["stg_orders", "fct_orders"])
+        self.assertIn("Relium Deployment Decision", output)
+
     def test_existing_pr_review_demo_command_behavior_is_unchanged(self):
         result, output = _invoke(["pr-review-demo"])
 
         self.assertEqual(result.exit_code, 0, output)
         self.assertIn("Relium AI Deployment Review", output)
         self.assertIn("Deployment Decision", output)
+
+    def test_existing_cli_commands_unchanged(self):
+        result, output = _invoke(["pr-review-demo"])
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("Relium AI Deployment Review", output)
 
 
 def _invoke(args):
@@ -369,6 +524,69 @@ def _write_project_context(tmp):
         encoding="utf-8",
     )
     return path
+
+
+def _write_dbt_manifest(tmp):
+    path = Path(tmp) / "manifest.json"
+    path.write_text(json.dumps(_dbt_manifest()), encoding="utf-8")
+    return path
+
+
+def _dbt_manifest():
+    return {
+        "metadata": {
+            "project_name": "jaffle_shop",
+            "dbt_version": "1.8.0",
+        },
+        "nodes": {
+            "model.jaffle_shop.stg_orders": {
+                "resource_type": "model",
+                "name": "stg_orders",
+                "unique_id": "model.jaffle_shop.stg_orders",
+                "original_file_path": "models/staging/stg_orders.sql",
+                "columns": {
+                    "order_id": {"name": "order_id"},
+                    "payment_amount": {"name": "payment_amount"},
+                },
+                "depends_on": {
+                    "nodes": ["source.jaffle_shop.raw_shop.orders"],
+                },
+                "config": {"materialized": "view"},
+            },
+            "model.jaffle_shop.fct_orders": {
+                "resource_type": "model",
+                "name": "fct_orders",
+                "unique_id": "model.jaffle_shop.fct_orders",
+                "path": "marts/fct_orders.sql",
+                "columns": {
+                    "order_id": {"name": "order_id"},
+                    "gross_revenue": {"name": "gross_revenue"},
+                },
+                "depends_on": {
+                    "nodes": ["model.jaffle_shop.stg_orders"],
+                },
+                "config": {"materialized": "table"},
+            },
+        },
+        "sources": {
+            "source.jaffle_shop.raw_shop.orders": {
+                "resource_type": "source",
+                "name": "orders",
+                "source_name": "raw_shop",
+                "table_name": "orders",
+                "unique_id": "source.jaffle_shop.raw_shop.orders",
+            }
+        },
+        "metrics": {
+            "metric.jaffle_shop.revenue": {
+                "name": "Revenue / GMV",
+                "label": "Revenue",
+                "type": "simple",
+                "description": "Completed customer payment volume.",
+                "model": "ref('fct_orders')",
+            }
+        },
+    }
 
 
 def _snapshot(snapshot_id, deployment_id, *, decision="ALLOW"):
