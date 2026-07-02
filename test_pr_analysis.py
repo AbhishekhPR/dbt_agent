@@ -1,5 +1,6 @@
 import copy
 import unittest
+from types import SimpleNamespace
 from unittest.mock import sentinel
 
 from agent.decision_engine import DeploymentDecision
@@ -194,16 +195,68 @@ class PrAnalysisTests(unittest.TestCase):
         with _patched_detectors() as calls:
             incident = analyze_changed_models(changed_models)
 
-        self.assertEqual(len(calls["kpi_discovery"]), 1)
-        self.assertEqual(len(calls["semantic_graph"]), 1)
-        self.assertEqual(len(calls["semantic_kpi_inference"]), 1)
+        self.assertEqual(len(calls["semantic_context"]), 1)
         self.assertEqual(len(calls["kpi_impact_signal"]), 1)
-        self.assertEqual(incident.signals[-1].component, "kpi_impact")
+        self.assertEqual(incident.signals[-2].component, "kpi_impact")
         self.assertEqual(incident.health, 0)
         self.assertEqual(
-            incident.signals[-1].metadata["impacted_kpis"],
+            incident.signals[-2].metadata["impacted_kpis"],
             ["Revenue / GMV"],
         )
+
+    def test_pr_analysis_builds_semantic_context(self):
+        changed_models = [
+            {
+                "model_name": "stg_orders",
+                "sql": "select 1",
+                "project_context": {
+                    "model_names": ["stg_orders"],
+                    "column_names": ["gross_revenue"],
+                    "metrics": [{"name": "Revenue / GMV", "model": "fct_orders"}],
+                },
+            }
+        ]
+
+        with _patched_detectors() as calls:
+            analyze_changed_models(changed_models)
+
+        self.assertEqual(
+            calls["semantic_context"],
+            [
+                {
+                    "project_context": {
+                        "model_names": ["stg_orders"],
+                        "column_names": ["gross_revenue"],
+                        "metrics": [{"name": "Revenue / GMV", "model": "fct_orders"}],
+                    },
+                    "changed_models": ["stg_orders"],
+                    "metadata": {
+                        "model_count": 1,
+                        "models": ["stg_orders"],
+                    },
+                }
+            ],
+        )
+
+    def test_semantic_contract_signal_participates_in_decision(self):
+        changed_models = [
+            {
+                "model_name": "stg_orders",
+                "sql": "select 1",
+                "project_context": {
+                    "model_names": ["stg_orders"],
+                    "column_names": ["gross_revenue"],
+                    "metrics": [{"name": "Revenue / GMV", "model": "fct_orders"}],
+                },
+            }
+        ]
+
+        with _patched_detectors():
+            incident = analyze_changed_models(changed_models)
+
+        self.assertEqual(incident.signals[-1].component, "semantic_contract")
+        self.assertEqual(incident.signals[-1].metadata["contract_names"], ["Revenue / GMV"])
+        self.assertEqual(incident.health, 0)
 
     def test_incident_preserves_kpi_impact_metadata(self):
         changed_models = [
@@ -233,6 +286,23 @@ class PrAnalysisTests(unittest.TestCase):
             incident.metadata["kpi_impact"]["changed_models"],
             ["stg_orders"],
         )
+        self.assertIn("semantic_context", incident.metadata)
+        self.assertEqual(
+            incident.metadata["semantic_context"]["kpi_impact_report"]["impacted_kpis"][0]["name"],
+            "Revenue / GMV",
+        )
+        self.assertEqual(
+            incident.metadata["impacted_kpis"],
+            ["Revenue / GMV"],
+        )
+        self.assertEqual(
+            incident.metadata["impact_paths"],
+            [["stg_orders", "fct_orders", "Revenue / GMV"]],
+        )
+        self.assertEqual(
+            incident.metadata["contract_validation"]["contract_names"],
+            ["Revenue / GMV"],
+        )
 
     def test_existing_detector_ordering_is_unchanged_before_kpi_impact(self):
         changed_models = [
@@ -259,6 +329,7 @@ class PrAnalysisTests(unittest.TestCase):
                 "blast_radius",
                 "historical_reliability",
                 "kpi_impact",
+                "semantic_contract",
             ],
         )
 
@@ -294,10 +365,9 @@ class _patched_detectors:
             "blast": [],
             "history": [],
             "business_metrics": [],
-            "kpi_discovery": [],
-            "semantic_graph": [],
-            "semantic_kpi_inference": [],
+            "semantic_context": [],
             "kpi_impact_signal": [],
+            "semantic_contract_signal": [],
         }
         self.patchers = [
             patch("agent.pr_analysis.run_ast_analysis", side_effect=self._run_ast),
@@ -313,10 +383,9 @@ class _patched_detectors:
             patch("agent.pr_analysis.calculate_operational_metrics", side_effect=self._calculate_business_metrics),
             patch("agent.pr_analysis.evaluate_metric_reliability", side_effect=self._evaluate_metric_reliability),
             patch("agent.pr_analysis.business_metrics_to_signal", side_effect=self._business_metric_signal),
-            patch("agent.pr_analysis.discover_kpis", side_effect=self._discover_kpis),
-            patch("agent.pr_analysis.build_semantic_graph", side_effect=self._build_semantic_graph),
-            patch("agent.pr_analysis.infer_impacted_kpis", side_effect=self._infer_impacted_kpis),
+            patch("agent.pr_analysis.build_semantic_context", side_effect=self._build_semantic_context),
             patch("agent.pr_analysis.kpi_impact_to_signal", side_effect=self._kpi_impact_signal),
+            patch("agent.pr_analysis.semantic_contract_to_signal", side_effect=self._semantic_contract_signal),
         ]
         for patcher in self.patchers:
             patcher.start()
@@ -419,23 +488,64 @@ class _patched_detectors:
             metadata=dict(result["metadata"]),
         )
 
-    def _discover_kpis(self, project_context):
-        self.calls["kpi_discovery"].append(copy.deepcopy(project_context))
-        return [sentinel.revenue_kpi]
-
-    def _build_semantic_graph(self, project_context):
-        self.calls["semantic_graph"].append(copy.deepcopy(project_context))
-        return sentinel.semantic_graph
-
-    def _infer_impacted_kpis(self, *, changed_models, discovered_kpis, semantic_graph=None):
-        self.calls["semantic_kpi_inference"].append(
+    def _build_semantic_context(self, *, project_context, changed_models=None, metadata=None):
+        self.calls["semantic_context"].append(
             {
+                "project_context": copy.deepcopy(project_context),
                 "changed_models": list(changed_models),
-                "discovered_kpis": list(discovered_kpis),
-                "semantic_graph": semantic_graph,
+                "metadata": copy.deepcopy(metadata),
             }
         )
-        return sentinel.kpi_impact_report
+        impacted_kpi = SimpleNamespace(
+            name="Revenue / GMV",
+            confidence=95,
+            impacted_by_models=["stg_orders", "fct_orders"],
+            related_columns=["gross_revenue"],
+            reasons=["Revenue / GMV is impacted through stg_orders → fct_orders → Revenue / GMV"],
+            metadata={"impact_paths": [["stg_orders", "fct_orders", "Revenue / GMV"]]},
+        )
+        kpi_impact_report = SimpleNamespace(
+            changed_models=["stg_orders"],
+            impacted_kpis=[impacted_kpi],
+            unaffected_kpis=[],
+            confidence=95,
+            reasons=["Revenue / GMV impacted by stg_orders, fct_orders"],
+            metadata={"semantic_graph_provided": True},
+        )
+        contract_validation_result = {
+            "severity": "MEDIUM",
+            "confidence": 85,
+            "score": -15,
+            "reasons": ["Revenue / GMV may be impacted by changed model stg_orders"],
+            "metadata": {
+                "contract_names": ["Revenue / GMV"],
+                "violated_invariants": {},
+                "impacted_models": ["stg_orders"],
+                "impacted_kpis": ["Revenue / GMV"],
+                "impact_paths": [["stg_orders", "fct_orders", "Revenue / GMV"]],
+            },
+        }
+        return SimpleNamespace(
+            project_context=copy.deepcopy(project_context),
+            discovered_kpis=[sentinel.revenue_kpi],
+            semantic_graph=sentinel.semantic_graph,
+            kpi_impact_report=kpi_impact_report,
+            knowledge_report=sentinel.knowledge_report,
+            contract_validation_result=contract_validation_result,
+            metadata={"kpi_count": 1, "contract_count": 1},
+            to_dict=lambda: {
+                "project_context": copy.deepcopy(project_context),
+                "discovered_kpis": [{"name": "Revenue / GMV"}],
+                "semantic_graph": {"nodes": {}, "edges": []},
+                "kpi_impact_report": {
+                    "impacted_kpis": [{"name": "Revenue / GMV"}],
+                    "confidence": 95,
+                },
+                "knowledge_report": {"contracts": [{"kpi_name": "Revenue / GMV"}]},
+                "contract_validation_result": copy.deepcopy(contract_validation_result),
+                "metadata": {"kpi_count": 1, "contract_count": 1},
+            },
+        )
 
     def _kpi_impact_signal(self, report):
         self.calls["kpi_impact_signal"].append(report)
@@ -451,6 +561,17 @@ class _patched_detectors:
                 "unaffected_kpis": [],
                 "impact_paths": [["stg_orders", "fct_orders", "Revenue / GMV"]],
             },
+        )
+
+    def _semantic_contract_signal(self, result):
+        self.calls["semantic_contract_signal"].append(copy.deepcopy(result))
+        return Signal(
+            "semantic_contract",
+            Severity.MEDIUM,
+            85,
+            -15,
+            reasons=list(result["reasons"]),
+            metadata=dict(result["metadata"]),
         )
 
 
