@@ -36,6 +36,26 @@ COMPONENT_PRIORITIES = {
     "business_metrics": 3,
 }
 
+SEMANTIC_DIFF_REASON_PATTERNS = (
+    ("invariant", ("removed", "lost", "dropped")),
+    ("invariant", ("changed", "updated", "modified")),
+    ("upstream dependency", ("added", "gained", "introduced")),
+    ("upstream dependency", ("changed", "updated", "modified")),
+    ("upstream dependency", ("removed", "lost", "dropped")),
+    ("contract meaning", ("changed", "updated", "modified")),
+    ("assumption", ("changed", "updated", "modified")),
+    ("related column", ("changed", "updated", "modified")),
+    ("related model", ("changed", "updated", "modified")),
+    ("related model", ("added", "gained", "introduced")),
+    ("downstream consumer", ("changed", "updated", "modified")),
+    ("downstream consumer", ("added", "gained", "introduced")),
+)
+
+GENERIC_KPI_REASON_PATTERNS = (
+    ("kpi", ("added", "gained", "introduced")),
+    ("kpi", ("removed", "lost", "dropped")),
+)
+
 
 def curate_reasons(signals, max_reasons: int = 8) -> list[str]:
     return [
@@ -74,6 +94,10 @@ def clean_reason(reason: Any) -> str:
     return re.sub(r"[ \t]+", " ", text).strip()
 
 
+def is_low_level_reason(reason: Any) -> bool:
+    return _is_low_level_reason(clean_reason(reason))
+
+
 def _curated_items(signals) -> list[dict]:
     candidates = []
     for signal_index, signal in enumerate(list(signals or [])):
@@ -91,6 +115,9 @@ def _curated_items(signals) -> list[dict]:
                     "confidence": getattr(signal, "confidence", 0),
                     "component": component,
                     "_priority": _priority(component),
+                    "_semantic_diff_priority": semantic_diff_reason_priority(
+                        cleaned_reason
+                    ),
                     "_signal_index": signal_index,
                     "_reason_index": reason_index,
                 }
@@ -99,6 +126,9 @@ def _curated_items(signals) -> list[dict]:
     candidates.sort(
         key=lambda item: (
             item["_priority"],
+            item["_semantic_diff_priority"]
+            if str(item["component"]).lower() == "semantic_diff"
+            else 0,
             item["_signal_index"],
             item["_reason_index"],
         )
@@ -131,6 +161,19 @@ def _is_low_level_reason(reason: str) -> bool:
 
 def _priority(component: str) -> int:
     return COMPONENT_PRIORITIES.get(str(component or "").lower(), 4)
+
+
+def semantic_diff_reason_priority(reason: Any) -> int:
+    cleaned = clean_reason(reason).casefold()
+    for priority, (subject, actions) in enumerate(SEMANTIC_DIFF_REASON_PATTERNS):
+        if subject in cleaned and any(action in cleaned for action in actions):
+            return priority
+
+    for offset, (subject, actions) in enumerate(GENERIC_KPI_REASON_PATTERNS):
+        if subject in cleaned and any(action in cleaned for action in actions):
+            return len(SEMANTIC_DIFF_REASON_PATTERNS) + offset
+
+    return len(SEMANTIC_DIFF_REASON_PATTERNS) + len(GENERIC_KPI_REASON_PATTERNS)
 
 
 def _enum_value(value: Any) -> Any:

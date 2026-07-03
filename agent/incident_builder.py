@@ -1,7 +1,11 @@
 from typing import Any
 
 from agent.decision_engine import SEVERITY_RANKS, Decision
-from agent.evidence_curation import clean_reason, is_low_level_reason
+from agent.evidence_curation import (
+    clean_reason,
+    is_low_level_reason,
+    semantic_diff_reason_priority,
+)
 from agent.incident import Incident, create_incident
 from agent.signals import Severity, Signal
 
@@ -97,6 +101,26 @@ def _prioritized_component_reason(
     ]
     if not component_signals:
         return ""
+
+    if component == "semantic_diff":
+        semantic_reasons = []
+        for signal_index, signal in enumerate(component_signals):
+            for reason_index, reason in enumerate(signal.reasons or []):
+                if is_low_level_reason(reason):
+                    continue
+                cleaned = clean_reason(reason)
+                if cleaned:
+                    semantic_reasons.append(
+                        (
+                            semantic_diff_reason_priority(cleaned),
+                            signal_index,
+                            reason_index,
+                            cleaned,
+                        )
+                    )
+
+        if semantic_reasons:
+            return min(semantic_reasons)[3]
 
     highest_signal = max(
         component_signals,

@@ -80,6 +80,66 @@ class IncidentBuilderTests(unittest.TestCase):
             "Revenue gained upstream dependency refunds",
         )
 
+    def test_upstream_dependency_semantic_diff_reason_beats_related_model_reason(self):
+        semantic_diff = Signal(
+            component="semantic_diff",
+            severity=Severity.HIGH,
+            confidence=92,
+            score=-35,
+            reasons=[
+                "Revenue gained related model stg_refunds",
+                "Revenue gained upstream dependency refunds",
+            ],
+        )
+        decision = evaluate([semantic_diff])
+
+        incident = build_incident(decision)
+
+        self.assertEqual(
+            incident.root_cause,
+            "Revenue gained upstream dependency refunds",
+        )
+
+    def test_upstream_dependency_semantic_diff_reason_beats_downstream_consumer_reason(self):
+        semantic_diff = Signal(
+            component="semantic_diff",
+            severity=Severity.HIGH,
+            confidence=92,
+            score=-35,
+            reasons=[
+                "Revenue gained downstream consumer revenue_dashboard",
+                "Revenue gained upstream dependency refunds",
+            ],
+        )
+        decision = evaluate([semantic_diff])
+
+        incident = build_incident(decision)
+
+        self.assertEqual(
+            incident.root_cause,
+            "Revenue gained upstream dependency refunds",
+        )
+
+    def test_invariant_removal_semantic_diff_reason_beats_upstream_dependency_reason(self):
+        semantic_diff = Signal(
+            component="semantic_diff",
+            severity=Severity.HIGH,
+            confidence=92,
+            score=-35,
+            reasons=[
+                "Revenue gained upstream dependency refunds",
+                "Revenue lost invariant never negative",
+            ],
+        )
+        decision = evaluate([semantic_diff])
+
+        incident = build_incident(decision)
+
+        self.assertEqual(
+            incident.root_cause,
+            "Revenue lost invariant never negative",
+        )
+
     def test_semantic_contract_reason_is_chosen_when_semantic_diff_absent(self):
         semantic_contract = Signal(
             component="semantic_contract",

@@ -1,4 +1,5 @@
 import unittest
+import copy
 
 from agent.evidence_curation import curate_evidence, curate_reasons
 from agent.signals import Severity, Signal
@@ -139,6 +140,73 @@ class EvidenceCurationTests(unittest.TestCase):
                 "Metadata changed",
             ],
         )
+
+    def test_curated_reasons_order_semantic_diff_reasons_by_business_priority(self):
+        signals = [
+            Signal(
+                "semantic_diff",
+                Severity.HIGH,
+                95,
+                -35,
+                reasons=[
+                    "Revenue gained related model stg_refunds",
+                    "Revenue gained upstream dependency refunds",
+                    "Revenue gained downstream consumer revenue_dashboard",
+                ],
+            )
+        ]
+
+        self.assertEqual(
+            curate_reasons(signals),
+            [
+                "Revenue gained upstream dependency refunds",
+                "Revenue gained related model stg_refunds",
+                "Revenue gained downstream consumer revenue_dashboard",
+            ],
+        )
+
+    def test_invariant_removal_orders_before_upstream_dependency_reason(self):
+        signals = [
+            Signal(
+                "semantic_diff",
+                Severity.HIGH,
+                95,
+                -35,
+                reasons=[
+                    "Revenue gained upstream dependency refunds",
+                    "Revenue lost invariant never negative",
+                ],
+            )
+        ]
+
+        self.assertEqual(
+            curate_reasons(signals),
+            [
+                "Revenue lost invariant never negative",
+                "Revenue gained upstream dependency refunds",
+            ],
+        )
+
+    def test_curating_semantic_diff_reasons_does_not_mutate_inputs(self):
+        signals = [
+            Signal(
+                "semantic_diff",
+                Severity.HIGH,
+                95,
+                -35,
+                reasons=[
+                    "Revenue gained related model stg_refunds",
+                    "Revenue gained upstream dependency refunds",
+                ],
+                metadata={"changed_kpis": ["Revenue"]},
+            )
+        ]
+        before = copy.deepcopy(signals)
+
+        curate_reasons(signals)
+        curate_evidence(signals)
+
+        self.assertEqual(signals, before)
 
 
 if __name__ == "__main__":
