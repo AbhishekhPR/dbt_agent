@@ -504,6 +504,45 @@ def pr_review_demo(output):
     click.echo(markdown)
 
 
+@cli.command(name="init-baseline")
+@click.option(
+    "--dbt-manifest",
+    required=True,
+    help="Path to a dbt manifest.json artifact.",
+)
+@click.option(
+    "--history-path",
+    default=".relium/deployment_history.json",
+    show_default=True,
+    help="Path to Relium deployment history JSON.",
+)
+@click.option(
+    "--deployment-id",
+    default="production-baseline",
+    show_default=True,
+    help="Deployment identifier for the trusted production baseline.",
+)
+def init_baseline_command(dbt_manifest, history_path, deployment_id):
+    """Initialize Relium history from a trusted production manifest."""
+    from agent.baseline import initialize_production_baseline
+
+    try:
+        result = initialize_production_baseline(
+            dbt_manifest_path=dbt_manifest,
+            history_path=history_path,
+            deployment_id=deployment_id,
+        )
+    except ValueError as error:
+        raise click.ClickException(str(error)) from error
+
+    click.echo("Baseline snapshot initialized")
+    click.echo(f"Snapshot ID: {result.snapshot_id}")
+    click.echo(f"Deployment ID: {result.deployment_id}")
+    click.echo(f"Models: {result.model_count}")
+    click.echo(f"Discovered KPIs: {result.kpi_count}")
+    click.echo(f"History Path: {result.history_path}")
+
+
 @cli.command(name="review-deployment")
 @click.option(
     "--project-context",
@@ -519,6 +558,12 @@ def pr_review_demo(output):
     "changed_models",
     multiple=True,
     help="Changed model name. May be provided more than once.",
+)
+@click.option(
+    "--changed-file",
+    "changed_files",
+    multiple=True,
+    help="Changed file path. May be provided more than once.",
 )
 @click.option(
     "--history-path",
@@ -546,6 +591,7 @@ def review_deployment_command(
     project_context,
     dbt_manifest,
     changed_models,
+    changed_files,
     history_path,
     deployment_id,
     auto_record,
@@ -559,14 +605,33 @@ def review_deployment_command(
     from agent.deployment_history import DeploymentHistoryStore
     from agent.deployment_lifecycle import review_deployment
 
-    context_payload = _load_review_project_context(project_context, dbt_manifest)
+    if changed_files and not dbt_manifest:
+        raise click.ClickException("--changed-file requires --dbt-manifest.")
 
-    if not changed_models:
+    context_payload = _load_review_project_context(project_context, dbt_manifest)
+    resolved_changed_models = _review_deployment_changed_models(
+        changed_models=changed_models,
+        changed_files=changed_files,
+        dbt_manifest=dbt_manifest,
+    )
+
+    if not resolved_changed_models:
+        if changed_files:
+            raise click.ClickException(
+                "At least one changed model is required after applying "
+                "--changed-model and --changed-file."
+            )
         raise click.ClickException("At least one --changed-model is required.")
 
     history_store = DeploymentHistoryStore(history_path)
     result = review_deployment(
-        changed_models=list(changed_models),
+        changed_models=[
+            {
+                "model_name": Path(model).stem,
+                "sql": f"select * from {Path(model).stem}",
+            }
+            for model in resolved_changed_models
+        ],
         project_context=context_payload,
         history_store=history_store,
         deployment_id=deployment_id,
@@ -583,6 +648,34 @@ def review_deployment_command(
         return
 
     click.echo(rendered)
+
+
+def _review_deployment_changed_models(changed_models, changed_files, dbt_manifest):
+    inferred_models = []
+    if changed_files:
+        from agent.dbt_changes import load_changed_models_from_paths
+
+        try:
+            inferred_models = load_changed_models_from_paths(
+                manifest_path=dbt_manifest,
+                changed_files=list(changed_files),
+            )
+        except ValueError as error:
+            raise click.ClickException(str(error)) from error
+
+    return _ordered_unique([*list(changed_models or []), *inferred_models])
+
+
+def _ordered_unique(values):
+    unique = []
+    seen = set()
+    for value in values:
+        text = str(value)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        unique.append(text)
+    return unique
 
 
 def _load_review_project_context(project_context, dbt_manifest):

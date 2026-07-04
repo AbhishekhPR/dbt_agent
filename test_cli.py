@@ -74,6 +74,259 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, output)
         self.assertIn("Previous Snapshot Loaded: NO", output)
 
+    def test_init_baseline_creates_deployment_history_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = _write_dbt_manifest(tmp)
+            history_path = Path(tmp) / "history.json"
+
+            result, output = _invoke(
+                [
+                    "init-baseline",
+                    "--dbt-manifest",
+                    str(manifest_path),
+                    "--history-path",
+                    str(history_path),
+                    "--deployment-id",
+                    "production-baseline",
+                ]
+            )
+
+            history_exists = history_path.exists()
+            latest_snapshot = DeploymentHistoryStore(history_path).load_latest_snapshot()
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertTrue(history_exists)
+        self.assertIsNotNone(latest_snapshot)
+        self.assertIn("Baseline snapshot initialized", output)
+
+    def test_init_baseline_output_includes_snapshot_id_and_history_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = _write_dbt_manifest(tmp)
+            history_path = Path(tmp) / "history.json"
+
+            result, output = _invoke(
+                [
+                    "init-baseline",
+                    "--dbt-manifest",
+                    str(manifest_path),
+                    "--history-path",
+                    str(history_path),
+                ]
+            )
+
+            latest_snapshot = DeploymentHistoryStore(history_path).load_latest_snapshot()
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn(latest_snapshot["snapshot_id"], output)
+        self.assertIn(str(history_path), output)
+        self.assertIn("Deployment ID: production-baseline", output)
+        self.assertIn("Models: 2", output)
+        self.assertIn("Discovered KPIs: 1", output)
+
+    def test_init_baseline_missing_manifest_exits_nonzero(self):
+        result, output = _invoke(
+            [
+                "init-baseline",
+                "--dbt-manifest",
+                "missing-manifest.json",
+            ]
+        )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("Manifest file not found", output)
+
+    def test_init_baseline_invalid_manifest_json_exits_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            manifest_path.write_text("{not json", encoding="utf-8")
+
+            result, output = _invoke(
+                [
+                    "init-baseline",
+                    "--dbt-manifest",
+                    str(manifest_path),
+                ]
+            )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("Invalid manifest JSON", output)
+
+    def test_init_baseline_empty_project_context_exits_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = _write_empty_dbt_manifest(tmp)
+
+            result, output = _invoke(
+                [
+                    "init-baseline",
+                    "--dbt-manifest",
+                    str(manifest_path),
+                ]
+            )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("No dbt models found", output)
+
+    def test_review_deployment_accepts_changed_file_with_dbt_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = _write_dbt_manifest(tmp)
+            history_path = Path(tmp) / "history.json"
+            captured = {}
+
+            def analyze(**kwargs):
+                captured["changed_models"] = kwargs["changed_models"]
+                return _fake_analyzer()(**kwargs)
+
+            with patch(
+                "agent.deployment_lifecycle.analyze_pr_with_history",
+                side_effect=analyze,
+            ):
+                result, output = _invoke(
+                    [
+                        "review-deployment",
+                        "--dbt-manifest",
+                        str(manifest_path),
+                        "--changed-file",
+                        "models/staging/stg_orders.sql",
+                        "--history-path",
+                        str(history_path),
+                    ]
+                )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("Relium Deployment Decision", output)
+        self.assertEqual(
+            [model["model_name"] for model in captured["changed_models"]],
+            ["stg_orders"],
+        )
+
+    def test_changed_file_infers_model_and_produces_successful_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = _write_dbt_manifest(tmp)
+            history_path = Path(tmp) / "history.json"
+
+            with patch(
+                "agent.deployment_lifecycle.analyze_pr_with_history",
+                side_effect=_fake_analyzer(),
+            ):
+                result, output = _invoke(
+                    [
+                        "review-deployment",
+                        "--dbt-manifest",
+                        str(manifest_path),
+                        "--changed-file",
+                        "models/marts/fct_orders.sql",
+                        "--history-path",
+                        str(history_path),
+                    ]
+                )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("Previous Snapshot Loaded: NO", output)
+
+    def test_multiple_changed_files_deduplicate_models(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = _write_dbt_manifest(tmp)
+            history_path = Path(tmp) / "history.json"
+            captured = {}
+
+            def analyze(**kwargs):
+                captured["changed_models"] = kwargs["changed_models"]
+                return _fake_analyzer()(**kwargs)
+
+            with patch(
+                "agent.deployment_lifecycle.analyze_pr_with_history",
+                side_effect=analyze,
+            ):
+                result, output = _invoke(
+                    [
+                        "review-deployment",
+                        "--dbt-manifest",
+                        str(manifest_path),
+                        "--changed-file",
+                        "models/staging/stg_orders.sql",
+                        "--changed-file",
+                        "./models/staging/stg_orders.sql",
+                        "--changed-file",
+                        "models/marts/fct_orders.sql",
+                        "--history-path",
+                        str(history_path),
+                    ]
+                )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertEqual(
+            [model["model_name"] for model in captured["changed_models"]],
+            ["stg_orders", "fct_orders"],
+        )
+
+    def test_explicit_changed_model_still_works(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = _write_project_context(tmp)
+            history_path = Path(tmp) / "history.json"
+            captured = {}
+
+            def analyze(**kwargs):
+                captured["changed_models"] = kwargs["changed_models"]
+                return _fake_analyzer()(**kwargs)
+
+            with patch(
+                "agent.deployment_lifecycle.analyze_pr_with_history",
+                side_effect=analyze,
+            ):
+                result, output = _invoke(
+                    [
+                        "review-deployment",
+                        "--project-context",
+                        str(context_path),
+                        "--changed-model",
+                        "stg_orders",
+                        "--history-path",
+                        str(history_path),
+                    ]
+                )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertEqual(
+            [model["model_name"] for model in captured["changed_models"]],
+            ["stg_orders"],
+        )
+
+    def test_changed_file_and_changed_model_combine_correctly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = _write_dbt_manifest(tmp)
+            history_path = Path(tmp) / "history.json"
+            captured = {}
+
+            def analyze(**kwargs):
+                captured["changed_models"] = kwargs["changed_models"]
+                return _fake_analyzer()(**kwargs)
+
+            with patch(
+                "agent.deployment_lifecycle.analyze_pr_with_history",
+                side_effect=analyze,
+            ):
+                result, output = _invoke(
+                    [
+                        "review-deployment",
+                        "--dbt-manifest",
+                        str(manifest_path),
+                        "--changed-model",
+                        "fct_orders",
+                        "--changed-file",
+                        "models/staging/stg_orders.sql",
+                        "--changed-file",
+                        "models/marts/fct_orders.sql",
+                        "--history-path",
+                        str(history_path),
+                    ]
+                )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertEqual(
+            [model["model_name"] for model in captured["changed_models"]],
+            ["fct_orders", "stg_orders"],
+        )
+
     def test_review_deployment_command_exits_zero_with_valid_project_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             context_path = _write_project_context(tmp)
@@ -342,6 +595,40 @@ class CliTests(unittest.TestCase):
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("At least one --changed-model is required", output)
 
+    def test_changed_file_without_dbt_manifest_exits_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = _write_project_context(tmp)
+
+            result, output = _invoke(
+                [
+                    "review-deployment",
+                    "--project-context",
+                    str(context_path),
+                    "--changed-file",
+                    "models/staging/stg_orders.sql",
+                ]
+            )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("--changed-file requires --dbt-manifest", output)
+
+    def test_unmapped_changed_file_exits_nonzero_when_no_changed_model_remains(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = _write_dbt_manifest(tmp)
+
+            result, output = _invoke(
+                [
+                    "review-deployment",
+                    "--dbt-manifest",
+                    str(manifest_path),
+                    "--changed-file",
+                    "README.md",
+                ]
+            )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("At least one changed model is required", output)
+
     def test_missing_manifest_path_exits_nonzero(self):
         result, output = _invoke(
             [
@@ -607,6 +894,19 @@ def _write_project_context(tmp):
 def _write_dbt_manifest(tmp):
     path = Path(tmp) / "manifest.json"
     path.write_text(json.dumps(_dbt_manifest()), encoding="utf-8")
+    return path
+
+
+def _write_empty_dbt_manifest(tmp):
+    path = Path(tmp) / "manifest.json"
+    payload = {
+        "metadata": {
+            "project_name": "empty_project",
+            "dbt_version": "1.8.0",
+        },
+        "nodes": {},
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
     return path
 
 

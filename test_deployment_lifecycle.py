@@ -159,6 +159,53 @@ class DeploymentLifecycleTests(unittest.TestCase):
         self.assertEqual(payload["current_snapshot"]["snapshot_id"], "snap-current")
         self.assertEqual(payload["metadata"]["request_metadata"], {"source": "unit-test"})
 
+    def test_initialize_production_baseline_saves_loadable_snapshot(self):
+        from agent.baseline import initialize_production_baseline
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = _write_baseline_manifest(tmp)
+            history_path = Path(tmp) / "history.json"
+
+            result = initialize_production_baseline(
+                dbt_manifest_path=str(manifest_path),
+                history_path=str(history_path),
+                deployment_id="production-baseline",
+            )
+            loaded_snapshot = DeploymentHistoryStore(history_path).load_latest_snapshot()
+
+        self.assertEqual(loaded_snapshot["snapshot_id"], result.snapshot_id)
+        self.assertEqual(loaded_snapshot["deployment_id"], "production-baseline")
+        self.assertEqual(
+            loaded_snapshot["changed_models"],
+            ["fct_orders", "stg_orders"],
+        )
+        self.assertIn("semantic_context", loaded_snapshot)
+        self.assertEqual(
+            loaded_snapshot["semantic_context"]["metadata"]["changed_models"],
+            ["fct_orders", "stg_orders"],
+        )
+        self.assertEqual(result.model_count, 2)
+        self.assertEqual(result.kpi_count, 1)
+
+    def test_initialize_production_baseline_rejects_manifest_with_no_models(self):
+        from agent.baseline import initialize_production_baseline
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            history_path = Path(tmp) / "history.json"
+            manifest_path.write_text(
+                json.dumps({"metadata": {"project_name": "empty"}, "nodes": {}}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "No dbt models found"):
+                initialize_production_baseline(
+                    dbt_manifest_path=str(manifest_path),
+                    history_path=str(history_path),
+                )
+
+            self.assertFalse(history_path.exists())
+
 
 def _review_with_recorded_decision(decision, *, allow_blocked_recording=False):
     with tempfile.TemporaryDirectory() as tmp:
@@ -237,6 +284,55 @@ def _project_context():
         "column_names": ["gross_revenue"],
         "metrics": [{"name": "Revenue", "model": "fct_orders"}],
     }
+
+
+def _write_baseline_manifest(tmp):
+    path = Path(tmp) / "manifest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "project_name": "jaffle_shop",
+                    "dbt_version": "1.8.0",
+                },
+                "nodes": {
+                    "model.jaffle_shop.stg_orders": {
+                        "resource_type": "model",
+                        "name": "stg_orders",
+                        "unique_id": "model.jaffle_shop.stg_orders",
+                        "original_file_path": "models/staging/stg_orders.sql",
+                        "columns": {
+                            "order_id": {"name": "order_id"},
+                            "payment_amount": {"name": "payment_amount"},
+                        },
+                    },
+                    "model.jaffle_shop.fct_orders": {
+                        "resource_type": "model",
+                        "name": "fct_orders",
+                        "unique_id": "model.jaffle_shop.fct_orders",
+                        "original_file_path": "models/marts/fct_orders.sql",
+                        "columns": {
+                            "order_id": {"name": "order_id"},
+                            "gross_revenue": {"name": "gross_revenue"},
+                        },
+                        "depends_on": {
+                            "nodes": ["model.jaffle_shop.stg_orders"],
+                        },
+                    },
+                },
+                "metrics": {
+                    "metric.jaffle_shop.revenue": {
+                        "name": "Revenue / GMV",
+                        "label": "Revenue",
+                        "type": "simple",
+                        "model": "ref('fct_orders')",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 if __name__ == "__main__":
