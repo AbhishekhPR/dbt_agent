@@ -57,6 +57,15 @@ class SemanticContextTests(unittest.TestCase):
             {"Revenue / GMV": ["never negative"]},
         )
 
+    def test_context_includes_column_lineage_graph(self):
+        context = build_semantic_context(project_context=_project_context())
+
+        self.assertIn("fct_orders", context.column_lineage_graph.models)
+        self.assertEqual(
+            context.column_lineage_graph.models["fct_orders"].output_columns,
+            ["gross_revenue", "order_id"],
+        )
+
     def test_context_serializes_to_dict(self):
         context = build_semantic_context(
             project_context=_project_context(),
@@ -69,7 +78,24 @@ class SemanticContextTests(unittest.TestCase):
         json.dumps(payload)
         self.assertEqual(payload["discovered_kpis"][0]["name"], "Revenue / GMV")
         self.assertEqual(payload["kpi_impact_report"]["impacted_kpis"][0]["name"], "Revenue / GMV")
+        self.assertIn("column_lineage_graph", payload)
         self.assertEqual(to_dict(context), payload)
+
+    def test_missing_sql_does_not_crash_column_lineage(self):
+        context = build_semantic_context(
+            project_context={
+                "models": [{"name": "fct_orders", "columns": ["gross_revenue"]}],
+                "metrics": [{"name": "Revenue / GMV", "model": "fct_orders"}],
+                "column_names": ["gross_revenue"],
+            },
+            changed_models=["fct_orders"],
+        )
+
+        self.assertEqual(
+            context.column_lineage_graph.models["fct_orders"].unknown_columns,
+            ["gross_revenue"],
+        )
+        json.dumps(context.to_dict())
 
     def test_inputs_are_not_mutated(self):
         project_context = _project_context()
@@ -99,6 +125,7 @@ class SemanticContextTests(unittest.TestCase):
         self.assertIsNone(context.kpi_impact_report)
         self.assertEqual(context.knowledge_report.contracts, [])
         self.assertEqual(context.contract_validation_result["severity"], "LOW")
+        self.assertEqual(context.column_lineage_graph.models, {})
         json.dumps(context.to_dict())
 
 
@@ -109,8 +136,21 @@ def _project_context():
         "business_terms": ["completed customer payments"],
         "sources": [{"name": "raw_orders"}],
         "models": [
-            {"name": "stg_orders", "sources": ["raw_orders"]},
-            {"name": "fct_orders"},
+            {
+                "name": "stg_orders",
+                "sources": ["raw_orders"],
+                "columns": ["order_id", "payment_amount"],
+                "sql": "select order_id, payment_amount from raw_orders",
+            },
+            {
+                "name": "fct_orders",
+                "columns": ["gross_revenue", "order_id"],
+                "sql": (
+                    "select order_id, "
+                    "sum(payment_amount) as gross_revenue "
+                    "from stg_orders group by order_id"
+                ),
+            },
         ],
         "refs": [{"parent": "stg_orders", "child": "fct_orders"}],
         "metrics": [{"name": "Revenue / GMV", "model": "fct_orders"}],

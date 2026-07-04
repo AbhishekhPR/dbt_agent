@@ -41,6 +41,7 @@ def compare_semantic_snapshots(previous_snapshot, current_snapshot) -> SemanticD
     reasons = []
     severity_hits = []
     change_counts_by_kpi = {}
+    column_changes = _column_lineage_changes(previous, current)
 
     for kpi in added_kpis:
         reasons.append(f"{kpi} KPI was added")
@@ -81,6 +82,10 @@ def compare_semantic_snapshots(previous_snapshot, current_snapshot) -> SemanticD
         severity_hits.extend(dependency_severities)
         severity_hits.extend(contract_severities)
 
+    if column_changes["column_dependency_changes"]:
+        reasons.extend(column_changes["column_dependency_changes"])
+        severity_hits.append("LOW")
+
     severity = _severity(severity_hits)
     return SemanticDiff(
         previous_snapshot_id=str(previous.get("snapshot_id", "")),
@@ -99,6 +104,8 @@ def compare_semantic_snapshots(previous_snapshot, current_snapshot) -> SemanticD
             "changed_kpis": sorted(changed_kpis),
             "affected_dependencies": dependency_changes,
             "affected_contracts": contract_changes,
+            "changed_columns_by_model": column_changes["changed_columns_by_model"],
+            "column_dependency_changes": column_changes["column_dependency_changes"],
         },
     )
 
@@ -196,6 +203,101 @@ def _contracts_by_kpi(snapshot: dict) -> dict[str, dict]:
     }
 
 
+def _column_lineage_changes(previous: dict, current: dict) -> dict[str, Any]:
+    previous_models = _column_lineage_models(previous)
+    current_models = _column_lineage_models(current)
+    if not previous_models or not current_models:
+        return {
+            "changed_columns_by_model": {},
+            "column_dependency_changes": [],
+        }
+
+    changed_columns_by_model: dict[str, list[str]] = {}
+    reasons = []
+    for model_name in sorted(set(previous_models) | set(current_models)):
+        previous_model = previous_models.get(model_name) or {}
+        current_model = current_models.get(model_name) or {}
+        previous_outputs = {
+            str(column)
+            for column in previous_model.get("output_columns") or []
+        }
+        current_outputs = {
+            str(column)
+            for column in current_model.get("output_columns") or []
+        }
+
+        added_outputs = sorted(current_outputs - previous_outputs)
+        removed_outputs = sorted(previous_outputs - current_outputs)
+        for column in added_outputs:
+            _add_changed_column(changed_columns_by_model, model_name, column)
+            reasons.append(f"{model_name}.{column} output column was added")
+        for column in removed_outputs:
+            _add_changed_column(changed_columns_by_model, model_name, column)
+            reasons.append(f"{model_name}.{column} output column was removed")
+
+        previous_dependencies = _dependencies_by_output(previous_model)
+        current_dependencies = _dependencies_by_output(current_model)
+        for column in sorted(previous_outputs & current_outputs):
+            previous_upstream = previous_dependencies.get(column, set())
+            current_upstream = current_dependencies.get(column, set())
+            added_upstream = sorted(current_upstream - previous_upstream)
+            removed_upstream = sorted(previous_upstream - current_upstream)
+            if not added_upstream and not removed_upstream:
+                continue
+            _add_changed_column(changed_columns_by_model, model_name, column)
+            for upstream in added_upstream:
+                reasons.append(
+                    f"{model_name}.{column} gained upstream column {upstream}"
+                )
+            for upstream in removed_upstream:
+                reasons.append(
+                    f"{model_name}.{column} lost upstream column {upstream}"
+                )
+
+    return {
+        "changed_columns_by_model": {
+            model: sorted(columns)
+            for model, columns in sorted(changed_columns_by_model.items())
+        },
+        "column_dependency_changes": _ordered_unique(reasons),
+    }
+
+
+def _column_lineage_models(snapshot: dict) -> dict[str, dict]:
+    semantic_context = snapshot.get("semantic_context") or {}
+    graph = semantic_context.get("column_lineage_graph") or {}
+    models = graph.get("models") if isinstance(graph, dict) else {}
+    return dict(models or {}) if isinstance(models, dict) else {}
+
+
+def _dependencies_by_output(model_lineage: dict) -> dict[str, set[str]]:
+    dependencies: dict[str, set[str]] = {}
+    for edge in model_lineage.get("edges") or []:
+        if not isinstance(edge, dict):
+            continue
+        to_column = edge.get("to_column")
+        from_column = edge.get("from_column")
+        if not to_column or not from_column:
+            continue
+        upstream = _upstream_column(edge)
+        dependencies.setdefault(str(to_column), set()).add(upstream)
+    return dependencies
+
+
+def _upstream_column(edge: dict) -> str:
+    from_model = edge.get("from_model")
+    from_column = str(edge.get("from_column"))
+    if from_model:
+        return f"{from_model}.{from_column}"
+    return from_column
+
+
+def _add_changed_column(changed_columns_by_model: dict[str, list[str]], model_name: str, column: str) -> None:
+    changed_columns_by_model.setdefault(str(model_name), [])
+    if column not in changed_columns_by_model[str(model_name)]:
+        changed_columns_by_model[str(model_name)].append(column)
+
+
 def _snapshot_dict(snapshot) -> dict:
     if hasattr(snapshot, "to_dict"):
         return snapshot.to_dict()
@@ -256,6 +358,12 @@ def _signal_metadata(diff: SemanticDiff) -> dict[str, Any]:
         "removed_kpis": _serializable(diff.removed_kpis),
         "dependency_changes": _serializable(diff.dependency_changes),
         "contract_changes": _serializable(diff.contract_changes),
+        "changed_columns_by_model": _serializable(
+            (diff.metadata or {}).get("changed_columns_by_model", {})
+        ),
+        "column_dependency_changes": _serializable(
+            (diff.metadata or {}).get("column_dependency_changes", [])
+        ),
     }
 
 

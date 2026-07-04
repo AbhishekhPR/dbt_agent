@@ -274,6 +274,101 @@ class SemanticDiffTests(unittest.TestCase):
 
         self.assertEqual(signal.metadata["contract_changes"], diff.contract_changes)
 
+    def test_derives_changed_columns_by_model_from_column_dependency_changes(self):
+        previous = _snapshot(
+            "previous",
+            [_contract("Revenue", related_models=["fct_revenue"], related_columns=["net_revenue"])],
+            column_lineage_graph=_column_graph(
+                "fct_revenue",
+                ["net_revenue"],
+                {"net_revenue": ["stg_orders.order_total"]},
+            ),
+        )
+        current = _snapshot(
+            "current",
+            [_contract("Revenue", related_models=["fct_revenue"], related_columns=["net_revenue"])],
+            column_lineage_graph=_column_graph(
+                "fct_revenue",
+                ["net_revenue"],
+                {
+                    "net_revenue": [
+                        "stg_orders.order_total",
+                        "stg_refunds.refund_amount",
+                    ]
+                },
+            ),
+        )
+
+        diff = compare_semantic_snapshots(previous, current)
+
+        self.assertEqual(
+            diff.metadata["changed_columns_by_model"],
+            {"fct_revenue": ["net_revenue"]},
+        )
+        self.assertIn(
+            "fct_revenue.net_revenue gained upstream column stg_refunds.refund_amount",
+            diff.metadata["column_dependency_changes"],
+        )
+
+    def test_detects_added_output_column(self):
+        previous = _snapshot(
+            "previous",
+            [_contract("Revenue")],
+            column_lineage_graph=_column_graph("fct_revenue", ["net_revenue"], {}),
+        )
+        current = _snapshot(
+            "current",
+            [_contract("Revenue")],
+            column_lineage_graph=_column_graph("fct_revenue", ["debug_flag", "net_revenue"], {}),
+        )
+
+        diff = compare_semantic_snapshots(previous, current)
+
+        self.assertEqual(
+            diff.metadata["changed_columns_by_model"],
+            {"fct_revenue": ["debug_flag"]},
+        )
+        self.assertIn(
+            "fct_revenue.debug_flag output column was added",
+            diff.metadata["column_dependency_changes"],
+        )
+
+    def test_detects_removed_output_column(self):
+        previous = _snapshot(
+            "previous",
+            [_contract("Revenue")],
+            column_lineage_graph=_column_graph("fct_revenue", ["debug_flag", "net_revenue"], {}),
+        )
+        current = _snapshot(
+            "current",
+            [_contract("Revenue")],
+            column_lineage_graph=_column_graph("fct_revenue", ["net_revenue"], {}),
+        )
+
+        diff = compare_semantic_snapshots(previous, current)
+
+        self.assertEqual(
+            diff.metadata["changed_columns_by_model"],
+            {"fct_revenue": ["debug_flag"]},
+        )
+        self.assertIn(
+            "fct_revenue.debug_flag output column was removed",
+            diff.metadata["column_dependency_changes"],
+        )
+
+    def test_old_snapshots_without_column_lineage_still_work(self):
+        diff = compare_semantic_snapshots(
+            _snapshot("previous", [_contract("Revenue")]),
+            _snapshot(
+                "current",
+                [_contract("Revenue")],
+                column_lineage_graph=_column_graph("fct_revenue", ["net_revenue"], {}),
+            ),
+        )
+
+        self.assertEqual(diff.metadata["changed_columns_by_model"], {})
+        self.assertEqual(diff.metadata["column_dependency_changes"], [])
+
     def test_to_signal_does_not_mutate_diff(self):
         diff = compare_semantic_snapshots(
             _snapshot("previous", [_contract("Revenue", invariants=["never negative"])]),
@@ -286,7 +381,7 @@ class SemanticDiffTests(unittest.TestCase):
         self.assertEqual(diff, original)
 
 
-def _snapshot(snapshot_id, contracts):
+def _snapshot(snapshot_id, contracts, *, column_lineage_graph=None):
     return DeploymentSnapshot(
         snapshot_id=snapshot_id,
         deployment_id=f"deploy-{snapshot_id}",
@@ -296,6 +391,11 @@ def _snapshot(snapshot_id, contracts):
             "discovered_kpis": [{"name": contract["kpi_name"]} for contract in contracts],
             "knowledge_report": {"contracts": contracts},
             "metadata": {"kpi_count": len(contracts)},
+            **(
+                {"column_lineage_graph": copy.deepcopy(column_lineage_graph)}
+                if column_lineage_graph is not None
+                else {}
+            ),
         },
         decision=None,
         incident_summary=None,
@@ -326,6 +426,38 @@ def _contract(
         "invariants": list(invariants or []),
         "confidence": 80,
         "metadata": {},
+    }
+
+
+def _column_graph(model_name, output_columns, dependencies):
+    edges = []
+    for to_column, upstream_columns in dependencies.items():
+        for upstream in upstream_columns:
+            if "." in upstream:
+                from_model, from_column = upstream.rsplit(".", 1)
+            else:
+                from_model, from_column = None, upstream
+            edges.append(
+                {
+                    "from_model": from_model,
+                    "from_column": from_column,
+                    "to_model": model_name,
+                    "to_column": to_column,
+                    "confidence": 0.95 if from_model else 0.7,
+                    "reason": "unit-test",
+                }
+            )
+    return {
+        "models": {
+            model_name: {
+                "model_name": model_name,
+                "output_columns": list(output_columns),
+                "edges": edges,
+                "unknown_columns": [],
+                "metadata": {},
+            }
+        },
+        "metadata": {"source": "unit-test"},
     }
 
 

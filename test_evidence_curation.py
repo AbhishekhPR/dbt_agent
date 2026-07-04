@@ -135,8 +135,8 @@ class EvidenceCurationTests(unittest.TestCase):
             [item["reason"] for item in first],
             [
                 "Revenue gained refunds",
-                "Revenue invariant changed",
                 "Revenue is impacted",
+                "Revenue invariant changed",
                 "Metadata changed",
             ],
         )
@@ -207,6 +207,93 @@ class EvidenceCurationTests(unittest.TestCase):
         curate_evidence(signals)
 
         self.assertEqual(signals, before)
+
+    def test_business_semantic_diff_reasons_rank_above_column_level_reasons(self):
+        reasons = curate_reasons(_noisy_column_lineage_signals())
+
+        self.assertEqual(
+            reasons[:2],
+            [
+                "Revenue gained upstream dependency refunds",
+                "Revenue gained related model stg_refunds",
+            ],
+        )
+        self.assertLess(
+            reasons.index("Revenue gained upstream dependency refunds"),
+            reasons.index("fct_revenue.refund_amount output column was added"),
+        )
+
+    def test_staging_output_column_additions_are_not_promoted_into_top_reasons(self):
+        reasons = curate_reasons(_noisy_column_lineage_signals(), max_reasons=5)
+
+        self.assertEqual(
+            reasons,
+            [
+                "Revenue gained upstream dependency refunds",
+                "Revenue gained related model stg_refunds",
+                "fct_revenue.refund_amount output column was added",
+                "Revenue may be impacted by changed model fct_revenue",
+                "Revenue is semantically impacted by changed models",
+            ],
+        )
+        self.assertNotIn("stg_refunds.order_id output column was added", reasons)
+        self.assertNotIn("stg_refunds.refund_amount output column was added", reasons)
+        self.assertNotIn("stg_refunds.refund_id output column was added", reasons)
+
+    def test_evidence_does_not_start_with_staging_column_additions(self):
+        evidence = curate_evidence(_noisy_column_lineage_signals(), max_items=5)
+
+        self.assertEqual(
+            [item["reason"] for item in evidence],
+            [
+                "Revenue gained upstream dependency refunds",
+                "Revenue gained related model stg_refunds",
+                "fct_revenue.refund_amount output column was added",
+                "Revenue may be impacted by changed model fct_revenue",
+                "Revenue is semantically impacted by changed models",
+            ],
+        )
+
+
+def _noisy_column_lineage_signals():
+    return [
+        Signal(
+            "semantic_diff",
+            Severity.HIGH,
+            95,
+            -35,
+            reasons=[
+                "stg_refunds.order_id output column was added",
+                "stg_refunds.refund_amount output column was added",
+                "Revenue gained upstream dependency refunds",
+                "fct_revenue.refund_amount output column was added",
+                "Revenue gained related model stg_refunds",
+                "stg_refunds.refund_id output column was added",
+            ],
+            metadata={
+                "column_dependency_changes": [
+                    "stg_refunds.order_id output column was added",
+                    "stg_refunds.refund_amount output column was added",
+                    "fct_revenue.refund_amount output column was added",
+                    "stg_refunds.refund_id output column was added",
+                ],
+            },
+        ),
+        Signal(
+            "kpi_impact",
+            Severity.HIGH,
+            92,
+            -30,
+            reasons=["Revenue may be impacted by changed model fct_revenue"],
+        ),
+        Signal(
+            "semantic_contract",
+            Severity.MEDIUM,
+            85,
+            -15,
+            reasons=["Revenue is semantically impacted by changed models"],
+        ),
+    ]
 
 
 if __name__ == "__main__":

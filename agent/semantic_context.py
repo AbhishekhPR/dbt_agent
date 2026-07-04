@@ -3,6 +3,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
 from typing import Any
 
+from agent.column_lineage import build_column_lineage_graph
 from agent.kpi_discovery import discover_kpis
 from agent.semantic_contract_validation import validate_semantic_contracts
 from agent.semantic_graph import build_semantic_graph
@@ -15,6 +16,7 @@ class SemanticContext:
     project_context: dict[str, Any] = field(default_factory=dict)
     discovered_kpis: list[Any] = field(default_factory=list)
     semantic_graph: Any = None
+    column_lineage_graph: Any = None
     kpi_impact_report: Any = None
     knowledge_report: Any = None
     contract_validation_result: dict[str, Any] | None = None
@@ -36,12 +38,15 @@ def build_semantic_context(
 
     discovered_kpis = discover_kpis(context)
     semantic_graph = build_semantic_graph(context)
+    column_lineage_graph = build_column_lineage_graph(context)
     kpi_impact_report = None
     if changed:
         kpi_impact_report = infer_impacted_kpis(
             changed_models=changed,
             discovered_kpis=discovered_kpis,
             semantic_graph=semantic_graph,
+            column_lineage_graph=column_lineage_graph,
+            changed_columns_by_model=validation_metadata.get("changed_columns_by_model"),
         )
 
     knowledge_report = build_semantic_knowledge(
@@ -60,6 +65,7 @@ def build_semantic_context(
         project_context=context,
         discovered_kpis=discovered_kpis,
         semantic_graph=semantic_graph,
+        column_lineage_graph=column_lineage_graph,
         kpi_impact_report=kpi_impact_report,
         knowledge_report=knowledge_report,
         contract_validation_result=contract_validation_result,

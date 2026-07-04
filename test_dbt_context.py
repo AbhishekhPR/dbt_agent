@@ -32,6 +32,19 @@ class DbtContextTests(unittest.TestCase):
         self.assertEqual(fct_orders["columns"], ["gross_revenue", "order_id"])
         self.assertIn("gross_revenue", context["column_names"])
 
+    def test_preserves_model_sql_code(self):
+        context = extract_project_context_from_manifest(_manifest())
+
+        fct_orders = _named(context["models"], "fct_orders")
+        stg_orders = _named(context["models"], "stg_orders")
+
+        self.assertEqual(fct_orders["raw_code"], "select * from {{ ref('stg_orders') }}")
+        self.assertEqual(
+            fct_orders["compiled_code"],
+            "select order_id, payment_amount as gross_revenue from stg_orders",
+        )
+        self.assertEqual(stg_orders["original_file_path"], "models/staging/stg_orders.sql")
+
     def test_extracts_refs(self):
         context = extract_project_context_from_manifest(_manifest())
 
@@ -209,6 +222,8 @@ def _manifest():
                 "name": "stg_orders",
                 "unique_id": "model.jaffle_shop.stg_orders",
                 "original_file_path": "models/staging/stg_orders.sql",
+                "raw_code": "select * from {{ source('raw_shop', 'orders') }}",
+                "compiled_code": "select order_id, payment_amount from raw_shop.orders",
                 "columns": {
                     "order_id": {"name": "order_id", "description": "Order id"},
                     "payment_amount": {"name": "payment_amount"},
@@ -225,6 +240,8 @@ def _manifest():
                 "name": "fct_orders",
                 "unique_id": "model.jaffle_shop.fct_orders",
                 "path": "marts/fct_orders.sql",
+                "raw_code": "select * from {{ ref('stg_orders') }}",
+                "compiled_code": "select order_id, payment_amount as gross_revenue from stg_orders",
                 "columns": {
                     "order_id": {"name": "order_id"},
                     "gross_revenue": {"name": "gross_revenue"},

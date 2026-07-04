@@ -99,8 +99,11 @@ def analyze_changed_models(
         "model_count": len(model_specs),
         "models": list(affected_models),
     }
+    changed_columns_by_model = _changed_columns_by_model_from_specs(model_specs)
+    if changed_columns_by_model:
+        metadata["changed_columns_by_model"] = changed_columns_by_model
+
     semantic_context = _semantic_context(model_specs, affected_models, metadata)
-    semantic_signals = _semantic_signals(semantic_context)
     current_snapshot = None
     semantic_diff = None
     if previous_snapshot is not None:
@@ -111,6 +114,27 @@ def analyze_changed_models(
             metadata,
         )
         semantic_diff = compare_semantic_snapshots(previous_snapshot, current_snapshot)
+        derived_changed_columns = (
+            (semantic_diff.metadata or {}).get("changed_columns_by_model") or {}
+        )
+        if derived_changed_columns:
+            metadata["changed_columns_by_model"] = _merge_changed_columns(
+                changed_columns_by_model,
+                derived_changed_columns,
+            )
+            metadata["column_dependency_changes"] = list(
+                (semantic_diff.metadata or {}).get("column_dependency_changes") or []
+            )
+            semantic_context = _semantic_context(model_specs, affected_models, metadata)
+            current_snapshot = _current_snapshot(
+                deployment_id,
+                affected_models,
+                semantic_context,
+                metadata,
+            )
+
+    semantic_signals = _semantic_signals(semantic_context)
+    if semantic_diff is not None:
         semantic_signals.append(_source_signal(semantic_diff_to_signal(semantic_diff)))
 
     signals.extend(semantic_signals)
@@ -199,6 +223,18 @@ def _ast_signal(model_spec: Any, model_name: str) -> Signal:
 
 
 def _metadata_signal(model_spec: Any, model_name: str) -> Signal:
+    if _value(model_spec, "conn") is None:
+        return metadata_checks_to_signal(
+            {
+                "model_name": model_name,
+                "row_count": 1,
+                "null_count": 0,
+                "duplicate_count": 0,
+                "freshness_timestamp": "not_evaluated",
+                "schema_column_count": 0,
+                "anomalies": [],
+            }
+        )
     metadata_result = run_metadata_checks(
         _value(model_spec, "conn"),
         model_name,
@@ -208,15 +244,39 @@ def _metadata_signal(model_spec: Any, model_name: str) -> Signal:
 
 
 def _drift_signal(model_spec: Any, model_name: str) -> Signal:
-    drift_result = compare_last_run(
-        _value(model_spec, "metadata_db_path"),
-        _value(model_spec, "project_name"),
-        model_name,
-    )
+    try:
+        drift_result = compare_last_run(
+            _value(model_spec, "metadata_db_path"),
+            _value(model_spec, "project_name"),
+            model_name,
+        )
+    except ValueError:
+        drift_result = {
+            "project_name": _value(model_spec, "project_name"),
+            "model_name": model_name,
+            "row_count_change_pct": 0.0,
+            "null_count_change_pct": 0.0,
+            "duplicate_count_change_pct": 0.0,
+            "schema_column_count_change": 0,
+            "freshness_regressed": False,
+            "drift_level": "LOW",
+            "report_text": "Metadata Drift: LOW",
+        }
     return metadata_drift_to_signal(drift_result)
 
 
 def _blast_radius_signal(model_spec: Any, model_name: str) -> Signal:
+    if _value(model_spec, "project_path") is None:
+        return blast_radius_to_signal(
+            {
+                "changed_table": model_name,
+                "changed_columns": list(_value(model_spec, "changed_columns", []) or []),
+                "directly_affected": [],
+                "indirectly_affected": [],
+                "total_affected": 0,
+                "summary": "Blast radius not evaluated.",
+            }
+        )
     blast_radius_result = calculate_blast_radius(
         _value(model_spec, "project_path"),
         model_name,
@@ -336,6 +396,18 @@ def _add_semantic_metadata(
         metadata["changed_kpis"] = list(semantic_diff.changed_kpis or [])
         metadata["dependency_changes"] = dict(semantic_diff_dict.get("dependency_changes", {}))
         metadata["contract_changes"] = dict(semantic_diff_dict.get("contract_changes", {}))
+        metadata["changed_columns_by_model"] = dict(
+            semantic_diff_dict.get("metadata", {}).get(
+                "changed_columns_by_model",
+                metadata.get("changed_columns_by_model", {}),
+            )
+        )
+        metadata["column_dependency_changes"] = list(
+            semantic_diff_dict.get("metadata", {}).get(
+                "column_dependency_changes",
+                metadata.get("column_dependency_changes", []),
+            )
+        )
 
 
 def _source_signal(signal: Signal) -> Signal:
@@ -440,3 +512,43 @@ def _copy_list_items(values: list[Any]) -> list[Any]:
         else:
             copied.append(value)
     return copied
+
+
+def _changed_columns_by_model_from_specs(model_specs: list[Any]) -> dict[str, list[str]]:
+    changed: dict[str, list[str]] = {}
+    for model_spec in model_specs:
+        columns = [
+            str(column)
+            for column in list(_value(model_spec, "changed_columns", []) or [])
+            if column
+        ]
+        if not columns:
+            continue
+        changed[_model_name(model_spec)] = _ordered_unique(columns)
+    return changed
+
+
+def _merge_changed_columns(*maps: dict[str, list[str]]) -> dict[str, list[str]]:
+    merged: dict[str, list[str]] = {}
+    for values_by_model in maps:
+        for model_name, columns in (values_by_model or {}).items():
+            merged.setdefault(str(model_name), [])
+            merged[str(model_name)].extend(str(column) for column in columns or [] if column)
+            merged[str(model_name)] = _ordered_unique(merged[str(model_name)])
+    return {
+        model_name: columns
+        for model_name, columns in merged.items()
+        if columns
+    }
+
+
+def _ordered_unique(values) -> list[str]:
+    unique = []
+    seen = set()
+    for value in values:
+        text = str(value)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        unique.append(text)
+    return unique

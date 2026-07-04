@@ -3,7 +3,12 @@ from enum import Enum
 from typing import Any
 
 from agent.decision_engine import DeploymentDecision
-from agent.evidence_curation import curate_reasons
+from agent.evidence_curation import (
+    curate_reasons,
+    is_column_level_reason,
+    is_supporting_column_reason,
+    order_semantic_diff_reasons,
+)
 from agent.incident import Incident
 from agent.reasoning_engine import build_reasoning_report
 
@@ -27,7 +32,7 @@ def _serialize(value: Any) -> Any:
 
 
 def _top_reasons(incident: Incident) -> list[str]:
-    return curate_reasons(incident.signals)
+    return curate_reasons(incident.signals, max_reasons=5)
 
 
 def _bullet_list(items: list[str]) -> list[str]:
@@ -50,9 +55,29 @@ def _semantic_diff_signal(incident: Incident):
     return None
 
 
+def _column_lineage_lines(incident: Incident) -> list[str]:
+    lines = []
+    for signal in incident.signals:
+        metadata = dict(signal.metadata or {})
+        signal_column_lines = []
+        for item in metadata.get("column_dependency_changes") or []:
+            text = str(item)
+            if is_column_level_reason(text) and not is_supporting_column_reason(text):
+                signal_column_lines.append(text)
+        signal_evidence_lines = [
+            str(item)
+            for item in metadata.get("column_level_evidence") or []
+        ]
+        lines.extend(signal_column_lines)
+        if signal_column_lines or signal_evidence_lines:
+            lines.extend(_lineage_summary_lines(signal))
+        lines.extend(signal_evidence_lines)
+    return _ordered_unique(line for line in lines if line)
+
+
 def _semantic_diff_lines(signal) -> list[str]:
     metadata = dict(signal.metadata or {})
-    lines = list(signal.reasons or [])
+    lines = order_semantic_diff_reasons(list(signal.reasons or []))
     lines.extend([
         f"Changed KPIs: {_list_text(metadata.get('changed_kpis'))}",
         f"Added KPIs: {_list_text(metadata.get('added_kpis'))}",
@@ -61,6 +86,27 @@ def _semantic_diff_lines(signal) -> list[str]:
     lines.extend(_change_lines("Dependency Changes", metadata.get("dependency_changes") or {}))
     lines.extend(_change_lines("Contract Changes", metadata.get("contract_changes") or {}))
     return lines
+
+
+def _lineage_summary_lines(signal) -> list[str]:
+    if signal.component != "semantic_diff":
+        return []
+    summaries = []
+    for reason in signal.reasons or []:
+        match = re.match(
+            r"^(?P<kpi>.+?) gained upstream dependency (?P<dependency>.+)$",
+            str(reason).strip(),
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            continue
+        kpi = match.group("kpi").strip()
+        dependency = match.group("dependency").strip()
+        if "refund" in dependency.casefold():
+            summaries.append(f"{kpi} lineage now includes refund-related data")
+        else:
+            summaries.append(f"{kpi} lineage now includes {dependency} data")
+    return summaries
 
 
 def _semantic_diff_snapshot_lines(signal) -> list[str]:
@@ -107,6 +153,18 @@ def _list_text(values: Any) -> str:
     return ", ".join(items)
 
 
+def _ordered_unique(values) -> list[str]:
+    unique = []
+    seen = set()
+    for value in values:
+        text = str(value)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        unique.append(text)
+    return unique
+
+
 def _change_lines(label: str, changes: dict) -> list[str]:
     lines = []
     for kpi in sorted(changes):
@@ -139,6 +197,7 @@ def render_cli(incident: Incident) -> str:
     reasoning = build_reasoning_report(incident)
     business_metric_lines = _business_metric_lines(incident)
     semantic_diff_signal = _semantic_diff_signal(incident)
+    column_lineage_lines = _column_lineage_lines(incident)
     lines = [
         "Relium Deployment Decision",
         "",
@@ -175,6 +234,13 @@ def render_cli(incident: Incident) -> str:
             ]),
         ])
 
+    if column_lineage_lines:
+        lines.extend([
+            "",
+            "Column-Level Lineage",
+            *_bullet_list(column_lineage_lines),
+        ])
+
     if incident.affected_models:
         lines.extend([
             "",
@@ -203,6 +269,7 @@ def render_markdown(incident: Incident) -> str:
     reasoning = build_reasoning_report(incident)
     business_metric_lines = _business_metric_lines(incident)
     semantic_diff_signal = _semantic_diff_signal(incident)
+    column_lineage_lines = _column_lineage_lines(incident)
     lines = [
         "# Relium Deployment Decision",
         "",
@@ -247,6 +314,13 @@ def render_markdown(incident: Incident) -> str:
             "",
             f"**Previous Snapshot:** {_snapshot_value(previous_snapshot)}  ",
             f"**Current Snapshot:** {_snapshot_value(current_snapshot)}",
+        ])
+
+    if column_lineage_lines:
+        lines.extend([
+            "",
+            "## Column-Level Lineage",
+            *_bullet_list(column_lineage_lines),
         ])
 
     if incident.affected_models:

@@ -1,6 +1,7 @@
 import copy
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import sentinel
@@ -673,6 +674,109 @@ class PrAnalysisTests(unittest.TestCase):
 
         self.assertEqual(loaded_after, original)
 
+    def test_unrelated_derived_changed_column_reduces_kpi_impact(self):
+        previous_snapshot = _previous_snapshot(
+            "previous",
+            [_semantic_contract(related_models=["fct_revenue"], related_columns=["net_revenue"])],
+            column_lineage_graph=_column_graph(
+                "fct_revenue",
+                ["net_revenue"],
+                {"net_revenue": ["order_total"]},
+            ),
+        )
+
+        with _patched_non_semantic_detectors():
+            incident = analyze_changed_models(
+                [
+                    _lineage_model_spec(
+                        "select order_total as net_revenue, true as debug_flag from stg_orders"
+                    )
+                ],
+                previous_snapshot=previous_snapshot,
+                deployment_id="deploy-current",
+            )
+
+        kpi_signal = _signal(incident, "kpi_impact")
+
+        self.assertEqual(kpi_signal.severity, Severity.LOW)
+        self.assertEqual(kpi_signal.score, 0)
+        self.assertEqual(
+            kpi_signal.metadata["changed_columns_by_model"],
+            {"fct_revenue": ["debug_flag"]},
+        )
+        self.assertIn(
+            "Revenue / GMV does not read fct_revenue.debug_flag",
+            kpi_signal.metadata["column_level_evidence"],
+        )
+
+    def test_kpi_relevant_derived_changed_column_preserves_kpi_impact(self):
+        previous_snapshot = _previous_snapshot(
+            "previous",
+            [_semantic_contract(related_models=["fct_revenue"], related_columns=["net_revenue"])],
+            column_lineage_graph=_column_graph(
+                "fct_revenue",
+                ["net_revenue"],
+                {"net_revenue": ["stg_orders.order_total"]},
+            ),
+        )
+
+        with _patched_non_semantic_detectors():
+            incident = analyze_changed_models(
+                [
+                    _lineage_model_spec(
+                        (
+                            "select order_total - refund_amount as net_revenue "
+                            "from stg_orders"
+                        ),
+                        output_columns=["net_revenue"],
+                    )
+                ],
+                previous_snapshot=previous_snapshot,
+                deployment_id="deploy-current",
+            )
+
+        kpi_signal = _signal(incident, "kpi_impact")
+
+        self.assertEqual(kpi_signal.severity, Severity.HIGH)
+        self.assertGreaterEqual(kpi_signal.confidence, 90)
+        self.assertEqual(
+            kpi_signal.metadata["changed_columns_by_model"],
+            {"fct_revenue": ["net_revenue"]},
+        )
+        self.assertIn(
+            "Revenue / GMV reads fct_revenue.net_revenue",
+            kpi_signal.metadata["column_level_evidence"],
+        )
+
+    def test_no_previous_snapshot_falls_back_to_model_level_kpi_impact(self):
+        with _patched_non_semantic_detectors():
+            incident = analyze_changed_models(
+                [_lineage_model_spec("select net_revenue, true as debug_flag from stg_orders")]
+            )
+
+        kpi_signal = _signal(incident, "kpi_impact")
+
+        self.assertEqual(kpi_signal.severity, Severity.HIGH)
+        self.assertEqual(kpi_signal.metadata["fallback_reason"], "changed columns unavailable")
+
+    def test_old_snapshot_without_column_lineage_keeps_model_level_behavior(self):
+        previous_snapshot = _previous_snapshot(
+            "previous",
+            [_semantic_contract(related_models=["fct_revenue"], related_columns=["net_revenue"])],
+        )
+
+        with _patched_non_semantic_detectors():
+            incident = analyze_changed_models(
+                [_lineage_model_spec("select net_revenue, true as debug_flag from stg_orders")],
+                previous_snapshot=previous_snapshot,
+                deployment_id="deploy-current",
+            )
+
+        kpi_signal = _signal(incident, "kpi_impact")
+
+        self.assertEqual(kpi_signal.severity, Severity.HIGH)
+        self.assertEqual(kpi_signal.metadata["fallback_reason"], "changed columns unavailable")
+
 
 class _patched_detectors:
     def __init__(self, *, neutral=False):
@@ -955,6 +1059,62 @@ class _patched_detectors:
         )
 
 
+class _patched_non_semantic_detectors:
+    def __enter__(self):
+        from unittest.mock import patch
+
+        self.stack = ExitStack()
+        self.stack.enter_context(
+            patch("agent.pr_analysis.run_ast_analysis", return_value={"model_name": "fct_revenue"})
+        )
+        self.stack.enter_context(
+            patch(
+                "agent.pr_analysis.ast_to_signal",
+                return_value=Signal("ast", Severity.LOW, 90, 0, metadata={}),
+            )
+        )
+        self.stack.enter_context(
+            patch("agent.pr_analysis.run_metadata_checks", return_value={"model_name": "fct_revenue"})
+        )
+        self.stack.enter_context(
+            patch(
+                "agent.pr_analysis.metadata_checks_to_signal",
+                return_value=Signal("metadata_checks", Severity.LOW, 90, 0, metadata={}),
+            )
+        )
+        self.stack.enter_context(
+            patch("agent.pr_analysis.compare_last_run", return_value={"model_name": "fct_revenue"})
+        )
+        self.stack.enter_context(
+            patch(
+                "agent.pr_analysis.metadata_drift_to_signal",
+                return_value=Signal("metadata_drift", Severity.LOW, 90, 0, metadata={}),
+            )
+        )
+        self.stack.enter_context(
+            patch("agent.pr_analysis.calculate_blast_radius", return_value={"changed_model": "fct_revenue"})
+        )
+        self.stack.enter_context(
+            patch(
+                "agent.pr_analysis.blast_radius_to_signal",
+                return_value=Signal("blast_radius", Severity.LOW, 90, 0, metadata={}),
+            )
+        )
+        self.stack.enter_context(
+            patch("agent.pr_analysis.evaluate_history", return_value={"metadata": {}})
+        )
+        self.stack.enter_context(
+            patch(
+                "agent.pr_analysis.historical_reliability_to_signal",
+                return_value=Signal("historical_reliability", Severity.LOW, 90, 0, metadata={}),
+            )
+        )
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.stack.close()
+
+
 def _semantic_model_spec():
     return {
         "model_name": "stg_orders",
@@ -977,7 +1137,34 @@ def _project_context():
     }
 
 
-def _previous_snapshot(snapshot_id, contracts):
+def _lineage_model_spec(sql, *, output_columns=None):
+    columns = list(output_columns or ["debug_flag", "net_revenue"])
+    return {
+        "model_name": "fct_revenue",
+        "sql": sql,
+        "project_context": {
+            "model_names": ["fct_revenue"],
+            "column_names": ["debug_flag", "net_revenue", "revenue"],
+            "models": [
+                {
+                    "name": "fct_revenue",
+                    "columns": columns,
+                    "sql": sql,
+                }
+            ],
+            "metrics": [{"name": "Revenue", "model": "fct_revenue"}],
+        },
+    }
+
+
+def _signal(incident, component):
+    for signal in incident.signals:
+        if signal.component == component:
+            return signal
+    raise AssertionError(f"{component!r} signal not found")
+
+
+def _previous_snapshot(snapshot_id, contracts, *, column_lineage_graph=None):
     return DeploymentSnapshot(
         snapshot_id=snapshot_id,
         deployment_id=f"deploy-{snapshot_id}",
@@ -987,6 +1174,11 @@ def _previous_snapshot(snapshot_id, contracts):
             "discovered_kpis": [{"name": contract["kpi_name"]} for contract in contracts],
             "knowledge_report": {"contracts": copy.deepcopy(contracts)},
             "metadata": {"kpi_count": len(contracts)},
+            **(
+                {"column_lineage_graph": copy.deepcopy(column_lineage_graph)}
+                if column_lineage_graph is not None
+                else {}
+            ),
         },
         decision=None,
         incident_summary=None,
@@ -1017,6 +1209,38 @@ def _semantic_contract(
         "invariants": list(invariants or []),
         "confidence": 80,
         "metadata": {},
+    }
+
+
+def _column_graph(model_name, output_columns, dependencies):
+    edges = []
+    for to_column, upstream_columns in dependencies.items():
+        for upstream in upstream_columns:
+            if "." in upstream:
+                from_model, from_column = upstream.rsplit(".", 1)
+            else:
+                from_model, from_column = None, upstream
+            edges.append(
+                {
+                    "from_model": from_model,
+                    "from_column": from_column,
+                    "to_model": model_name,
+                    "to_column": to_column,
+                    "confidence": 0.95 if from_model else 0.7,
+                    "reason": "unit-test",
+                }
+            )
+    return {
+        "models": {
+            model_name: {
+                "model_name": model_name,
+                "output_columns": list(output_columns),
+                "edges": edges,
+                "unknown_columns": [],
+                "metadata": {},
+            }
+        },
+        "metadata": {"source": "unit-test"},
     }
 
 

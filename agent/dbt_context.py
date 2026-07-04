@@ -81,19 +81,21 @@ def _extract_models(manifest: dict, id_names: dict[str, str], id_types: dict[str
     for key, node in _resource_items(manifest.get("nodes"), "model"):
         unique_id = _unique_id(key, node)
         model_name = _name(node, unique_id)
-        models.append(
-            {
-                "name": model_name,
-                "unique_id": unique_id,
-                "path": node.get("original_file_path") or node.get("path"),
-                "columns": _columns(node),
-                "refs": _model_refs(node, id_names, id_types),
-                "sources": _model_sources(node, id_names, id_types),
-                "description": str(node.get("description") or ""),
-                "tags": _string_list(node.get("tags")),
-                "materialized": _materialized(node),
-            }
-        )
+        model = {
+            "name": model_name,
+            "unique_id": unique_id,
+            "path": node.get("original_file_path") or node.get("path"),
+            "columns": _columns(node),
+            "refs": _model_refs(node, id_names, id_types),
+            "sources": _model_sources(node, id_names, id_types),
+            "description": str(node.get("description") or ""),
+            "tags": _string_list(node.get("tags")),
+            "materialized": _materialized(node),
+        }
+        for field_name in ("raw_code", "compiled_code", "sql", "original_file_path"):
+            if node.get(field_name):
+                model[field_name] = node.get(field_name)
+        models.append(model)
     return sorted(models, key=lambda model: (model["name"], model["unique_id"]))
 
 

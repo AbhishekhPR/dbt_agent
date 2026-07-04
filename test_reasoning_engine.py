@@ -309,8 +309,8 @@ class ReasoningEngineTests(unittest.TestCase):
         self.assertEqual(
             [item.title for item in report.evidence],
             [
-                "Historical Semantic Change: Revenue gained upstream dependency refunds",
                 "Historical Semantic Change: Revenue lost invariant never negative",
+                "Historical Semantic Change: Revenue gained upstream dependency refunds",
             ],
         )
 
@@ -402,6 +402,54 @@ class ReasoningEngineTests(unittest.TestCase):
         self.assertEqual(len(report.evidence), 1)
         self.assertIn("1 evidence item", report.conclusion)
         self.assertNotIn("21 evidence items", report.conclusion)
+
+    def test_business_semantic_evidence_precedes_column_lineage_details(self):
+        incident = make_incident(
+            signals=[
+                Signal(
+                    "semantic_diff",
+                    Severity.HIGH,
+                    95,
+                    -35,
+                    reasons=[
+                        "stg_refunds.order_id output column was added",
+                        "stg_refunds.refund_amount output column was added",
+                        "Revenue gained upstream dependency refunds",
+                        "fct_revenue.refund_amount output column was added",
+                        "Revenue gained related model stg_refunds",
+                        "stg_refunds.refund_id output column was added",
+                    ],
+                    metadata={
+                        "column_dependency_changes": [
+                            "stg_refunds.order_id output column was added",
+                            "stg_refunds.refund_amount output column was added",
+                            "fct_revenue.refund_amount output column was added",
+                            "stg_refunds.refund_id output column was added",
+                        ],
+                    },
+                ),
+                Signal(
+                    "kpi_impact",
+                    Severity.HIGH,
+                    92,
+                    -30,
+                    reasons=["Revenue may be impacted by changed model fct_revenue"],
+                ),
+            ],
+        )
+
+        report = build_reasoning_report(incident)
+
+        self.assertEqual(
+            [item.title for item in report.evidence[:4]],
+            [
+                "Historical Semantic Change: Revenue gained upstream dependency refunds",
+                "Historical Semantic Change: Revenue gained related model stg_refunds",
+                "Historical Semantic Change: fct_revenue.refund_amount output column was added",
+                "KPI Impact: Revenue may be impacted by changed model fct_revenue",
+            ],
+        )
+        self.assertNotIn("stg_refunds.", " ".join(item.title for item in report.evidence[:4]))
 
 
 if __name__ == "__main__":

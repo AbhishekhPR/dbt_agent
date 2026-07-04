@@ -33,20 +33,31 @@ def infer_impacted_kpis(
     discovered_kpis: list[DiscoveredKPI],
     lineage: dict[str, list[str]] | None = None,
     semantic_graph: SemanticGraph | None = None,
+    column_lineage_graph: Any = None,
+    changed_columns_by_model: dict[str, list[str]] | None = None,
 ) -> KPIImpactReport:
     changed = list(changed_models or [])
     kpis = list(discovered_kpis or [])
     lineage_map = _copy_lineage(lineage)
+    changed_columns = _copy_changed_columns(changed_columns_by_model)
     downstream_by_model = {
         model: _downstream_models(model, lineage_map)
         for model in changed
     }
+    column_lineage = _column_lineage_dict(column_lineage_graph)
 
     impacted = []
     unaffected = []
 
     for kpi in kpis:
-        impact = _impact_for_kpi(kpi, changed, downstream_by_model, semantic_graph)
+        impact = _impact_for_kpi(
+            kpi,
+            changed,
+            downstream_by_model,
+            semantic_graph,
+            column_lineage,
+            changed_columns,
+        )
         if impact:
             impacted.append(impact)
         else:
@@ -65,6 +76,10 @@ def infer_impacted_kpis(
         metadata={
             "lineage_provided": lineage is not None,
             "semantic_graph_provided": semantic_graph is not None,
+            "column_lineage_available": bool(column_lineage),
+            "changed_columns_by_model": changed_columns,
+            "fallback_reason": _report_fallback_reason(impacted, changed_columns, column_lineage),
+            "column_level_evidence": _report_column_evidence(impacted),
             "downstream_models_by_changed_model": downstream_by_model,
             "impacted_count": len(impacted),
             "unaffected_count": len(unaffected),
@@ -90,6 +105,8 @@ def _impact_for_kpi(
     changed_models: list[str],
     downstream_by_model: dict[str, list[str]],
     semantic_graph: SemanticGraph | None,
+    column_lineage: dict[str, Any],
+    changed_columns_by_model: dict[str, list[str]],
 ) -> ImpactedKPI | None:
     related_models = list(kpi.related_models or [])
     related_model_set = set(related_models)
@@ -122,6 +139,15 @@ def _impact_for_kpi(
 
     confidence = _impact_confidence(direct_matches, downstream_matches, impact_paths)
     impact_reasons = _impact_reasons(direct_matches, supporting_matches, impact_paths, kpi.name)
+    column_assessment = _column_assessment_for_kpi(
+        kpi,
+        changed_models,
+        impacted_by_models,
+        column_lineage,
+        changed_columns_by_model,
+    )
+    confidence = _column_adjusted_confidence(confidence, column_assessment)
+    impact_reasons.extend(column_assessment.get("evidence", []))
 
     return ImpactedKPI(
         name=kpi.name,
@@ -136,6 +162,11 @@ def _impact_for_kpi(
             "downstream_matches": sorted(downstream_matches),
             "supporting_matches": supporting_matches,
             "impact_paths": impact_paths,
+            "column_lineage_available": bool(column_lineage),
+            "changed_columns_by_model": changed_columns_by_model,
+            "fallback_reason": column_assessment.get("fallback_reason"),
+            "column_level_evidence": list(column_assessment.get("evidence", [])),
+            "column_impact": column_assessment.get("impact"),
         },
     )
 
@@ -223,6 +254,113 @@ def _copy_lineage(lineage: dict[str, list[str]] | None) -> dict[str, list[str]]:
     }
 
 
+def _copy_changed_columns(changed_columns_by_model: dict[str, list[str]] | None) -> dict[str, list[str]]:
+    copied = {}
+    for model_name, columns in (changed_columns_by_model or {}).items():
+        values = _ordered_unique(str(column) for column in columns or [] if column)
+        if values:
+            copied[str(model_name)] = values
+    return copied
+
+
+def _column_lineage_dict(column_lineage_graph: Any) -> dict[str, Any]:
+    if column_lineage_graph is None:
+        return {}
+    if hasattr(column_lineage_graph, "to_dict"):
+        payload = column_lineage_graph.to_dict()
+    elif isinstance(column_lineage_graph, dict):
+        payload = column_lineage_graph
+    else:
+        return {}
+    models = payload.get("models") if isinstance(payload, dict) else {}
+    return dict(models or {}) if isinstance(models, dict) else {}
+
+
+def _column_assessment_for_kpi(
+    kpi: DiscoveredKPI,
+    changed_models: list[str],
+    impacted_by_models: list[str],
+    column_lineage: dict[str, Any],
+    changed_columns_by_model: dict[str, list[str]],
+) -> dict[str, Any]:
+    if not column_lineage:
+        return {"impact": "fallback", "fallback_reason": "column lineage unavailable", "evidence": []}
+    if not changed_columns_by_model:
+        return {"impact": "fallback", "fallback_reason": "changed columns unavailable", "evidence": []}
+
+    relevant_columns = {str(column).casefold() for column in list(kpi.related_columns or []) if column}
+    if not relevant_columns:
+        return {"impact": "fallback", "fallback_reason": "kpi columns unavailable", "evidence": []}
+
+    evidence = []
+    ambiguous = False
+    related = False
+    evaluated = False
+    impacted_model_set = set(impacted_by_models)
+    for model_name in changed_models:
+        if model_name not in impacted_model_set and model_name not in list(kpi.related_models or []):
+            continue
+        lineage = column_lineage.get(model_name)
+        changed_columns = changed_columns_by_model.get(model_name) or []
+        if not changed_columns:
+            continue
+        if not isinstance(lineage, dict):
+            ambiguous = True
+            continue
+        unknown_columns = {str(column).casefold() for column in lineage.get("unknown_columns") or []}
+        output_columns = {str(column).casefold() for column in lineage.get("output_columns") or []}
+        for column in changed_columns:
+            evaluated = True
+            normalized = str(column).casefold()
+            display = f"{model_name}.{column}"
+            if normalized in unknown_columns or normalized not in output_columns:
+                ambiguous = True
+                continue
+            if normalized in relevant_columns:
+                related = True
+                evidence.append(f"{kpi.name} reads {display}")
+            else:
+                evidence.append(f"{kpi.name} does not read {display}")
+
+    if related:
+        return {"impact": "related", "fallback_reason": None, "evidence": _ordered_unique(evidence)}
+    if ambiguous or not evaluated:
+        return {"impact": "fallback", "fallback_reason": "column lineage ambiguous", "evidence": []}
+    return {"impact": "unrelated", "fallback_reason": None, "evidence": _ordered_unique(evidence)}
+
+
+def _column_adjusted_confidence(confidence: int, assessment: dict[str, Any]) -> int:
+    impact = assessment.get("impact")
+    if impact == "related":
+        return max(confidence, 95)
+    if impact == "unrelated":
+        return min(confidence, 55)
+    return confidence
+
+
+def _report_column_evidence(impacted: list[ImpactedKPI]) -> list[str]:
+    evidence = []
+    for impact in impacted:
+        evidence.extend((impact.metadata or {}).get("column_level_evidence") or [])
+    return _ordered_unique(evidence)
+
+
+def _report_fallback_reason(
+    impacted: list[ImpactedKPI],
+    changed_columns_by_model: dict[str, list[str]],
+    column_lineage: dict[str, Any],
+) -> str | None:
+    for impact in impacted:
+        reason = (impact.metadata or {}).get("fallback_reason")
+        if reason:
+            return reason
+    if not column_lineage:
+        return "column lineage unavailable"
+    if not changed_columns_by_model:
+        return "changed columns unavailable"
+    return None
+
+
 def _ordered_unique(values) -> list[str]:
     unique = []
     for value in values:
@@ -241,6 +379,8 @@ def _sort_supporting_matches(matches: list[str]) -> list[str]:
 def _signal_severity(impacted_kpis: list[ImpactedKPI], confidence: int) -> str:
     if impacted_kpis and confidence >= 90:
         return "HIGH"
+    if impacted_kpis and confidence < 70:
+        return "LOW"
     if impacted_kpis:
         return "MEDIUM"
     return "LOW"
@@ -272,6 +412,7 @@ def _signal_metadata(report: KPIImpactReport) -> dict[str, Any]:
         "impacted_kpis": [impact.name for impact in impacted],
         "unaffected_kpis": [kpi.name for kpi in unaffected],
         "impact_paths": _signal_impact_paths(impacted),
+        "column_level_evidence": _report_column_evidence(impacted),
     }
 
 

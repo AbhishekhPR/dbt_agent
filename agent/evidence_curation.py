@@ -26,14 +26,14 @@ COMPONENT_LABELS = {
 
 COMPONENT_PRIORITIES = {
     "semantic_diff": 0,
-    "semantic_contract": 1,
     "kpi_impact": 2,
-    "ast": 3,
-    "metadata_checks": 3,
-    "metadata_drift": 3,
-    "blast_radius": 3,
-    "historical_reliability": 3,
-    "business_metrics": 3,
+    "semantic_contract": 3,
+    "ast": 4,
+    "metadata_checks": 4,
+    "metadata_drift": 4,
+    "blast_radius": 4,
+    "historical_reliability": 4,
+    "business_metrics": 4,
 }
 
 SEMANTIC_DIFF_REASON_PATTERNS = (
@@ -98,6 +98,32 @@ def is_low_level_reason(reason: Any) -> bool:
     return _is_low_level_reason(clean_reason(reason))
 
 
+def order_semantic_diff_reasons(reasons: list[Any]) -> list[str]:
+    candidates = []
+    for reason_index, reason in enumerate(reasons or []):
+        cleaned_reason = clean_reason(reason)
+        if not cleaned_reason:
+            continue
+        candidates.append(
+            (
+                _semantic_diff_sort_priority(cleaned_reason),
+                reason_index,
+                cleaned_reason,
+            )
+        )
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return _ordered_unique(item[2] for item in candidates)
+
+
+def is_column_level_reason(reason: Any) -> bool:
+    return _column_reason_model(clean_reason(reason)) is not None
+
+
+def is_supporting_column_reason(reason: Any) -> bool:
+    model = _column_reason_model(clean_reason(reason))
+    return bool(model and _is_staging_or_source_model(model))
+
+
 def _curated_items(signals) -> list[dict]:
     candidates = []
     for signal_index, signal in enumerate(list(signals or [])):
@@ -114,8 +140,8 @@ def _curated_items(signals) -> list[dict]:
                     "severity": _enum_value(getattr(signal, "severity", "")),
                     "confidence": getattr(signal, "confidence", 0),
                     "component": component,
-                    "_priority": _priority(component),
-                    "_semantic_diff_priority": semantic_diff_reason_priority(
+                    "_priority": _item_priority(component, cleaned_reason),
+                    "_semantic_diff_priority": _semantic_diff_sort_priority(
                         cleaned_reason
                     ),
                     "_signal_index": signal_index,
@@ -126,9 +152,6 @@ def _curated_items(signals) -> list[dict]:
     candidates.sort(
         key=lambda item: (
             item["_priority"],
-            item["_semantic_diff_priority"]
-            if str(item["component"]).lower() == "semantic_diff"
-            else 0,
             item["_signal_index"],
             item["_reason_index"],
         )
@@ -163,8 +186,31 @@ def _priority(component: str) -> int:
     return COMPONENT_PRIORITIES.get(str(component or "").lower(), 4)
 
 
+def _item_priority(component: str, reason: str) -> tuple[int, int]:
+    normalized = str(component or "").lower()
+    if normalized == "semantic_diff":
+        semantic_priority = _semantic_diff_sort_priority(reason)
+        if is_supporting_column_reason(reason):
+            return (8, semantic_priority)
+        if is_column_level_reason(reason):
+            return (1, semantic_priority)
+        return (0, semantic_priority)
+    return (_priority(normalized), 0)
+
+
 def semantic_diff_reason_priority(reason: Any) -> int:
+    return _semantic_diff_sort_priority(clean_reason(reason))
+
+
+def _semantic_diff_sort_priority(reason: Any) -> int:
     cleaned = clean_reason(reason).casefold()
+    if is_supporting_column_reason(cleaned):
+        return 100
+    if is_column_level_reason(cleaned):
+        if "upstream column" in cleaned:
+            return 20
+        return 30
+
     for priority, (subject, actions) in enumerate(SEMANTIC_DIFF_REASON_PATTERNS):
         if subject in cleaned and any(action in cleaned for action in actions):
             return priority
@@ -174,6 +220,41 @@ def semantic_diff_reason_priority(reason: Any) -> int:
             return len(SEMANTIC_DIFF_REASON_PATTERNS) + offset
 
     return len(SEMANTIC_DIFF_REASON_PATTERNS) + len(GENERIC_KPI_REASON_PATTERNS)
+
+
+def _column_reason_model(reason: str) -> str | None:
+    match = re.match(
+        r"^(?P<model>[A-Za-z_][\w]*)\.[A-Za-z_][\w]* "
+        r"(?:output column was (?:added|removed)|(?:gained|lost) upstream column)\b",
+        reason,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return match.group("model")
+
+
+def _is_staging_or_source_model(model_name: str) -> bool:
+    normalized = str(model_name or "").casefold()
+    return normalized.startswith((
+        "stg_",
+        "stage_",
+        "staging_",
+        "src_",
+        "source_",
+        "raw_",
+    ))
+
+
+def _ordered_unique(values) -> list[str]:
+    unique = []
+    seen = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
 
 
 def _enum_value(value: Any) -> Any:
