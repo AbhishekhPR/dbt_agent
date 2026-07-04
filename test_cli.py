@@ -327,6 +327,54 @@ class CliTests(unittest.TestCase):
             ["fct_orders", "stg_orders"],
         )
 
+    def test_changed_file_only_review_uses_column_level_semantic_diff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous_manifest = _write_lineage_manifest(
+                tmp,
+                "manifest_previous.json",
+                columns=["net_revenue"],
+                compiled_code="select order_total as net_revenue from stg_orders",
+            )
+            current_manifest = _write_lineage_manifest(
+                tmp,
+                "manifest_current.json",
+                columns=["net_revenue", "debug_flag"],
+                compiled_code=(
+                    "select order_total as net_revenue, "
+                    "true as debug_flag from stg_orders"
+                ),
+            )
+            history_path = Path(tmp) / "history.json"
+
+            baseline_result, baseline_output = _invoke(
+                [
+                    "init-baseline",
+                    "--dbt-manifest",
+                    str(previous_manifest),
+                    "--history-path",
+                    str(history_path),
+                ]
+            )
+            review_result, review_output = _invoke(
+                [
+                    "review-deployment",
+                    "--dbt-manifest",
+                    str(current_manifest),
+                    "--changed-file",
+                    "models/marts/fct_revenue.sql",
+                    "--history-path",
+                    str(history_path),
+                    "--format",
+                    "markdown",
+                ]
+            )
+
+        self.assertEqual(baseline_result.exit_code, 0, baseline_output)
+        self.assertEqual(review_result.exit_code, 0, review_output)
+        self.assertIn("Column-Level Lineage", review_output)
+        self.assertIn("fct_revenue.debug_flag output column was added", review_output)
+        self.assertIn("Revenue does not read fct_revenue.debug_flag", review_output)
+
     def test_review_deployment_command_exits_zero_with_valid_project_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             context_path = _write_project_context(tmp)
@@ -907,6 +955,43 @@ def _write_empty_dbt_manifest(tmp):
         "nodes": {},
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _write_lineage_manifest(tmp, filename, *, columns, compiled_code):
+    path = Path(tmp) / filename
+    path.write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "project_name": "jaffle_shop",
+                    "dbt_version": "1.8.0",
+                },
+                "nodes": {
+                    "model.jaffle_shop.fct_revenue": {
+                        "resource_type": "model",
+                        "name": "fct_revenue",
+                        "unique_id": "model.jaffle_shop.fct_revenue",
+                        "original_file_path": "models/marts/fct_revenue.sql",
+                        "compiled_code": compiled_code,
+                        "columns": {
+                            column: {"name": column}
+                            for column in columns
+                        },
+                    }
+                },
+                "metrics": {
+                    "metric.jaffle_shop.revenue": {
+                        "name": "Revenue",
+                        "label": "Revenue",
+                        "type": "simple",
+                        "model": "ref('fct_revenue')",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     return path
 
 

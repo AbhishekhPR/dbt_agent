@@ -1,6 +1,7 @@
 from enum import Enum
 from typing import Any
 
+from agent.evidence_curation import order_semantic_diff_reasons
 from agent.incident import Incident
 from agent.reasoning_engine import build_reasoning_report
 
@@ -149,7 +150,7 @@ def _historical_semantic_change(incident: Incident) -> dict[str, Any] | None:
             "contract_changes": _serialize(dict(metadata.get("contract_changes") or {})),
             "previous_snapshot_id": _serialize(metadata.get("previous_snapshot_id")),
             "current_snapshot_id": _serialize(metadata.get("current_snapshot_id")),
-            "reasons": list(signal.reasons or []),
+            "reasons": order_semantic_diff_reasons(list(signal.reasons or [])),
         }
     return None
 

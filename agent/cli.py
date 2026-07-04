@@ -1,6 +1,13 @@
 import click
 
 
+def run_simulation(*args, **kwargs):
+    """Lazy simulator entry point, kept patchable for CLI tests."""
+    from agent.simulator import run_simulation as _run_simulation
+
+    return _run_simulation(*args, **kwargs)
+
+
 def print_diagnosis(result: dict):
     """Reusable formatted diagnosis printer"""
     severity_color = {
@@ -209,8 +216,6 @@ def scan(project, changed_model, diff_base, verbose, output_format, output):
 @click.option('--no-sync-baseline', is_flag=True, help='Use existing baseline instead of syncing before simulation')
 def simulate(project, db, table, anomaly_type, no_restore, no_sync_baseline):
     """Simulate a local data quality incident and run the quality checker"""
-    from agent.simulator import run_simulation
-
     run_simulation(
         project,
         db,
