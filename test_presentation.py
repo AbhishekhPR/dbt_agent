@@ -204,6 +204,153 @@ def make_column_lineage_incident():
     )
 
 
+def make_generated_assumption_verification_incident():
+    checks = [
+        _assumption_check(
+            column_name=f"revenue_check_{index}",
+            sql=f"SELECT COUNT(*) FROM fct_revenue WHERE revenue_check_{index} < 0",
+        )
+        for index in range(1, 9)
+    ]
+    return Incident(
+        incident_id="INC-ASSUMPTIONS",
+        health=92,
+        decision=DeploymentDecision.ALLOW,
+        severity=Severity.LOW,
+        confidence=88,
+        root_cause="",
+        recommendation="",
+        signals=[],
+        metadata={
+            "assumption_verification": {
+                "checks": checks,
+                "metadata": {
+                    "evaluated": False,
+                    "check_count": 8,
+                    "evaluated_count": 0,
+                },
+            }
+        },
+    )
+
+
+def make_passing_assumption_verification_incident():
+    checks = [
+        _assumption_check(
+            column_name=f"revenue_check_{index}",
+            evaluated=True,
+            status="passed",
+            passed=True,
+            violation_count=0,
+        )
+        for index in range(1, 9)
+    ]
+    return _assumption_incident(
+        {
+            "checks": checks,
+            "metadata": {
+                "evaluated": True,
+                "check_count": 8,
+                "evaluated_count": 8,
+                "failed_count": 0,
+            },
+        }
+    )
+
+
+def make_failed_assumption_verification_incident():
+    return _assumption_incident(
+        {
+            "checks": [
+                _assumption_check(
+                    model_name="fct_revenue",
+                    column_name="revenue",
+                    check_type="non_negative",
+                    invariant="never negative",
+                    evaluated=True,
+                    status="failed",
+                    passed=False,
+                    violation_count=3,
+                    sql="SELECT COUNT(*) FROM fct_revenue WHERE revenue < 0",
+                ),
+                _assumption_check(
+                    model_name="fct_orders",
+                    column_name="customer_id",
+                    check_type="not_null",
+                    invariant="not null",
+                    evaluated=True,
+                    status="failed",
+                    passed=False,
+                    violation_count=10,
+                    sql="SELECT COUNT(*) FROM fct_orders WHERE customer_id IS NULL",
+                ),
+                _assumption_check(
+                    model_name="fct_orders",
+                    column_name="order_id",
+                    check_type="not_null",
+                    invariant="not null",
+                    evaluated=True,
+                    status="passed",
+                    passed=True,
+                    violation_count=0,
+                ),
+            ],
+            "metadata": {
+                "evaluated": True,
+                "check_count": 3,
+                "evaluated_count": 3,
+                "failed_count": 2,
+            },
+        },
+        health=63,
+        decision=DeploymentDecision.BLOCK,
+        severity=Severity.HIGH,
+    )
+
+
+def _assumption_incident(report, *, health=92, decision=DeploymentDecision.ALLOW, severity=Severity.LOW):
+    return Incident(
+        incident_id="INC-ASSUMPTIONS",
+        health=health,
+        decision=decision,
+        severity=severity,
+        confidence=88,
+        root_cause="",
+        recommendation="",
+        signals=[],
+        metadata={"assumption_verification": report},
+    )
+
+
+def _assumption_check(
+    *,
+    kpi_name="Revenue",
+    model_name="fct_revenue",
+    column_name="revenue",
+    invariant="never negative",
+    check_type="non_negative",
+    sql="SELECT COUNT(*) AS violation_count FROM fct_revenue WHERE revenue < 0",
+    evaluated=False,
+    status="not_evaluated",
+    passed=None,
+    violation_count=None,
+):
+    return {
+        "kpi_name": kpi_name,
+        "model_name": model_name,
+        "column_name": column_name,
+        "invariant": invariant,
+        "check_type": check_type,
+        "sql": sql,
+        "evaluated": evaluated,
+        "status": status,
+        "passed": passed,
+        "violation_count": violation_count,
+        "error": None,
+        "metadata": {},
+    }
+
+
 def make_noisy_column_lineage_incident():
     return Incident(
         incident_id="INC-NOISY-LINEAGE",
@@ -497,6 +644,46 @@ class PresentationTests(unittest.TestCase):
         rendered = render_cli(make_incident())
 
         self.assertNotIn("Business Metrics", rendered)
+
+    def test_generated_only_assumption_checks_render_compact_summary(self):
+        rendered = render_cli(make_generated_assumption_verification_incident())
+
+        self.assertIn("Assumption Verification", rendered)
+        self.assertIn("- 8 checks generated for Revenue", rendered)
+        self.assertIn("- 0 checks evaluated", rendered)
+        self.assertIn("- Not evaluated: no warehouse connection provided", rendered)
+        self.assertNotIn("revenue_check_1 never negative", rendered)
+        self.assertNotIn("SELECT COUNT(*)", rendered)
+
+    def test_evaluated_passing_assumption_checks_render_compact_success(self):
+        rendered = render_cli(make_passing_assumption_verification_incident())
+
+        self.assertIn("Assumption Verification", rendered)
+        self.assertIn("- 8 checks evaluated", rendered)
+        self.assertIn("- All assumption checks passed", rendered)
+        self.assertNotIn("revenue_check_1 never negative", rendered)
+
+    def test_failed_assumption_checks_render_explicit_failed_lines(self):
+        rendered = render_cli(make_failed_assumption_verification_incident())
+
+        self.assertIn("Assumption Verification", rendered)
+        self.assertIn("- FAILED: fct_revenue.revenue has 3 negative values", rendered)
+        self.assertIn("- FAILED: fct_orders.customer_id has 10 null values", rendered)
+        self.assertNotIn("fct_orders.order_id not null (passed)", rendered)
+
+    def test_markdown_assumption_verification_stays_compact_and_hides_sql(self):
+        rendered = render_markdown(make_generated_assumption_verification_incident())
+
+        self.assertIn("## Assumption Verification", rendered)
+        self.assertIn("- 8 checks generated for Revenue", rendered)
+        self.assertIn("- 0 checks evaluated", rendered)
+        self.assertNotIn("SELECT COUNT(*)", rendered)
+        self.assertNotIn("revenue_check_1 never negative", rendered)
+
+    def test_existing_rendering_has_no_assumption_verification_without_report(self):
+        rendered = render_cli(make_incident())
+
+        self.assertNotIn("Assumption Verification", rendered)
 
     def test_cli_renders_historical_semantic_change_when_semantic_diff_exists(self):
         rendered = render_cli(make_semantic_diff_incident())

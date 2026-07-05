@@ -1,4 +1,5 @@
 import copy
+import sqlite3
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -776,6 +777,93 @@ class PrAnalysisTests(unittest.TestCase):
 
         self.assertEqual(kpi_signal.severity, Severity.HIGH)
         self.assertEqual(kpi_signal.metadata["fallback_reason"], "changed columns unavailable")
+
+    def test_pr_analysis_preserves_not_evaluated_assumption_verification(self):
+        with _patched_non_semantic_detectors():
+            incident = analyze_changed_models(
+                [_lineage_model_spec("select net_revenue from stg_orders")]
+            )
+
+        report = incident.metadata["assumption_verification"]
+
+        self.assertTrue(report["checks"])
+        self.assertTrue(all(not check["evaluated"] for check in report["checks"]))
+        self.assertNotIn(
+            "assumption_verification",
+            [signal.component for signal in incident.signals],
+        )
+
+    def test_pr_analysis_evaluates_assumption_verification_when_connection_exists(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE fct_revenue (net_revenue INTEGER, order_id TEXT)")
+        conn.executemany(
+            "INSERT INTO fct_revenue (net_revenue, order_id) VALUES (?, ?)",
+            [(10, "o1"), (-2, None)],
+        )
+
+        model_spec = _lineage_model_spec(
+            "select net_revenue, order_id from stg_orders",
+            output_columns=["net_revenue", "order_id"],
+        )
+        model_spec["conn"] = conn
+
+        try:
+            with _patched_non_semantic_detectors():
+                incident = analyze_changed_models([model_spec])
+        finally:
+            conn.close()
+
+        checks = incident.metadata["assumption_verification"]["checks"]
+        non_negative = next(
+            check for check in checks
+            if check["check_type"] == "non_negative" and check["column_name"] == "net_revenue"
+        )
+        not_null = next(
+            check for check in checks
+            if check["check_type"] == "not_null" and check["column_name"] == "order_id"
+        )
+
+        self.assertTrue(non_negative["evaluated"])
+        self.assertEqual(non_negative["status"], "failed")
+        self.assertEqual(non_negative["violation_count"], 1)
+        self.assertEqual(not_null["status"], "failed")
+        self.assertEqual(not_null["violation_count"], 1)
+
+        assumption_signal = _signal(incident, "assumption_verification")
+
+        self.assertEqual(assumption_signal.severity, Severity.HIGH)
+        self.assertEqual(assumption_signal.score, -30)
+        self.assertIn(
+            "Revenue / GMV assumption failed: fct_revenue.net_revenue never negative (1 violation)",
+            assumption_signal.reasons,
+        )
+        self.assertEqual(assumption_signal.metadata["failed_count"], 2)
+
+    def test_pr_analysis_adds_low_signal_when_assumption_checks_pass(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE fct_revenue (net_revenue INTEGER, order_id TEXT)")
+        conn.execute(
+            "INSERT INTO fct_revenue (net_revenue, order_id) VALUES (?, ?)",
+            (12, "o1"),
+        )
+
+        model_spec = _lineage_model_spec(
+            "select net_revenue, order_id from stg_orders",
+            output_columns=["net_revenue", "order_id"],
+        )
+        model_spec["conn"] = conn
+
+        try:
+            with _patched_non_semantic_detectors():
+                incident = analyze_changed_models([model_spec])
+        finally:
+            conn.close()
+
+        assumption_signal = _signal(incident, "assumption_verification")
+
+        self.assertEqual(assumption_signal.severity, Severity.LOW)
+        self.assertEqual(assumption_signal.score, 0)
+        self.assertEqual(assumption_signal.reasons, ["All evaluated assumption checks passed"])
 
 
 class _patched_detectors:

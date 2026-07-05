@@ -66,6 +66,23 @@ class SemanticContextTests(unittest.TestCase):
             ["gross_revenue", "order_id"],
         )
 
+    def test_context_includes_assumption_verification_report(self):
+        context = build_semantic_context(project_context=_project_context())
+
+        check_types = [
+            check["check_type"]
+            for check in context.assumption_verification.to_dict()["checks"]
+        ]
+
+        self.assertIn("non_negative", check_types)
+        self.assertIn("model_not_empty", check_types)
+        self.assertTrue(
+            all(
+                not check["evaluated"]
+                for check in context.assumption_verification.to_dict()["checks"]
+            )
+        )
+
     def test_context_serializes_to_dict(self):
         context = build_semantic_context(
             project_context=_project_context(),
@@ -79,6 +96,7 @@ class SemanticContextTests(unittest.TestCase):
         self.assertEqual(payload["discovered_kpis"][0]["name"], "Revenue / GMV")
         self.assertEqual(payload["kpi_impact_report"]["impacted_kpis"][0]["name"], "Revenue / GMV")
         self.assertIn("column_lineage_graph", payload)
+        self.assertIn("assumption_verification", payload)
         self.assertEqual(to_dict(context), payload)
 
     def test_missing_sql_does_not_crash_column_lineage(self):
@@ -126,6 +144,7 @@ class SemanticContextTests(unittest.TestCase):
         self.assertEqual(context.knowledge_report.contracts, [])
         self.assertEqual(context.contract_validation_result["severity"], "LOW")
         self.assertEqual(context.column_lineage_graph.models, {})
+        self.assertEqual(context.assumption_verification.checks, [])
         json.dumps(context.to_dict())
 
 

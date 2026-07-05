@@ -16,6 +16,7 @@ LOW_LEVEL_REASON_PATTERNS = (
 COMPONENT_LABELS = {
     "semantic_diff": "Historical Semantic Change",
     "semantic_contract": "Semantic Contract",
+    "assumption_verification": "Assumption Verification",
     "kpi_impact": "KPI Impact",
     "ast": "SQL Logic",
     "metadata_checks": "Metadata Checks",
@@ -28,6 +29,7 @@ COMPONENT_PRIORITIES = {
     "semantic_diff": 0,
     "kpi_impact": 2,
     "semantic_contract": 3,
+    "assumption_verification": 3,
     "ast": 4,
     "metadata_checks": 4,
     "metadata_drift": 4,

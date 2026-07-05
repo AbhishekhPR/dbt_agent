@@ -3,6 +3,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
 from typing import Any
 
+from agent.assumption_verification import build_assumption_verification_report
 from agent.column_lineage import build_column_lineage_graph
 from agent.kpi_discovery import discover_kpis
 from agent.semantic_contract_validation import validate_semantic_contracts
@@ -17,6 +18,7 @@ class SemanticContext:
     discovered_kpis: list[Any] = field(default_factory=list)
     semantic_graph: Any = None
     column_lineage_graph: Any = None
+    assumption_verification: Any = None
     kpi_impact_report: Any = None
     knowledge_report: Any = None
     contract_validation_result: dict[str, Any] | None = None
@@ -31,6 +33,7 @@ def build_semantic_context(
     project_context,
     changed_models=None,
     metadata=None,
+    assumption_connection=None,
 ) -> SemanticContext:
     context = copy.deepcopy(project_context or {})
     changed = list(changed_models or [])
@@ -54,6 +57,11 @@ def build_semantic_context(
         semantic_graph=semantic_graph,
         project_context=context,
     )
+    assumption_verification = build_assumption_verification_report(
+        contracts=knowledge_report.contracts,
+        project_context=context,
+        connection=assumption_connection,
+    )
     contract_validation_result = validate_semantic_contracts(
         contracts=knowledge_report.contracts,
         changed_models=changed,
@@ -66,6 +74,7 @@ def build_semantic_context(
         discovered_kpis=discovered_kpis,
         semantic_graph=semantic_graph,
         column_lineage_graph=column_lineage_graph,
+        assumption_verification=assumption_verification,
         kpi_impact_report=kpi_impact_report,
         knowledge_report=knowledge_report,
         contract_validation_result=contract_validation_result,
@@ -74,6 +83,7 @@ def build_semantic_context(
             "has_kpi_impact_report": kpi_impact_report is not None,
             "kpi_count": len(discovered_kpis),
             "contract_count": len(knowledge_report.contracts),
+            "assumption_check_count": len(assumption_verification.checks),
         },
     )
 

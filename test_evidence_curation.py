@@ -88,6 +88,67 @@ class EvidenceCurationTests(unittest.TestCase):
             "Revenue is impacted through stg_orders -> fct_revenue -> Revenue",
         )
 
+    def test_labels_assumption_verification_evidence(self):
+        signals = [
+            Signal(
+                "assumption_verification",
+                Severity.HIGH,
+                95,
+                -30,
+                reasons=[
+                    (
+                        "Revenue / GMV assumption failed: "
+                        "fct_revenue.net_revenue never negative (1 violation)"
+                    )
+                ],
+            )
+        ]
+
+        evidence = curate_evidence(signals)
+
+        self.assertEqual(evidence[0]["label"], "Assumption Verification")
+        self.assertEqual(
+            evidence[0]["reason"],
+            (
+                "Revenue / GMV assumption failed: "
+                "fct_revenue.net_revenue never negative (1 violation)"
+            ),
+        )
+
+    def test_evaluated_assumption_failures_rank_after_business_semantics(self):
+        signals = [
+            Signal(
+                "assumption_verification",
+                Severity.HIGH,
+                95,
+                -30,
+                reasons=["Revenue / GMV assumption failed: fct_revenue.net_revenue never negative (1 violation)"],
+            ),
+            Signal(
+                "semantic_diff",
+                Severity.HIGH,
+                95,
+                -35,
+                reasons=["Revenue gained upstream dependency refunds"],
+            ),
+            Signal(
+                "kpi_impact",
+                Severity.HIGH,
+                92,
+                -30,
+                reasons=["Revenue may be impacted by changed model fct_revenue"],
+            ),
+        ]
+
+        self.assertEqual(
+            curate_reasons(signals),
+            [
+                "Revenue gained upstream dependency refunds",
+                "Revenue may be impacted by changed model fct_revenue",
+                "Revenue / GMV assumption failed: fct_revenue.net_revenue never negative (1 violation)",
+            ],
+        )
+
     def test_fixes_joined_spacing_issues(self):
         signals = [
             Signal(

@@ -2,6 +2,7 @@ import copy
 from pathlib import Path
 from typing import Any
 
+from agent.assumption_verification import to_signal as assumption_verification_to_signal
 from agent.ast_analyzer import run_ast_analysis
 from agent.ast_analyzer import to_signal as ast_to_signal
 from agent.blast_radius import calculate_blast_radius
@@ -313,11 +314,16 @@ def _semantic_context(model_specs: list[Any], affected_models: list[str], metada
     if project_context is None:
         return None
 
-    return build_semantic_context(
-        project_context=project_context,
-        changed_models=list(affected_models),
-        metadata=dict(metadata),
-    )
+    kwargs = {
+        "project_context": project_context,
+        "changed_models": list(affected_models),
+        "metadata": dict(metadata),
+    }
+    assumption_connection = _assumption_connection(model_specs)
+    if assumption_connection is not None:
+        kwargs["assumption_connection"] = assumption_connection
+
+    return build_semantic_context(**kwargs)
 
 
 def _semantic_signals(semantic_context) -> list[Signal]:
@@ -329,6 +335,11 @@ def _semantic_signals(semantic_context) -> list[Signal]:
         signals.append(_source_signal(kpi_impact_to_signal(semantic_context.kpi_impact_report)))
     if semantic_context.contract_validation_result is not None:
         signals.append(_source_signal(semantic_contract_to_signal(semantic_context.contract_validation_result)))
+    assumption_signal = assumption_verification_to_signal(
+        getattr(semantic_context, "assumption_verification", None)
+    )
+    if assumption_signal is not None:
+        signals.append(_source_signal(assumption_signal))
     return signals
 
 
@@ -359,7 +370,12 @@ def _add_semantic_metadata(
     semantic_diff=None,
 ) -> None:
     if semantic_context is not None:
-        metadata["semantic_context"] = semantic_context.to_dict()
+        semantic_context_dict = semantic_context.to_dict()
+        metadata["semantic_context"] = semantic_context_dict
+        if semantic_context_dict.get("assumption_verification"):
+            metadata["assumption_verification"] = dict(
+                semantic_context_dict["assumption_verification"]
+            )
         metadata["impacted_kpis"] = list(_signal_metadata_value(semantic_signals, "impacted_kpis", []))
         metadata["impact_paths"] = [
             list(path)
@@ -500,6 +516,14 @@ def _project_context(model_specs: list[Any]) -> dict[str, Any] | None:
             else:
                 merged[key] = value
     return merged
+
+
+def _assumption_connection(model_specs: list[Any]):
+    for model_spec in model_specs:
+        connection = _value(model_spec, "conn")
+        if connection is not None:
+            return connection
+    return None
 
 
 def _copy_list_items(values: list[Any]) -> list[Any]:

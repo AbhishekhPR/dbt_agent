@@ -48,6 +48,133 @@ def _business_metric_lines(incident: Incident) -> list[str]:
     return []
 
 
+def _assumption_verification_lines(incident: Incident) -> list[str]:
+    report = _assumption_verification_report(incident)
+    checks = list((report or {}).get("checks") or [])
+    if not checks:
+        return []
+
+    failed_checks = [
+        check
+        for check in checks
+        if isinstance(check, dict) and str(check.get("status") or "") == "failed"
+    ]
+    if failed_checks:
+        return [
+            line
+            for line in [_failed_assumption_check_line(check) for check in failed_checks]
+            if line
+        ]
+
+    evaluated_count = _assumption_evaluated_count(report, checks)
+    if evaluated_count > 0:
+        return [
+            f"{evaluated_count} {_plural(evaluated_count, 'check')} evaluated",
+            "All assumption checks passed",
+        ]
+
+    check_count = _assumption_check_count(report, checks)
+    return [
+        (
+            f"{check_count} {_plural(check_count, 'check')} generated "
+            f"for {_assumption_kpi_label(checks)}"
+        ),
+        "0 checks evaluated",
+        "Not evaluated: no warehouse connection provided",
+    ]
+
+
+def _assumption_verification_report(incident: Incident) -> dict:
+    metadata = dict(incident.metadata or {})
+    if isinstance(metadata.get("assumption_verification"), dict):
+        return dict(metadata["assumption_verification"])
+    semantic_context = metadata.get("semantic_context")
+    if isinstance(semantic_context, dict) and isinstance(
+        semantic_context.get("assumption_verification"),
+        dict,
+    ):
+        return dict(semantic_context["assumption_verification"])
+    return {}
+
+
+def _failed_assumption_check_line(check: dict) -> str:
+    if not isinstance(check, dict):
+        return ""
+    subject = _assumption_subject(check)
+    count = check.get("violation_count")
+    if count is None:
+        return f"FAILED: {subject} {_assumption_check_label(check)}"
+
+    check_type = str(check.get("check_type") or "")
+    if check_type == "non_negative":
+        return f"FAILED: {subject} has {count} negative {_plural(count, 'value')}"
+    if check_type == "not_null":
+        return f"FAILED: {subject} has {count} null {_plural(count, 'value')}"
+    if check_type == "percentage_range":
+        return f"FAILED: {subject} has {count} {_plural(count, 'value')} outside 0 to 100"
+    if check_type == "model_not_empty":
+        return f"FAILED: {subject} is empty"
+    return f"FAILED: {subject} has {count} {_plural(count, 'violation')}"
+
+
+def _assumption_subject(check: dict) -> str:
+    model_name = str(check.get("model_name") or "model")
+    column_name = check.get("column_name")
+    return f"{model_name}.{column_name}" if column_name else model_name
+
+
+def _assumption_check_count(report: dict, checks: list[dict]) -> int:
+    metadata = dict((report or {}).get("metadata") or {})
+    return int(metadata.get("check_count") or len(checks))
+
+
+def _assumption_evaluated_count(report: dict, checks: list[dict]) -> int:
+    metadata = dict((report or {}).get("metadata") or {})
+    if metadata.get("evaluated_count") is not None:
+        return int(metadata.get("evaluated_count") or 0)
+    return len([
+        check
+        for check in checks
+        if isinstance(check, dict) and bool(check.get("evaluated"))
+    ])
+
+
+def _assumption_kpi_label(checks: list[dict]) -> str:
+    kpis = []
+    seen = set()
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        kpi_name = str(check.get("kpi_name") or "").strip()
+        if not kpi_name or kpi_name in seen:
+            continue
+        seen.add(kpi_name)
+        kpis.append(kpi_name)
+    if not kpis:
+        return "KPI"
+    if len(kpis) == 1:
+        return kpis[0]
+    return f"{len(kpis)} KPIs"
+
+
+def _plural(count, singular: str) -> str:
+    return singular if count == 1 else f"{singular}s"
+
+
+def _assumption_check_label(check: dict) -> str:
+    check_type = str(check.get("check_type") or "")
+    invariant = str(check.get("invariant") or "")
+    if check_type == "model_not_empty":
+        return "has rows"
+    if check_type == "non_negative":
+        return "never negative"
+    if check_type == "percentage_range":
+        return "between 0 and 100"
+    if check_type == "not_null":
+        return "not null"
+    return invariant or check_type or "verified"
+
+
 def _semantic_diff_signal(incident: Incident):
     for signal in incident.signals:
         if signal.component == "semantic_diff":
@@ -198,6 +325,7 @@ def render_cli(incident: Incident) -> str:
     business_metric_lines = _business_metric_lines(incident)
     semantic_diff_signal = _semantic_diff_signal(incident)
     column_lineage_lines = _column_lineage_lines(incident)
+    assumption_verification_lines = _assumption_verification_lines(incident)
     lines = [
         "Relium Deployment Decision",
         "",
@@ -222,6 +350,13 @@ def render_cli(incident: Incident) -> str:
             "",
             "Business Metrics",
             *_bullet_list(business_metric_lines),
+        ])
+
+    if assumption_verification_lines:
+        lines.extend([
+            "",
+            "Assumption Verification",
+            *_bullet_list(assumption_verification_lines),
         ])
 
     if semantic_diff_signal is not None:
@@ -270,6 +405,7 @@ def render_markdown(incident: Incident) -> str:
     business_metric_lines = _business_metric_lines(incident)
     semantic_diff_signal = _semantic_diff_signal(incident)
     column_lineage_lines = _column_lineage_lines(incident)
+    assumption_verification_lines = _assumption_verification_lines(incident)
     lines = [
         "# Relium Deployment Decision",
         "",
@@ -303,6 +439,13 @@ def render_markdown(incident: Incident) -> str:
             "",
             "## Business Metrics",
             *_bullet_list(business_metric_lines),
+        ])
+
+    if assumption_verification_lines:
+        lines.extend([
+            "",
+            "## Assumption Verification",
+            *_bullet_list(assumption_verification_lines),
         ])
 
     if semantic_diff_signal is not None:
