@@ -655,6 +655,97 @@ def review_deployment_command(
     click.echo(rendered)
 
 
+@cli.command(name="backtest-deployment")
+@click.option(
+    "--dbt-manifest",
+    required=True,
+    help="Path to the historical deployment dbt manifest.json artifact.",
+)
+@click.option(
+    "--baseline-manifest",
+    default=None,
+    help="Path to the trusted production manifest before the historical deployment.",
+)
+@click.option(
+    "--changed-model",
+    "changed_models",
+    multiple=True,
+    help="Changed model name in the historical deployment. May be provided more than once.",
+)
+@click.option(
+    "--changed-file",
+    "changed_files",
+    multiple=True,
+    help="Changed file path in the historical deployment. May be provided more than once.",
+)
+@click.option(
+    "--history-path",
+    default=".relium/deployment_history.json",
+    show_default=True,
+    help="Path to Relium deployment history JSON when --baseline-manifest is not provided.",
+)
+@click.option(
+    "--deployment-id",
+    default="historical-backtest",
+    show_default=True,
+    help="Historical deployment identifier.",
+)
+@click.option("--output", default=None, help="Write rendered backtest to this file.")
+@click.option(
+    "--format",
+    "output_format",
+    default="cli",
+    show_default=True,
+    type=click.Choice(["cli", "markdown", "json"]),
+    help="Rendered output format.",
+)
+def backtest_deployment_command(
+    dbt_manifest,
+    baseline_manifest,
+    changed_models,
+    changed_files,
+    history_path,
+    deployment_id,
+    output,
+    output_format,
+):
+    """Replay a historical deployment through Relium's review logic."""
+    from pathlib import Path
+
+    from agent.backtest import backtest_deployment
+
+    resolved_changed_models = _review_deployment_changed_models(
+        changed_models=changed_models,
+        changed_files=changed_files,
+        dbt_manifest=dbt_manifest,
+    )
+    if not resolved_changed_models:
+        raise click.ClickException(
+            "At least one --changed-model or --changed-file is required for backtest."
+        )
+
+    try:
+        result = backtest_deployment(
+            dbt_manifest_path=dbt_manifest,
+            baseline_manifest_path=baseline_manifest,
+            history_path=history_path,
+            changed_models=resolved_changed_models,
+            deployment_id=deployment_id,
+        )
+    except ValueError as error:
+        raise click.ClickException(str(error)) from error
+
+    rendered = _render_backtest_result(result, output_format)
+    if output:
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(rendered, encoding="utf-8")
+        click.echo(f"Backtest written to {output}")
+        return
+
+    click.echo(rendered)
+
+
 def _review_deployment_changed_models(changed_models, changed_files, dbt_manifest):
     inferred_models = []
     if changed_files:
@@ -741,6 +832,68 @@ def _render_deployment_review_result(result, output_format):
     rendered = render_cli(result.incident)
     status_lines = _deployment_review_status_lines(result, markdown=False)
     return f"{rendered}\n\nDeployment History\n" + "\n".join(status_lines)
+
+
+def _render_backtest_result(result, output_format):
+    import json
+
+    from agent.presentation import render_cli, render_json, render_markdown
+
+    if output_format == "json":
+        payload = render_json(result.incident)
+        payload["deployment_lifecycle"] = _deployment_lifecycle_metadata(result.review)
+        payload["backtest"] = _backtest_metadata(result)
+        return json.dumps(payload, indent=2, sort_keys=True)
+
+    if output_format == "markdown":
+        rendered = render_markdown(result.incident)
+        lines = [
+            "# Relium Backtest Result",
+            "",
+            f"**Historical Deployment:** {result.historical_deployment_id}",
+            f"**Would Have Decided:** {_backtest_decision_label(result.would_have_decision)}",
+            f"**Pipeline Health:** {result.would_have_health} / 100",
+            f"**Baseline Source:** {result.baseline_source}",
+            "",
+            rendered,
+            "",
+            "## Backtest History",
+            *_deployment_review_status_lines(result.review, markdown=True),
+        ]
+        return "\n".join(lines)
+
+    rendered = render_cli(result.incident)
+    lines = [
+        "Relium Backtest Result",
+        "",
+        f"Historical Deployment: {result.historical_deployment_id}",
+        f"Would Have Decided: {_backtest_decision_label(result.would_have_decision)}",
+        f"Pipeline Health: {result.would_have_health} / 100",
+        f"Baseline Source: {result.baseline_source}",
+        "",
+        rendered,
+        "",
+        "Backtest History",
+        *_deployment_review_status_lines(result.review, markdown=False),
+    ]
+    return "\n".join(lines)
+
+
+def _backtest_metadata(result):
+    lifecycle = _deployment_lifecycle_metadata(result.review)
+    return {
+        "historical_deployment_id": result.historical_deployment_id,
+        "would_have_decision": result.would_have_decision,
+        "would_have_health": result.would_have_health,
+        "baseline_source": result.baseline_source,
+        **lifecycle,
+    }
+
+
+def _backtest_decision_label(decision):
+    if str(decision) == "BLOCK":
+        return "BLOCK DEPLOYMENT"
+    return str(decision)
 
 
 def _deployment_lifecycle_metadata(result):

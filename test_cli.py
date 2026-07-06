@@ -859,6 +859,88 @@ class CliTests(unittest.TestCase):
         self.assertIn("**Previous Snapshot Loaded:** YES", output)
         self.assertIn("Revenue gained upstream dependency refunds", output)
 
+    def test_backtest_deployment_uses_baseline_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline_manifest = _write_dbt_manifest(tmp)
+            current_manifest = Path(tmp) / "manifest_current.json"
+            current_manifest.write_text(
+                baseline_manifest.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+
+            result, output = _invoke(
+                [
+                    "backtest-deployment",
+                    "--baseline-manifest",
+                    str(baseline_manifest),
+                    "--dbt-manifest",
+                    str(current_manifest),
+                    "--changed-model",
+                    "stg_orders",
+                    "--deployment-id",
+                    "historical-42",
+                    "--format",
+                    "markdown",
+                ]
+            )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("# Relium Backtest Result", output)
+        self.assertIn("**Historical Deployment:** historical-42", output)
+        self.assertIn("**Would Have Decided:**", output)
+        self.assertIn("Relium Deployment Decision", output)
+
+    def test_backtest_deployment_json_includes_backtest_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline_manifest = _write_dbt_manifest(tmp)
+            current_manifest = Path(tmp) / "manifest_current.json"
+            current_manifest.write_text(
+                baseline_manifest.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+
+            result, output = _invoke(
+                [
+                    "backtest-deployment",
+                    "--baseline-manifest",
+                    str(baseline_manifest),
+                    "--dbt-manifest",
+                    str(current_manifest),
+                    "--changed-model",
+                    "stg_orders",
+                    "--deployment-id",
+                    "historical-42",
+                    "--format",
+                    "json",
+                ]
+            )
+
+        payload = json.loads(output)
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertEqual(payload["backtest"]["historical_deployment_id"], "historical-42")
+        self.assertIn(payload["backtest"]["would_have_decision"], ["ALLOW", "WARN", "BLOCK"])
+        self.assertTrue(payload["backtest"]["previous_snapshot_loaded"])
+
+    def test_backtest_deployment_requires_previous_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            current_manifest = _write_dbt_manifest(tmp)
+
+            result, output = _invoke(
+                [
+                    "backtest-deployment",
+                    "--dbt-manifest",
+                    str(current_manifest),
+                    "--changed-model",
+                    "stg_orders",
+                    "--history-path",
+                    str(Path(tmp) / "missing-history.json"),
+                ]
+            )
+
+        self.assertNotEqual(result.exit_code, 0, output)
+        self.assertIn("Backtest requires a previous production snapshot", output)
+
 
 def _invoke(args):
     stdout = io.StringIO()
