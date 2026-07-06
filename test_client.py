@@ -1,16 +1,22 @@
-from agent.groq_client import call_llm, call_llm_json
+from agent.sql_analyzer import analyze_sql_logic
+from agent.diagnose import diagnose_failure
 
-# Basic test
-reply = call_llm(
-    prompt="What is dbt used for? One sentence.",
-    system="You are a data engineering expert."
-)
-print("Basic:", reply)
+SQL = """
+SELECT * FROM customers c
+LEFT JOIN orders o ON c.id = o.customer_id
+WHERE o.is_deleted = 0
+"""
 
-# JSON test
-result = call_llm_json(
-    prompt="Return a JSON with keys 'tool' and 'purpose' describing dbt.",
-    system="You only return valid JSON. No explanation, no markdown."
-)
-print("JSON:", result)
-print("Type:", type(result))  # should be <class 'dict'>
+
+def main():
+    print("=== SQL Analyzer Demo ===")
+    report = analyze_sql_logic("demo_model", SQL, context='["id","name","email"]')
+    print(report)
+
+    print("=== Diagnosis Demo ===")
+    err = "ERROR: column \"customer_id\" does not exist"
+    print(diagnose_failure(err, SQL, ""))
+
+
+if __name__ == "__main__":
+    main()
