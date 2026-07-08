@@ -1,10 +1,17 @@
 import copy
 import json
 import unittest
+from types import SimpleNamespace
 
 from agent.decision_engine import DeploymentDecision
 from agent.incident import Incident
-from agent.presentation import render_cli, render_json, render_markdown
+from agent.presentation import (
+    render_backtest_cli,
+    render_backtest_markdown,
+    render_cli,
+    render_json,
+    render_markdown,
+)
 from agent.signals import Severity, Signal
 
 
@@ -424,6 +431,41 @@ def make_noisy_column_lineage_incident():
     )
 
 
+def make_backtest_result():
+    incident = make_noisy_column_lineage_incident()
+    incident.health = 0
+    incident.decision = DeploymentDecision.BLOCK
+    incident.confidence = 82
+    incident.metadata = {
+        "assumption_verification": {
+            "checks": [
+                _assumption_check(column_name=f"revenue_check_{index}")
+                for index in range(1, 16)
+            ],
+            "metadata": {
+                "evaluated": False,
+                "check_count": 15,
+                "evaluated_count": 0,
+            },
+        }
+    }
+    incident.signals.extend(
+        [
+            Signal("ast", Severity.LOW, 75, 0),
+            Signal("metadata_checks", Severity.LOW, 75, 0),
+            Signal("metadata_drift", Severity.LOW, 75, 0),
+            Signal("blast_radius", Severity.LOW, 75, 0),
+            Signal("historical_reliability", Severity.LOW, 75, 0),
+        ]
+    )
+    return SimpleNamespace(
+        incident=incident,
+        historical_deployment_id="refunds-backtest",
+        would_have_decision="BLOCK",
+        would_have_health=0,
+    )
+
+
 class PresentationTests(unittest.TestCase):
     def test_cli_contains_every_major_section(self):
         rendered = render_cli(make_incident())
@@ -507,6 +549,57 @@ class PresentationTests(unittest.TestCase):
         self.assertIn("## Recommendation", rendered)
         self.assertIn("## Signals Considered", rendered)
         self.assertIn("## Affected Models", rendered)
+
+    def test_normal_deployment_markdown_heading_remains_unchanged(self):
+        rendered = render_markdown(make_incident())
+
+        self.assertIn("# Relium Deployment Decision", rendered)
+        self.assertIn("## Deployment Decision", rendered)
+
+    def test_backtest_markdown_is_compact_and_purpose_built(self):
+        rendered = render_backtest_markdown(make_backtest_result())
+
+        self.assertIn("# Relium Backtest Result", rendered)
+        self.assertIn("## Would Have Decided\nWOULD BLOCK", rendered)
+        self.assertIn("## Historical Deployment\nrefunds-backtest", rendered)
+        self.assertIn("## Pipeline Health\n0 / 100", rendered)
+        self.assertIn("## Severity\nHIGH", rendered)
+        self.assertIn("## Confidence\n82%", rendered)
+        self.assertIn("## Primary Root Cause\nRevenue gained upstream dependency refunds", rendered)
+        self.assertIn("## What Relium Would Have Caught", rendered)
+        self.assertIn("- Revenue gained upstream dependency refunds", rendered)
+        self.assertIn("- Revenue gained related model stg_refunds", rendered)
+        self.assertIn("- fct_revenue.refund_amount output column was added", rendered)
+        self.assertIn("## Semantic Change", rendered)
+        self.assertIn("- Dependency Changes: Revenue upstream_sources added refunds", rendered)
+        self.assertIn("## Column-Level Lineage", rendered)
+        self.assertIn("- Revenue lineage now includes refund-related data", rendered)
+        self.assertIn("## Assumption Verification", rendered)
+        self.assertIn("- 15 checks generated for Revenue", rendered)
+        self.assertIn("- 0 checks evaluated", rendered)
+        self.assertIn("- Not evaluated: no warehouse connection provided", rendered)
+        self.assertIn("## Signals Considered", rendered)
+        self.assertIn("- semantic_diff", rendered)
+        self.assertIn("- kpi_impact", rendered)
+        self.assertIn("- semantic_contract", rendered)
+        self.assertIn("- ast", rendered)
+        self.assertIn("## Summary", rendered)
+        self.assertIn(
+            "Relium would have blocked this deployment before production because Revenue gained upstream dependency refunds",
+            rendered,
+        )
+        self.assertNotIn("# Relium Deployment Decision", rendered)
+
+    def test_backtest_cli_is_compact(self):
+        rendered = render_backtest_cli(make_backtest_result())
+
+        self.assertIn("Relium Backtest Result", rendered)
+        self.assertIn("Would Have Decided: WOULD BLOCK", rendered)
+        self.assertIn("What Relium Would Have Caught:", rendered)
+        self.assertIn("Semantic Change:", rendered)
+        self.assertIn("Summary:", rendered)
+        self.assertNotIn("Relium Deployment Decision", rendered)
+        self.assertNotIn("Reasoning:", rendered)
 
     def test_markdown_includes_reasoning_section(self):
         rendered = render_markdown(make_incident())

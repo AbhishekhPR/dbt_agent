@@ -493,6 +493,140 @@ def render_markdown(incident: Incident) -> str:
     return "\n".join(lines)
 
 
+def render_backtest_markdown(result: Any) -> str:
+    incident = result.incident
+    semantic_diff_signal = _semantic_diff_signal(incident)
+    semantic_change_lines = _backtest_semantic_change_lines(semantic_diff_signal)
+    column_lineage_lines = _column_lineage_lines(incident)
+    assumption_verification_lines = _assumption_verification_lines(incident)
+
+    lines = [
+        "# Relium Backtest Result",
+        "",
+        "## Would Have Decided",
+        _would_have_decision_label(result.would_have_decision),
+        "",
+        "## Historical Deployment",
+        _display_text(result.historical_deployment_id),
+        "",
+        "## Pipeline Health",
+        _health_text(result.would_have_health),
+        "",
+        "## Severity",
+        str(_enum_value(incident.severity)),
+        "",
+        "## Confidence",
+        _confidence_text(incident.confidence),
+        "",
+        "## Primary Root Cause",
+        _display_text(incident.root_cause or "None"),
+        "",
+        "## What Relium Would Have Caught",
+        *_bullet_list(_top_reasons(incident)),
+        "",
+        "## Semantic Change",
+        *_bullet_list(semantic_change_lines),
+        "",
+        "## Column-Level Lineage",
+        *_bullet_list(column_lineage_lines),
+        "",
+        "## Assumption Verification",
+        *_bullet_list(assumption_verification_lines),
+        "",
+        "## Signals Considered",
+        *_bullet_list([signal.component for signal in incident.signals]),
+        "",
+        "## Summary",
+        _backtest_summary(result, semantic_diff_signal),
+    ]
+    return "\n".join(lines)
+
+
+def render_backtest_cli(result: Any) -> str:
+    incident = result.incident
+    semantic_diff_signal = _semantic_diff_signal(incident)
+    semantic_change_lines = _backtest_semantic_change_lines(semantic_diff_signal)
+    lines = [
+        "Relium Backtest Result",
+        "",
+        f"Would Have Decided: {_would_have_decision_label(result.would_have_decision)}",
+        f"Historical Deployment: {_display_text(result.historical_deployment_id)}",
+        f"Pipeline Health: {_health_text(result.would_have_health)}",
+        f"Severity: {_enum_value(incident.severity)}",
+        f"Confidence: {_confidence_text(incident.confidence)}",
+        "",
+        f"Primary Root Cause: {_display_text(incident.root_cause or 'None')}",
+        "",
+        "What Relium Would Have Caught:",
+        *_bullet_list(_top_reasons(incident)),
+        "",
+        "Semantic Change:",
+        *_bullet_list(semantic_change_lines),
+        "",
+        "Column-Level Lineage:",
+        *_bullet_list(_column_lineage_lines(incident)),
+        "",
+        "Assumption Verification:",
+        *_bullet_list(_assumption_verification_lines(incident)),
+        "",
+        "Signals Considered:",
+        *_bullet_list([signal.component for signal in incident.signals]),
+        "",
+        f"Summary: {_backtest_summary(result, semantic_diff_signal)}",
+    ]
+    return "\n".join(lines)
+
+
+def _backtest_semantic_change_lines(signal) -> list[str]:
+    if signal is None:
+        return []
+    metadata = dict(signal.metadata or {})
+    lines = order_semantic_diff_reasons(list(signal.reasons or []))
+    lines.extend(_change_lines("Dependency Changes", metadata.get("dependency_changes") or {}))
+    lines.extend(_change_lines("Contract Changes", metadata.get("contract_changes") or {}))
+    return [
+        line
+        for line in _ordered_unique(lines)
+        if not str(line).endswith(": None")
+    ]
+
+
+def _would_have_decision_label(decision: Any) -> str:
+    value = str(_enum_value(decision)).upper()
+    if value == DeploymentDecision.BLOCK.value:
+        return "WOULD BLOCK"
+    if value == DeploymentDecision.WARN.value:
+        return "WOULD WARN"
+    if value == DeploymentDecision.ALLOW.value:
+        return "WOULD ALLOW"
+    return f"WOULD {value}"
+
+
+def _backtest_summary(result: Any, semantic_diff_signal) -> str:
+    action = _backtest_action(result.would_have_decision)
+    root_cause = _display_text(result.incident.root_cause or "the deployment risk changed")
+    if semantic_diff_signal is not None:
+        return (
+            f"Relium would have {action} this deployment before production "
+            f"because {root_cause} and the semantic meaning of the KPI changed."
+        )
+    return (
+        f"Relium would have {action} this deployment before production "
+        f"because {root_cause}."
+    )
+
+
+def _backtest_action(decision: Any) -> str:
+    value = str(_enum_value(decision)).upper()
+    if value == DeploymentDecision.BLOCK.value:
+        return "blocked"
+    if value == DeploymentDecision.WARN.value:
+        return "warned on"
+    if value == DeploymentDecision.ALLOW.value:
+        return "allowed"
+    return f"flagged as {value}"
+
+
 def render_json(incident: Incident) -> dict:
     return {
         "incident_id": incident.incident_id,

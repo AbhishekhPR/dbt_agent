@@ -886,9 +886,10 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0, output)
         self.assertIn("# Relium Backtest Result", output)
-        self.assertIn("**Historical Deployment:** historical-42", output)
-        self.assertIn("**Would Have Decided:**", output)
-        self.assertIn("Relium Deployment Decision", output)
+        self.assertIn("## Historical Deployment\nhistorical-42", output)
+        self.assertIn("## Would Have Decided\nWOULD", output)
+        self.assertIn("## What Relium Would Have Caught", output)
+        self.assertNotIn("# Relium Deployment Decision", output)
 
     def test_backtest_deployment_json_includes_backtest_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:

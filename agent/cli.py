@@ -837,7 +837,7 @@ def _render_deployment_review_result(result, output_format):
 def _render_backtest_result(result, output_format):
     import json
 
-    from agent.presentation import render_cli, render_json, render_markdown
+    from agent.presentation import render_backtest_cli, render_backtest_markdown, render_json
 
     if output_format == "json":
         payload = render_json(result.incident)
@@ -846,37 +846,9 @@ def _render_backtest_result(result, output_format):
         return json.dumps(payload, indent=2, sort_keys=True)
 
     if output_format == "markdown":
-        rendered = render_markdown(result.incident)
-        lines = [
-            "# Relium Backtest Result",
-            "",
-            f"**Historical Deployment:** {result.historical_deployment_id}",
-            f"**Would Have Decided:** {_backtest_decision_label(result.would_have_decision)}",
-            f"**Pipeline Health:** {result.would_have_health} / 100",
-            f"**Baseline Source:** {result.baseline_source}",
-            "",
-            rendered,
-            "",
-            "## Backtest History",
-            *_deployment_review_status_lines(result.review, markdown=True),
-        ]
-        return "\n".join(lines)
+        return render_backtest_markdown(result)
 
-    rendered = render_cli(result.incident)
-    lines = [
-        "Relium Backtest Result",
-        "",
-        f"Historical Deployment: {result.historical_deployment_id}",
-        f"Would Have Decided: {_backtest_decision_label(result.would_have_decision)}",
-        f"Pipeline Health: {result.would_have_health} / 100",
-        f"Baseline Source: {result.baseline_source}",
-        "",
-        rendered,
-        "",
-        "Backtest History",
-        *_deployment_review_status_lines(result.review, markdown=False),
-    ]
-    return "\n".join(lines)
+    return render_backtest_cli(result)
 
 
 def _backtest_metadata(result):
