@@ -942,6 +942,73 @@ class CliTests(unittest.TestCase):
         self.assertNotEqual(result.exit_code, 0, output)
         self.assertIn("Backtest requires a previous production snapshot", output)
 
+    def test_record_outcome_writes_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outcomes_path = Path(tmp) / "deployment_outcomes.json"
+
+            result, output = _invoke(
+                [
+                    "record-outcome",
+                    "--deployment-id",
+                    "deploy-1",
+                    "--decision",
+                    "BLOCK",
+                    "--outcome",
+                    "false_positive",
+                    "--snapshot-id",
+                    "snap-1",
+                    "--notes",
+                    "Engineer reviewed and approved",
+                    "--metadata",
+                    '{"reviewer":"analytics"}',
+                    "--outcomes-path",
+                    str(outcomes_path),
+                ]
+            )
+
+            payload = json.loads(outcomes_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("Outcome recorded", output)
+        self.assertEqual(payload["outcomes"][0]["deployment_id"], "deploy-1")
+        self.assertEqual(payload["outcomes"][0]["decision"], "BLOCK")
+        self.assertEqual(payload["outcomes"][0]["outcome"], "false_positive")
+        self.assertEqual(payload["outcomes"][0]["snapshot_id"], "snap-1")
+        self.assertEqual(payload["outcomes"][0]["notes"], "Engineer reviewed and approved")
+        self.assertEqual(payload["outcomes"][0]["metadata"], {"reviewer": "analytics"})
+
+    def test_outcome_summary_prints_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outcomes_path = Path(tmp) / "deployment_outcomes.json"
+            record_result, record_output = _invoke(
+                [
+                    "record-outcome",
+                    "--deployment-id",
+                    "deploy-1",
+                    "--decision",
+                    "ALLOW",
+                    "--outcome",
+                    "incident_occurred",
+                    "--outcomes-path",
+                    str(outcomes_path),
+                ]
+            )
+
+            result, output = _invoke(
+                [
+                    "outcome-summary",
+                    "--outcomes-path",
+                    str(outcomes_path),
+                ]
+            )
+
+        self.assertEqual(record_result.exit_code, 0, record_output)
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("Deployment Outcome Summary", output)
+        self.assertIn("Total outcomes: 1", output)
+        self.assertIn("Incidents after ALLOW: 1", output)
+        self.assertIn("False positives: 0", output)
+
 
 def _invoke(args):
     stdout = io.StringIO()

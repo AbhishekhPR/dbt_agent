@@ -746,6 +746,79 @@ def backtest_deployment_command(
     click.echo(rendered)
 
 
+@cli.command(name="record-outcome")
+@click.option("--deployment-id", required=True, help="Reviewed deployment identifier.")
+@click.option(
+    "--decision",
+    required=True,
+    type=click.Choice(["ALLOW", "WARN", "BLOCK"], case_sensitive=False),
+    help="Deployment decision that Relium made.",
+)
+@click.option("--outcome", required=True, help="Observed deployment outcome.")
+@click.option("--snapshot-id", default=None, help="Related deployment snapshot identifier.")
+@click.option("--notes", default=None, help="Optional human notes about the outcome.")
+@click.option(
+    "--outcomes-path",
+    default=".relium/deployment_outcomes.json",
+    show_default=True,
+    help="Path to Relium deployment outcomes JSON.",
+)
+@click.option("--metadata", default=None, help="Optional metadata JSON object.")
+def record_outcome_command(
+    deployment_id,
+    decision,
+    outcome,
+    snapshot_id,
+    notes,
+    outcomes_path,
+    metadata,
+):
+    """Record what happened after a deployment decision."""
+    import uuid
+    from datetime import datetime, timezone
+
+    from agent.deployment_outcomes import DeploymentOutcome, DeploymentOutcomeStore
+
+    try:
+        metadata_payload = _load_outcome_metadata(metadata)
+    except ValueError as error:
+        raise click.ClickException(str(error)) from error
+
+    deployment_outcome = DeploymentOutcome(
+        outcome_id=f"outcome-{uuid.uuid4().hex}",
+        deployment_id=deployment_id,
+        snapshot_id=snapshot_id,
+        decision=decision.upper(),
+        outcome=outcome,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        notes=notes,
+        metadata=metadata_payload,
+    )
+
+    DeploymentOutcomeStore(outcomes_path).save_outcome(deployment_outcome)
+    click.echo("Outcome recorded")
+    click.echo(f"Outcome ID: {deployment_outcome.outcome_id}")
+    click.echo(f"Deployment ID: {deployment_outcome.deployment_id}")
+    click.echo(f"Decision: {deployment_outcome.decision}")
+    click.echo(f"Outcome: {deployment_outcome.outcome}")
+    click.echo(f"Outcomes Path: {outcomes_path}")
+
+
+@cli.command(name="outcome-summary")
+@click.option(
+    "--outcomes-path",
+    default=".relium/deployment_outcomes.json",
+    show_default=True,
+    help="Path to Relium deployment outcomes JSON.",
+)
+def outcome_summary_command(outcomes_path):
+    """Print a summary of recorded deployment outcomes."""
+    from agent.deployment_outcomes import DeploymentOutcomeStore
+
+    summary = DeploymentOutcomeStore(outcomes_path).summarize_outcomes()
+    click.echo(_format_outcome_summary(summary))
+
+
 def _review_deployment_changed_models(changed_models, changed_files, dbt_manifest):
     inferred_models = []
     if changed_files:
@@ -812,6 +885,39 @@ def _load_review_project_context(project_context, dbt_manifest):
         raise click.ClickException("Project context JSON must be an object.")
 
     return context_payload
+
+
+def _load_outcome_metadata(metadata):
+    if metadata is None or not str(metadata).strip():
+        return {}
+
+    import json
+
+    try:
+        payload = json.loads(metadata)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Invalid metadata JSON: {error}") from error
+
+    if not isinstance(payload, dict):
+        raise ValueError("Outcome metadata JSON must be an object.")
+    return payload
+
+
+def _format_outcome_summary(summary):
+    return "\n".join(
+        [
+            "Deployment Outcome Summary",
+            f"Total outcomes: {summary['total_outcomes']}",
+            f"False positives: {summary['false_positives']}",
+            f"Incidents after ALLOW: {summary['incidents_after_allow']}",
+            f"Incidents after WARN: {summary['incidents_after_warn']}",
+            f"Incidents after BLOCK: {summary['incidents_after_block']}",
+            f"Accepted risks: {summary['accepted_risks']}",
+            f"Reverted deployments: {summary['reverted_deployments']}",
+            f"Blocked deployments: {summary['blocked_deployments']}",
+            f"Manually approved deployments: {summary['manually_approved_deployments']}",
+        ]
+    )
 
 
 def _render_deployment_review_result(result, output_format):
