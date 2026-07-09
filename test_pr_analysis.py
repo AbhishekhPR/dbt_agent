@@ -9,6 +9,7 @@ from unittest.mock import sentinel
 
 from agent.decision_engine import DeploymentDecision
 from agent.deployment_history import DeploymentHistoryStore
+from agent.deployment_outcomes import DeploymentOutcome
 from agent.deployment_snapshot import DeploymentSnapshot
 from agent.pr_analysis import analyze_changed_models, analyze_pr_with_history
 from agent.signals import Severity, Signal
@@ -507,6 +508,64 @@ class PrAnalysisTests(unittest.TestCase):
             ],
         )
 
+    def test_outcome_memory_signal_is_added_before_kpi_impact(self):
+        outcomes = [
+            _outcome("out-1", "deploy-previous", DeploymentDecision.ALLOW, "incident_occurred")
+        ]
+
+        with _patched_detectors(neutral=True):
+            incident = analyze_changed_models(
+                [_semantic_model_spec()],
+                deployment_id="deploy-current",
+                outcomes=outcomes,
+            )
+
+        self.assertEqual(
+            [signal.component for signal in incident.signals],
+            [
+                "ast",
+                "metadata_checks",
+                "metadata_drift",
+                "blast_radius",
+                "historical_reliability",
+                "deployment_outcomes",
+                "kpi_impact",
+                "semantic_contract",
+            ],
+        )
+        outcome_signal = _signal(incident, "deployment_outcomes")
+        self.assertEqual(outcome_signal.severity, Severity.MEDIUM)
+        self.assertEqual(outcome_signal.score, -10)
+        self.assertIn(
+            "Previous allowed or warned deployments were followed by incidents",
+            outcome_signal.reasons,
+        )
+
+    def test_no_outcomes_keeps_existing_signal_ordering(self):
+        with _patched_detectors(neutral=True):
+            incident = analyze_changed_models(
+                [_semantic_model_spec()],
+                deployment_id="deploy-current",
+                outcomes=[],
+            )
+
+        self.assertNotIn("deployment_outcomes", [signal.component for signal in incident.signals])
+
+    def test_outcome_memory_does_not_mutate_input_outcomes(self):
+        outcomes = [
+            _outcome("out-1", "deploy-previous", DeploymentDecision.ALLOW, "incident_occurred")
+        ]
+        original = copy.deepcopy(outcomes)
+
+        with _patched_detectors(neutral=True):
+            analyze_changed_models(
+                [_semantic_model_spec()],
+                deployment_id="deploy-current",
+                outcomes=outcomes,
+            )
+
+        self.assertEqual(outcomes, original)
+
     def test_previous_snapshot_input_is_not_mutated(self):
         previous_snapshot = _previous_snapshot(
             "previous",
@@ -570,6 +629,23 @@ class PrAnalysisTests(unittest.TestCase):
                 )
 
         self.assertEqual(incident.signals[-1].component, "semantic_diff")
+
+    def test_analyze_pr_with_history_adds_outcome_memory_signal(self):
+        outcomes = [
+            _outcome("out-1", "deploy-previous", DeploymentDecision.WARN, "reverted")
+        ]
+
+        with _patched_detectors(neutral=True):
+            incident = analyze_pr_with_history(
+                changed_models=[{"model_name": "stg_orders", "sql": "select 1"}],
+                project_context=_project_context(),
+                deployment_id="deploy-current",
+                outcomes=outcomes,
+            )
+
+        outcome_signal = _signal(incident, "deployment_outcomes")
+        self.assertEqual(outcome_signal.severity, Severity.MEDIUM)
+        self.assertEqual(outcome_signal.metadata["total_outcomes"], 1)
 
     def test_analyze_pr_with_history_empty_store_keeps_behavior_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1270,6 +1346,17 @@ def _previous_snapshot(snapshot_id, contracts, *, column_lineage_graph=None):
         },
         decision=None,
         incident_summary=None,
+        metadata={"source": "unit-test"},
+    )
+
+
+def _outcome(outcome_id, deployment_id, decision, outcome):
+    return DeploymentOutcome(
+        outcome_id=outcome_id,
+        deployment_id=deployment_id,
+        decision=decision,
+        outcome=outcome,
+        created_at="2026-07-02T00:00:00+00:00",
         metadata={"source": "unit-test"},
     )
 

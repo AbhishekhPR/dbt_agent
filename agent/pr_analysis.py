@@ -11,6 +11,8 @@ from agent.business_metrics import calculate_operational_metrics
 from agent.business_metrics import evaluate_metric_reliability
 from agent.business_metrics import to_signal as business_metrics_to_signal
 from agent.decision_assembly import assemble_decision_incident
+from agent.deployment_outcomes import analyze_outcome_history
+from agent.deployment_outcomes import outcome_history_to_signal
 from agent.deployment_snapshot import create_deployment_snapshot
 from agent.historical_reliability import evaluate_history
 from agent.historical_reliability import to_signal as historical_reliability_to_signal
@@ -35,6 +37,7 @@ def analyze_pr_with_history(
     deployment_id=None,
     metadata=None,
     events=None,
+    outcomes=None,
     **existing_options,
 ) -> Incident:
     history_enabled = history_store is not None
@@ -54,6 +57,7 @@ def analyze_pr_with_history(
         model_specs,
         previous_snapshot=previous_snapshot,
         deployment_id=deployment_id,
+        outcomes=copy.deepcopy(outcomes) if outcomes is not None else None,
     )
 
     incident.metadata["history_enabled"] = history_enabled
@@ -72,6 +76,7 @@ def analyze_changed_models(
     *,
     previous_snapshot=None,
     deployment_id=None,
+    outcomes=None,
 ) -> Incident:
     model_specs = list(changed_models)
     signals = []
@@ -103,6 +108,15 @@ def analyze_changed_models(
     changed_columns_by_model = _changed_columns_by_model_from_specs(model_specs)
     if changed_columns_by_model:
         metadata["changed_columns_by_model"] = changed_columns_by_model
+
+    outcome_signal = _deployment_outcome_signal(
+        outcomes,
+        deployment_id=deployment_id,
+        changed_models=affected_models,
+    )
+    if outcome_signal is not None:
+        signals.append(outcome_signal)
+        metadata["outcome_memory"] = copy.deepcopy(outcome_signal.metadata)
 
     semantic_context = _semantic_context(model_specs, affected_models, metadata)
     current_snapshot = None
@@ -307,6 +321,17 @@ def _business_metric_signal(model_spec: Any) -> Signal | None:
         dict(baseline) if baseline is not None else None,
     )
     return business_metrics_to_signal(result)
+
+
+def _deployment_outcome_signal(outcomes, *, deployment_id, changed_models) -> Signal | None:
+    if not outcomes:
+        return None
+    analysis = analyze_outcome_history(
+        copy.deepcopy(list(outcomes or [])),
+        deployment_id=deployment_id,
+        changed_models=list(changed_models or []),
+    )
+    return outcome_history_to_signal(analysis)
 
 
 def _semantic_context(model_specs: list[Any], affected_models: list[str], metadata: dict[str, Any]):

@@ -5,7 +5,12 @@ import unittest
 from pathlib import Path
 
 from agent.decision_engine import DeploymentDecision
-from agent.deployment_outcomes import DeploymentOutcome, DeploymentOutcomeStore
+from agent.deployment_outcomes import (
+    DeploymentOutcome,
+    DeploymentOutcomeStore,
+    analyze_outcome_history,
+)
+from agent.signals import Severity
 
 
 class DeploymentOutcomeTests(unittest.TestCase):
@@ -126,6 +131,81 @@ class DeploymentOutcomeTests(unittest.TestCase):
             store.save_outcome(outcome)
 
             self.assertEqual(outcome, original)
+
+    def test_analyze_outcome_history_returns_low_no_op_for_empty_outcomes(self):
+        result = analyze_outcome_history([])
+
+        self.assertEqual(result.severity, Severity.LOW)
+        self.assertEqual(result.confidence, 0)
+        self.assertEqual(result.score, 0)
+        self.assertEqual(result.reasons, [])
+        self.assertEqual(result.metadata["total_outcomes"], 0)
+
+    def test_false_positive_after_block_creates_context_signal(self):
+        result = analyze_outcome_history([
+            _outcome("out-1", "deploy-1", decision=DeploymentDecision.BLOCK, outcome="false_positive")
+        ])
+
+        self.assertEqual(result.severity, Severity.LOW)
+        self.assertEqual(result.score, 0)
+        self.assertIn(
+            "Previous BLOCK decisions were marked false positive",
+            result.reasons,
+        )
+
+    def test_incident_after_allow_or_warn_creates_risk_signal(self):
+        result = analyze_outcome_history([
+            _outcome("out-1", "deploy-1", decision=DeploymentDecision.ALLOW, outcome="incident_occurred"),
+            _outcome("out-2", "deploy-2", decision=DeploymentDecision.WARN, outcome="incident_occurred"),
+        ])
+
+        self.assertEqual(result.severity, Severity.HIGH)
+        self.assertEqual(result.score, -20)
+        self.assertGreater(result.confidence, 70)
+        self.assertIn(
+            "Previous allowed or warned deployments were followed by incidents",
+            result.reasons,
+        )
+
+    def test_reverted_after_allow_or_warn_creates_risk_signal(self):
+        result = analyze_outcome_history([
+            _outcome("out-1", "deploy-1", decision=DeploymentDecision.WARN, outcome="reverted")
+        ])
+
+        self.assertEqual(result.severity, Severity.MEDIUM)
+        self.assertEqual(result.score, -10)
+        self.assertIn(
+            "Previous allowed or warned deployments were reverted",
+            result.reasons,
+        )
+
+    def test_accepted_risk_appears_as_context_but_does_not_reduce_health(self):
+        result = analyze_outcome_history([
+            _outcome("out-1", "deploy-1", decision=DeploymentDecision.WARN, outcome="accepted_risk")
+        ])
+
+        self.assertEqual(result.severity, Severity.LOW)
+        self.assertEqual(result.score, 0)
+        self.assertIn("Similar risk was previously accepted", result.reasons)
+
+    def test_fixed_before_merge_after_block_supports_block(self):
+        result = analyze_outcome_history([
+            _outcome("out-1", "deploy-1", decision=DeploymentDecision.BLOCK, outcome="fixed_before_merge")
+        ])
+
+        self.assertEqual(result.severity, Severity.MEDIUM)
+        self.assertEqual(result.score, -10)
+        self.assertIn("Previous block led to fix before merge", result.reasons)
+
+    def test_analyze_outcome_history_does_not_mutate_outcomes(self):
+        outcomes = [
+            _outcome("out-1", "deploy-1", decision=DeploymentDecision.ALLOW, outcome="incident_occurred")
+        ]
+        original = copy.deepcopy(outcomes)
+
+        analyze_outcome_history(outcomes, deployment_id="deploy-new", changed_models=["stg_orders"])
+
+        self.assertEqual(outcomes, original)
 
 
 def _outcome(

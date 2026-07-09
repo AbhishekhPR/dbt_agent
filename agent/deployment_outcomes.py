@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.decision_engine import DeploymentDecision
+from agent.signals import Severity, Signal
 
 
 @dataclass
@@ -76,6 +77,18 @@ class DeploymentOutcome:
             notes=payload.get("notes"),
             metadata=metadata,
         )
+
+
+@dataclass
+class OutcomeHistoryAnalysis:
+    severity: Severity
+    confidence: int
+    score: int
+    reasons: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serializable(self)
 
 
 class DeploymentOutcomeStore:
@@ -194,10 +207,144 @@ class DeploymentOutcomeStore:
         tmp_path.replace(self.path)
 
 
+def analyze_outcome_history(
+    outcomes,
+    deployment_id=None,
+    changed_models=None,
+    root_cause=None,
+) -> OutcomeHistoryAnalysis:
+    outcome_list = [_coerce_outcome(outcome) for outcome in list(outcomes or [])]
+    outcome_dicts = [outcome.to_dict() for outcome in outcome_list]
+
+    counts = {
+        "false_positive_after_block_count": 0,
+        "incident_after_allow_or_warn_count": 0,
+        "reverted_after_allow_or_warn_count": 0,
+        "accepted_risk_count": 0,
+        "fixed_before_merge_after_block_count": 0,
+    }
+    supporting_ids: dict[str, list[str]] = {
+        key: []
+        for key in counts
+    }
+
+    for outcome in outcome_list:
+        decision = str(outcome.decision).upper()
+        outcome_name = str(outcome.outcome).lower()
+
+        if decision == DeploymentDecision.BLOCK.value and outcome_name == "false_positive":
+            _increment_outcome_count(
+                counts,
+                supporting_ids,
+                "false_positive_after_block_count",
+                outcome.outcome_id,
+            )
+        elif decision in _ALLOW_WARN and outcome_name == "incident_occurred":
+            _increment_outcome_count(
+                counts,
+                supporting_ids,
+                "incident_after_allow_or_warn_count",
+                outcome.outcome_id,
+            )
+        elif decision in _ALLOW_WARN and outcome_name == "reverted":
+            _increment_outcome_count(
+                counts,
+                supporting_ids,
+                "reverted_after_allow_or_warn_count",
+                outcome.outcome_id,
+            )
+        elif outcome_name == "accepted_risk":
+            _increment_outcome_count(
+                counts,
+                supporting_ids,
+                "accepted_risk_count",
+                outcome.outcome_id,
+            )
+        elif decision == DeploymentDecision.BLOCK.value and outcome_name == "fixed_before_merge":
+            _increment_outcome_count(
+                counts,
+                supporting_ids,
+                "fixed_before_merge_after_block_count",
+                outcome.outcome_id,
+            )
+
+    reasons = []
+    if counts["false_positive_after_block_count"]:
+        reasons.append("Previous BLOCK decisions were marked false positive")
+    if counts["incident_after_allow_or_warn_count"]:
+        reasons.append("Previous allowed or warned deployments were followed by incidents")
+    if counts["reverted_after_allow_or_warn_count"]:
+        reasons.append("Previous allowed or warned deployments were reverted")
+    if counts["accepted_risk_count"]:
+        reasons.append("Similar risk was previously accepted")
+    if counts["fixed_before_merge_after_block_count"]:
+        reasons.append("Previous block led to fix before merge")
+
+    risk_count = (
+        counts["incident_after_allow_or_warn_count"]
+        + counts["reverted_after_allow_or_warn_count"]
+        + counts["fixed_before_merge_after_block_count"]
+    )
+    if risk_count >= 2:
+        severity = Severity.HIGH
+        score = -20
+    elif risk_count == 1:
+        severity = Severity.MEDIUM
+        score = -10
+    else:
+        severity = Severity.LOW
+        score = 0
+
+    supporting_count = sum(counts.values())
+    confidence = 0 if supporting_count == 0 else min(95, 65 + (supporting_count * 8))
+    metadata = {
+        "total_outcomes": len(outcome_list),
+        "deployment_id": str(deployment_id) if deployment_id else None,
+        "changed_models": [str(model) for model in list(changed_models or [])],
+        "root_cause": str(root_cause) if root_cause else None,
+        "supporting_outcome_ids": {
+            key: list(ids)
+            for key, ids in supporting_ids.items()
+            if ids
+        },
+        "outcomes": outcome_dicts,
+        **counts,
+    }
+    return OutcomeHistoryAnalysis(
+        severity=severity,
+        confidence=confidence,
+        score=score,
+        reasons=reasons,
+        metadata=metadata,
+    )
+
+
+def outcome_history_to_signal(analysis: OutcomeHistoryAnalysis) -> Signal | None:
+    if analysis is None or not analysis.reasons:
+        return None
+    return Signal(
+        component="deployment_outcomes",
+        severity=analysis.severity,
+        confidence=analysis.confidence,
+        score=analysis.score,
+        reasons=list(analysis.reasons),
+        metadata=copy.deepcopy(dict(analysis.metadata or {})),
+    )
+
+
 def _outcome_dict(outcome) -> dict[str, Any]:
     if hasattr(outcome, "to_dict"):
         return copy.deepcopy(outcome.to_dict())
     return DeploymentOutcome.from_dict(copy.deepcopy(dict(outcome or {}))).to_dict()
+
+
+def _coerce_outcome(outcome) -> DeploymentOutcome:
+    return DeploymentOutcome.from_dict(_outcome_dict(outcome))
+
+
+def _increment_outcome_count(counts, supporting_ids, key, outcome_id) -> None:
+    counts[key] += 1
+    supporting_ids[key].append(str(outcome_id))
 
 
 def _serializable(value):
@@ -219,3 +366,9 @@ def _enum_value(value) -> str:
     if isinstance(value, Enum):
         return str(value.value)
     return str(value)
+
+
+_ALLOW_WARN = {
+    DeploymentDecision.ALLOW.value,
+    DeploymentDecision.WARN.value,
+}

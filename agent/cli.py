@@ -576,6 +576,12 @@ def init_baseline_command(dbt_manifest, history_path, deployment_id):
     show_default=True,
     help="Path to Relium deployment history JSON.",
 )
+@click.option(
+    "--outcomes-path",
+    default=".relium/deployment_outcomes.json",
+    show_default=True,
+    help="Path to Relium deployment outcomes JSON.",
+)
 @click.option("--deployment-id", default=None, help="Deployment identifier.")
 @click.option("--auto-record", is_flag=True, help="Record accepted snapshots.")
 @click.option(
@@ -598,6 +604,7 @@ def review_deployment_command(
     changed_models,
     changed_files,
     history_path,
+    outcomes_path,
     deployment_id,
     auto_record,
     allow_blocked_recording,
@@ -629,6 +636,7 @@ def review_deployment_command(
         raise click.ClickException("At least one --changed-model is required.")
 
     history_store = DeploymentHistoryStore(history_path)
+    outcome_options = _load_review_outcome_options(outcomes_path)
     result = review_deployment(
         changed_models=[
             {
@@ -642,6 +650,7 @@ def review_deployment_command(
         deployment_id=deployment_id,
         auto_record=auto_record,
         allow_blocked_recording=allow_blocked_recording,
+        **outcome_options,
     )
     rendered = _render_deployment_review_result(result, output_format)
 
@@ -885,6 +894,21 @@ def _load_review_project_context(project_context, dbt_manifest):
         raise click.ClickException("Project context JSON must be an object.")
 
     return context_payload
+
+
+def _load_review_outcome_options(outcomes_path):
+    from pathlib import Path
+
+    path = Path(outcomes_path)
+    if not path.exists():
+        return {}
+
+    from agent.deployment_outcomes import DeploymentOutcomeStore
+
+    outcomes = DeploymentOutcomeStore(path).list_outcomes()
+    if not outcomes:
+        return {}
+    return {"outcomes": outcomes}
 
 
 def _load_outcome_metadata(metadata):

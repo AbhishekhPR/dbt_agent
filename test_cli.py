@@ -11,6 +11,7 @@ from click.testing import CliRunner
 from agent.cli import cli
 from agent.decision_engine import DeploymentDecision
 from agent.deployment_history import DeploymentHistoryStore
+from agent.deployment_outcomes import DeploymentOutcome, DeploymentOutcomeStore
 from agent.incident import Incident
 from agent.signals import Severity, Signal
 
@@ -540,6 +541,83 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["deployment_lifecycle"]["previous_snapshot_loaded"], False)
         self.assertEqual(payload["decision"], "ALLOW")
 
+    def test_review_deployment_loads_outcomes_file_and_includes_outcome_memory_signal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = _write_project_context(tmp)
+            history_path = Path(tmp) / "history.json"
+            outcomes_path = Path(tmp) / "deployment_outcomes.json"
+            DeploymentOutcomeStore(outcomes_path).save_outcome(
+                DeploymentOutcome(
+                    outcome_id="out-1",
+                    deployment_id="deploy-previous",
+                    decision=DeploymentDecision.ALLOW,
+                    outcome="incident_occurred",
+                    created_at="2026-07-02T00:00:00+00:00",
+                )
+            )
+
+            with patch(
+                "agent.deployment_lifecycle.analyze_pr_with_history",
+                side_effect=_fake_analyzer(),
+            ):
+                result, output = _invoke(
+                    [
+                        "review-deployment",
+                        "--project-context",
+                        str(context_path),
+                        "--changed-model",
+                        "stg_orders",
+                        "--history-path",
+                        str(history_path),
+                        "--outcomes-path",
+                        str(outcomes_path),
+                        "--format",
+                        "markdown",
+                    ]
+                )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("- deployment_outcomes", output)
+        self.assertIn("## Deployment Outcome Memory", output)
+        self.assertIn(
+            "Previous allowed or warned deployments were followed by incidents",
+            output,
+        )
+
+    def test_review_deployment_behavior_unchanged_when_no_outcomes_file_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = _write_project_context(tmp)
+            history_path = Path(tmp) / "history.json"
+            outcomes_path = Path(tmp) / "missing_outcomes.json"
+            captured = {}
+
+            def analyze(**kwargs):
+                captured.update(kwargs)
+                return _fake_analyzer()(**kwargs)
+
+            with patch(
+                "agent.deployment_lifecycle.analyze_pr_with_history",
+                side_effect=analyze,
+            ):
+                result, output = _invoke(
+                    [
+                        "review-deployment",
+                        "--project-context",
+                        str(context_path),
+                        "--changed-model",
+                        "stg_orders",
+                        "--history-path",
+                        str(history_path),
+                        "--outcomes-path",
+                        str(outcomes_path),
+                    ]
+                )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertNotIn("outcomes", captured)
+        self.assertNotIn("deployment_outcomes", output)
+        self.assertNotIn("Deployment Outcome Memory", output)
+
     def test_review_deployment_auto_record_saves_allowed_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             context_path = _write_project_context(tmp)
@@ -1039,7 +1117,21 @@ def _fake_analyzer(*, decision=DeploymentDecision.ALLOW):
         }
         if previous_snapshot is not None:
             metadata["previous_snapshot_id"] = previous_snapshot["snapshot_id"]
-        return _incident(decision, metadata=metadata)
+        incident = _incident(decision, metadata=metadata)
+        if kwargs.get("outcomes"):
+            incident.signals.append(
+                Signal(
+                    "deployment_outcomes",
+                    Severity.MEDIUM,
+                    75,
+                    -10,
+                    reasons=[
+                        "Previous allowed or warned deployments were followed by incidents"
+                    ],
+                    metadata={"total_outcomes": len(kwargs["outcomes"])},
+                )
+            )
+        return incident
 
     return analyze
 

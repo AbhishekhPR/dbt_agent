@@ -139,6 +139,35 @@ def make_semantic_diff_incident():
     )
 
 
+def make_outcome_memory_incident():
+    return Incident(
+        incident_id="INC-OUTCOME-MEMORY",
+        health=90,
+        decision=DeploymentDecision.WARN,
+        severity=Severity.MEDIUM,
+        confidence=78,
+        root_cause="Historical outcome memory raised deployment risk",
+        recommendation="Review prior incidents before deployment.",
+        signals=[
+            Signal(
+                component="deployment_outcomes",
+                severity=Severity.MEDIUM,
+                confidence=78,
+                score=-10,
+                reasons=[
+                    "Previous allowed or warned deployments were followed by incidents",
+                    "Similar risk was previously accepted",
+                ],
+                metadata={
+                    "total_outcomes": 2,
+                    "incident_after_allow_or_warn_count": 1,
+                    "accepted_risk_count": 1,
+                },
+            )
+        ],
+    )
+
+
 def make_noisy_kpi_incident():
     return Incident(
         incident_id="INC-NOISY-KPI",
@@ -800,12 +829,43 @@ class PresentationTests(unittest.TestCase):
         self.assertIn("- Added KPIs: MRR", rendered)
         self.assertIn("- Removed KPIs: Churn", rendered)
 
+    def test_cli_renders_deployment_outcome_memory(self):
+        rendered = render_cli(make_outcome_memory_incident())
+
+        self.assertIn("- deployment_outcomes", rendered)
+        self.assertIn("Deployment Outcome Memory", rendered)
+        self.assertIn(
+            "- Previous allowed or warned deployments were followed by incidents",
+            rendered,
+        )
+        self.assertIn("- Similar risk was previously accepted", rendered)
+
+    def test_markdown_renders_deployment_outcome_memory(self):
+        rendered = render_markdown(make_outcome_memory_incident())
+
+        self.assertIn("## Deployment Outcome Memory", rendered)
+        self.assertIn(
+            "- Previous allowed or warned deployments were followed by incidents",
+            rendered,
+        )
+        self.assertIn("- Similar risk was previously accepted", rendered)
+
+    def test_outcome_memory_json_is_serializable(self):
+        payload = render_json(make_outcome_memory_incident())
+
+        serialized = json.dumps(payload)
+
+        self.assertIsInstance(serialized, str)
+        self.assertEqual(payload["signal_components"], ["deployment_outcomes"])
+
     def test_existing_rendering_has_no_historical_semantic_change_without_signal(self):
         cli = render_cli(make_incident())
         markdown = render_markdown(make_incident())
 
         self.assertNotIn("Historical Semantic Change", cli)
         self.assertNotIn("Historical Semantic Change", markdown)
+        self.assertNotIn("Deployment Outcome Memory", cli)
+        self.assertNotIn("Deployment Outcome Memory", markdown)
 
     def test_historical_semantic_change_snapshot_ids_are_rendered(self):
         cli = render_cli(make_semantic_diff_incident())
