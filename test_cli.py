@@ -11,6 +11,7 @@ from click.testing import CliRunner
 from agent.cli import cli
 from agent.decision_engine import DeploymentDecision
 from agent.deployment_history import DeploymentHistoryStore
+from agent.deployment_outcomes import DeploymentOutcome, DeploymentOutcomeStore
 from agent.incident import Incident
 from agent.signals import Severity, Signal
 
@@ -540,6 +541,83 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["deployment_lifecycle"]["previous_snapshot_loaded"], False)
         self.assertEqual(payload["decision"], "ALLOW")
 
+    def test_review_deployment_loads_outcomes_file_and_includes_outcome_memory_signal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = _write_project_context(tmp)
+            history_path = Path(tmp) / "history.json"
+            outcomes_path = Path(tmp) / "deployment_outcomes.json"
+            DeploymentOutcomeStore(outcomes_path).save_outcome(
+                DeploymentOutcome(
+                    outcome_id="out-1",
+                    deployment_id="deploy-previous",
+                    decision=DeploymentDecision.ALLOW,
+                    outcome="incident_occurred",
+                    created_at="2026-07-02T00:00:00+00:00",
+                )
+            )
+
+            with patch(
+                "agent.deployment_lifecycle.analyze_pr_with_history",
+                side_effect=_fake_analyzer(),
+            ):
+                result, output = _invoke(
+                    [
+                        "review-deployment",
+                        "--project-context",
+                        str(context_path),
+                        "--changed-model",
+                        "stg_orders",
+                        "--history-path",
+                        str(history_path),
+                        "--outcomes-path",
+                        str(outcomes_path),
+                        "--format",
+                        "markdown",
+                    ]
+                )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("- deployment_outcomes", output)
+        self.assertIn("## Deployment Outcome Memory", output)
+        self.assertIn(
+            "Previous allowed or warned deployments were followed by incidents",
+            output,
+        )
+
+    def test_review_deployment_behavior_unchanged_when_no_outcomes_file_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = _write_project_context(tmp)
+            history_path = Path(tmp) / "history.json"
+            outcomes_path = Path(tmp) / "missing_outcomes.json"
+            captured = {}
+
+            def analyze(**kwargs):
+                captured.update(kwargs)
+                return _fake_analyzer()(**kwargs)
+
+            with patch(
+                "agent.deployment_lifecycle.analyze_pr_with_history",
+                side_effect=analyze,
+            ):
+                result, output = _invoke(
+                    [
+                        "review-deployment",
+                        "--project-context",
+                        str(context_path),
+                        "--changed-model",
+                        "stg_orders",
+                        "--history-path",
+                        str(history_path),
+                        "--outcomes-path",
+                        str(outcomes_path),
+                    ]
+                )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertNotIn("outcomes", captured)
+        self.assertNotIn("deployment_outcomes", output)
+        self.assertNotIn("Deployment Outcome Memory", output)
+
     def test_review_deployment_auto_record_saves_allowed_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             context_path = _write_project_context(tmp)
@@ -942,6 +1020,73 @@ class CliTests(unittest.TestCase):
         self.assertNotEqual(result.exit_code, 0, output)
         self.assertIn("Backtest requires a previous production snapshot", output)
 
+    def test_record_outcome_writes_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outcomes_path = Path(tmp) / "deployment_outcomes.json"
+
+            result, output = _invoke(
+                [
+                    "record-outcome",
+                    "--deployment-id",
+                    "deploy-1",
+                    "--decision",
+                    "BLOCK",
+                    "--outcome",
+                    "false_positive",
+                    "--snapshot-id",
+                    "snap-1",
+                    "--notes",
+                    "Engineer reviewed and approved",
+                    "--metadata",
+                    '{"reviewer":"analytics"}',
+                    "--outcomes-path",
+                    str(outcomes_path),
+                ]
+            )
+
+            payload = json.loads(outcomes_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("Outcome recorded", output)
+        self.assertEqual(payload["outcomes"][0]["deployment_id"], "deploy-1")
+        self.assertEqual(payload["outcomes"][0]["decision"], "BLOCK")
+        self.assertEqual(payload["outcomes"][0]["outcome"], "false_positive")
+        self.assertEqual(payload["outcomes"][0]["snapshot_id"], "snap-1")
+        self.assertEqual(payload["outcomes"][0]["notes"], "Engineer reviewed and approved")
+        self.assertEqual(payload["outcomes"][0]["metadata"], {"reviewer": "analytics"})
+
+    def test_outcome_summary_prints_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outcomes_path = Path(tmp) / "deployment_outcomes.json"
+            record_result, record_output = _invoke(
+                [
+                    "record-outcome",
+                    "--deployment-id",
+                    "deploy-1",
+                    "--decision",
+                    "ALLOW",
+                    "--outcome",
+                    "incident_occurred",
+                    "--outcomes-path",
+                    str(outcomes_path),
+                ]
+            )
+
+            result, output = _invoke(
+                [
+                    "outcome-summary",
+                    "--outcomes-path",
+                    str(outcomes_path),
+                ]
+            )
+
+        self.assertEqual(record_result.exit_code, 0, record_output)
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("Deployment Outcome Summary", output)
+        self.assertIn("Total outcomes: 1", output)
+        self.assertIn("Incidents after ALLOW: 1", output)
+        self.assertIn("False positives: 0", output)
+
 
 def _invoke(args):
     stdout = io.StringIO()
@@ -972,7 +1117,21 @@ def _fake_analyzer(*, decision=DeploymentDecision.ALLOW):
         }
         if previous_snapshot is not None:
             metadata["previous_snapshot_id"] = previous_snapshot["snapshot_id"]
-        return _incident(decision, metadata=metadata)
+        incident = _incident(decision, metadata=metadata)
+        if kwargs.get("outcomes"):
+            incident.signals.append(
+                Signal(
+                    "deployment_outcomes",
+                    Severity.MEDIUM,
+                    75,
+                    -10,
+                    reasons=[
+                        "Previous allowed or warned deployments were followed by incidents"
+                    ],
+                    metadata={"total_outcomes": len(kwargs["outcomes"])},
+                )
+            )
+        return incident
 
     return analyze
 

@@ -182,6 +182,20 @@ def _semantic_diff_signal(incident: Incident):
     return None
 
 
+def _outcome_memory_signal(incident: Incident):
+    for signal in incident.signals:
+        if signal.component == "deployment_outcomes":
+            return signal
+    return None
+
+
+def _outcome_memory_lines(incident: Incident) -> list[str]:
+    signal = _outcome_memory_signal(incident)
+    if signal is None:
+        return []
+    return _ordered_unique(str(reason) for reason in list(signal.reasons or []) if reason)
+
+
 def _column_lineage_lines(incident: Incident) -> list[str]:
     lines = []
     for signal in incident.signals:
@@ -324,6 +338,7 @@ def render_cli(incident: Incident) -> str:
     reasoning = build_reasoning_report(incident)
     business_metric_lines = _business_metric_lines(incident)
     semantic_diff_signal = _semantic_diff_signal(incident)
+    outcome_memory_lines = _outcome_memory_lines(incident)
     column_lineage_lines = _column_lineage_lines(incident)
     assumption_verification_lines = _assumption_verification_lines(incident)
     lines = [
@@ -344,6 +359,13 @@ def render_cli(incident: Incident) -> str:
         "Signals Considered:",
         *_bullet_list([signal.component for signal in incident.signals]),
     ]
+
+    if outcome_memory_lines:
+        lines.extend([
+            "",
+            "Deployment Outcome Memory",
+            *_bullet_list(outcome_memory_lines),
+        ])
 
     if business_metric_lines:
         lines.extend([
@@ -404,6 +426,7 @@ def render_markdown(incident: Incident) -> str:
     reasoning = build_reasoning_report(incident)
     business_metric_lines = _business_metric_lines(incident)
     semantic_diff_signal = _semantic_diff_signal(incident)
+    outcome_memory_lines = _outcome_memory_lines(incident)
     column_lineage_lines = _column_lineage_lines(incident)
     assumption_verification_lines = _assumption_verification_lines(incident)
     lines = [
@@ -433,6 +456,13 @@ def render_markdown(incident: Incident) -> str:
         "## Signals Considered",
         *_bullet_list([signal.component for signal in incident.signals]),
     ]
+
+    if outcome_memory_lines:
+        lines.extend([
+            "",
+            "## Deployment Outcome Memory",
+            *_bullet_list(outcome_memory_lines),
+        ])
 
     if business_metric_lines:
         lines.extend([
