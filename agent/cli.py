@@ -612,47 +612,71 @@ def review_deployment_command(
     output_format,
 ):
     """Run a history-aware Relium deployment review."""
+    import json
     from pathlib import Path
 
-    from agent.deployment_history import DeploymentHistoryStore
-    from agent.deployment_lifecycle import review_deployment
+    from agent.dbt_context import load_manifest_from_path
+    from agent.deployment_review_service import (
+        _review_project_context_change,
+        review_manifest_change,
+    )
 
     if changed_files and not dbt_manifest:
         raise click.ClickException("--changed-file requires --dbt-manifest.")
 
-    context_payload = _load_review_project_context(project_context, dbt_manifest)
-    resolved_changed_models = _review_deployment_changed_models(
-        changed_models=changed_models,
-        changed_files=changed_files,
-        dbt_manifest=dbt_manifest,
-    )
+    if bool(project_context) == bool(dbt_manifest):
+        raise click.ClickException(
+            "Exactly one of --project-context or --dbt-manifest is required."
+        )
 
-    if not resolved_changed_models:
-        if changed_files:
-            raise click.ClickException(
-                "At least one changed model is required after applying "
-                "--changed-model and --changed-file."
+    try:
+        if dbt_manifest:
+            manifest = load_manifest_from_path(dbt_manifest)
+            service_result = review_manifest_change(
+                manifest=manifest,
+                changed_files=list(changed_files),
+                changed_models=list(changed_models),
+                deployment_id=deployment_id,
+                history_path=history_path,
+                outcomes_path=outcomes_path,
+                auto_record=auto_record,
+                allow_blocked_recording=allow_blocked_recording,
             )
-        raise click.ClickException("At least one --changed-model is required.")
+        else:
+            context_payload = _load_review_project_context(project_context, None)
+            resolved_changed_models = _ordered_unique(list(changed_models or []))
+            if not resolved_changed_models:
+                raise ValueError("At least one --changed-model is required.")
+            service_result = _review_project_context_change(
+                project_context=context_payload,
+                changed_files=[],
+                changed_models=resolved_changed_models,
+                deployment_id=deployment_id,
+                history_path=history_path,
+                outcomes_path=outcomes_path,
+                auto_record=auto_record,
+                allow_blocked_recording=allow_blocked_recording,
+            )
+    except ValueError as error:
+        message = str(error)
+        if message == "At least one changed model is required.":
+            if changed_files:
+                message = (
+                    "At least one changed model is required after applying "
+                    "--changed-model and --changed-file."
+                )
+            else:
+                message = "At least one --changed-model is required."
+        raise click.ClickException(message) from error
 
-    history_store = DeploymentHistoryStore(history_path)
-    outcome_options = _load_review_outcome_options(outcomes_path)
-    result = review_deployment(
-        changed_models=[
-            {
-                "model_name": Path(model).stem,
-                "sql": f"select * from {Path(model).stem}",
-            }
-            for model in resolved_changed_models
-        ],
-        project_context=context_payload,
-        history_store=history_store,
-        deployment_id=deployment_id,
-        auto_record=auto_record,
-        allow_blocked_recording=allow_blocked_recording,
-        **outcome_options,
-    )
-    rendered = _render_deployment_review_result(result, output_format)
+    if output_format == "json":
+        payload = dict(service_result["incident"])
+        payload["deployment_lifecycle"] = dict(
+            service_result["deployment_lifecycle"]
+        )
+        rendered = json.dumps(payload, indent=2, sort_keys=True)
+    else:
+        rendered = service_result["rendered"][output_format]
 
     if output:
         output_path = Path(output)
@@ -896,21 +920,6 @@ def _load_review_project_context(project_context, dbt_manifest):
     return context_payload
 
 
-def _load_review_outcome_options(outcomes_path):
-    from pathlib import Path
-
-    path = Path(outcomes_path)
-    if not path.exists():
-        return {}
-
-    from agent.deployment_outcomes import DeploymentOutcomeStore
-
-    outcomes = DeploymentOutcomeStore(path).list_outcomes()
-    if not outcomes:
-        return {}
-    return {"outcomes": outcomes}
-
-
 def _load_outcome_metadata(metadata):
     if metadata is None or not str(metadata).strip():
         return {}
@@ -942,26 +951,6 @@ def _format_outcome_summary(summary):
             f"Manually approved deployments: {summary['manually_approved_deployments']}",
         ]
     )
-
-
-def _render_deployment_review_result(result, output_format):
-    import json
-
-    from agent.presentation import render_cli, render_json, render_markdown
-
-    if output_format == "json":
-        payload = render_json(result.incident)
-        payload["deployment_lifecycle"] = _deployment_lifecycle_metadata(result)
-        return json.dumps(payload, indent=2, sort_keys=True)
-
-    if output_format == "markdown":
-        rendered = render_markdown(result.incident)
-        status_lines = _deployment_review_status_lines(result, markdown=True)
-        return f"{rendered}\n\n## Deployment History\n" + "\n".join(status_lines)
-
-    rendered = render_cli(result.incident)
-    status_lines = _deployment_review_status_lines(result, markdown=False)
-    return f"{rendered}\n\nDeployment History\n" + "\n".join(status_lines)
 
 
 def _render_backtest_result(result, output_format):
@@ -1006,26 +995,6 @@ def _deployment_lifecycle_metadata(result):
         "saved_snapshot_id": result.saved_snapshot_id,
         "history_enabled": bool((result.metadata or {}).get("history_enabled")),
     }
-
-
-def _deployment_review_status_lines(result, *, markdown):
-    loaded = "YES" if result.previous_snapshot_loaded else "NO"
-    previous_snapshot_id = _snapshot_id(result.previous_snapshot)
-    lines = []
-    if markdown:
-        lines.append(f"**Previous Snapshot Loaded:** {loaded}")
-        if result.previous_snapshot_loaded:
-            lines.append(f"**Previous Snapshot:** {previous_snapshot_id or 'None'}")
-        if result.saved_snapshot_id:
-            lines.append(f"**Saved Snapshot:** {result.saved_snapshot_id}")
-        return lines
-
-    lines.append(f"Previous Snapshot Loaded: {loaded}")
-    if result.previous_snapshot_loaded:
-        lines.append(f"Previous Snapshot: {previous_snapshot_id or 'None'}")
-    if result.saved_snapshot_id:
-        lines.append(f"Saved Snapshot: {result.saved_snapshot_id}")
-    return lines
 
 
 def _snapshot_id(snapshot):

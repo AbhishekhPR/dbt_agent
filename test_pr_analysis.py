@@ -941,6 +941,63 @@ class PrAnalysisTests(unittest.TestCase):
         self.assertEqual(assumption_signal.score, 0)
         self.assertEqual(assumption_signal.reasons, ["All evaluated assumption checks passed"])
 
+    def test_missing_sql_skips_ast_and_records_unavailable_metadata(self):
+        model_spec = {
+            "model_name": "fct_revenue",
+            "name": "fct_revenue",
+            "unique_id": "model.analytics.fct_revenue",
+            "path": "models/marts/fct_revenue.sql",
+            "sql": None,
+            "sql_available": False,
+            "sql_source": "unavailable",
+        }
+
+        with _patched_detectors() as calls:
+            incident = analyze_changed_models([model_spec])
+
+        self.assertEqual(calls["ast"], [])
+        self.assertNotIn("ast", [signal.component for signal in incident.signals])
+        self.assertEqual(
+            incident.metadata["sql_sources"],
+            [
+                {
+                    "unique_id": "model.analytics.fct_revenue",
+                    "name": "fct_revenue",
+                    "original_file_path": None,
+                    "path": "models/marts/fct_revenue.sql",
+                    "sql_available": False,
+                    "sql_source": "unavailable",
+                    "ast_status": "skipped",
+                }
+            ],
+        )
+
+    def test_available_sql_records_evaluated_ast_metadata(self):
+        model_spec = {
+            "model_name": "fct_revenue",
+            "name": "fct_revenue",
+            "unique_id": "model.analytics.fct_revenue",
+            "sql": "select customer_id from raw_orders",
+            "sql_available": True,
+            "sql_source": "compiled_code",
+        }
+
+        with _patched_detectors() as calls:
+            incident = analyze_changed_models([model_spec])
+
+        self.assertEqual(
+            calls["ast"],
+            [("select customer_id from raw_orders", "fct_revenue")],
+        )
+        self.assertEqual(
+            incident.metadata["sql_sources"][0]["ast_status"],
+            "evaluated",
+        )
+        self.assertEqual(
+            incident.metadata["sql_sources"][0]["sql_source"],
+            "compiled_code",
+        )
+
 
 class _patched_detectors:
     def __init__(self, *, neutral=False):

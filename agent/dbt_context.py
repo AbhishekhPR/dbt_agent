@@ -58,7 +58,7 @@ def extract_project_context_from_manifest(manifest: dict) -> dict:
     }
 
 
-def load_project_context_from_manifest_path(path: str) -> dict:
+def load_manifest_from_path(path: str | Path) -> dict:
     manifest_path = Path(path)
     if not manifest_path.is_file():
         raise ValueError(f"Manifest file not found: {path}")
@@ -72,6 +72,12 @@ def load_project_context_from_manifest_path(path: str) -> dict:
 
     if not isinstance(manifest, dict):
         raise ValueError(f"Manifest JSON must be an object: {path}")
+
+    return manifest
+
+
+def load_project_context_from_manifest_path(path: str) -> dict:
+    manifest = load_manifest_from_path(path)
 
     return extract_project_context_from_manifest(manifest)
 

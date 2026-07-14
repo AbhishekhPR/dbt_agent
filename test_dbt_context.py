@@ -6,6 +6,7 @@ from pathlib import Path
 
 from agent.dbt_context import (
     extract_project_context_from_manifest,
+    load_manifest_from_path,
     load_project_context_from_manifest_path,
 )
 from agent.semantic_context import build_semantic_context
@@ -44,6 +45,16 @@ class DbtContextTests(unittest.TestCase):
             "select order_id, payment_amount as gross_revenue from stg_orders",
         )
         self.assertEqual(stg_orders["original_file_path"], "models/staging/stg_orders.sql")
+
+    def test_load_manifest_from_path_returns_manifest_object(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.json"
+            expected = _manifest()
+            path.write_text(json.dumps(expected), encoding="utf-8")
+
+            loaded = load_manifest_from_path(path)
+
+        self.assertEqual(loaded, expected)
 
     def test_extracts_refs(self):
         context = extract_project_context_from_manifest(_manifest())

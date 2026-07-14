@@ -28,6 +28,7 @@ class CliTests(unittest.TestCase):
 
             def analyze(**kwargs):
                 captured["project_context"] = kwargs["project_context"]
+                captured["changed_models"] = kwargs["changed_models"]
                 return _fake_analyzer()(**kwargs)
 
             with patch(
@@ -50,6 +51,12 @@ class CliTests(unittest.TestCase):
         self.assertIn("Relium Deployment Decision", output)
         self.assertEqual(captured["project_context"]["model_names"], ["fct_orders", "stg_orders"])
         self.assertEqual(captured["project_context"]["metadata"]["source"], "dbt_manifest")
+        self.assertEqual(
+            captured["changed_models"][0]["sql"],
+            "select order_id, payment_amount from raw_shop.orders",
+        )
+        self.assertEqual(captured["changed_models"][0]["sql_source"], "compiled_code")
+        self.assertNotEqual(captured["changed_models"][0]["sql"], "select * from stg_orders")
 
     def test_dbt_manifest_path_produces_successful_review(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1249,6 +1256,7 @@ def _dbt_manifest():
                 "name": "stg_orders",
                 "unique_id": "model.jaffle_shop.stg_orders",
                 "original_file_path": "models/staging/stg_orders.sql",
+                "compiled_code": "select order_id, payment_amount from raw_shop.orders",
                 "columns": {
                     "order_id": {"name": "order_id"},
                     "payment_amount": {"name": "payment_amount"},
@@ -1263,6 +1271,7 @@ def _dbt_manifest():
                 "name": "fct_orders",
                 "unique_id": "model.jaffle_shop.fct_orders",
                 "path": "marts/fct_orders.sql",
+                "compiled_code": "select order_id, payment_amount as gross_revenue from stg_orders",
                 "columns": {
                     "order_id": {"name": "order_id"},
                     "gross_revenue": {"name": "gross_revenue"},

@@ -99,12 +99,17 @@ def analyze_changed_models(
         signals.extend(
             _with_model_attribution(signal, model_name)
             for signal in model_signals
+            if signal is not None
         )
 
     metadata = {
         "model_count": len(model_specs),
         "models": list(affected_models),
     }
+    sql_sources = [
+        _sql_source_metadata(model_spec)
+        for model_spec in model_specs
+    ]
     changed_columns_by_model = _changed_columns_by_model_from_specs(model_specs)
     if changed_columns_by_model:
         metadata["changed_columns_by_model"] = changed_columns_by_model
@@ -161,6 +166,7 @@ def analyze_changed_models(
         current_snapshot=current_snapshot,
         semantic_diff=semantic_diff,
     )
+    metadata["sql_sources"] = sql_sources
 
     return assemble_decision_incident(
         signals,
@@ -232,9 +238,24 @@ def _snapshot_id(snapshot) -> str | None:
     return str(value) if value else None
 
 
-def _ast_signal(model_spec: Any, model_name: str) -> Signal:
-    ast_result = run_ast_analysis(_sql(model_spec), model_name)
-    return ast_to_signal(ast_result)
+def _ast_signal(model_spec: Any, model_name: str) -> Signal | None:
+    if _value(model_spec, "sql_available") is False:
+        return None
+
+    sql = _sql(model_spec)
+    if not isinstance(sql, str) or not sql.strip():
+        return None
+
+    ast_result = run_ast_analysis(sql, model_name)
+    signal = ast_to_signal(ast_result)
+    signal.metadata.update(
+        {
+            "sql_available": True,
+            "sql_source": _value(model_spec, "sql_source", "sql"),
+            "ast_status": "evaluated",
+        }
+    )
+    return signal
 
 
 def _metadata_signal(model_spec: Any, model_name: str) -> Signal:
@@ -509,6 +530,29 @@ def _sql(model_spec: Any) -> str:
         return Path(path).read_text(encoding="utf-8")
 
     return ""
+
+
+def _sql_source_metadata(model_spec: Any) -> dict[str, Any]:
+    sql_available = _value(model_spec, "sql_available")
+    if sql_available is None:
+        sql = _value(model_spec, "sql")
+        sql_available = isinstance(sql, str) and bool(sql.strip())
+    else:
+        sql_available = bool(sql_available)
+
+    return {
+        "unique_id": _value(model_spec, "unique_id"),
+        "name": _model_name(model_spec),
+        "original_file_path": _value(model_spec, "original_file_path"),
+        "path": _value(model_spec, "path") or _value(model_spec, "sql_path"),
+        "sql_available": sql_available,
+        "sql_source": (
+            _value(model_spec, "sql_source", "sql")
+            if sql_available
+            else "unavailable"
+        ),
+        "ast_status": "evaluated" if sql_available else "skipped",
+    }
 
 
 def _value(model_spec: Any, key: str, default: Any = None) -> Any:
