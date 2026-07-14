@@ -4,13 +4,17 @@ import json
 from collections import deque
 from pathlib import Path
 
-from agent.ast_analyzer import run_ast_analysis
+from agent.ast_analyzer import RULE_RECOMMENDATIONS, run_ast_analysis
 
 
 SEVERITY_RANK = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 
 
-def scan_dbt_project(project_path: str, changed_model: str | None = None) -> dict:
+def scan_dbt_project(
+    project_path: str,
+    changed_model: str | None = None,
+    diff_base: str = "origin/main",
+) -> dict:
     """Scan compiled dbt model SQL and optionally calculate downstream impact."""
     project = Path(project_path)
     _validate_project(project)
@@ -25,19 +29,24 @@ def scan_dbt_project(project_path: str, changed_model: str | None = None) -> dic
         reports.append(report)
     risks_found = sum(len(report.get("bugs", [])) for report in reports)
     highest_severity = _highest_severity(reports)
-    resolved_changed_model = _resolve_changed_model(manifest, changed_model)
+    if changed_model is not None:
+        resolved_changed_models = [_resolve_changed_model(manifest, changed_model)]
+    else:
+        from agent.changed_models import detect_changed_models
+
+        resolved_changed_models = [
+            _resolve_changed_model(manifest, model)
+            for model in detect_changed_models(project, diff_base)
+        ]
 
     return {
         "project_name": project_name,
         "models_scanned": len(reports),
         "risks_found": risks_found,
         "highest_severity": highest_severity,
-        "changed_model": resolved_changed_model,
-        "affected_models": (
-            _downstream_models(manifest, resolved_changed_model)
-            if resolved_changed_model
-            else []
-        ),
+        "changed_model": resolved_changed_models[0] if len(resolved_changed_models) == 1 else None,
+        "changed_models": resolved_changed_models,
+        "affected_models": _affected_models(manifest, resolved_changed_models),
         "safe_to_merge": highest_severity not in {"HIGH", "CRITICAL"},
         "model_reports": reports,
     }
@@ -46,7 +55,9 @@ def scan_dbt_project(project_path: str, changed_model: str | None = None) -> dic
 def format_scan_report(report: dict) -> str:
     """Return the compact terminal report for a completed project scan."""
     affected_models = ", ".join(report["affected_models"])
-    changed_model = report["changed_model"] or "not provided"
+    changed_models = report.get("changed_models", [])
+    changed_model = ", ".join(changed_models) or "not provided"
+    changed_label = "Changed model" if len(changed_models) <= 1 else "Changed models"
     safe_to_merge = "YES" if report["safe_to_merge"] else "NO"
 
     return "\n".join(
@@ -56,11 +67,123 @@ def format_scan_report(report: dict) -> str:
             f"Models scanned: {report['models_scanned']}",
             f"Risks found: {report['risks_found']}",
             f"Highest severity: {report['highest_severity']}",
-            f"Changed model: {changed_model}",
+            f"{changed_label}: {changed_model}",
             f"Affected downstream models: [{affected_models}]",
             f"Safe to merge: {safe_to_merge}",
         ]
     )
+
+
+def format_markdown_scan_report(report: dict) -> str:
+    """Render a decision-first Markdown summary for pull-request review."""
+    changed_models = report.get("changed_models", [])
+    changed_model = ", ".join(changed_models) or "not provided"
+    changed_label = "Changed model" if len(changed_models) <= 1 else "Changed models"
+    affected_models = ", ".join(report["affected_models"]) or "[]"
+    safe_to_merge = "YES" if report["safe_to_merge"] else "NO"
+    rows = [
+        ("Project", report["project_name"]),
+        ("Models scanned", report["models_scanned"]),
+        ("Risks found", report["risks_found"]),
+        ("Highest severity", report["highest_severity"]),
+        (changed_label, changed_model),
+        ("Affected downstream models", affected_models),
+        ("Safe to merge", safe_to_merge),
+    ]
+    if report["safe_to_merge"]:
+        recommendation = [
+            "🟢 **SAFE TO MERGE**",
+            "",
+            "No high or critical logic risks detected.",
+        ]
+    else:
+        recommendation = [
+            "🔴 **DO NOT MERGE YET**",
+            "",
+            "High or critical logic risks require review.",
+        ]
+
+    impact = [f"{changed_label}:", f"`{changed_model}`", "", "Affected downstream models:"]
+    if report["affected_models"]:
+        impact.append(", ".join(f"`{model}`" for model in report["affected_models"]))
+    else:
+        impact.append("None")
+
+    findings = _format_grouped_markdown_findings(report["model_reports"])
+
+    return "\n".join(
+        [
+            "## Relium PR Risk Summary",
+            "",
+            "### Merge Recommendation",
+            "",
+            *recommendation,
+            "",
+            "### Changed Model Impact",
+            "",
+            *impact,
+            "",
+            "### Findings",
+            "",
+            *findings,
+            "",
+            "### Scan Details",
+            "",
+            "| Field | Value |",
+            "|---|---|",
+            *[f"| {field} | {value} |" for field, value in rows],
+        ]
+    )
+
+
+def _format_grouped_markdown_findings(model_reports: list[dict]) -> list[str]:
+    """Group repeated AST findings into one reviewer-focused section per rule."""
+    grouped: dict[str, dict] = {}
+    for model_report in model_reports:
+        for bug in model_report.get("bugs", []):
+            rule = bug.get("rule", "UNCLASSIFIED")
+            group = grouped.setdefault(
+                rule,
+                {
+                    "models": [],
+                    "bugs": [],
+                },
+            )
+            if model_report["model_name"] not in group["models"]:
+                group["models"].append(model_report["model_name"])
+            group["bugs"].append(bug)
+
+    if not grouped:
+        return ["No SQL risks found in the compiled models."]
+
+    lines = []
+    for rule, group in grouped.items():
+        representative = group["bugs"][0]
+        severity = max(
+            (bug.get("severity", "low").upper() for bug in group["bugs"]),
+            key=lambda value: SEVERITY_RANK.get(value, 0),
+        )
+        lines.extend(
+            [
+                f"#### {rule}",
+                "",
+                f"Severity: {severity}",
+                "",
+                "Affected models:",
+                *[f"- {model_name}" for model_name in group["models"]],
+                "",
+                "Why it matters:",
+                representative.get("description", "No description provided."),
+                "",
+                "Recommendation:",
+                representative.get(
+                    "recommendation",
+                    RULE_RECOMMENDATIONS.get(rule, "Review the affected model."),
+                ),
+                "",
+            ]
+        )
+    return lines
 
 
 def format_verbose_scan_report(report: dict) -> str:
@@ -70,7 +193,7 @@ def format_verbose_scan_report(report: dict) -> str:
     for model_report in report["model_reports"]:
         lines.extend(_format_model_audit(model_report))
 
-    if report["changed_model"]:
+    if report.get("changed_models", []):
         downstream_models = ", ".join(report["affected_models"])
         lines.extend(["", f"Downstream models: [{downstream_models}]"])
 
@@ -225,6 +348,18 @@ def _downstream_models(manifest: dict, changed_model: str) -> list[str]:
         )
         queue.extend(reverse_dependencies.get(downstream_node_id, []))
 
+    return affected_models
+
+
+def _affected_models(manifest: dict, changed_models: list[str]) -> list[str]:
+    affected_models = []
+    seen = set()
+    for changed_model in changed_models:
+        for model_name in _downstream_models(manifest, changed_model):
+            model_key = model_name.casefold()
+            if model_key not in seen:
+                seen.add(model_key)
+                affected_models.append(model_name)
     return affected_models
 
 

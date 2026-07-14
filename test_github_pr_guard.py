@@ -522,8 +522,8 @@ class GithubPrGuardTests(unittest.TestCase):
                 "previous_snapshot_id": "abc123",
                 "current_snapshot_id": "def456",
                 "reasons": [
-                    "Revenue gained upstream dependency refunds",
                     "Revenue lost invariant never negative",
+                    "Revenue gained upstream dependency refunds",
                 ],
             },
         )

@@ -140,6 +140,36 @@ class IncidentBuilderTests(unittest.TestCase):
             "Revenue lost invariant never negative",
         )
 
+    def test_staging_column_lineage_noise_does_not_become_primary_root_cause(self):
+        semantic_diff = Signal(
+            component="semantic_diff",
+            severity=Severity.HIGH,
+            confidence=92,
+            score=-35,
+            reasons=[
+                "stg_refunds.order_id output column was added",
+                "stg_refunds.refund_amount output column was added",
+                "Revenue gained upstream dependency refunds",
+                "fct_revenue.refund_amount output column was added",
+                "Revenue gained related model stg_refunds",
+            ],
+        )
+        kpi_impact = Signal(
+            component="kpi_impact",
+            severity=Severity.HIGH,
+            confidence=92,
+            score=-30,
+            reasons=["Revenue may be impacted by changed model fct_revenue"],
+        )
+        decision = evaluate([kpi_impact, semantic_diff])
+
+        incident = build_incident(decision)
+
+        self.assertEqual(
+            incident.root_cause,
+            "Revenue gained upstream dependency refunds",
+        )
+
     def test_semantic_contract_reason_is_chosen_when_semantic_diff_absent(self):
         semantic_contract = Signal(
             component="semantic_contract",

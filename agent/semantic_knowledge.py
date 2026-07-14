@@ -97,10 +97,10 @@ def _business_meaning(kpi: DiscoveredKPI, project_context: dict[str, Any]) -> st
     name = _normalise(kpi.name)
     if "mrr" in name or "recurring_revenue" in text or "subscription_revenue" in text:
         return "Represents recurring subscription revenue."
+    if ("revenue" in name and "gmv" not in name) or "payment" in text:
+        return "Represents completed customer payments."
     if "gmv" in name or "gross_merchandise" in text:
         return "Represents gross merchandise value."
-    if "revenue" in name or "payment" in text:
-        return "Represents completed customer payments."
     if "playback" in name or "stream" in text:
         return "Represents successful playback sessions."
     if "retention" in name:

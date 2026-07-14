@@ -1,8 +1,12 @@
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from agent.presentation import render_markdown
+
 
 DEFAULT_REPORT_PATH = Path("pipeline_validation_report.md")
+DEFAULT_JSON_REPORT_PATH = Path("pipeline_validation_report.json")
 
 
 def format_pipeline_validation_report(result: dict) -> str:
@@ -89,13 +93,7 @@ def format_pipeline_validation_report(result: dict) -> str:
         "",
         "------------------------------------------------",
         "",
-        "## Final Decision",
-        "",
-        "SAFE TO MERGE:",
-        "YES" if safe_to_merge else "NO",
-        "",
-        "Reason",
-        primary_reason,
+        _format_deployment_decision_section(result, safe_to_merge, primary_reason),
         "",
         "------------------------------------------------",
         "",
@@ -111,8 +109,62 @@ def write_pipeline_validation_report(
     result: dict,
     path: str | Path = DEFAULT_REPORT_PATH,
 ) -> Path:
+    if not result.get("generated_timestamp"):
+        result = {**result, "generated_timestamp": _generated_timestamp()}
     report_path = Path(path)
     report_path.write_text(format_pipeline_validation_report(result), encoding="utf-8")
+    write_pipeline_validation_json(result, DEFAULT_JSON_REPORT_PATH)
+    return report_path
+
+
+def format_pipeline_validation_json(result: dict) -> dict:
+    drift = result.get("drift_result")
+    safe_to_continue = bool(result.get("safe_to_continue"))
+    generated_at = result.get("generated_timestamp") or _generated_timestamp()
+    return {
+        "generated_at": generated_at,
+        "project": result.get("project_name"),
+        "model": result.get("model_name"),
+        "scenario": result.get("scenario"),
+        "run_id": result.get("scan_id"),
+        "risk_level": result.get("severity"),
+        "safe_to_continue": safe_to_continue,
+        "static_analysis": {
+            "risk_level": result.get("severity"),
+            "safe_to_merge": safe_to_continue,
+            "detected_sql_risks": _sql_risk_items(result),
+            "confidence": _confidence(result),
+            "changed_model": result.get("changed_model") or result.get("model_name"),
+            "affected_downstream_models": result.get("affected_models") or [],
+            "recommendation": result.get("recommendation")
+            or "Review the SQL transformation before deployment.",
+        },
+        "metadata_checks": {
+            "row_count": result.get("row_count"),
+            "null_count": result.get("null_count"),
+            "duplicate_count": result.get("duplicate_count"),
+            "freshness_timestamp": result.get("freshness_timestamp"),
+            "schema_column_count": result.get("schema_column_count"),
+        },
+        "drift_detection": _json_drift_detection(drift),
+        "final_decision": {
+            "safe_to_merge": safe_to_continue,
+            "decision": "SAFE_TO_MERGE" if safe_to_continue else "BLOCK_DEPLOYMENT",
+            "reason": _primary_reason(result, drift),
+        },
+        "recommended_actions": _recommended_action_items(result, drift),
+    }
+
+
+def write_pipeline_validation_json(
+    result: dict,
+    path: str | Path = DEFAULT_JSON_REPORT_PATH,
+) -> Path:
+    report_path = Path(path)
+    report_path.write_text(
+        json.dumps(format_pipeline_validation_json(result), indent=2) + "\n",
+        encoding="utf-8",
+    )
     return report_path
 
 
@@ -120,18 +172,59 @@ def _generated_timestamp() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _format_deployment_decision_section(
+    result: dict,
+    safe_to_merge: bool,
+    primary_reason: str,
+) -> str:
+    incident = result.get("incident")
+    if incident:
+        return _format_incident_markdown_for_report(incident)
+    return "\n".join(
+        [
+            "## Final Decision",
+            "",
+            "SAFE TO MERGE:",
+            "YES" if safe_to_merge else "NO",
+            "",
+            "Reason",
+            primary_reason,
+        ]
+    )
+
+
+def _format_incident_markdown_for_report(incident) -> str:
+    rendered = render_markdown(incident)
+    rendered = rendered.replace(
+        f"## Pipeline Health\n{incident.health}",
+        f"## Pipeline Health\n{incident.health} / 100",
+        1,
+    )
+    rendered = rendered.replace(
+        f"## Confidence\n{incident.confidence}",
+        f"## Confidence\n{incident.confidence}%",
+        1,
+    )
+    return rendered
+
+
 def _format_sql_risks(result: dict) -> str:
+    return "\n".join(f"- {item}" for item in _sql_risk_items(result))
+
+
+def _sql_risk_items(result: dict) -> list[str]:
     bugs = result.get("sql_risks") or []
-    if bugs:
-        lines = []
-        for bug in bugs:
-            description = bug.get("description") or bug.get("category") or "SQL risk detected"
-            lines.append(f"- {description}")
-        return "\n".join(lines)
+    items = []
+    for bug in bugs:
+        items.append(
+            bug.get("description") or bug.get("category") or "SQL risk detected"
+        )
+    if items:
+        return items
     text = result.get("static_analysis_text")
     if text:
-        return f"- {text}"
-    return "- None detected"
+        return [text]
+    return ["None detected"]
 
 
 def _confidence(result: dict) -> str:
@@ -182,6 +275,10 @@ def _primary_reason(result: dict, drift: dict | None) -> str:
 
 
 def _recommended_actions(result: dict, drift: dict | None) -> str:
+    return "\n".join(f"- {action}" for action in _recommended_action_items(result, drift))
+
+
+def _recommended_action_items(result: dict, drift: dict | None) -> list[str]:
     actions = []
     if result.get("severity") in {"HIGH", "CRITICAL"}:
         actions.append("Review the SQL transformation before deployment.")
@@ -191,7 +288,33 @@ def _recommended_actions(result: dict, drift: dict | None) -> str:
         actions.append("Compare the current run against the previous baseline before merging.")
     if not actions:
         actions.append("Proceed with standard deployment review.")
-    return "\n".join(f"- {action}" for action in actions)
+    return actions
+
+
+def _json_drift_detection(drift: dict | None) -> dict:
+    if not drift:
+        return {
+            "status": "not_enough_history",
+            "previous_run_timestamp": None,
+            "current_run_timestamp": None,
+            "row_count_change_pct": None,
+            "null_count_change_pct": None,
+            "duplicate_count_change_pct": None,
+            "schema_column_count_change": None,
+            "freshness_regression": None,
+            "overall_metadata_drift": None,
+        }
+    return {
+        "status": "available",
+        "previous_run_timestamp": drift.get("previous_run_timestamp"),
+        "current_run_timestamp": drift.get("current_run_timestamp"),
+        "row_count_change_pct": drift.get("row_count_change_pct"),
+        "null_count_change_pct": drift.get("null_count_change_pct"),
+        "duplicate_count_change_pct": drift.get("duplicate_count_change_pct"),
+        "schema_column_count_change": drift.get("schema_column_count_change"),
+        "freshness_regression": bool(drift.get("freshness_regressed")),
+        "overall_metadata_drift": drift.get("drift_level"),
+    }
 
 
 def _drift_level_text(drift: dict | None) -> str:

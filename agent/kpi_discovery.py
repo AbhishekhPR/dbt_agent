@@ -115,11 +115,12 @@ def discover_kpis(project_context: dict) -> list[DiscoveredKPI]:
         hints = _hints_for_category(category, observed)
         if not hints:
             continue
+        name = _display_name(category, hints)
         related_models = _related_values("model_names", hints)
         related_columns = _related_values("column_names", hints)
         discovered.append(
             DiscoveredKPI(
-                name=category["name"],
+                name=name,
                 description=category["description"],
                 industry_hint=category.get("industry_hint"),
                 related_models=related_models,
@@ -200,6 +201,17 @@ def _confidence(hints: list[KPIHint]) -> int:
     evidence_bonus = min(len(hints) * 10, 45)
     base = max(hint.confidence for hint in hints)
     return min(95, base + source_bonus + evidence_bonus)
+
+
+def _display_name(category: dict, hints: list[KPIHint]) -> str:
+    metric_aliases = {
+        "Revenue / GMV": {"Revenue", "GMV"},
+    }
+    aliases = metric_aliases.get(category["name"], set())
+    for hint in hints:
+        if hint.source == "dbt_metrics" and hint.value in aliases:
+            return hint.value
+    return category["name"]
 
 
 def _keyword_matches(text: str, keyword: str) -> bool:
