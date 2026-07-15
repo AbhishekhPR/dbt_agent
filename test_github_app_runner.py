@@ -61,7 +61,7 @@ class GitHubAppRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             client = FakeClient()
             runner = PullRequestReviewRunner(storage=RepositoryStorage(tmp), reviewer=reviewer)
-            response = runner.run(_event(), client)
+            response = runner.run(_event(), client, expected_app_id=123)
 
         self.assertEqual(response["status"], "reviewed")
         reviewer.assert_called_once_with(
@@ -80,8 +80,8 @@ class GitHubAppRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             runner = PullRequestReviewRunner(storage=RepositoryStorage(tmp), reviewer=reviewer)
             client = FakeClient()
-            runner.run(_event(), client)
-            response = runner.run(_event(), client)
+            runner.run(_event(), client, expected_app_id=123)
+            response = runner.run(_event(), client, expected_app_id=123)
         self.assertEqual(response["status"], "duplicate")
         reviewer.assert_called_once()
 
@@ -92,7 +92,9 @@ class GitHubAppRunnerTests(unittest.TestCase):
         client = Mock()
         client.get_file.return_value = b"version: 1\nenabled: false\n"
         with tempfile.TemporaryDirectory() as tmp:
-            response = PullRequestReviewRunner(storage=RepositoryStorage(tmp)).run(_event(), client)
+            response = PullRequestReviewRunner(storage=RepositoryStorage(tmp)).run(
+                _event(), client, expected_app_id=123
+            )
         self.assertEqual(response["status"], "disabled")
         client.get_file.assert_called_once()
 
@@ -106,22 +108,74 @@ class GitHubAppRunnerTests(unittest.TestCase):
             client = FakeClient()
             client.create_check_run = Mock(side_effect=RuntimeError("publication failed"))
             with self.assertRaisesRegex(RuntimeError, "publication failed"):
-                runner.run(_event(), client)
+                runner.run(_event(), client, expected_app_id=123)
             client.create_check_run = Mock(return_value={"id": 2})
-            self.assertEqual(runner.run(_event(), client)["status"], "reviewed")
+            self.assertEqual(
+                runner.run(_event(), client, expected_app_id=123)["status"],
+                "reviewed",
+            )
 
     def test_missing_manifest_publishes_actionable_neutral_result(self):
+        from agent.github_app.client import GitHubNotFoundError
         from agent.github_app.runner import PullRequestReviewRunner
         from agent.github_app.storage import RepositoryStorage
 
         client = FakeClient()
         original = client.get_file
-        client.get_file = lambda owner, repository, path, ref: None if path == "build/manifest.json" else original(owner, repository, path, ref)
+
+        def get_file(owner, repository, path, ref):
+            if path == "build/manifest.json":
+                raise GitHubNotFoundError("missing", status_code=404)
+            return original(owner, repository, path, ref)
+
+        client.get_file = get_file
         with tempfile.TemporaryDirectory() as tmp:
-            response = PullRequestReviewRunner(storage=RepositoryStorage(tmp)).run(_event(), client)
+            response = PullRequestReviewRunner(storage=RepositoryStorage(tmp)).run(
+                _event(), client, expected_app_id=123
+            )
         self.assertEqual(response["status"], "missing_manifest")
         self.assertEqual(client.checks[0]["conclusion"], "neutral")
         self.assertIn("build/manifest.json", client.comments[0]["body"])
+
+    def test_missing_config_uses_defaults_and_missing_manifest_is_actionable(self):
+        from agent.github_app.client import GitHubNotFoundError
+        from agent.github_app.runner import PullRequestReviewRunner
+        from agent.github_app.storage import RepositoryStorage
+
+        client = FakeClient()
+
+        def get_file(owner, repository, path, ref):
+            raise GitHubNotFoundError("missing", status_code=404)
+
+        client.get_file = get_file
+        with tempfile.TemporaryDirectory() as tmp:
+            response = PullRequestReviewRunner(storage=RepositoryStorage(tmp)).run(
+                _event("missing-defaults"), client, expected_app_id=123
+            )
+        self.assertEqual(response["status"], "missing_manifest")
+        self.assertEqual(client.checks[0]["conclusion"], "neutral")
+        self.assertIn(
+            "Relium could not find target/manifest.json. "
+            "Run dbt compile before the Relium review.",
+            client.comments[0]["body"],
+        )
+
+    def test_non_404_config_error_is_not_treated_as_missing(self):
+        from agent.github_app.client import GitHubAPIError
+        from agent.github_app.runner import PullRequestReviewRunner
+        from agent.github_app.storage import RepositoryStorage
+
+        client = FakeClient()
+        client.get_file = Mock(
+            side_effect=GitHubAPIError("forbidden", status_code=403)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(GitHubAPIError):
+                PullRequestReviewRunner(storage=RepositoryStorage(tmp)).run(
+                    _event("api-error"), client, expected_app_id=123
+                )
+        self.assertEqual(client.comments, [])
+        self.assertEqual(client.checks, [])
 
     def test_no_changed_models_publishes_neutral_skipped_result(self):
         from agent.github_app.runner import PullRequestReviewRunner
@@ -130,7 +184,9 @@ class GitHubAppRunnerTests(unittest.TestCase):
         reviewer = Mock(side_effect=ValueError("At least one changed model is required."))
         with tempfile.TemporaryDirectory() as tmp:
             client = FakeClient()
-            response = PullRequestReviewRunner(storage=RepositoryStorage(tmp), reviewer=reviewer).run(_event(), client)
+            response = PullRequestReviewRunner(
+                storage=RepositoryStorage(tmp), reviewer=reviewer
+            ).run(_event(), client, expected_app_id=123)
         self.assertEqual(response["status"], "skipped")
         self.assertEqual(client.checks[0]["conclusion"], "neutral")
 
@@ -159,7 +215,9 @@ class GitHubAppRunnerTests(unittest.TestCase):
         self.assertEqual(response["status"], "reviewed")
         installation_client.create_installation_access_token.assert_called_once_with(9, "jwt")
         installation_client.with_token.assert_called_once_with("token")
-        runner.run.assert_called_once_with(runner.run.call_args.args[0], scoped_client)
+        runner.run.assert_called_once_with(
+            runner.run.call_args.args[0], scoped_client, expected_app_id=1
+        )
 
     def test_adapter_rejects_bad_signature_before_authentication(self):
         from agent.github_app.adapter import GitHubAppAdapter

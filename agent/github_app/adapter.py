@@ -35,4 +35,8 @@ class GitHubAppAdapter:
         app_jwt = self.jwt_factory(self.app_id, self.private_key)
         app_client = self.client_factory()
         token = get_installation_token(app_client, event.installation_id, app_jwt)
-        return self.runner.run(event, app_client.with_token(token))
+        return self.runner.run(
+            event,
+            app_client.with_token(token),
+            expected_app_id=int(self.app_id),
+        )

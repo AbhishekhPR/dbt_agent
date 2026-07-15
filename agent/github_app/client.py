@@ -5,8 +5,20 @@ import urllib.parse
 import urllib.request
 
 
-class GitHubClientError(RuntimeError):
-    pass
+class GitHubAPIError(RuntimeError):
+    """Raised when GitHub returns a non-successful API response."""
+
+    def __init__(self, message, *, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class GitHubNotFoundError(GitHubAPIError):
+    """Raised when a requested GitHub resource does not exist."""
+
+
+# Backwards-compatible name for callers that used the original client error.
+GitHubClientError = GitHubAPIError
 
 
 class GitHubClient:
@@ -31,7 +43,7 @@ class GitHubClient:
         try:
             return base64.b64decode(response["content"], validate=True)
         except (KeyError, ValueError, TypeError) as exc:
-            raise GitHubClientError("GitHub file response was invalid.") from exc
+            raise GitHubAPIError("GitHub file response was invalid.") from exc
 
     def compare_files(self, owner, repository, base_sha, head_sha):
         response = self._request("GET", f"/repos/{owner}/{repository}/compare/{base_sha}...{head_sha}")
@@ -60,5 +72,9 @@ class GitHubClient:
             with self.transport(request) as response:
                 content = response.read()
         except urllib.error.HTTPError as exc:
-            raise GitHubClientError(f"GitHub API request failed with status {exc.code}.") from exc
+            error_type = GitHubNotFoundError if exc.code == 404 else GitHubAPIError
+            raise error_type(
+                f"GitHub API request failed with status {exc.code}.",
+                status_code=exc.code,
+            ) from exc
         return json.loads(content) if content else {}
