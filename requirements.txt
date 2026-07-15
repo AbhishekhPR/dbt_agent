@@ -1,3 +1,5 @@
 click>=8.1,<9
 python-dotenv>=1.0,<2
 sqlglot>=25,<26
+PyYAML>=6.0.3,<7
+cryptography>=44,<47
