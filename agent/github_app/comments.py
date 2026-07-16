@@ -10,7 +10,8 @@ def upsert_review_comment(
     body: str,
     expected_app_id: int,
 ):
-    marked_body = f"{COMMENT_MARKER}\n{body}"
+    unmarked_body = body.replace(COMMENT_MARKER, "").lstrip("\r\n")
+    marked_body = f"{COMMENT_MARKER}\n{unmarked_body}"
     comments = client.list_issue_comments(owner, repository, pull_number)
     owned = [
         comment

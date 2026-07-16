@@ -53,7 +53,7 @@ jobs:
 
           Status: **SKIPPED**
 
-          No root dbt project or `target/manifest.json` is present, so Relium did not run a semantic review.
+          Relium skipped: no dbt manifest was available for this repository.
           EOF
             exit 0
           fi
@@ -65,7 +65,9 @@ jobs:
 
           Status: **SKIPPED**
 
-          A dbt project is present, but its installed dependencies do not provide the documented `dbt` command. Relium did not run a semantic review or invent a manifest.
+          Relium skipped: no dbt manifest was available for this repository.
+
+          The repository dependencies do not provide the documented `dbt` command, so no semantic review ran.
           EOF
             exit 0
           fi

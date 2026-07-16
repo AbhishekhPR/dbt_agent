@@ -129,13 +129,21 @@ class GitHubAppRunnerTests(unittest.TestCase):
             return original(owner, repository, path, ref)
 
         client.get_file = get_file
+        reviewer = Mock()
         with tempfile.TemporaryDirectory() as tmp:
-            response = PullRequestReviewRunner(storage=RepositoryStorage(tmp)).run(
+            response = PullRequestReviewRunner(
+                storage=RepositoryStorage(tmp), reviewer=reviewer
+            ).run(
                 _event(), client, expected_app_id=123
             )
         self.assertEqual(response["status"], "missing_manifest")
         self.assertEqual(client.checks[0]["conclusion"], "neutral")
-        self.assertIn("build/manifest.json", client.comments[0]["body"])
+        self.assertIn(
+            "Relium could not find build/manifest.json. "
+            "Generate the configured dbt manifest before the Relium review.",
+            client.comments[0]["body"],
+        )
+        reviewer.assert_not_called()
 
     def test_missing_config_uses_defaults_and_missing_manifest_is_actionable(self):
         from agent.github_app.client import GitHubNotFoundError
@@ -148,8 +156,11 @@ class GitHubAppRunnerTests(unittest.TestCase):
             raise GitHubNotFoundError("missing", status_code=404)
 
         client.get_file = get_file
+        reviewer = Mock()
         with tempfile.TemporaryDirectory() as tmp:
-            response = PullRequestReviewRunner(storage=RepositoryStorage(tmp)).run(
+            response = PullRequestReviewRunner(
+                storage=RepositoryStorage(tmp), reviewer=reviewer
+            ).run(
                 _event("missing-defaults"), client, expected_app_id=123
             )
         self.assertEqual(response["status"], "missing_manifest")
@@ -159,23 +170,27 @@ class GitHubAppRunnerTests(unittest.TestCase):
             "Run dbt compile before the Relium review.",
             client.comments[0]["body"],
         )
+        reviewer.assert_not_called()
 
     def test_non_404_config_error_is_not_treated_as_missing(self):
         from agent.github_app.client import GitHubAPIError
         from agent.github_app.runner import PullRequestReviewRunner
         from agent.github_app.storage import RepositoryStorage
 
-        client = FakeClient()
-        client.get_file = Mock(
-            side_effect=GitHubAPIError("forbidden", status_code=403)
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaises(GitHubAPIError):
-                PullRequestReviewRunner(storage=RepositoryStorage(tmp)).run(
-                    _event("api-error"), client, expected_app_id=123
+        for status in (401, 403, 500):
+            with self.subTest(status=status):
+                client = FakeClient()
+                client.get_file = Mock(
+                    side_effect=GitHubAPIError("request failed", status_code=status)
                 )
-        self.assertEqual(client.comments, [])
-        self.assertEqual(client.checks, [])
+                with tempfile.TemporaryDirectory() as tmp:
+                    with self.assertRaises(GitHubAPIError) as raised:
+                        PullRequestReviewRunner(storage=RepositoryStorage(tmp)).run(
+                            _event(f"api-error-{status}"), client, expected_app_id=123
+                        )
+                self.assertEqual(raised.exception.status_code, status)
+                self.assertEqual(client.comments, [])
+                self.assertEqual(client.checks, [])
 
     def test_no_changed_models_publishes_neutral_skipped_result(self):
         from agent.github_app.runner import PullRequestReviewRunner

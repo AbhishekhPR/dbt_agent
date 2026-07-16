@@ -4,7 +4,7 @@ from agent.deployment_review_service import review_manifest_change
 from agent.github_app.checks import create_review_check
 from agent.github_app.client import GitHubNotFoundError
 from agent.github_app.comments import upsert_review_comment
-from agent.github_app.config import load_repository_config
+from agent.github_app.config import DEFAULT_MANIFEST_PATH, load_repository_config
 
 
 class ReviewRunnerError(ValueError):
@@ -48,15 +48,22 @@ class PullRequestReviewRunner:
         except GitHubNotFoundError:
             manifest_content = None
         if manifest_content is None:
+            if config.manifest_path == DEFAULT_MANIFEST_PATH:
+                message = (
+                    "Relium could not find target/manifest.json. "
+                    "Run dbt compile before the Relium review."
+                )
+            else:
+                message = (
+                    f"Relium could not find {config.manifest_path}. "
+                    "Generate the configured dbt manifest before the Relium review."
+                )
             return self._publish_neutral(
                 event,
                 client,
                 config.mode,
                 status="missing_manifest",
-                message=(
-                    f"Relium could not find {config.manifest_path}. "
-                    "Run dbt compile before the Relium review."
-                ),
+                message=message,
                 expected_app_id=expected_app_id,
             )
         try:
