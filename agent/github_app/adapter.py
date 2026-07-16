@@ -29,6 +29,14 @@ class GitHubAppAdapter:
             secret=self.webhook_secret, body=body, signature_header=signature
         ):
             raise PermissionError("Webhook signature is invalid.")
+        return self.handle_verified(
+            event_name=event_name,
+            delivery_id=delivery_id,
+            body=body,
+        )
+
+    def handle_verified(self, *, event_name, delivery_id, body):
+        """Process a webhook already verified by the trusted HTTP boundary."""
         event = parse_webhook(event_name=event_name, delivery_id=delivery_id, body=body)
         if event is None:
             return {"status": "ignored", "delivery_id": delivery_id}

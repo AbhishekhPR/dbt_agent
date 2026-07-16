@@ -2,6 +2,7 @@ import io
 import json
 import urllib.error
 import unittest
+from unittest.mock import Mock, patch
 
 
 def _http_error(status):
@@ -60,6 +61,27 @@ class GitHubAppClientTests(unittest.TestCase):
         client = GitHubClient(transport=lambda request: response)
         with self.assertRaisesRegex(GitHubAPIError, "file response was invalid"):
             client.get_file("a", "r", "target/manifest.json", "head")
+
+    def test_default_transport_uses_explicit_timeout(self):
+        from agent.github_app.client import GitHubClient
+
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = b"{}"
+        with patch("urllib.request.urlopen", return_value=response) as transport:
+            client = GitHubClient(timeout=4.5)
+            self.assertEqual(client.list_issue_comments("a", "r", 1), {})
+        self.assertEqual(transport.call_args.kwargs, {"timeout": 4.5})
+
+    def test_timeout_must_be_positive(self):
+        from agent.github_app.client import GitHubClient
+
+        for timeout in (0, -1, "secret-invalid-timeout"):
+            with self.subTest(timeout=timeout):
+                with self.assertRaisesRegex(ValueError, "timeout") as raised:
+                    GitHubClient(timeout=timeout)
+                self.assertNotIn(str(timeout), str(raised.exception))
 
 
 if __name__ == "__main__":

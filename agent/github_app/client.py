@@ -1,5 +1,6 @@
 import base64
 import json
+import math
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,13 +25,33 @@ GitHubClientError = GitHubAPIError
 class GitHubClient:
     """Injectable GitHub API boundary; tests supply a fake instead of using the network."""
 
-    def __init__(self, token=None, *, api_url="https://api.github.com", transport=None):
+    def __init__(
+        self,
+        token=None,
+        *,
+        api_url="https://api.github.com",
+        transport=None,
+        timeout=10.0,
+    ):
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("GitHub request timeout must be a positive number.")
         self.token = token
         self.api_url = api_url.rstrip("/")
-        self.transport = transport or urllib.request.urlopen
+        self.transport = transport
+        self.timeout = float(timeout)
 
     def with_token(self, token):
-        return type(self)(token, api_url=self.api_url, transport=self.transport)
+        return type(self)(
+            token,
+            api_url=self.api_url,
+            transport=self.transport,
+            timeout=self.timeout,
+        )
 
     def create_installation_access_token(self, installation_id, app_jwt):
         return self._request("POST", f"/app/installations/{installation_id}/access_tokens", token=app_jwt)
@@ -69,7 +90,12 @@ class GitHubClient:
         body = json.dumps(data).encode("utf-8") if data is not None else None
         request = urllib.request.Request(self.api_url + path, data=body, headers=headers, method=method)
         try:
-            with self.transport(request) as response:
+            response_context = (
+                urllib.request.urlopen(request, timeout=self.timeout)
+                if self.transport is None
+                else self.transport(request)
+            )
+            with response_context as response:
                 content = response.read()
         except urllib.error.HTTPError as exc:
             error_type = GitHubNotFoundError if exc.code == 404 else GitHubAPIError
