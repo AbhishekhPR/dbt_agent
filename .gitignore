@@ -1,4 +1,10 @@
-﻿.env
+.env
+.env.github-app
+!.env.github-app.example
+*.pem
+*.private-key.pem
+.relium/github-app/
+github-app-storage/
 venv/
 __pycache__/
 
