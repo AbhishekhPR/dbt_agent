@@ -73,8 +73,15 @@ class GitHubClient:
                 content = response.read()
         except urllib.error.HTTPError as exc:
             error_type = GitHubNotFoundError if exc.code == 404 else GitHubAPIError
+            exc.close()
             raise error_type(
                 f"GitHub API request failed with status {exc.code}.",
                 status_code=exc.code,
             ) from exc
-        return json.loads(content) if content else {}
+        if not content:
+            return {}
+        try:
+            return json.loads(content)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+        raise GitHubAPIError("GitHub API response was invalid.")
