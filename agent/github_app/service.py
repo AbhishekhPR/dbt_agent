@@ -2,6 +2,7 @@ import logging
 import time
 from dataclasses import dataclass
 
+from agent.github_app.client import safe_github_error_fields
 from agent.github_app.jobs import WebhookJob, safe_error_category
 
 
@@ -41,6 +42,7 @@ class WebhookProcessingService:
                     "attempt": job.attempt,
                     "duration": duration,
                     "error_category": safe_error_category(exc),
+                    **safe_github_error_fields(exc),
                 },
             )
             raise

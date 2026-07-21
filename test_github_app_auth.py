@@ -27,6 +27,24 @@ class GitHubAppAuthTests(unittest.TestCase):
         with self.assertRaises(AuthenticationError):
             get_installation_token(client, 9, "jwt")
 
+    def test_installation_token_is_an_opaque_non_empty_string(self):
+        from agent.github_app.auth import get_installation_token
+
+        tokens = (
+            "traditional-installation-token",
+            "ghs_1234567890_eyJhbGciOiJSUzI1NiJ9.payload.signature",
+            "token_with_underscores",
+            "token.with.periods",
+        )
+        for token in tokens:
+            with self.subTest(token=token):
+                client = Mock()
+                client.create_installation_access_token.return_value = {
+                    "token": token,
+                    "permissions": {"issues": "write", "checks": "write"},
+                }
+                self.assertEqual(get_installation_token(client, 9, "jwt"), token)
+
     def test_invalid_ids_and_keys_are_rejected(self):
         from agent.github_app.auth import AuthenticationError, create_app_jwt
 

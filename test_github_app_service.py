@@ -92,6 +92,40 @@ class GitHubAppServiceTests(unittest.TestCase):
         self.assertNotIn("token-secret", str(logged))
         self.assertNotIn("raw-body-secret", str(logged))
 
+    def test_service_logs_safe_github_operation_diagnostics(self):
+        from agent.github_app.client import GitHubAPIError
+        from agent.github_app.service import WebhookProcessingService
+
+        error = GitHubAPIError(
+            "safe failure",
+            status_code=403,
+            operation="get_repository_file",
+            http_method="GET",
+            route_template="/repos/{owner}/{repo}/contents/{path}",
+            github_request_id="SAFE-REQUEST-ID",
+            accepted_github_permissions="contents=read",
+            message_category="permission",
+            response_representation="raw",
+        )
+        adapter = Mock()
+        adapter.handle_verified.side_effect = error
+        logger = Mock()
+        with self.assertRaises(GitHubAPIError):
+            WebhookProcessingService(
+                adapter, clock=Mock(side_effect=[1.0, 1.1]), logger=logger
+            ).process(_job(attempt=2))
+
+        extra = logger.error.call_args.kwargs["extra"]
+        self.assertEqual(extra["operation"], "get_repository_file")
+        self.assertEqual(extra["http_method"], "GET")
+        self.assertEqual(extra["http_status"], 403)
+        self.assertEqual(extra["github_request_id"], "SAFE-REQUEST-ID")
+        self.assertEqual(extra["accepted_github_permissions"], "contents=read")
+        self.assertEqual(extra["github_message_category"], "permission")
+        self.assertEqual(extra["response_representation"], "raw")
+        self.assertFalse(extra["retryable"])
+        self.assertEqual(extra["attempt"], 2)
+
     def test_verified_adapter_reuses_fake_auth_client_and_runner(self):
         from agent.github_app.adapter import GitHubAppAdapter
         from agent.github_app.service import WebhookProcessingService
