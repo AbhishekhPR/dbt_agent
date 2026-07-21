@@ -25,6 +25,15 @@ _LOG_FIELDS = (
     "processing_outcome",
     "duration",
     "error_category",
+    "operation",
+    "http_method",
+    "route_template",
+    "http_status",
+    "github_request_id",
+    "accepted_github_permissions",
+    "github_message_category",
+    "response_representation",
+    "retryable",
 )
 
 

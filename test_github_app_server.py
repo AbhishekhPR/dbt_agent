@@ -79,10 +79,26 @@ class GitHubAppServerTests(unittest.TestCase):
         record.error_category = "network"
         record.raw_body = "raw-body-secret"
         record.authorization = "Bearer token-secret"
+        record.operation = "create_issue_comment"
+        record.http_method = "POST"
+        record.route_template = "/repos/{owner}/{repo}/issues/{pull_number}/comments"
+        record.http_status = 403
+        record.github_request_id = "SAFE-REQUEST-ID"
+        record.accepted_github_permissions = "issues=write"
+        record.github_message_category = "permission"
+        record.response_representation = "raw"
+        record.retryable = False
         rendered = SafeJsonFormatter().format(record)
         payload = json.loads(rendered)
         self.assertEqual(payload["message"], "webhook_processing_failed")
         self.assertEqual(payload["delivery_id"], "delivery-1")
+        self.assertEqual(payload["operation"], "create_issue_comment")
+        self.assertEqual(payload["http_status"], 403)
+        self.assertEqual(payload["github_request_id"], "SAFE-REQUEST-ID")
+        self.assertEqual(payload["accepted_github_permissions"], "issues=write")
+        self.assertEqual(payload["github_message_category"], "permission")
+        self.assertEqual(payload["response_representation"], "raw")
+        self.assertFalse(payload["retryable"])
         self.assertNotIn("raw-body-secret", rendered)
         self.assertNotIn("token-secret", rendered)
 

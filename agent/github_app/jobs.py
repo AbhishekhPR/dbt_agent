@@ -6,7 +6,7 @@ import time
 import urllib.error
 from dataclasses import dataclass, field, replace
 
-from agent.github_app.client import GitHubAPIError
+from agent.github_app.client import GitHubAPIError, safe_github_error_fields
 
 
 class WebhookJobError(ValueError):
@@ -118,6 +118,7 @@ class RetryingJobProcessor:
                         "event_name": current.event_name,
                         "attempt": current.attempt,
                         "error_category": safe_error_category(exc),
+                        **safe_github_error_fields(exc),
                     },
                 )
                 self.sleep(delay)
@@ -224,6 +225,7 @@ class BoundedJobQueue:
                             "event_name": item.event_name,
                             "attempt": item.attempt,
                             "error_category": safe_error_category(exc),
+                            **safe_github_error_fields(exc),
                         },
                     )
             finally:

@@ -170,6 +170,43 @@ class RetryingJobProcessorTests(unittest.TestCase):
                 self.assertEqual(calls, [0, 1])
                 self.assertEqual(sleeps, [0.1])
 
+    def test_retry_log_includes_safe_github_operation_fields(self):
+        from agent.github_app.client import GitHubAPIError
+
+        logger = Mock()
+        error = GitHubAPIError(
+            "safe",
+            status_code=429,
+            operation="create_check_run",
+            http_method="POST",
+            route_template="/repos/{owner}/{repo}/check-runs",
+            github_request_id="SAFE-REQUEST-ID",
+            accepted_github_permissions="checks=write",
+        )
+        calls = []
+
+        def process(job):
+            calls.append(job.attempt)
+            if job.attempt == 0:
+                raise error
+            return "processed"
+
+        from agent.github_app.jobs import RetryPolicy, RetryingJobProcessor
+
+        processor = RetryingJobProcessor(
+            process,
+            RetryPolicy(max_retries=1, base_seconds=0.1),
+            sleep=Mock(),
+            logger=logger,
+        )
+        self.assertEqual(processor(_job()), "processed")
+        extra = logger.warning.call_args.kwargs["extra"]
+        self.assertEqual(extra["operation"], "create_check_run")
+        self.assertEqual(extra["http_status"], 429)
+        self.assertEqual(extra["github_request_id"], "SAFE-REQUEST-ID")
+        self.assertTrue(extra["retryable"])
+        self.assertEqual(extra["attempt"], 0)
+
 
 class BoundedJobQueueTests(unittest.TestCase):
     def test_queue_processes_jobs_with_bounded_workers(self):
@@ -240,6 +277,42 @@ class BoundedJobQueueTests(unittest.TestCase):
             logged = logger.error.call_args
             self.assertEqual(logged.args[0], "webhook_job_failed")
             self.assertNotIn("secret failure detail", str(logged))
+        finally:
+            self.assertTrue(jobs.stop(timeout=1.0))
+
+    def test_final_failure_log_includes_safe_github_operation_fields(self):
+        from agent.github_app.client import GitHubAPIError
+        from agent.github_app.jobs import BoundedJobQueue
+
+        completed = threading.Event()
+        logger = Mock()
+        error = GitHubAPIError(
+            "safe",
+            status_code=403,
+            operation="create_issue_comment",
+            http_method="POST",
+            route_template="/repos/{owner}/{repo}/issues/{pull_number}/comments",
+            github_request_id="SAFE-REQUEST-ID",
+            accepted_github_permissions="issues=write",
+        )
+
+        def process(job):
+            completed.set()
+            raise error
+
+        jobs = BoundedJobQueue(process, worker_count=1, capacity=1, logger=logger)
+        jobs.start()
+        try:
+            self.assertTrue(jobs.enqueue(_job()))
+            self.assertTrue(completed.wait(1.0))
+            while logger.error.call_count == 0:
+                time.sleep(0.001)
+            extra = logger.error.call_args.kwargs["extra"]
+            self.assertEqual(extra["operation"], "create_issue_comment")
+            self.assertEqual(extra["http_status"], 403)
+            self.assertEqual(extra["github_request_id"], "SAFE-REQUEST-ID")
+            self.assertFalse(extra["retryable"])
+            self.assertEqual(extra["attempt"], 0)
         finally:
             self.assertTrue(jobs.stop(timeout=1.0))
 
