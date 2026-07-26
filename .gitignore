@@ -1,7 +1,17 @@
-﻿# Environment and secrets
+# Environment and secrets
 .env
 .env.*
 !.env.example
+.env.github-app
+!.env.github-app.example
+
+# Credentials and key files
+*.pem
+*.private-key.pem
+
+# GitHub App storage
+.relium/github-app/
+github-app-storage/
 
 # Virtual environments
 venv/
