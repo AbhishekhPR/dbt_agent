@@ -1,4 +1,32 @@
 import click
+from pathlib import Path
+from agent.logging_config import configure_logging
+
+
+def _validate_file_exists(file_path: str, description: str) -> Path:
+    """Validate a file exists and return a Path object.
+
+    Raises click.ClickException if file does not exist.
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise click.ClickException(f"{description} not found: {file_path}")
+    if not path.is_file():
+        raise click.ClickException(f"{description} is not a file: {file_path}")
+    return path
+
+
+def _validate_directory_exists(dir_path: str, description: str) -> Path:
+    """Validate a directory exists and return a Path object.
+
+    Raises click.ClickException if directory does not exist.
+    """
+    path = Path(dir_path)
+    if not path.exists():
+        raise click.ClickException(f"{description} not found: {dir_path}")
+    if not path.is_dir():
+        raise click.ClickException(f"{description} is not a directory: {dir_path}")
+    return path
 
 
 def run_simulation(*args, **kwargs):
@@ -46,7 +74,7 @@ def print_diagnosis(result: dict):
 @click.group()
 def cli():
     """dbt-agent — AI-powered dbt pipeline diagnostics"""
-    pass
+    configure_logging()
 
 
 @cli.command()
@@ -59,22 +87,26 @@ def diagnose(log, model, schema):
 
     click.echo("\nAnalyzing pipeline failure...\n")
 
-    with open(log) as f:
-        error_log = f.read()
+    try:
+        log_path = _validate_file_exists(log, "Error log file")
+        model_path = _validate_file_exists(model, "Model file")
+        schema_path = _validate_file_exists(schema, "Schema file")
 
-    with open(model) as f:
-        model_sql = f.read()
+        error_log = log_path.read_text(encoding='utf-8')
+        model_sql = model_path.read_text(encoding='utf-8')
+        upstream_schema = schema_path.read_text(encoding='utf-8')
 
-    with open(schema) as f:
-        upstream_schema = f.read()
+        result = diagnose_failure(
+            error_log,
+            model_sql,
+            upstream_schema
+        )
 
-    result = diagnose_failure(
-        error_log,
-        model_sql,
-        upstream_schema
-    )
-
-    print_diagnosis(result)
+        print_diagnosis(result)
+    except click.ClickException:
+        raise
+    except Exception as e:
+        raise click.ClickException(f"Failed to diagnose: {e}") from e
 
 
 @cli.command()
@@ -153,7 +185,17 @@ def analyze(project):
 def quality(project, db):
     """Run data quality checks — catches row drops, null explosions, duplicates"""
     from agent.quality_checker import run_quality_check
-    run_quality_check(project, db)
+
+    try:
+        _validate_directory_exists(project, "dbt project")
+        db_path = Path(db)
+        if not db_path.exists():
+            raise click.ClickException(f"SQLite database not found: {db}")
+        run_quality_check(project, db)
+    except click.ClickException:
+        raise
+    except Exception as e:
+        raise click.ClickException(f"Quality check failed: {e}") from e
 
 
 @cli.command()
@@ -173,7 +215,10 @@ def scan(project, changed_model, diff_base, verbose, output_format, output):
     )
 
     try:
+        _validate_directory_exists(project, "dbt project")
         report = scan_dbt_project(project, changed_model, diff_base)
+    except click.ClickException:
+        raise
     except ValueError as error:
         raise click.ClickException(str(error)) from error
 

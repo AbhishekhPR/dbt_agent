@@ -1,9 +1,21 @@
 import json
 import sqlite3
 from pathlib import Path
-from dotenv import load_dotenv
-from agent.groq_client import call_llm_json
+from agent.logging_config import get_logger
 from agent.slack import send_slack_alert
+
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    def load_dotenv(*args, **kwargs):
+        return False
+
+try:
+    from agent.groq_client import call_llm_json
+except ImportError:
+    call_llm_json = None
+
+logger = get_logger(__name__)
 
 env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
@@ -12,10 +24,15 @@ BASELINE_PATH = Path(__file__).resolve().parent.parent / "quality_baselines"
 BASELINE_PATH.mkdir(exist_ok=True)
 
 SYSTEM_PROMPT = """
-You are a senior data quality engineer. You analyze data pipeline 
+You are a senior data quality engineer. You analyze data pipeline
 metrics and identify anomalies that indicate silent data corruption.
 You always respond with valid JSON only. No explanation outside JSON.
 """
+
+
+def _quote_identifier(identifier: str) -> str:
+    """Safely quote a SQLite identifier to prevent injection."""
+    return '"' + identifier.replace('"', '""') + '"'
 
 
 def get_table_metrics(db_path: str, table_name: str) -> dict:
@@ -29,30 +46,32 @@ def get_table_metrics(db_path: str, table_name: str) -> dict:
 
     try:
         # Row count
-        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+        quoted_table = _quote_identifier(table_name)
+        cursor.execute(f"SELECT COUNT(*) FROM {quoted_table}")
         metrics["row_count"] = cursor.fetchone()[0]
 
         # Get columns
-        cursor.execute(f"PRAGMA table_info({table_name})")
+        cursor.execute(f"PRAGMA table_info({quoted_table})")
         columns = [row[1] for row in cursor.fetchall()]
         metrics["columns"] = columns
 
         # Null rates per column
         null_rates = {}
         for col in columns:
+            quoted_col = _quote_identifier(col)
             cursor.execute(f"""
-                SELECT 
-                    ROUND(100.0 * SUM(CASE WHEN {col} IS NULL THEN 1 ELSE 0 END) 
+                SELECT
+                    ROUND(100.0 * SUM(CASE WHEN {quoted_col} IS NULL THEN 1 ELSE 0 END)
                     / COUNT(*), 2)
-                FROM {table_name}
+                FROM {quoted_table}
             """)
             null_rates[col] = cursor.fetchone()[0] or 0.0
         metrics["null_rates"] = null_rates
 
         # Duplicate rate
         cursor.execute(f"""
-            SELECT COUNT(*) - COUNT(DISTINCT rowid) 
-            FROM {table_name}
+            SELECT COUNT(*) - COUNT(DISTINCT rowid)
+            FROM {quoted_table}
         """)
         metrics["duplicate_rows"] = cursor.fetchone()[0]
 
@@ -60,13 +79,14 @@ def get_table_metrics(db_path: str, table_name: str) -> dict:
         numeric_stats = {}
         for col in columns:
             try:
+                quoted_col = _quote_identifier(col)
                 cursor.execute(f"""
-                    SELECT 
-                        MIN(CAST({col} AS REAL)),
-                        MAX(CAST({col} AS REAL)),
-                        AVG(CAST({col} AS REAL))
-                    FROM {table_name}
-                    WHERE {col} IS NOT NULL
+                    SELECT
+                        MIN(CAST({quoted_col} AS REAL)),
+                        MAX(CAST({quoted_col} AS REAL)),
+                        AVG(CAST({quoted_col} AS REAL))
+                    FROM {quoted_table}
+                    WHERE {quoted_col} IS NOT NULL
                 """)
                 row = cursor.fetchone()
                 if row and row[0] is not None:
@@ -75,18 +95,20 @@ def get_table_metrics(db_path: str, table_name: str) -> dict:
                         "max": round(row[1], 2),
                         "avg": round(row[2], 2)
                     }
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Could not compute numeric stats for {col}: {e}")
         metrics["numeric_stats"] = numeric_stats
 
         # Distinct value counts per column
         distinct_counts = {}
         for col in columns:
-            cursor.execute(f"SELECT COUNT(DISTINCT {col}) FROM {table_name}")
+            quoted_col = _quote_identifier(col)
+            cursor.execute(f"SELECT COUNT(DISTINCT {quoted_col}) FROM {quoted_table}")
             distinct_counts[col] = cursor.fetchone()[0]
         metrics["distinct_counts"] = distinct_counts
 
     except Exception as e:
+        logger.error(f"Error getting metrics for {table_name}: {e}")
         metrics["error"] = str(e)
     finally:
         conn.close()
@@ -195,7 +217,7 @@ def ask_claude_about_anomalies(anomalies: list, metrics: dict) -> dict:
     """
     Sends anomalies to Claude for deeper analysis and recommendations.
     """
-    if not anomalies:
+    if not anomalies or not call_llm_json:
         return {}
 
     prompt = f"""
@@ -216,7 +238,11 @@ Analyze these anomalies and return a JSON object with:
   "confidence": "high | medium | low"
 }}
 """
-    return call_llm_json(prompt=prompt, system=SYSTEM_PROMPT)
+    try:
+        return call_llm_json(prompt=prompt, system=SYSTEM_PROMPT)
+    except Exception as e:
+        logger.warning(f"Could not get Claude analysis for anomalies: {e}")
+        return {}
 
 
 def run_quality_check(project_name: str, db_path: str):

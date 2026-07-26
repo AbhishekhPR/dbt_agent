@@ -1,5 +1,8 @@
 import subprocess
 from pathlib import Path
+from agent.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 def detect_changed_models(project_path: str | Path, diff_base: str = "origin/main") -> list[str]:
@@ -17,12 +20,26 @@ def detect_changed_models(project_path: str | Path, diff_base: str = "origin/mai
             check=False,
             capture_output=True,
             text=True,
+            timeout=30,
         )
-    except OSError:
+    except OSError as e:
+        logger.debug(f"git diff failed: git executable not found or not a git repository: {e}")
         return []
+    except subprocess.TimeoutExpired:
+        logger.warning(f"git diff timed out after 30 seconds on {diff_base}...HEAD — skipping changed model detection")
+        return []
+
     if completed.returncode != 0:
+        if completed.stderr:
+            logger.debug(f"git diff returned {completed.returncode}: {completed.stderr.strip()[:100]}")
+        else:
+            logger.debug(f"git diff returned {completed.returncode} (no error message)")
         return []
-    return _models_from_paths(completed.stdout.splitlines())
+
+    models = _models_from_paths(completed.stdout.splitlines())
+    if models:
+        logger.debug(f"Detected changed models: {', '.join(models)}")
+    return models
 
 
 def _models_from_paths(paths: list[str]) -> list[str]:

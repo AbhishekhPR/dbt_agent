@@ -1,12 +1,30 @@
+﻿# Environment and secrets
 .env
-.env.github-app
-!.env.github-app.example
-*.pem
-*.private-key.pem
-.relium/github-app/
-github-app-storage/
-venv/
-__pycache__/
+.env.*
+!.env.example
 
+# Virtual environments
+venv/
+.venv/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Test and development
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Git worktrees
 .worktrees/
 
+# Generated runtime artifacts
+relium_metadata.db
+pipeline_validation_report.json
+pipeline_validation_report.md
+*.relium/
