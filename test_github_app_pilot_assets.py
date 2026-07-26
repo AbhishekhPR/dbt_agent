@@ -45,12 +45,13 @@ class GitHubAppPilotAssetTests(unittest.TestCase):
         result = subprocess.run(
             ["git", "check-ignore", "--stdin"],
             cwd=ROOT,
-            input=candidates,
-            text=True,
+            input=candidates.encode("utf-8"),
             capture_output=True,
             check=True,
         )
-        self.assertEqual(set(result.stdout.splitlines()), set(candidates.splitlines()))
+        output_lines = set(result.stdout.decode("utf-8").splitlines())
+        expected_lines = set(candidates.splitlines())
+        self.assertEqual(output_lines, expected_lines)
         example = subprocess.run(
             ["git", "check-ignore", ".env.github-app.example"],
             cwd=ROOT,

@@ -8,6 +8,7 @@ fail() {
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$repo_root"
+export PYTHONPATH="${repo_root}:${PYTHONPATH:-}"
 
 if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
   python_bin="${VIRTUAL_ENV}/bin/python"
@@ -43,7 +44,7 @@ if [[ ! -d "$RELIUM_STORAGE_ROOT" || ! -w "$RELIUM_STORAGE_ROOT" ]]; then
 fi
 
 if ! "$python_bin" -B -c \
-  'import cryptography, httpx, starlette, uvicorn, yaml; from agent.github_app.server import main' \
+  'import sys; sys.path.insert(0, "'"${repo_root}"'"); import cryptography, httpx, starlette, uvicorn, yaml; from agent.github_app.server import main' \
   >/dev/null 2>&1; then
   fail "required Python dependencies could not be imported."
 fi
@@ -62,6 +63,8 @@ then
 fi
 
 if ! "$python_bin" -B - <<'PY' >/dev/null 2>&1
+import sys
+sys.path.insert(0, """$repo_root""")
 from agent.github_app.settings import load_settings
 
 load_settings()

@@ -61,7 +61,8 @@ class GitHubAppConfigTests(unittest.TestCase):
             root = Path(tmp) / "repository"
             root.mkdir()
             resolved = resolve_repository_path(root, "target/manifest.json")
-            self.assertEqual(resolved, root / "target" / "manifest.json")
+            expected = (root / "target" / "manifest.json").resolve()
+            self.assertEqual(resolved, expected)
 
             with self.assertRaisesRegex(RepositoryConfigError, "repository"):
                 resolve_repository_path(root, "../outside.json")
