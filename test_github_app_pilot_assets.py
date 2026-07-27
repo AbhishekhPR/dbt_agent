@@ -8,6 +8,8 @@ from pathlib import Path
 
 import yaml
 
+from bash_test_support import run_bash
+
 
 ROOT = Path(__file__).resolve().parent
 
@@ -73,14 +75,13 @@ class GitHubAppPilotAssetTests(unittest.TestCase):
                 self.assertTrue(content.startswith("#!/usr/bin/env bash\n"))
                 self.assertIn("set -euo pipefail", content)
                 self.assertIn(required, content)
-                syntax = subprocess.run(
-                    ["bash", "-n", str(path)], capture_output=True, text=True
-                )
+                syntax = run_bash(["-n"], input_text=content)
                 self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
     def test_preflight_accepts_fake_local_credentials_without_printing_them(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             root = Path(temporary)
+            bash_root = root.relative_to(ROOT)
             key_path = root / "pilot-test.private-key.pem"
             key_value = "temporary-test-key-material"
             key_path.write_text(key_value, encoding="utf-8")
@@ -92,24 +93,24 @@ class GitHubAppPilotAssetTests(unittest.TestCase):
                 {
                     "RELIUM_GITHUB_APP_ID": "123",
                     "RELIUM_GITHUB_WEBHOOK_SECRET": "temporary-webhook-secret",
-                    "RELIUM_GITHUB_PRIVATE_KEY_PATH": str(key_path),
-                    "RELIUM_STORAGE_ROOT": str(root / "storage"),
+                    "RELIUM_GITHUB_PRIVATE_KEY_PATH": (
+                        bash_root / key_path.name
+                    ).as_posix(),
+                    "RELIUM_STORAGE_ROOT": (bash_root / "storage").as_posix(),
                     "RELIUM_HOST": "127.0.0.1",
                     "RELIUM_PORT": str(port),
                 }
             )
-            result = subprocess.run(
-                ["bash", "scripts/github_app_pilot_preflight.sh"],
+            result = run_bash(
+                ["scripts/github_app_pilot_preflight.sh"],
                 cwd=ROOT,
                 env=environment,
-                text=True,
-                capture_output=True,
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         combined = result.stdout + result.stderr
         self.assertNotIn(environment["RELIUM_GITHUB_WEBHOOK_SECRET"], combined)
         self.assertNotIn(key_value, combined)
-        self.assertNotIn(str(key_path), combined)
+        self.assertNotIn(environment["RELIUM_GITHUB_PRIVATE_KEY_PATH"], combined)
 
     def test_live_pilot_guide_covers_commands_permissions_and_scenarios(self):
         guide = (ROOT / "docs" / "github-app-live-pilot.md").read_text(
