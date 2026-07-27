@@ -1,8 +1,9 @@
 import pathlib
-import subprocess
 import unittest
 
 import yaml
+
+from bash_test_support import run_bash
 
 
 WORKFLOW = pathlib.Path(".github/workflows/relium-pr-review.yml")
@@ -20,13 +21,7 @@ class GitHubWorkflowTests(unittest.TestCase):
         self.assertTrue(shell_blocks)
         for block in shell_blocks:
             with self.subTest(block=block.splitlines()[0]):
-                result = subprocess.run(
-                    ["bash", "-n"],
-                    input=block,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                )
+                result = run_bash(["-n"], input_text=block)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_workflow_uses_truthful_skip_and_supported_review_path(self):
