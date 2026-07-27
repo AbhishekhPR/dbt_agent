@@ -13,6 +13,7 @@ class GitHubAppConfigTests(unittest.TestCase):
         self.assertTrue(config.enabled)
         self.assertEqual(config.manifest_path, "target/manifest.json")
         self.assertEqual(config.mode, "warn")
+        self.assertEqual(config.enforcement_mode, "shadow")
 
     def test_loads_repository_yaml(self):
         from agent.github_app.config import load_repository_config
@@ -25,6 +26,13 @@ class GitHubAppConfigTests(unittest.TestCase):
         self.assertFalse(config.enabled)
         self.assertEqual(config.manifest_path, "artifacts/manifest.json")
 
+    def test_loads_explicit_enforcement_mode(self):
+        from agent.github_app.config import load_repository_config
+
+        config = load_repository_config("enforcement_mode: enforce\n")
+
+        self.assertEqual(config.enforcement_mode, "enforce")
+
     def test_rejects_unknown_versions_and_invalid_types(self):
         from agent.github_app.config import RepositoryConfigError, load_repository_config
 
@@ -36,6 +44,8 @@ class GitHubAppConfigTests(unittest.TestCase):
             load_repository_config("- version\n- 1\n")
         with self.assertRaisesRegex(RepositoryConfigError, "mode"):
             load_repository_config("mode: enforce\n")
+        with self.assertRaisesRegex(RepositoryConfigError, "enforcement_mode"):
+            load_repository_config("enforcement_mode: block\n")
 
     def test_rejects_absolute_traversal_and_windows_paths(self):
         from agent.github_app.config import RepositoryConfigError, load_repository_config

@@ -128,25 +128,47 @@ def format_compare_last_run_report(result: dict) -> str:
 
 def to_signal(drift_result: dict) -> Signal:
     drift_level = str(drift_result.get("drift_level", "LOW")).upper()
+    neutral = _drift_signal_is_neutral(drift_result, drift_level)
     report_text = drift_result.get("report_text", "")
     reasons = [
         line.strip()
         for line in report_text.splitlines()
         if line.strip()
     ]
-    if not reasons:
+    if not reasons and not neutral:
         reasons = [f"Metadata Drift: {drift_level}"]
+
+    metadata = {
+        field: drift_result.get(field)
+        for field in DRIFT_SIGNAL_METADATA_FIELDS
+    }
+    if drift_result.get("comparison_status") is not None:
+        metadata["comparison_status"] = drift_result.get("comparison_status")
 
     return Signal(
         component="metadata_drift",
         severity=drift_level,
         confidence=DRIFT_SIGNAL_CONFIDENCE.get(drift_level, 75),
-        score=DRIFT_SIGNAL_SCORES.get(drift_level, -5),
-        reasons=reasons,
-        metadata={
-            field: drift_result.get(field)
-            for field in DRIFT_SIGNAL_METADATA_FIELDS
-        },
+        score=0 if neutral else DRIFT_SIGNAL_SCORES.get(drift_level, -5),
+        reasons=[] if neutral else reasons,
+        metadata=metadata,
+    )
+
+
+def _drift_signal_is_neutral(result: dict, drift_level: str) -> bool:
+    status = str(result.get("comparison_status") or "evaluated").casefold()
+    if status in {"unavailable", "skipped", "not_evaluated", "unevaluated"}:
+        return True
+    if drift_level != "LOW":
+        return False
+    return not any(
+        [
+            float(result.get("row_count_change_pct") or 0),
+            float(result.get("null_count_change_pct") or 0),
+            float(result.get("duplicate_count_change_pct") or 0),
+            int(result.get("schema_column_count_change") or 0),
+            bool(result.get("freshness_regressed")),
+        ]
     )
 
 

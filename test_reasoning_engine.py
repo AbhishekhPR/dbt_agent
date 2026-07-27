@@ -58,7 +58,7 @@ class ReasoningEngineTests(unittest.TestCase):
         self.assertIn("90%", report.executive_summary)
         self.assertNotIn("Deployment BLOCK was blocked", report.executive_summary)
         self.assertIn("BLOCK DEPLOYMENT", report.conclusion)
-        self.assertIn("multiple reliability signals", report.conclusion)
+        self.assertIn("material reliability signal", report.conclusion)
 
     def test_warn_decision_executive_summary(self):
         incident = make_incident(
@@ -154,7 +154,10 @@ class ReasoningEngineTests(unittest.TestCase):
         self.assertEqual(len(report.evidence), 1)
         self.assertEqual(
             report.evidence[0].title,
-            "Historical Reliability: Signal detected",
+            (
+                "Historical Reliability: Historical Reliability reduced "
+                "pipeline health by 5 points"
+            ),
         )
         self.assertEqual(
             report.evidence[0].supporting_metadata,

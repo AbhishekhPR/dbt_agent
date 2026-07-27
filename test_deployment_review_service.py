@@ -18,7 +18,7 @@ GROUP BY o.customer_id"""
 
 
 class DeploymentReviewServiceTests(unittest.TestCase):
-    def test_compiled_code_is_preferred_and_reaches_ast_unchanged(self):
+    def test_raw_code_is_preferred_for_customer_authored_ast_analysis(self):
         manifest = _manifest(
             compiled_code=RISKY_SQL,
             raw_code="select 1 as raw_value",
@@ -28,11 +28,11 @@ class DeploymentReviewServiceTests(unittest.TestCase):
         with patch("agent.pr_analysis.run_ast_analysis", wraps=run_ast_analysis) as analyzer:
             result = _review(manifest)
 
-        analyzer.assert_called_once_with(RISKY_SQL, "fct_revenue")
-        self.assertEqual(result["sql_sources"][0]["sql_source"], "compiled_code")
+        analyzer.assert_called_once_with("select 1 as raw_value", "fct_revenue")
+        self.assertEqual(result["sql_sources"][0]["sql_source"], "raw_code")
         self.assertEqual(result["sql_sources"][0]["ast_status"], "evaluated")
         self.assertIn("ast", result["incident"]["signal_components"])
-        self.assertIn("LEFT JOIN", " ".join(result["incident"]["top_reasons"]))
+        self.assertNotIn("LEFT JOIN", " ".join(result["incident"]["top_reasons"]))
 
     def test_raw_code_is_used_when_compiled_code_is_blank(self):
         raw_sql = "select customer_id from raw_customers"
@@ -108,24 +108,97 @@ class DeploymentReviewServiceTests(unittest.TestCase):
         self.assertIn("markdown", first["rendered"])
         json.dumps(first, sort_keys=True)
 
+    def test_comment_only_model_change_is_allow(self):
+        result = _review(
+            _manifest(
+                model_name="dim_calendar",
+                columns=["date_day"],
+                raw_code=(
+                    "-- Explain why this projection is intentionally narrow.\n"
+                    "select date_day from raw_dates"
+                ),
+                compiled_code="select date_day from raw_dates",
+            )
+        )
+
+        self.assertEqual(result["decision"], "ALLOW")
+        self.assertEqual(result["incident"]["health"], 100)
+        self.assertEqual(result["incident"]["top_reasons"], [])
+        self.assertIn(
+            "No material deployment risks detected.",
+            result["rendered"]["markdown"],
+        )
+
+    def test_macro_expansion_findings_are_not_attributed_to_customer_sql(self):
+        raw_sql = "{{ dbt_date.get_base_dates(n_dateparts=30, datepart='day') }}"
+        generated_sql = (
+            "select *, amount / denominator as ratio "
+            "from generated_date_spine where status != 'cancelled'"
+        )
+        manifest = _manifest(
+            model_name="dim_calendar",
+            columns=["date_day"],
+            raw_code=raw_sql,
+            compiled_code=generated_sql,
+        )
+
+        with patch("agent.pr_analysis.run_ast_analysis", wraps=run_ast_analysis) as analyzer:
+            result = _review(manifest)
+
+        analyzer.assert_called_once_with(raw_sql, "dim_calendar")
+        self.assertEqual(result["decision"], "ALLOW")
+        rendered = json.dumps(result)
+        self.assertNotIn("Division without a zero-safe guard", rendered)
+        self.assertNotIn("Not-equal filter may silently exclude NULL rows", rendered)
+
+    def test_customer_authored_division_and_null_filter_block(self):
+        risky_raw_sql = (
+            "select amount / denominator as ratio "
+            "from raw_orders where status != 'cancelled'"
+        )
+
+        result = _review(
+            _manifest(
+                raw_code=risky_raw_sql,
+                compiled_code=risky_raw_sql,
+            )
+        )
+
+        self.assertEqual(result["decision"], "BLOCK")
+        self.assertLess(result["incident"]["health"], 70)
+        reasons = " ".join(result["incident"]["top_reasons"])
+        self.assertIn("zero", reasons.lower())
+        self.assertIn("NULL", reasons)
+
 
 def _review(manifest):
+    model = next(iter(manifest["nodes"].values()))
     return review_manifest_change(
         manifest=manifest,
-        changed_files=["models/marts/fct_revenue.sql"],
+        changed_files=[model["original_file_path"]],
         deployment_id="deploy-1",
     )
 
 
-def _manifest(*, compiled_code=None, raw_code=None, sql=None):
+def _manifest(
+    *,
+    compiled_code=None,
+    raw_code=None,
+    sql=None,
+    model_name="fct_revenue",
+    columns=None,
+):
+    columns = list(columns or ["customer_id", "revenue"])
+    unique_id = f"model.analytics.{model_name}"
+    original_file_path = f"models/marts/{model_name}.sql"
     model = {
         "resource_type": "model",
-        "name": "fct_revenue",
-        "unique_id": "model.analytics.fct_revenue",
-        "original_file_path": "models/marts/fct_revenue.sql",
+        "name": model_name,
+        "unique_id": unique_id,
+        "original_file_path": original_file_path,
         "columns": {
-            "customer_id": {"name": "customer_id"},
-            "revenue": {"name": "revenue"},
+            column: {"name": column}
+            for column in columns
         },
     }
     if compiled_code is not None:
@@ -136,7 +209,7 @@ def _manifest(*, compiled_code=None, raw_code=None, sql=None):
         model["sql"] = sql
     return {
         "metadata": {"project_name": "analytics", "dbt_version": "1.8.0"},
-        "nodes": {"model.analytics.fct_revenue": model},
+        "nodes": {unique_id: model},
     }
 
 

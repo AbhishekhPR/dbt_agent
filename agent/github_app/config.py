@@ -7,7 +7,9 @@ import yaml
 
 
 DEFAULT_MANIFEST_PATH = "target/manifest.json"
-_ALLOWED_KEYS = frozenset({"version", "enabled", "manifest_path", "mode"})
+_ALLOWED_KEYS = frozenset(
+    {"version", "enabled", "manifest_path", "mode", "enforcement_mode"}
+)
 
 
 class RepositoryConfigError(ValueError):
@@ -36,6 +38,7 @@ class RepositoryConfig:
     enabled: bool = True
     manifest_path: str = DEFAULT_MANIFEST_PATH
     mode: str = "warn"
+    enforcement_mode: str = "shadow"
 
 
 def load_repository_config(content) -> RepositoryConfig:
@@ -79,8 +82,17 @@ def load_repository_config(content) -> RepositoryConfig:
     mode = values.get("mode", "warn")
     if mode not in {"warn", "block"}:
         raise RepositoryConfigError("Repository config mode must be warn or block.")
+    enforcement_mode = values.get("enforcement_mode", "shadow")
+    if enforcement_mode not in {"shadow", "enforce"}:
+        raise RepositoryConfigError(
+            "Repository config enforcement_mode must be shadow or enforce."
+        )
     return RepositoryConfig(
-        version=version, enabled=enabled, manifest_path=manifest_path, mode=mode
+        version=version,
+        enabled=enabled,
+        manifest_path=manifest_path,
+        mode=mode,
+        enforcement_mode=enforcement_mode,
     )
 
 

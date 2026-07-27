@@ -121,7 +121,7 @@ class BlastRadiusTests(unittest.TestCase):
         self.assertIn("Downstream models affected", signal.reasons)
         self.assertIn("Executive dashboard affected", signal.reasons)
 
-    def test_to_signal_converts_low_blast_radius_to_low_signal(self):
+    def test_to_signal_treats_no_downstream_models_as_neutral(self):
         from agent.blast_radius import to_signal
         from agent.signals import Severity
 
@@ -138,7 +138,31 @@ class BlastRadiusTests(unittest.TestCase):
         self.assertEqual(signal.component, "blast_radius")
         self.assertEqual(signal.severity, Severity.LOW)
         self.assertEqual(signal.confidence, 75)
+        self.assertEqual(signal.score, 0)
+        self.assertEqual(signal.reasons, [])
+
+    def test_to_signal_preserves_a_genuine_low_blast_radius_finding(self):
+        from agent.blast_radius import to_signal
+        from agent.signals import Severity
+
+        signal = to_signal(
+            {
+                "changed_table": "raw_customers",
+                "risk_level": "LOW",
+                "directly_affected": [
+                    {
+                        "model": "dim_customers",
+                        "risk": "low",
+                    }
+                ],
+                "indirectly_affected": [],
+                "total_affected": 1,
+            }
+        )
+
+        self.assertEqual(signal.severity, Severity.LOW)
         self.assertEqual(signal.score, -5)
+        self.assertEqual(signal.reasons, ["Downstream models affected"])
 
     def test_to_signal_preserves_affected_models(self):
         from agent.blast_radius import to_signal

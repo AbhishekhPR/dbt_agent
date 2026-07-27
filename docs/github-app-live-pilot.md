@@ -138,6 +138,7 @@ Use this minimal `relium.yml`:
 ```yaml
 manifest_path: target/manifest.json
 mode: warn
+enforcement_mode: shadow
 enabled: true
 ```
 
@@ -159,6 +160,10 @@ Delivery state is stored under `RELIUM_STORAGE_ROOT/<repository-id>/deliveries/`
 | 4. Re-delivered webhook | `202 accepted` | No duplicate comment or publication | No additional check run | Existing completed delivery claim is preserved |
 | 5. BLOCK result in warn mode | `202 accepted` | Review shows the BLOCK decision and evidence | `neutral`, so it does not block merging | Delivery becomes `complete` |
 | 6. BLOCK result in block mode | `202 accepted` | Review shows the BLOCK decision and evidence | `failure` | Delivery becomes `complete` |
+
+`enforcement_mode` controls the workflow exit code. `shadow` is the safe default:
+ALLOW, WARN, and BLOCK remain advisory and exit zero. With `enforce`, BLOCK exits
+nonzero while ALLOW and WARN still exit zero.
 
 For scenario 6, change only `mode: warn` to `mode: block` in the test repository's
 `relium.yml`, then open or synchronize a new test pull request. Do not change

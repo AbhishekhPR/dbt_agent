@@ -11,6 +11,7 @@ from agent.evidence_curation import (
 )
 from agent.incident import Incident
 from agent.reasoning_engine import build_reasoning_report
+from agent.redaction import redact_sensitive_data, redact_text
 
 
 def _enum_value(value: Any) -> Any:
@@ -341,6 +342,8 @@ def render_cli(incident: Incident) -> str:
     outcome_memory_lines = _outcome_memory_lines(incident)
     column_lineage_lines = _column_lineage_lines(incident)
     assumption_verification_lines = _assumption_verification_lines(incident)
+    top_reasons = _top_reasons(incident)
+    clean_allow = _is_clean_allow(incident, top_reasons)
     lines = [
         "Relium Deployment Decision",
         "",
@@ -348,17 +351,27 @@ def render_cli(incident: Incident) -> str:
         f"Deployment Decision: {_decision_label(incident.decision)}",
         f"Severity: {_enum_value(incident.severity)}",
         f"Confidence: {_confidence_text(incident.confidence)}",
-        "",
-        f"Primary Root Cause: {_display_text(incident.root_cause or 'None')}",
-        "",
-        "Top Reasons:",
-        *_bullet_list(_top_reasons(incident)),
+    ]
+    if clean_allow:
+        lines.extend([
+            "",
+            "No material deployment risks detected.",
+        ])
+    else:
+        lines.extend([
+            "",
+            f"Primary Root Cause: {_display_text(_display_root_cause(incident, top_reasons))}",
+            "",
+            "Top Reasons:",
+            *_bullet_list(top_reasons),
+        ])
+    lines.extend([
         "",
         f"Recommendation: {_display_text(incident.recommendation or 'None')}",
         "",
         "Signals Considered:",
         *_bullet_list([signal.component for signal in incident.signals]),
-    ]
+    ])
 
     if outcome_memory_lines:
         lines.extend([
@@ -429,6 +442,8 @@ def render_markdown(incident: Incident) -> str:
     outcome_memory_lines = _outcome_memory_lines(incident)
     column_lineage_lines = _column_lineage_lines(incident)
     assumption_verification_lines = _assumption_verification_lines(incident)
+    top_reasons = _top_reasons(incident)
+    clean_allow = _is_clean_allow(incident, top_reasons)
     lines = [
         "# Relium Deployment Decision",
         "",
@@ -443,19 +458,30 @@ def render_markdown(incident: Incident) -> str:
         "",
         "## Confidence",
         _confidence_text(incident.confidence),
-        "",
-        "## Primary Root Cause",
-        _display_text(incident.root_cause or "None"),
-        "",
-        "## Top Reasons",
-        *_bullet_list(_top_reasons(incident)),
+    ]
+    if clean_allow:
+        lines.extend([
+            "",
+            "## Review Summary",
+            "No material deployment risks detected.",
+        ])
+    else:
+        lines.extend([
+            "",
+            "## Primary Root Cause",
+            _display_text(_display_root_cause(incident, top_reasons)),
+            "",
+            "## Top Reasons",
+            *_bullet_list(top_reasons),
+        ])
+    lines.extend([
         "",
         "## Recommendation",
         _display_text(incident.recommendation or "None"),
         "",
         "## Signals Considered",
         *_bullet_list([signal.component for signal in incident.signals]),
-    ]
+    ])
 
     if outcome_memory_lines:
         lines.extend([
@@ -658,21 +684,32 @@ def _backtest_action(decision: Any) -> str:
 
 
 def render_json(incident: Incident) -> dict:
+    top_reasons = _top_reasons(incident)
+    clean_allow = _is_clean_allow(incident, top_reasons)
     return {
         "incident_id": incident.incident_id,
         "health": incident.health,
         "decision": _enum_value(incident.decision),
         "severity": _enum_value(incident.severity),
         "confidence": incident.confidence,
-        "root_cause": incident.root_cause,
-        "recommendation": incident.recommendation,
+        "root_cause": (
+            ""
+            if clean_allow
+            else redact_text(_display_root_cause(incident, top_reasons))
+        ),
+        "summary": (
+            "No material deployment risks detected."
+            if clean_allow
+            else redact_text(_display_root_cause(incident, top_reasons))
+        ),
+        "recommendation": redact_text(incident.recommendation),
         "signal_count": len(incident.signals),
         "signal_components": [
             signal.component for signal in incident.signals
         ],
-        "top_reasons": _top_reasons(incident),
+        "top_reasons": redact_sensitive_data(top_reasons),
         "affected_models": list(incident.affected_models),
-        "metadata": _serialize(dict(incident.metadata)),
+        "metadata": redact_sensitive_data(_serialize(dict(incident.metadata))),
     }
 
 
@@ -716,7 +753,23 @@ def _decision_label(decision: Any) -> str:
 
 
 def _display_text(value: Any) -> str:
-    text = str(value)
+    text = redact_text(value)
     text = re.sub(r"(?<=[.!?])(?=[A-Z])", " ", text)
     text = re.sub(r"(?<=[A-Za-z])(?=with\b)", " ", text)
     return re.sub(r"[ \t]+", " ", text).strip()
+
+
+def _is_clean_allow(incident: Incident, top_reasons: list[str]) -> bool:
+    return (
+        _enum_value(incident.decision) == DeploymentDecision.ALLOW.value
+        and not top_reasons
+    )
+
+
+def _display_root_cause(incident: Incident, top_reasons: list[str]) -> str:
+    if top_reasons:
+        cleaned_root = str(incident.root_cause or "").strip()
+        if cleaned_root and cleaned_root in top_reasons:
+            return cleaned_root
+        return top_reasons[0]
+    return str(incident.root_cause or "Material deployment risk detected.")

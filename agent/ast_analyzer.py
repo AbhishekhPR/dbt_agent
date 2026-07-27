@@ -110,8 +110,6 @@ def to_signal(report: dict[str, Any]) -> Signal:
         bug.get("description") or bug.get("category") or "SQL logic risk detected"
         for bug in bugs
     ]
-    if not reasons and risk in {"clean", "low"}:
-        reasons = ["No SQL logic risks detected"]
     return Signal(
         component="ast",
         severity=severity,

@@ -18,8 +18,8 @@ def make_incident(
     health=42,
     severity=Severity.CRITICAL,
     confidence=91,
-    root_cause="LEFT JOIN nullification detected",
-    recommendation="Move right-side filters into JOIN clauses.",
+    root_cause="Cross join detected",
+    recommendation="Add an explicit join condition.",
     affected_models=None,
     signals=None,
 ):
@@ -109,12 +109,12 @@ class GithubPrGuardTests(unittest.TestCase):
         self.assertEqual(review["highest_severity"], "CRITICAL")
         self.assertEqual(
             review["primary_root_cause"],
-            "LEFT JOIN nullification detected",
+            "Cross join detected",
         )
         self.assertIn("Deployment is blocked because", review["executive_summary"])
         self.assertEqual(
             review["recommendation"],
-            "Move right-side filters into JOIN clauses.",
+            "Add an explicit join condition.",
         )
         self.assertEqual(review["models_reviewed"], 2)
         self.assertEqual(
@@ -163,6 +163,10 @@ class GithubPrGuardTests(unittest.TestCase):
         self.assertEqual(review["models_reviewed"], 1)
         self.assertIn("Deployment is allowed", review["executive_summary"])
         self.assertEqual(review["evidence"], [])
+
+        markdown = render_pr_review_markdown(review)
+        self.assertNotIn("Primary Root Cause", markdown)
+        self.assertIn("No material deployment risks detected.", markdown)
 
     def test_multiple_models_are_counted_correctly(self):
         incident = make_incident(
@@ -258,8 +262,8 @@ class GithubPrGuardTests(unittest.TestCase):
 
         self.assertIn("**Deployment Decision:** BLOCK", markdown)
         self.assertIn("Deployment is blocked because", markdown)
-        self.assertIn("LEFT JOIN nullification detected", markdown)
-        self.assertIn("Move right-side filters into JOIN clauses.", markdown)
+        self.assertIn("Cross join detected", markdown)
+        self.assertIn("Add an explicit join condition.", markdown)
 
     def test_warn_and_allow_markdown_render_correctly(self):
         warn = render_pr_review_markdown(

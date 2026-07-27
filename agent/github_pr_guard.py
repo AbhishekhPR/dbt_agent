@@ -1,9 +1,10 @@
 from enum import Enum
 from typing import Any
 
-from agent.evidence_curation import order_semantic_diff_reasons
+from agent.evidence_curation import curate_reasons, order_semantic_diff_reasons
 from agent.incident import Incident
 from agent.reasoning_engine import build_reasoning_report
+from agent.redaction import redact_sensitive_data, redact_text
 
 
 REVIEW_TITLE = "Relium AI Deployment Review"
@@ -11,6 +12,7 @@ REVIEW_TITLE = "Relium AI Deployment Review"
 
 def build_pr_review(incident: Incident) -> dict[str, Any]:
     reasoning = build_reasoning_report(incident)
+    material_reasons = curate_reasons(incident.signals)
     model_names = _model_names(incident)
     business_metrics = _business_metrics(incident)
     historical_semantic_change = _historical_semantic_change(incident)
@@ -26,19 +28,23 @@ def build_pr_review(incident: Incident) -> dict[str, Any]:
         "models_reviewed": len(model_names),
         "model_names": model_names,
         "highest_severity": _enum_value(incident.severity),
-        "primary_root_cause": incident.root_cause,
-        "executive_summary": reasoning.executive_summary,
+        "primary_root_cause": redact_text(
+            _material_root_cause(incident.root_cause, material_reasons)
+        ),
+        "executive_summary": redact_text(reasoning.executive_summary),
         "evidence": [
             {
-                "title": item.title,
-                "explanation": item.explanation,
+                "title": redact_text(item.title),
+                "explanation": redact_text(item.explanation),
                 "severity": item.severity,
                 "confidence": item.confidence,
-                "supporting_metadata": _serialize(dict(item.supporting_metadata)),
+                "supporting_metadata": redact_sensitive_data(
+                    _serialize(dict(item.supporting_metadata))
+                ),
             }
             for item in reasoning.evidence
         ],
-        "recommendation": reasoning.recommendation,
+        "recommendation": redact_text(reasoning.recommendation),
         "business_metrics": business_metrics,
         "business_metric_keys": _business_metric_keys(incident),
         "signals_considered": [
@@ -47,8 +53,8 @@ def build_pr_review(incident: Incident) -> dict[str, Any]:
                 "severity": _enum_value(signal.severity),
                 "confidence": signal.confidence,
                 "score": signal.score,
-                "reasons": list(signal.reasons),
-                "metadata": _serialize(dict(signal.metadata)),
+                "reasons": redact_sensitive_data(list(signal.reasons)),
+                "metadata": redact_sensitive_data(_serialize(dict(signal.metadata))),
             }
             for signal in incident.signals
         ],
@@ -59,39 +65,51 @@ def build_pr_review(incident: Incident) -> dict[str, Any]:
 
 
 def render_pr_review_markdown(review: dict) -> str:
-    return "\n".join(
-        [
-            "## Relium AI Deployment Review",
+    lines = [
+        "## Relium AI Deployment Review",
+        "",
+        f"**Deployment Decision:** {_review_text(review, 'deployment_decision')}",
+        f"**Pipeline Health:** {_review_text(review, 'pipeline_health')}",
+        f"**Confidence:** {_review_text(review, 'confidence')}",
+        f"**Models Reviewed:** {_review_text(review, 'models_reviewed')}",
+        f"**Highest Severity:** {_review_text(review, 'highest_severity')}",
+    ]
+    if (
+        _review_text(review, "deployment_decision") == "ALLOW"
+        and not review.get("evidence")
+    ):
+        lines.extend([
             "",
-            f"**Deployment Decision:** {_review_text(review, 'deployment_decision')}",
-            f"**Pipeline Health:** {_review_text(review, 'pipeline_health')}",
-            f"**Confidence:** {_review_text(review, 'confidence')}",
-            f"**Models Reviewed:** {_review_text(review, 'models_reviewed')}",
-            f"**Highest Severity:** {_review_text(review, 'highest_severity')}",
+            "No material deployment risks detected.",
+        ])
+    else:
+        lines.extend([
             "",
             "### Primary Root Cause",
             _review_text(review, "primary_root_cause", "None"),
-            "",
-            "### Executive Summary",
-            _review_text(review, "executive_summary", "None"),
-            "",
-            "### Evidence",
-            *_evidence_lines(review.get("evidence", [])),
-            "",
-            "### Recommendation",
-            _review_text(review, "recommendation", "None"),
-            "",
-            *_business_metric_section(
-                review.get("business_metrics", []),
-                review.get("business_metric_keys", []),
-            ),
-            *_historical_semantic_change_section(
-                review.get("historical_semantic_change"),
-            ),
-            "### Signals Considered",
-            *_signal_lines(review.get("signals_considered", [])),
-        ]
-    )
+        ])
+    lines.extend([
+        "",
+        "### Executive Summary",
+        _review_text(review, "executive_summary", "None"),
+        "",
+        "### Evidence",
+        *_evidence_lines(review.get("evidence", [])),
+        "",
+        "### Recommendation",
+        _review_text(review, "recommendation", "None"),
+        "",
+        *_business_metric_section(
+            review.get("business_metrics", []),
+            review.get("business_metric_keys", []),
+        ),
+        *_historical_semantic_change_section(
+            review.get("historical_semantic_change"),
+        ),
+        "### Signals Considered",
+        *_signal_lines(review.get("signals_considered", [])),
+    ])
+    return "\n".join(lines)
 
 
 def _business_metric_section(lines: list[str], metric_keys: list[str]) -> list[str]:
@@ -244,6 +262,13 @@ def _model_names(incident: Incident) -> list[str]:
     for signal in incident.signals:
         _append_unique(names, signal.metadata.get("model_name"))
     return names
+
+
+def _material_root_cause(root_cause: Any, material_reasons: list[str]) -> str:
+    root = str(root_cause or "").strip()
+    if root and root in material_reasons:
+        return root
+    return material_reasons[0] if material_reasons else ""
 
 
 def _evidence_lines(evidence: list[dict]) -> list[str]:

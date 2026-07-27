@@ -90,6 +90,11 @@ jobs:
           fi
 
           mapfile -t changed_files < changed_files.txt
+          enforcement_mode="shadow"
+          if [ -f relium.yml ]; then
+            enforcement_mode="$(python -c 'from pathlib import Path; from agent.github_app.config import load_repository_config; print(load_repository_config(Path("relium.yml").read_bytes()).enforcement_mode)')"
+          fi
+          echo "Relium enforcement mode: $enforcement_mode"
 
           if [ "${#changed_files[@]}" -eq 0 ]; then
             cat > relium-review.md <<'EOF'
@@ -107,6 +112,7 @@ jobs:
             --dbt-manifest target/manifest.json
             --history-path .relium/deployment_history.json
             --deployment-id "pr-${{ github.event.pull_request.number }}-${{ github.sha }}"
+            --enforcement-mode "$enforcement_mode"
             --format markdown
             --output relium-review.md
           )

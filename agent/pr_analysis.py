@@ -263,11 +263,7 @@ def _metadata_signal(model_spec: Any, model_name: str) -> Signal:
         return metadata_checks_to_signal(
             {
                 "model_name": model_name,
-                "row_count": 1,
-                "null_count": 0,
-                "duplicate_count": 0,
-                "freshness_timestamp": "not_evaluated",
-                "schema_column_count": 0,
+                "evaluation_status": "not_evaluated",
                 "anomalies": [],
             }
         )
@@ -290,13 +286,9 @@ def _drift_signal(model_spec: Any, model_name: str) -> Signal:
         drift_result = {
             "project_name": _value(model_spec, "project_name"),
             "model_name": model_name,
-            "row_count_change_pct": 0.0,
-            "null_count_change_pct": 0.0,
-            "duplicate_count_change_pct": 0.0,
-            "schema_column_count_change": 0,
-            "freshness_regressed": False,
+            "comparison_status": "unavailable",
             "drift_level": "LOW",
-            "report_text": "Metadata Drift: LOW",
+            "report_text": "Metadata drift was not evaluated.",
         }
     return metadata_drift_to_signal(drift_result)
 

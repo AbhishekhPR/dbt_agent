@@ -116,21 +116,25 @@ def to_signal(
 ) -> Signal:
     result = _metadata_result_as_dict(metadata_result)
     severity = _metadata_signal_severity(result, safe_to_continue)
+    neutral = _metadata_signal_is_neutral(result, severity)
+    metadata = {
+        "row_count": result.get("row_count"),
+        "null_count": result.get("null_count"),
+        "duplicate_count": result.get("duplicate_count"),
+        "freshness_timestamp": result.get("freshness_timestamp"),
+        "schema_columns": result.get("schema_column_count"),
+        "safe_to_continue": safe_to_continue,
+    }
+    if result.get("evaluation_status") is not None:
+        metadata["evaluation_status"] = result.get("evaluation_status")
 
     return Signal(
         component="metadata_checks",
         severity=severity,
         confidence=METADATA_CHECK_SIGNAL_CONFIDENCE[severity],
-        score=METADATA_CHECK_SIGNAL_SCORES[severity],
-        reasons=_metadata_signal_reasons(result),
-        metadata={
-            "row_count": result.get("row_count"),
-            "null_count": result.get("null_count"),
-            "duplicate_count": result.get("duplicate_count"),
-            "freshness_timestamp": result.get("freshness_timestamp"),
-            "schema_columns": result.get("schema_column_count"),
-            "safe_to_continue": safe_to_continue,
-        },
+        score=0 if neutral else METADATA_CHECK_SIGNAL_SCORES[severity],
+        reasons=[] if neutral else _metadata_signal_reasons(result),
+        metadata=metadata,
     )
 
 
@@ -172,3 +176,10 @@ def _metadata_signal_reasons(result: dict) -> list[str]:
     if result.get("schema_column_count_change"):
         reasons.append("Schema column count changed")
     return reasons or list(result.get("anomalies", []))
+
+
+def _metadata_signal_is_neutral(result: dict, severity: str) -> bool:
+    status = str(result.get("evaluation_status") or "evaluated").casefold()
+    if status in {"unavailable", "skipped", "not_evaluated", "unevaluated"}:
+        return True
+    return severity == "LOW" and not list(result.get("anomalies") or [])

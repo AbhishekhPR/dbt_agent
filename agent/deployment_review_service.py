@@ -155,7 +155,7 @@ def _hydrate_model_specs(
 
 
 def _select_sql(model: dict) -> tuple[str | None, str]:
-    for field_name in ("compiled_code", "raw_code", "sql"):
+    for field_name in ("raw_code", "sql", "compiled_code"):
         value = model.get(field_name)
         if isinstance(value, str) and value.strip():
             return value, field_name

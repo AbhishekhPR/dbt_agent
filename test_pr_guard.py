@@ -164,6 +164,77 @@ class RunPrGuardTests(unittest.TestCase):
         self.assertFalse(status["posted"])
         self.assertEqual(status["reason"], "missing_environment")
 
+    def test_compact_comment_includes_decision_health_findings_and_remediation(self):
+        from agent.pr_guard import render_pr_comment
+
+        report = {
+            "decision": "BLOCK",
+            "health": 65,
+            "highest_severity": "high",
+            "fail_on": "high",
+            "model_reports": [
+                {
+                    "model_name": "fct_orders",
+                    "bugs": [
+                        {
+                            "category": "Division without a zero-safe guard",
+                            "description": "Division can fail.",
+                            "recommendation": "Wrap the denominator in NULLIF.",
+                        },
+                        {
+                            "category": "Not-equal filter may exclude NULL rows",
+                            "description": "NULL rows can disappear.",
+                            "recommendation": "Add an explicit NULL guard.",
+                        },
+                    ],
+                }
+            ],
+        }
+
+        comment = render_pr_comment(report)
+
+        self.assertIn("Decision: **BLOCK**", comment)
+        self.assertIn("Health: **65 / 100**", comment)
+        self.assertIn("Severity: **high**", comment)
+        self.assertIn("Affected model: **fct_orders**", comment)
+        self.assertIn("Division without a zero-safe guard", comment)
+        self.assertIn("Wrap the denominator in NULLIF.", comment)
+        self.assertIn("Not-equal filter may exclude NULL rows", comment)
+        self.assertIn("Add an explicit NULL guard.", comment)
+
+    def test_compact_comment_limits_findings_and_redacts_secrets(self):
+        from agent.pr_guard import render_pr_comment
+
+        secret = "compact-comment-secret-456"
+        report = {
+            "decision": "BLOCK",
+            "health": 20,
+            "highest_severity": "critical",
+            "model_reports": [
+                {
+                    "model_name": "fct_orders",
+                    "bugs": [
+                        {
+                            "category": f"Finding {index}",
+                            "recommendation": (
+                                f"Remove token={secret}"
+                                if index == 1
+                                else f"Fix finding {index}"
+                            ),
+                        }
+                        for index in range(1, 6)
+                    ],
+                }
+            ],
+        }
+
+        comment = render_pr_comment(report)
+
+        self.assertNotIn(secret, comment)
+        self.assertIn("[REDACTED]", comment)
+        self.assertIn("Finding 3", comment)
+        self.assertNotIn("Finding 4", comment)
+
 
 def _invoke(args):
     stdout = io.StringIO()

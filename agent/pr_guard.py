@@ -12,6 +12,7 @@ from typing import Any
 from agent.ast_analyzer import run_ast_analysis
 from agent.blast_radius import calculate_blast_radius
 from agent.logging_config import get_logger
+from agent.redaction import redact_text
 
 
 logger = get_logger(__name__)
@@ -24,6 +25,15 @@ SEVERITY_ORDER = {
     "medium": 2,
     "high": 3,
     "critical": 4,
+}
+
+SEVERITY_HEALTH_SCORES = {
+    "clean": 0,
+    "info": 0,
+    "low": -5,
+    "medium": -15,
+    "high": -35,
+    "critical": -50,
 }
 
 
@@ -52,12 +62,28 @@ def run_pr_guard(
 
     highest_severity = _highest_severity(model_reports)
     exit_code = _exit_code(highest_severity, fail_on)
+    health = max(
+        0,
+        min(
+            100,
+            100
+            + sum(
+                SEVERITY_HEALTH_SCORES.get(
+                    str(model.get("overall_risk", "clean")).lower(),
+                    0,
+                )
+                for model in model_reports
+            ),
+        ),
+    )
 
     result: dict[str, Any] = {
         "project_path": str(project),
         "models_scanned": len(model_reports),
         "changed_files_provided": bool(changed_files),
         "highest_severity": highest_severity,
+        "decision": _decision_for_severity(highest_severity),
+        "health": health,
         "fail_on": fail_on.lower(),
         "passed": exit_code == 0,
         "exit_code": exit_code,
@@ -117,26 +143,59 @@ def render_markdown_report(report: dict[str, Any]) -> str:
 
 
 def render_pr_comment(report: dict[str, Any]) -> str:
-    status = "PASSED" if report.get("passed") else "FAILED"
+    decision = str(
+        report.get("decision")
+        or _decision_for_severity(str(report.get("highest_severity", "clean")))
+    )
     lines = [
-        f"### Relium PR Guard — {status}",
+        f"### Relium PR Guard — {decision}",
         "",
-        f"Highest severity: **{report.get('highest_severity', 'clean')}** "
-        f"(fail-on: {report.get('fail_on', 'high')})",
+        f"Decision: **{redact_text(decision)}**  ",
+        f"Health: **{report.get('health', 100)} / 100**  ",
+        f"Severity: **{redact_text(report.get('highest_severity', 'clean'))}**",
         "",
     ]
-    flagged = [
-        model_report
-        for model_report in (report.get("model_reports") or [])
-        if model_report.get("bugs")
-    ]
-    if not flagged:
-        lines.append("No issues found.")
+    findings = _compact_findings(report)
+    if not findings:
+        lines.append("No material deployment risks detected.")
         return "\n".join(lines)
 
-    for model_report in flagged:
-        lines.append(f"- **{model_report.get('model_name')}**: {model_report.get('summary')}")
+    current_model = None
+    for finding in findings:
+        model_name = redact_text(finding["model_name"])
+        if model_name != current_model:
+            lines.append(f"- Affected model: **{model_name}**")
+            current_model = model_name
+        lines.append(
+            f"  - **{redact_text(finding['title'])}** — "
+            f"{redact_text(finding['remediation'])}"
+        )
     return "\n".join(lines)
+
+
+def _compact_findings(report: dict[str, Any], limit: int = 3) -> list[dict[str, str]]:
+    findings = []
+    for model_report in report.get("model_reports") or []:
+        model_name = str(model_report.get("model_name") or "unknown model")
+        for bug in model_report.get("bugs") or []:
+            findings.append(
+                {
+                    "model_name": model_name,
+                    "title": str(
+                        bug.get("category")
+                        or bug.get("description")
+                        or "SQL risk detected"
+                    ),
+                    "remediation": str(
+                        bug.get("recommendation")
+                        or bug.get("fix")
+                        or "Review and correct the affected SQL."
+                    ),
+                }
+            )
+            if len(findings) >= limit:
+                return findings
+    return findings
 
 
 def _model_section_lines(model_report: dict[str, Any]) -> list[str]:
@@ -214,6 +273,15 @@ def _exit_code(highest_severity: str, fail_on: str) -> int:
     threshold = SEVERITY_ORDER.get(fail_on.lower(), SEVERITY_ORDER["high"])
     found = SEVERITY_ORDER.get(highest_severity, 0)
     return 1 if found >= threshold else 0
+
+
+def _decision_for_severity(highest_severity: str) -> str:
+    severity = str(highest_severity or "clean").lower()
+    if severity in {"high", "critical"}:
+        return "BLOCK"
+    if severity == "medium":
+        return "WARN"
+    return "ALLOW"
 
 
 def _github_comment_status() -> dict[str, Any]:

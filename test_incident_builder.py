@@ -56,6 +56,40 @@ class IncidentBuilderTests(unittest.TestCase):
 
         self.assertEqual(incident.root_cause, "High-risk AST finding")
 
+    def test_neutral_diagnostic_reason_cannot_become_root_cause(self):
+        neutral = Signal(
+            component="metadata_drift",
+            severity=Severity.LOW,
+            confidence=75,
+            score=0,
+            reasons=["Metadata drift was not evaluated"],
+        )
+        contributing = Signal(
+            component="ast",
+            severity=Severity.MEDIUM,
+            confidence=90,
+            score=-15,
+            reasons=["Hardcoded date literal in filter"],
+        )
+
+        incident = build_incident(evaluate([neutral, contributing]))
+
+        self.assertEqual(incident.root_cause, "Hardcoded date literal in filter")
+
+    def test_clean_allow_has_no_root_cause(self):
+        neutral = Signal(
+            component="ast",
+            severity=Severity.LOW,
+            confidence=75,
+            score=0,
+            reasons=["No SQL logic risks detected"],
+        )
+
+        incident = build_incident(evaluate([neutral]))
+
+        self.assertEqual(incident.decision, DeploymentDecision.ALLOW)
+        self.assertEqual(incident.root_cause, "")
+
     def test_semantic_diff_reason_becomes_primary_root_cause_when_present(self):
         semantic_diff = Signal(
             component="semantic_diff",

@@ -681,6 +681,72 @@ class CliTests(unittest.TestCase):
         self.assertEqual(snapshots, [])
         self.assertNotIn("Saved Snapshot:", output)
 
+    def test_review_deployment_shadow_mode_keeps_block_advisory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = _write_project_context(tmp)
+            with patch(
+                "agent.deployment_lifecycle.analyze_pr_with_history",
+                side_effect=_fake_analyzer(decision=DeploymentDecision.BLOCK),
+            ):
+                result, output = _invoke(
+                    [
+                        "review-deployment",
+                        "--project-context",
+                        str(context_path),
+                        "--changed-model",
+                        "stg_orders",
+                        "--enforcement-mode",
+                        "shadow",
+                    ]
+                )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("Deployment Decision: BLOCK DEPLOYMENT", output)
+
+    def test_review_deployment_enforce_mode_fails_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = _write_project_context(tmp)
+            with patch(
+                "agent.deployment_lifecycle.analyze_pr_with_history",
+                side_effect=_fake_analyzer(decision=DeploymentDecision.BLOCK),
+            ):
+                result, output = _invoke(
+                    [
+                        "review-deployment",
+                        "--project-context",
+                        str(context_path),
+                        "--changed-model",
+                        "stg_orders",
+                        "--enforcement-mode",
+                        "enforce",
+                    ]
+                )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("Deployment Decision: BLOCK DEPLOYMENT", output)
+
+    def test_review_deployment_enforce_mode_keeps_warn_advisory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = _write_project_context(tmp)
+            with patch(
+                "agent.deployment_lifecycle.analyze_pr_with_history",
+                side_effect=_fake_analyzer(decision=DeploymentDecision.WARN),
+            ):
+                result, output = _invoke(
+                    [
+                        "review-deployment",
+                        "--project-context",
+                        str(context_path),
+                        "--changed-model",
+                        "stg_orders",
+                        "--enforcement-mode",
+                        "enforce",
+                    ]
+                )
+
+        self.assertEqual(result.exit_code, 0, output)
+        self.assertIn("Deployment Decision: WARN", output)
+
     def test_review_deployment_invalid_project_context_path_exits_nonzero(self):
         result, output = _invoke(
             [

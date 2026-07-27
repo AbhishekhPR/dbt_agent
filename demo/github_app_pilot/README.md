@@ -29,3 +29,7 @@ Use only a dedicated test repository. The SQL is static input for Relium's parse
 do not execute it against a database. Exact decisions depend on the full manifest
 context, so verify the rendered evidence and then exercise both `mode: warn` and
 `mode: block` without changing detector scores or thresholds.
+
+The workflow enforcement setting is separate: `enforcement_mode: shadow` keeps
+all decisions advisory, while `enforcement_mode: enforce` makes only BLOCK return
+a nonzero CI exit code. WARN remains advisory in both modes.

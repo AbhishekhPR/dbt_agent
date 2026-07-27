@@ -148,6 +148,7 @@ class GitHubAppPilotAssetTests(unittest.TestCase):
             {
                 "manifest_path": "target/manifest.json",
                 "mode": "warn",
+                "enforcement_mode": "shadow",
                 "enabled": True,
             },
         )

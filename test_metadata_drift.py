@@ -194,6 +194,40 @@ class MetadataDriftTests(unittest.TestCase):
         self.assertEqual(signal.confidence, 75)
         self.assertEqual(signal.score, -5)
 
+    def test_no_history_available_is_neutral(self):
+        from agent.metadata_drift import to_signal
+
+        signal = to_signal(
+            {
+                "comparison_status": "unavailable",
+                "drift_level": "LOW",
+                "report_text": "Metadata drift was not evaluated.",
+            }
+        )
+
+        self.assertEqual(signal.score, 0)
+        self.assertEqual(signal.reasons, [])
+        self.assertEqual(signal.metadata["comparison_status"], "unavailable")
+
+    def test_evaluated_no_drift_is_neutral(self):
+        from agent.metadata_drift import to_signal
+
+        signal = to_signal(
+            {
+                "comparison_status": "evaluated",
+                "row_count_change_pct": 0.0,
+                "null_count_change_pct": 0.0,
+                "duplicate_count_change_pct": 0.0,
+                "schema_column_count_change": 0,
+                "freshness_regressed": False,
+                "drift_level": "LOW",
+                "report_text": "Metadata Drift: LOW",
+            }
+        )
+
+        self.assertEqual(signal.score, 0)
+        self.assertEqual(signal.reasons, [])
+
     def test_to_signal_preserves_metadata_fields(self):
         from agent.metadata_drift import to_signal
 

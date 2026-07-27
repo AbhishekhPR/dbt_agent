@@ -129,8 +129,19 @@ def is_supporting_column_reason(reason: Any) -> bool:
 def _curated_items(signals) -> list[dict]:
     candidates = []
     for signal_index, signal in enumerate(list(signals or [])):
+        score = int(getattr(signal, "score", 0) or 0)
+        if score >= 0:
+            continue
         component = str(getattr(signal, "component", "") or "")
-        reasons = list(getattr(signal, "reasons", None) or ["Signal detected"])
+        reasons = list(
+            getattr(signal, "reasons", None)
+            or [
+                (
+                    f"{label_for_component(component)} reduced pipeline health "
+                    f"by {abs(score)} points"
+                )
+            ]
+        )
         for reason_index, reason in enumerate(reasons):
             cleaned_reason = clean_reason(reason)
             if not cleaned_reason or _is_low_level_reason(cleaned_reason):

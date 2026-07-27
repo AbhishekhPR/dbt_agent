@@ -1,8 +1,9 @@
 from typing import Any
 
-from agent.decision_engine import SEVERITY_RANKS, Decision
+from agent.decision_engine import SEVERITY_RANKS, Decision, DeploymentDecision
 from agent.evidence_curation import (
     clean_reason,
+    curate_reasons,
     is_low_level_reason,
     semantic_diff_reason_priority,
 )
@@ -11,6 +12,7 @@ from agent.signals import Severity, Signal
 
 
 DEFAULT_RECOMMENDATION = "Review the flagged pipeline signals before deployment."
+ALLOW_RECOMMENDATION = "Proceed with deployment."
 
 
 def build_incident(
@@ -33,7 +35,11 @@ def build_incident(
         recommendation=(
             recommendation
             if recommendation is not None
-            else DEFAULT_RECOMMENDATION
+            else (
+                ALLOW_RECOMMENDATION
+                if decision.decision == DeploymentDecision.ALLOW
+                else DEFAULT_RECOMMENDATION
+            )
         ),
         affected_models=list(affected_models or []),
         metadata=dict(metadata or {}),
@@ -41,10 +47,6 @@ def build_incident(
 
 
 def summarize_incident(incident: Incident) -> dict:
-    top_reasons = []
-    for signal in incident.signals:
-        top_reasons.extend(signal.reasons)
-
     return {
         "incident_id": incident.incident_id,
         "decision": incident.decision.value,
@@ -55,7 +57,7 @@ def summarize_incident(incident: Incident) -> dict:
         "recommendation": incident.recommendation,
         "affected_models": list(incident.affected_models),
         "signal_count": len(incident.signals),
-        "top_reasons": top_reasons,
+        "top_reasons": curate_reasons(incident.signals),
     }
 
 
@@ -133,7 +135,7 @@ def _signals_with_reportable_reasons(signals: list[Signal]) -> list[Signal]:
     return [
         signal
         for signal in signals
-        if _first_reportable_reason(signal)
+        if signal.score < 0 and _first_reportable_reason(signal)
     ]
 
 
@@ -144,4 +146,10 @@ def _first_reportable_reason(signal: Signal) -> str:
         cleaned = clean_reason(reason)
         if cleaned:
             return cleaned
+    if signal.score < 0:
+        component = " ".join(
+            part.capitalize()
+            for part in str(signal.component or "signal").split("_")
+        )
+        return f"{component} reduced pipeline health by {abs(signal.score)} points"
     return ""

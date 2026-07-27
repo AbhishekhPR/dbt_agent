@@ -638,6 +638,16 @@ def init_baseline_command(dbt_manifest, history_path, deployment_id):
     is_flag=True,
     help="Allow BLOCK deployment snapshots to be recorded.",
 )
+@click.option(
+    "--enforcement-mode",
+    default="shadow",
+    show_default=True,
+    type=click.Choice(["shadow", "enforce"]),
+    help=(
+        "CI behavior: shadow keeps all decisions advisory; enforce exits "
+        "nonzero only for BLOCK. WARN remains advisory in both modes."
+    ),
+)
 @click.option("--output", default=None, help="Write rendered review to this file.")
 @click.option(
     "--format",
@@ -657,6 +667,7 @@ def review_deployment_command(
     deployment_id,
     auto_record,
     allow_blocked_recording,
+    enforcement_mode,
     output,
     output_format,
 ):
@@ -732,9 +743,11 @@ def review_deployment_command(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(rendered, encoding="utf-8")
         click.echo(f"Deployment review written to {output}")
-        return
+    else:
+        click.echo(rendered)
 
-    click.echo(rendered)
+    if enforcement_mode == "enforce" and service_result["decision"] == "BLOCK":
+        raise click.exceptions.Exit(1)
 
 
 @cli.command(name="backtest-deployment")

@@ -672,6 +672,122 @@ class PresentationTests(unittest.TestCase):
         self.assertIn("Confidence: 88%", render_cli(allow_incident))
         self.assertIn("98 / 100", render_markdown(allow_incident))
 
+    def test_clean_allow_omits_root_cause_and_uses_clean_message(self):
+        incident = Incident(
+            incident_id="INC-CLEAN",
+            health=100,
+            decision=DeploymentDecision.ALLOW,
+            severity=Severity.LOW,
+            confidence=75,
+            root_cause="",
+            recommendation="Proceed with deployment.",
+            affected_models=["fct_orders"],
+            signals=[
+                Signal(
+                    component="metadata_drift",
+                    severity=Severity.LOW,
+                    confidence=75,
+                    score=0,
+                    reasons=["Metadata drift was not evaluated"],
+                )
+            ],
+        )
+
+        markdown = render_markdown(incident)
+        payload = render_json(incident)
+
+        self.assertNotIn("Primary Root Cause", markdown)
+        self.assertIn("No material deployment risks detected.", markdown)
+        self.assertNotIn("Metadata drift was not evaluated", markdown)
+        self.assertEqual(payload["root_cause"], "")
+        self.assertEqual(payload["top_reasons"], [])
+        self.assertEqual(
+            payload["summary"],
+            "No material deployment risks detected.",
+        )
+
+    def test_warn_and_block_render_only_contributing_reasons(self):
+        for decision, health in [
+            (DeploymentDecision.WARN, 85),
+            (DeploymentDecision.BLOCK, 65),
+        ]:
+            with self.subTest(decision=decision):
+                incident = Incident(
+                    incident_id=f"INC-{decision.value}",
+                    health=health,
+                    decision=decision,
+                    severity=Severity.HIGH,
+                    confidence=90,
+                    root_cause="No SQL logic risks detected",
+                    recommendation="Guard the denominator with NULLIF.",
+                    signals=[
+                        Signal(
+                            component="metadata_drift",
+                            severity=Severity.LOW,
+                            confidence=75,
+                            score=0,
+                            reasons=["Metadata drift was not evaluated"],
+                        ),
+                        Signal(
+                            component="ast",
+                            severity=Severity.HIGH,
+                            confidence=95,
+                            score=-35,
+                            reasons=["Division without a zero-safe guard"],
+                        ),
+                    ],
+                )
+
+                markdown = render_markdown(incident)
+                payload = render_json(incident)
+
+                self.assertIn("## Primary Root Cause", markdown)
+                self.assertIn("Division without a zero-safe guard", markdown)
+                self.assertNotIn("No SQL logic risks detected", markdown)
+                self.assertNotIn("Metadata drift was not evaluated", markdown)
+                self.assertEqual(
+                    payload["top_reasons"],
+                    ["Division without a zero-safe guard"],
+                )
+
+    def test_json_and_markdown_redact_secret_values(self):
+        secret = "customer-secret-sentinel-123"
+        incident = Incident(
+            incident_id="INC-SECRET",
+            health=65,
+            decision=DeploymentDecision.BLOCK,
+            severity=Severity.HIGH,
+            confidence=95,
+            root_cause=f"Unsafe token={secret} was detected",
+            recommendation=f"Remove api_key={secret} from the model.",
+            signals=[
+                Signal(
+                    component="ast",
+                    severity=Severity.HIGH,
+                    confidence=95,
+                    score=-35,
+                    reasons=[f"Unsafe token={secret} was detected"],
+                )
+            ],
+            metadata={
+                "api_key": secret,
+                "raw_code": f"select '{secret}' as leaked_value",
+                "nested": {"password": secret, "safe": "visible"},
+            },
+        )
+
+        markdown = render_markdown(incident)
+        payload = render_json(incident)
+        serialized = json.dumps(payload)
+
+        self.assertNotIn(secret, markdown)
+        self.assertNotIn(secret, serialized)
+        self.assertIn("[REDACTED]", markdown)
+        self.assertEqual(payload["metadata"]["api_key"], "[REDACTED]")
+        self.assertEqual(payload["metadata"]["raw_code"], "[REDACTED]")
+        self.assertEqual(payload["metadata"]["nested"]["password"], "[REDACTED]")
+        self.assertEqual(payload["metadata"]["nested"]["safe"], "visible")
+
     def test_json_is_fully_serializable(self):
         payload = render_json(make_incident())
 
@@ -708,12 +824,12 @@ class PresentationTests(unittest.TestCase):
         markdown = render_markdown(incident)
         payload = render_json(incident)
 
-        self.assertIn("Top Reasons:", cli)
-        self.assertIn("- None", cli)
+        self.assertIn("No material deployment risks detected.", cli)
+        self.assertNotIn("Primary Root Cause", cli)
         self.assertIn("Signals Considered:", cli)
         self.assertNotIn("Affected Models:", cli)
-        self.assertIn("## Top Reasons", markdown)
-        self.assertIn("- None", markdown)
+        self.assertIn("No material deployment risks detected.", markdown)
+        self.assertNotIn("## Primary Root Cause", markdown)
         self.assertIn("## Signals Considered", markdown)
         self.assertNotIn("## Affected Models", markdown)
         self.assertEqual(payload["signal_count"], 0)

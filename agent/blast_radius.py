@@ -325,6 +325,7 @@ def _format_dependency_reason(path: list) -> str:
 def to_signal(blast_radius_result: dict) -> Signal:
     severity = _blast_radius_signal_severity(blast_radius_result)
     affected_models = _affected_model_names(blast_radius_result)
+    neutral = not affected_models
 
     metadata = {
         "changed_model": (
@@ -345,8 +346,12 @@ def to_signal(blast_radius_result: dict) -> Signal:
         component="blast_radius",
         severity=severity,
         confidence=BLAST_RADIUS_SIGNAL_CONFIDENCE[severity],
-        score=BLAST_RADIUS_SIGNAL_SCORES[severity],
-        reasons=_blast_radius_signal_reasons(blast_radius_result, affected_models),
+        score=0 if neutral else BLAST_RADIUS_SIGNAL_SCORES[severity],
+        reasons=(
+            []
+            if neutral
+            else _blast_radius_signal_reasons(blast_radius_result, affected_models)
+        ),
         metadata=metadata,
     )
 

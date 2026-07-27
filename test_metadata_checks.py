@@ -92,7 +92,7 @@ class MetadataChecksTests(unittest.TestCase):
         self.assertIn("Null rate increased", signal.reasons)
         self.assertIn("Duplicate count increased", signal.reasons)
 
-    def test_to_signal_converts_low_metadata_result_to_low_signal(self):
+    def test_to_signal_treats_clean_evaluated_metadata_as_neutral(self):
         from agent.metadata_checks import MetadataCheckResult, to_signal
         from agent.signals import Severity
 
@@ -111,7 +111,44 @@ class MetadataChecksTests(unittest.TestCase):
         self.assertEqual(signal.component, "metadata_checks")
         self.assertEqual(signal.severity, Severity.LOW)
         self.assertEqual(signal.confidence, 75)
+        self.assertEqual(signal.score, 0)
+        self.assertEqual(signal.reasons, [])
+
+    def test_to_signal_treats_unavailable_metadata_checks_as_neutral(self):
+        from agent.metadata_checks import to_signal
+
+        signal = to_signal(
+            {
+                "model_name": "sample_model",
+                "evaluation_status": "not_evaluated",
+                "anomalies": [],
+            }
+        )
+
+        self.assertEqual(signal.score, 0)
+        self.assertEqual(signal.reasons, [])
+        self.assertEqual(signal.metadata["evaluation_status"], "not_evaluated")
+
+    def test_to_signal_preserves_a_genuine_evaluated_low_finding(self):
+        from agent.metadata_checks import to_signal
+        from agent.signals import Severity
+
+        signal = to_signal(
+            {
+                "model_name": "sample_model",
+                "severity": "LOW",
+                "evaluation_status": "evaluated",
+                "freshness_timestamp": "2026-07-27T00:00:00",
+                "anomalies": ["Freshness is close to its warning boundary"],
+            }
+        )
+
+        self.assertEqual(signal.severity, Severity.LOW)
         self.assertEqual(signal.score, -5)
+        self.assertEqual(
+            signal.reasons,
+            ["Freshness is close to its warning boundary"],
+        )
 
     def test_to_signal_preserves_metadata_fields(self):
         from agent.metadata_checks import MetadataCheckResult, to_signal

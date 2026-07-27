@@ -105,7 +105,18 @@ def _executive_summary(incident: Incident) -> str:
 def _conclusion(incident: Incident, evidence: list[Evidence]) -> str:
     decision = _enum_value(incident.decision)
     evidence_count = len(evidence)
+    if decision == DeploymentDecision.ALLOW.value and evidence_count == 0:
+        return "No material deployment risks detected."
     plural = "item" if evidence_count == 1 else "items"
+    if evidence_count == 1:
+        return (
+            "The recommendation reflects the material reliability signal "
+            f"that contributed to the {_decision_label(decision)} outcome: "
+            f"1 evidence {plural} was considered with health "
+            f"{_health_text(incident.health)}, severity "
+            f"{_enum_value(incident.severity)}, and confidence "
+            f"{_confidence_text(incident.confidence)}."
+        )
     return (
         "The recommendation reflects that multiple reliability signals "
         f"contributed to the {_decision_label(decision)} outcome: "
