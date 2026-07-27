@@ -415,17 +415,21 @@ def sql_risks(project):
 @click.pass_context
 def pr_guard(ctx, project, changed_files, fail_on, output, github_comment, comment_output):
     """Run static SQL/dbt PR guard checks and write a Markdown report."""
-    from agent.pr_guard import run_pr_guard, terminal_summary
+    from agent.pr_guard import PrGuardError, run_pr_guard, terminal_summary
 
+    _validate_directory_exists(project, "dbt project")
     selected_files = list(changed_files) + list(ctx.args)
-    report = run_pr_guard(
-        project,
-        changed_files=selected_files or None,
-        fail_on=fail_on,
-        output=output,
-        github_comment=github_comment,
-        comment_output=comment_output,
-    )
+    try:
+        report = run_pr_guard(
+            project,
+            changed_files=selected_files or None,
+            fail_on=fail_on,
+            output=output,
+            github_comment=github_comment,
+            comment_output=comment_output,
+        )
+    except PrGuardError as e:
+        raise click.ClickException(str(e)) from e
     click.echo(terminal_summary(report))
     if github_comment:
         status = report.get("github_comment_status", {})
