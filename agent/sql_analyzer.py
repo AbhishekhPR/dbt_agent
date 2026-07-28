@@ -178,21 +178,21 @@ def analyze_all_models(project_path: str) -> list:
     models_path = Path(project_path) / "models"
 
     if not models_path.exists():
-        print(f"⚠️  No models folder found at {models_path}")
+        print(f"No models folder found at {models_path}")
         return []
 
     sql_files = list(models_path.glob("**/*.sql"))
 
     if not sql_files:
-        print("⚠️  No SQL models found.")
+        print("No SQL models found.")
         return []
 
-    print(f"\n🔬 Analyzing {len(sql_files)} SQL model(s) for logic errors...\n")
+    print(f"\nAnalyzing {len(sql_files)} SQL model(s) for logic errors...\n")
 
     reports = []
     for sql_file in sql_files:
         model_name = sql_file.stem
-        print(f"  → Checking {model_name}...")
+        print(f"  Checking {model_name}...")
 
         with open(sql_file) as f:
             sql = f.read()
@@ -217,33 +217,26 @@ def print_analysis_report(report: dict):
     print(f"\n{'━' * 55}")
     print(f"  Model: {report.get('model_name', 'unknown')}")
     print(f"  Risk:  {risk_emoji} {report.get('overall_risk', '').upper()}")
-    print(f"  Safe to run: {'✅ Yes' if report.get('safe_to_run') else '❌ NO — fix before running'}")
+    print(f"  Safe to run: {'Yes' if report.get('safe_to_run') else 'NO — fix before running'}")
     print(f"{'━' * 55}")
 
-    print(f"\n📋 Summary\n  {report.get('summary', 'N/A')}")
+    print(f"\nSummary\n  {report.get('summary', 'N/A')}")
 
     bugs = report.get("bugs", [])
     if not bugs:
-        print("\n✅ No logic errors detected.\n")
+        print("\nNo logic errors detected.\n")
         return
 
-    print(f"\n🐛 Found {len(bugs)} issue(s):\n")
+    print(f"\nFound {len(bugs)} issue(s):\n")
     for i, bug in enumerate(bugs, 1):
-        severity_emoji = {
-            "critical": "🔴",
-            "high":     "🟠",
-            "medium":   "🟡",
-            "low":      "🟢"
-        }.get(bug.get("severity", "low"), "⚪")
-
         # Confidence tag
         confidence = bug.get("confidence", "")
         confidence_display = {
-            "high":   "✓ high confidence",
-            "medium": "~ medium confidence",
+            "high":   "high confidence",
+            "medium": "medium confidence",
         }.get(confidence, "")
 
-        print(f"  {i}. {severity_emoji} [{bug.get('severity', '').upper()}] {bug.get('category', '')}")
+        print(f"  {i}. [{bug.get('severity', '').upper()}] {bug.get('category', '')}")
         if confidence_display:
             print(f"     Confidence: {confidence_display}")
         print(f"     SQL:    {bug.get('line_reference', 'N/A')}")
@@ -252,6 +245,6 @@ def print_analysis_report(report: dict):
         print(f"     Fix:    {bug.get('fix', 'N/A')}")
         print()
 
-    print(f"  Data loss risk:       {'⚠️  YES' if report.get('data_loss_risk') else '✅ No'}")
+    print(f"  Data loss risk:       {'⚠️ YES' if report.get('data_loss_risk') else 'No'}")
     print(f"  Rows affected:        {report.get('estimated_rows_affected', 'unknown')}")
     print()

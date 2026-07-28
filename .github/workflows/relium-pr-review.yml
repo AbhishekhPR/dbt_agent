@@ -1,0 +1,184 @@
+name: Relium PR Review
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  pr-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          fi
+
+      - name: Collect changed files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin "${{ github.base_ref }}"
+          git diff --name-only "origin/${{ github.base_ref }}...HEAD" > changed_files.txt
+          cat changed_files.txt
+
+      - name: Prepare dbt manifest when supported
+        id: manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .relium
+
+          if [ -f target/manifest.json ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ ! -f dbt_project.yml ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            cat > .relium/manifest-status.md <<'EOF'
+          ## Relium deployment review
+
+          Status: **SKIPPED**
+
+          Relium skipped: no dbt manifest was available for this repository.
+          EOF
+            exit 0
+          fi
+
+          if ! command -v dbt >/dev/null 2>&1; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            cat > .relium/manifest-status.md <<'EOF'
+          ## Relium deployment review
+
+          Status: **SKIPPED**
+
+          Relium skipped: no dbt manifest was available for this repository.
+
+          The repository dependencies do not provide the documented `dbt` command, so no semantic review ran.
+          EOF
+            exit 0
+          fi
+
+          if [ -f packages.yml ] || [ -f dependencies.yml ]; then
+            dbt deps
+          fi
+          dbt compile
+          test -f target/manifest.json
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Relium PR review
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ steps.manifest.outputs.available }}" != "true" ]; then
+            cp .relium/manifest-status.md relium-review.md
+            exit 0
+          fi
+
+          mapfile -t changed_files < changed_files.txt
+          enforcement_mode="shadow"
+          if [ -f relium.yml ]; then
+            enforcement_mode="$(python -c 'from pathlib import Path; from agent.github_app.config import load_repository_config; print(load_repository_config(Path("relium.yml").read_bytes()).enforcement_mode)')"
+          fi
+          echo "Relium enforcement mode: $enforcement_mode"
+
+          if [ "${#changed_files[@]}" -eq 0 ]; then
+            cat > relium-review.md <<'EOF'
+          ## Relium deployment review
+
+          Status: **SKIPPED**
+
+          No changed files were detected, so Relium did not run a semantic review.
+          EOF
+            exit 0
+          fi
+
+          command=(
+            python -m agent.cli review-deployment
+            --dbt-manifest target/manifest.json
+            --history-path .relium/deployment_history.json
+            --deployment-id "pr-${{ github.event.pull_request.number }}-${{ github.sha }}"
+            --enforcement-mode "$enforcement_mode"
+            --format markdown
+            --output relium-review.md
+          )
+
+          for file in "${changed_files[@]}"; do
+            command+=(--changed-file "$file")
+          done
+
+          set +e
+          "${command[@]}" 2>&1 | tee relium-review.log
+          exit_code="${PIPESTATUS[0]}"
+          set -e
+
+          if [ "$exit_code" -eq 0 ]; then
+            exit 0
+          fi
+
+          if grep -q "At least one changed model is required" relium-review.log; then
+            cat > relium-review.md <<'EOF'
+          ## Relium deployment review
+
+          Status: **SKIPPED**
+
+          No changed dbt models were detected, so Relium did not run a semantic review.
+          EOF
+            exit 0
+          fi
+
+          exit "$exit_code"
+
+      - name: Upload Relium PR review
+        uses: actions/upload-artifact@v4
+        with:
+          name: relium-pr-review
+          path: relium-review.md
+
+      - name: Comment Relium PR review
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- relium-pr-review -->';
+            const markdown = fs.readFileSync('relium-review.md', 'utf8');
+            const body = `${marker}\n\n${markdown}`;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+            });
+            const existing = comments.find((comment) =>
+              comment.body && comment.body.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                body,
+              });
+            }

@@ -1,492 +1,369 @@
 import re
-import sqlglot
-import sqlglot.expressions as exp
 from pathlib import Path
-from dotenv import load_dotenv
+from typing import Any
 
-env_path = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(dotenv_path=env_path)
+import sqlglot
+from sqlglot import expressions as exp
 
-
-# ─────────────────────────────────────────
-# JINJA STRIPPER
-# ─────────────────────────────────────────
-def strip_jinja(sql: str) -> str:
-    """
-    Removes dbt Jinja templating before AST parsing.
-    Replaces {{ ref('model') }} with a plain table name.
-    Replaces {{ config(...) }} blocks with nothing.
-    """
-    sql = re.sub(r'\{\{[^}]*config[^}]*\}\}', '', sql, flags=re.DOTALL)
-    sql = re.sub(r"\{\{\s*ref\(['\"](\w+)['\"]\)\s*\}\}", r'\1', sql)
-    sql = re.sub(r"\{\{\s*source\(['\"](\w+)['\"],\s*['\"](\w+)['\"]\)\s*\}\}", r'\1__\2', sql)
-    sql = re.sub(r'\{\{.*?\}\}', 'placeholder', sql, flags=re.DOTALL)
-    sql = re.sub(r'\{#.*?#\}', '', sql, flags=re.DOTALL)
-    sql = re.sub(r'\{%.*?%\}', '', sql, flags=re.DOTALL)
-    return sql.strip()
+from agent.signals import Severity, Signal
+from agent.sql_analyzer import analyze_sql_logic
 
 
-# ─────────────────────────────────────────
-# PARSER
-# ─────────────────────────────────────────
-def parse_sql(sql: str, dialect: str = "sqlite") -> exp.Expression | None:
-    try:
-        clean_sql = strip_jinja(sql)
-        return sqlglot.parse_one(clean_sql, dialect=dialect)
-    except Exception as e:
-        print(f"  ⚠️  AST parse failed: {e}")
-        return None
+RULE_RECOMMENDATIONS = {
+    "SELECT_STAR": "Replace SELECT * with explicit column selection for the fields this model actually needs.",
+    "MISSING_JOIN_ON": "Add an explicit ON clause or use CROSS JOIN intentionally.",
+    "LEFT_JOIN_NULLIFIED": "Move right-side filters into JOIN clauses or preserve NULL rows explicitly.",
+    "COUNT_AFTER_JOIN": "Use COUNT(DISTINCT key) or deduplicate upstream before aggregating.",
+    "MISSING_OR_RENAMED_COLUMNS": "Verify upstream schema and update column names or mappings.",
+    "DIVISION_BY_ZERO": "Wrap the denominator in NULLIF(denominator, 0) or add an explicit CASE guard.",
+    "INTEGER_DIVISION": "Cast an operand to a floating-point type or multiply the numerator by 1.0.",
+    "HARDCODED_DATE_FILTER": "Confirm the date is intentional or parameterize it (e.g. current_date - interval).",
+    "NOT_EQUAL_NULL_RISK": "Add an explicit OR column IS NULL clause or use IS DISTINCT FROM instead of != / <>.",
+}
 
 
-# ─────────────────────────────────────────
-# RULE 1: LEFT JOIN nullified by WHERE
-# ─────────────────────────────────────────
-def check_left_join_nullified(tree: exp.Expression) -> list:
-    """
-    Finds LEFT JOINs where the right table's column appears in a WHERE clause.
-    This silently converts LEFT JOIN to INNER JOIN, dropping unmatched rows.
-
-    Pattern:
-        LEFT JOIN customers c ON o.customer_id = c.id
-        WHERE c.is_deleted = 0   ← kills the LEFT JOIN
-    """
-    bugs = []
-    joins = list(tree.find_all(exp.Join))
-    where = tree.find(exp.Where)
-
-    if not where or not joins:
-        return bugs
-
-    # Collect aliases from LEFT JOINs only
-    left_join_aliases = set()
-    for join in joins:
-        if join.side and join.side.upper() == "LEFT":
-            alias = join.find(exp.TableAlias)
-            table = join.find(exp.Table)
-            if alias:
-                left_join_aliases.add(alias.name.lower())
-            elif table:
-                left_join_aliases.add(table.name.lower())
-
-    if not left_join_aliases:
-        return bugs
-
-    # Check WHERE for right-table column references
-    seen = set()
-    for condition in where.find_all(exp.EQ, exp.NEQ, exp.Is):
-        for col in condition.find_all(exp.Column):
-            table_ref = col.table
-            if table_ref and table_ref.lower() in left_join_aliases:
-                key = str(condition)
-                if key in seen:
-                    continue
-                seen.add(key)
-                bugs.append({
-                    "rule": "LEFT_JOIN_NULLIFIED",
-                    "category": "LEFT JOIN NULLIFIED BY WHERE CLAUSE",
-                    "severity": "high",
-                    "confidence": "high",
-                    "line_reference": f"WHERE {condition}",
-                    "description": (
-                        f"WHERE clause on right-table column '{col}' converts "
-                        f"LEFT JOIN to INNER JOIN silently. "
-                        f"Rows with no match in the right table are dropped."
-                    ),
-                    "impact": (
-                        "Unmatched rows silently excluded. "
-                        "Metrics like SUM(revenue) or COUNT(customers) will be understated."
-                    ),
-                    "fix": (
-                        f"Move the filter into the JOIN ON clause:\n"
-                        f"  LEFT JOIN ... ON ... AND {condition}"
-                    )
-                })
-
-    return bugs
+RULE_IDS = {
+    "select_star": "SELECT_STAR",
+    "missing_join_on": "MISSING_JOIN_ON",
+    "left_join_nullified_by_where": "LEFT_JOIN_NULLIFIED",
+    "count_after_join": "COUNT_AFTER_JOIN",
+    "missing_or_renamed_columns": "MISSING_OR_RENAMED_COLUMNS",
+    "division_by_zero": "DIVISION_BY_ZERO",
+    "integer_division": "INTEGER_DIVISION",
+    "hardcoded_date_filter": "HARDCODED_DATE_FILTER",
+    "not_equal_null_risk": "NOT_EQUAL_NULL_RISK",
+}
 
 
-# ─────────────────────────────────────────
-# RULE 2: NULL exclusion via != operator
-# ─────────────────────────────────────────
-def check_null_exclusion_via_neq(tree: exp.Expression) -> list:
-    """
-    Finds WHERE col != 'value' patterns.
-    SQL treats NULL != 'value' as UNKNOWN, silently excluding NULL rows.
-    """
-    bugs = []
-    where = tree.find(exp.Where)
-    if not where:
-        return bugs
-
-    seen = set()
-    for neq in where.find_all(exp.NEQ):
-        left = neq.left
-        right = neq.right
-
-        if isinstance(left, exp.Column) and isinstance(right, (exp.Literal, exp.Null)):
-            key = str(neq)
-            if key in seen:
-                    continue
-            seen.add(key)
-            bugs.append({
-                "rule": "NULL_EXCLUSION_NEQ",
-                "category": "NULL EXCLUSION VIA != OPERATOR",
-                "severity": "medium",
-                "confidence": "high",
-                "line_reference": f"WHERE {neq}",
-                "description": (
-                    f"'{left}' != '{right}' silently excludes NULL rows. "
-                    f"SQL evaluates NULL != value as UNKNOWN, not TRUE."
-                ),
-                "impact": (
-                    f"All rows where '{left}' IS NULL are silently dropped. "
-                    "Especially dangerous for status columns where NULL means pending/unknown."
-                ),
-                "fix": (
-                    f"WHERE {left} != {right} OR {left} IS NULL"
-                )
-            })
-
-    return bugs
+SEVERITY_SCORES = {
+    "critical": -50,
+    "high": -35,
+    "medium": -15,
+    "low": 0,
+    "clean": 0,
+}
 
 
-# ─────────────────────────────────────────
-# RULE 3: Divide by zero without NULLIF
-# ─────────────────────────────────────────
-def check_divide_by_zero(tree: exp.Expression) -> list:
-    """
-    Finds division where denominator is COUNT or SUM with no NULLIF protection.
-    Skips if NULLIF already appears anywhere in the full division expression.
-    Deduplicates by denominator SQL to prevent double-reporting.
-    """
-    bugs = []
-    flagged = set()
-
-    for div in tree.find_all(exp.Div):
-        denom = div.right
-
-        # If NULLIF appears anywhere in the entire division expression, skip
-        full_sql = div.sql().upper()
-        if "NULLIF" in full_sql:
-            continue
-
-        # Only flag COUNT or SUM denominators
-        if not isinstance(denom, (exp.Count, exp.Sum)):
-            continue
-
-        # Deduplicate by denominator SQL
-        denom_key = denom.sql()
-        if denom_key in flagged:
-            continue
-        flagged.add(denom_key)
-
-        bugs.append({
-            "rule": "DIVIDE_BY_ZERO",
-            "category": "DIVIDE BY ZERO WITHOUT NULLIF",
-            "severity": "high",
-            "confidence": "medium",
-            "line_reference": div.sql(),
-            "description": (
-                f"Denominator '{denom.sql()}' could be zero with no NULLIF protection. "
-                "Returns NULL silently in most warehouses, or crashes in strict mode."
-            ),
-            "impact": (
-                "Averages, rates, or ratios return NULL silently for any group "
-                "with zero rows. Looks like missing data, not a bug."
-            ),
-            "fix": (
-                f"Wrap denominator with NULLIF:\n"
-                f"  {div.left.sql()} / NULLIF({denom.sql()}, 0)"
-            )
-        })
-
-    return bugs
-
-
-# ─────────────────────────────────────────
-# RULE 4: SELECT * usage
-# ─────────────────────────────────────────
-def check_select_star(tree: exp.Expression) -> list:
-    """
-    Finds SELECT * patterns.
-    When upstream adds or reorders columns, SELECT * silently
-    changes the shape of your output table.
-    """
-    bugs = []
-
-    for select in tree.find_all(exp.Select):
-        for expr in select.expressions:
-            if isinstance(expr, exp.Star):
-                bugs.append({
-                    "rule": "SELECT_STAR",
-                    "category": "SELECT STAR SCHEMA RISK",
-                    "severity": "low",
-                    "confidence": "high",
-                    "line_reference": "SELECT *",
-                    "description": (
-                        "SELECT * picks up all columns from the source table. "
-                        "If upstream adds, removes, or reorders columns, "
-                        "the output schema changes silently."
-                    ),
-                    "impact": (
-                        "Downstream models that reference specific column positions "
-                        "or expect a fixed schema will break silently or return wrong data."
-                    ),
-                    "fix": (
-                        "Explicitly list the columns you need:\n"
-                        "  SELECT col1, col2, col3 FROM ..."
-                    )
-                })
-                break  # One flag per SELECT block is enough
-
-    return bugs
-
-
-# ─────────────────────────────────────────
-# RULE 5: Hardcoded date literals
-# ─────────────────────────────────────────
-def check_hardcoded_dates(tree: exp.Expression) -> list:
-    """
-    Finds hardcoded date string literals in WHERE clauses.
-    These become stale and silently exclude data over time.
-    """
-    bugs = []
-    date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-
-    where = tree.find(exp.Where)
-    if not where:
-        return bugs
-
-    seen = set()
-    for literal in where.find_all(exp.Literal):
-        val = literal.this
-        if isinstance(val, str) and date_pattern.match(val):
-            if val in seen:
-                continue
-            seen.add(val)
-            bugs.append({
-                "rule": "HARDCODED_DATE",
-                "category": "HARDCODED DATE FILTER",
-                "severity": "medium",
-                "confidence": "high",
-                "line_reference": f"WHERE ... '{val}'",
-                "description": (
-                    f"Hardcoded date '{val}' in WHERE clause. "
-                    "This filter becomes stale and silently excludes data over time."
-                ),
-                "impact": (
-                    f"Any model filtering from '{val}' is not measuring the full dataset. "
-                    "A 'lifetime' metric filtered to a static date is not lifetime."
-                ),
-                "fix": (
-                    "Replace with a dynamic date:\n"
-                    "  WHERE date_col >= DATEADD(day, -365, CURRENT_DATE)\n"
-                    "  or use a dbt variable: {{ var('start_date') }}"
-                )
-            })
-
-    return bugs
-
-
-# ─────────────────────────────────────────
-# RULE 6: CROSS JOIN detection
-# ─────────────────────────────────────────
-def check_cross_joins(tree: exp.Expression) -> list:
-    """
-    Finds CROSS JOINs — cartesian products that explode row counts silently.
-    """
-    bugs = []
-
-    for join in tree.find_all(exp.Join):
-        kind = join.kind
-        if kind and kind.upper() == "CROSS":
-            table = join.find(exp.Table)
-            bugs.append({
-                "rule": "CROSS_JOIN",
-                "category": "CROSS JOIN — CARTESIAN PRODUCT",
-                "severity": "critical",
-                "confidence": "high",
-                "line_reference": f"CROSS JOIN {table}",
-                "description": (
-                    "CROSS JOIN produces a cartesian product — every row "
-                    "in the left table paired with every row in the right table."
-                ),
-                "impact": (
-                    "If left has 1M rows and right has 1K rows, "
-                    "output has 1B rows. SUM(revenue) inflates by 1000×. "
-                    "No error is thrown."
-                ),
-                "fix": (
-                    "Replace CROSS JOIN with an appropriate JOIN type and ON condition, "
-                    "or confirm this is intentional (e.g. date spine generation)."
-                )
-            })
-
-    return bugs
-
-
-# ─────────────────────────────────────────
-# RULE 7: Integer division truncation
-# ─────────────────────────────────────────
-def check_integer_division(tree: exp.Expression) -> list:
-    """
-    Finds SUM(x) / COUNT(*) patterns where neither side has a float cast.
-    These truncate decimals silently — 10/3 = 3 not 3.33.
-    """
-    bugs = []
-    flagged = set()
-
-    for div in tree.find_all(exp.Div):
-        left = div.left
-        right = div.right
-
-        # Skip if NULLIF is present — means someone thought about this
-        full_sql = div.sql().upper()
-        if "NULLIF" in full_sql:
-            continue
-
-        # Skip if explicit float cast present
-        if "1.0" in full_sql or "FLOAT" in full_sql or "CAST" in full_sql or "100.0" in full_sql:
-            continue
-
-        left_is_agg = isinstance(left, (exp.Sum, exp.Count))
-        right_is_agg = isinstance(right, (exp.Sum, exp.Count))
-
-        if not (left_is_agg or right_is_agg):
-            continue
-
-        key = div.sql()
-        if key in flagged:
-            continue
-        flagged.add(key)
-
-        bugs.append({
-            "rule": "INTEGER_DIVISION",
-            "category": "INTEGER DIVISION TRUNCATION",
-            "severity": "medium",
-            "confidence": "medium",
-            "line_reference": div.sql(),
-            "description": (
-                f"Division '{div.sql()}' may truncate decimals. "
-                "If both operands are integers, 10/3 = 3 not 3.33."
-            ),
-            "impact": (
-                "Revenue averages, rates, and percentages silently rounded down. "
-                "Compounds across millions of rows."
-            ),
-            "fix": (
-                f"Multiply numerator by 1.0 to force float division:\n"
-                f"  {left.sql()} * 1.0 / {right.sql()}"
-            )
-        })
-
-    return bugs
-
-
-# ─────────────────────────────────────────
-# MAIN RUNNER
-# ─────────────────────────────────────────
-def run_ast_analysis(sql: str, model_name: str, dialect: str = "sqlite") -> dict:
-    """
-    Runs all deterministic AST rules against a SQL model.
-    Returns a structured report.
-    """
-    tree = parse_sql(sql, dialect)
-
-    if tree is None:
-        return {
-            "model_name": model_name,
-            "overall_risk": "unknown",
-            "summary": "AST parsing failed — falling back to LLM analysis only.",
-            "bugs": [],
-            "data_loss_risk": False,
-            "estimated_rows_affected": "unknown",
-            "safe_to_run": True,
-            "source": "ast"
-        }
-
-    # Rules list — order matters, runs top to bottom
-    rules = [
-        check_left_join_nullified,
-        check_null_exclusion_via_neq,
-        check_divide_by_zero,
-        check_integer_division,
-        check_select_star,
-        check_hardcoded_dates,
-        check_cross_joins,
-    ]
-
-    all_bugs = []
-    for rule in rules:
-        try:
-            found = rule(tree)
-            all_bugs.extend(found)
-        except Exception:
-            pass  # Never crash the whole analysis on a rule failure
-
-    # Final deduplication by line_reference + rule
-    seen = set()
-    deduped = []
-    for bug in all_bugs:
-        key = bug.get("line_reference", "") + bug.get("rule", "")
-        if key not in seen:
-            seen.add(key)
-            deduped.append(bug)
-
-    # Overall risk
-    severities = [b["severity"] for b in deduped]
-    if "critical" in severities:
-        overall = "critical"
-    elif "high" in severities:
-        overall = "high"
-    elif "medium" in severities:
-        overall = "medium"
-    elif "low" in severities:
-        overall = "low"
-    else:
-        overall = "clean"
-
-    data_loss = any(b["severity"] in ("critical", "high") for b in deduped)
-
+def run_ast_analysis(sql: str, model_name: str, dialect: str | None = None) -> dict:
+    sql = sql or ""
+    report = analyze_sql_logic(model_name, sql)
+    findings = list(report.get("findings", [])) + _additional_findings(
+        sql,
+        dialect=dialect,
+    )
+    bugs = [_bug_from_finding(finding) for finding in findings]
+    overall_risk = _overall_risk(findings)
     return {
         "model_name": model_name,
-        "overall_risk": overall,
-        "summary": (
-            f"AST analysis found {len(deduped)} deterministic issue(s)."
-            if deduped else "No deterministic bugs detected."
-        ),
-        "bugs": deduped,
-        "data_loss_risk": data_loss,
-        "estimated_rows_affected": "significant" if data_loss else "none",
-        "safe_to_run": overall not in ("critical", "high"),
-        "source": "ast"
+        "dialect": dialect,
+        "overall_risk": overall_risk,
+        "summary": f"Found {len(findings)} potential issue(s)",
+        "bugs": bugs,
+        "safe_to_run": overall_risk in ("low", "clean"),
+        "data_loss_risk": any(bug["severity"] in {"critical", "high"} for bug in bugs),
+        "findings": findings,
     }
 
 
-def analyze_all_models_ast(project_path: str, dialect: str = "sqlite") -> list:
-    """
-    Runs AST analysis on every SQL model in the dbt project.
-    """
+def _overall_risk(findings: list[dict]) -> str:
+    if any(finding["severity"] == "critical" for finding in findings):
+        return "critical"
+    if any(finding["severity"] == "high" for finding in findings):
+        return "high"
+    if findings:
+        return "medium"
+    return "clean"
+
+
+def analyze_all_models_ast(project_path: str, dialect: str = "sqlite") -> list[dict]:
     models_path = Path(project_path) / "models"
-
     if not models_path.exists():
-        print(f"⚠️  No models folder at {models_path}")
         return []
-
-    sql_files = list(models_path.glob("**/*.sql"))
-    if not sql_files:
-        print("⚠️  No SQL models found.")
-        return []
-
-    print(f"\n⚡ AST analysis on {len(sql_files)} model(s)...\n")
-
     reports = []
-    for sql_file in sql_files:
-        model_name = sql_file.stem
-        print(f"  → Parsing {model_name}...")
-        with open(sql_file) as f:
-            sql = f.read()
-        report = run_ast_analysis(sql, model_name, dialect)
-        reports.append(report)
-
+    for sql_file in sorted(models_path.glob("**/*.sql")):
+        reports.append(
+            run_ast_analysis(
+                sql_file.read_text(encoding="utf-8"),
+                sql_file.stem,
+                dialect=dialect,
+            )
+        )
     return reports
+
+
+def strip_jinja(sql: str) -> str:
+    text = str(sql or "")
+    text = re.sub(
+        r"\{\{\s*ref\(['\"]([^'\"]+)['\"]\)\s*\}\}",
+        r"\1",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\{\{\s*source\(['\"][^'\"]+['\"]\s*,\s*['\"]([^'\"]+)['\"]\)\s*\}\}",
+        r"\1",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\{#.*?#\}", " ", text, flags=re.DOTALL)
+    text = re.sub(r"\{[%{].*?[%}]\}", " ", text, flags=re.DOTALL)
+    return text
+
+
+def to_signal(report: dict[str, Any]) -> Signal:
+    risk = str(report.get("overall_risk") or "clean").lower()
+    severity = _severity(risk)
+    bugs = list(report.get("bugs") or [])
+    reasons = [
+        bug.get("description") or bug.get("category") or "SQL logic risk detected"
+        for bug in bugs
+    ]
+    return Signal(
+        component="ast",
+        severity=severity,
+        confidence=90 if bugs else 75,
+        score=SEVERITY_SCORES.get(risk, 0),
+        reasons=reasons,
+        metadata={
+            "model_name": report.get("model_name"),
+            "overall_risk": report.get("overall_risk", "clean"),
+            "bug_count": len(bugs),
+            "bugs": bugs,
+        },
+    )
+
+
+def _bug_from_finding(finding: dict) -> dict:
+    rule = RULE_IDS.get(finding.get("rule_id"), str(finding.get("rule_id") or "UNCLASSIFIED").upper())
+    return {
+        "rule": rule,
+        "category": finding.get("title", rule),
+        "severity": str(finding.get("severity", "low")).lower(),
+        "description": finding.get("why_it_matters") or finding.get("title") or rule,
+        "recommendation": finding.get("recommendation") or RULE_RECOMMENDATIONS.get(rule, "Review the affected model."),
+        "fix": finding.get("recommendation") or RULE_RECOMMENDATIONS.get(rule, "Review the affected model."),
+        "impact": finding.get("why_it_matters") or "",
+        "line_reference": finding.get("evidence") or "",
+        "confidence": finding.get("confidence", "medium"),
+    }
+
+
+_COMMENT_RE = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+_WHERE_CLAUSE_RE = re.compile(
+    r"\bwhere\b(.*?)(?:\bgroup\s+by\b|\border\s+by\b|\bhaving\b|\blimit\b|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+_CASE_ZERO_GUARD_TEMPLATE = r"when\s+{}\s*(?:=\s*0|<=\s*0)\b"
+_DATE_FILTER_RE = re.compile(
+    r"[\w\.\"]+\s*(?:=|<>|!=|>=|<=|>|<)\s*(?:date\s*|timestamp\s*)?'(\d{4}-\d{2}-\d{2})",
+    re.IGNORECASE,
+)
+_NOT_EQUAL_RE = re.compile(r"([\w\.\"]+)\s*(?:!=|<>)\s*", re.IGNORECASE)
+
+
+def _additional_findings(
+    sql: str,
+    *,
+    dialect: str | None = None,
+) -> list[dict]:
+    findings = []
+    for finder in (
+        lambda value: _division_by_zero_finding(value, dialect=dialect),
+        lambda value: _integer_division_finding(value, dialect=dialect),
+        _hardcoded_date_filter_finding,
+        _not_equal_null_risk_finding,
+    ):
+        finding = finder(sql)
+        if finding is not None:
+            findings.append(finding)
+    return findings
+
+
+def _extract_where_clause(sql: str) -> str:
+    match = _WHERE_CLAUSE_RE.search(sql)
+    return match.group(1) if match else ""
+
+
+def _is_safe_numeric_literal(token: str) -> bool:
+    try:
+        return float(token) != 0
+    except ValueError:
+        return False
+
+
+def _has_case_zero_guard(sql: str, denominator: str) -> bool:
+    pattern = re.compile(_CASE_ZERO_GUARD_TEMPLATE.format(re.escape(denominator)), re.IGNORECASE)
+    return bool(pattern.search(sql))
+
+
+def _find_division_by_zero_risk(
+    sql: str,
+    *,
+    dialect: str | None = None,
+) -> list[str]:
+    without_comments = _COMMENT_RE.sub(" ", sql)
+    tree = _parse_sql_tree(without_comments, dialect=dialect)
+    if tree is None:
+        return []
+
+    risky = []
+    for division in tree.find_all(exp.Div):
+        denominator = division.right
+        denominator_sql = denominator.sql()
+        if "NULLIF" in denominator_sql.upper():
+            continue
+        if isinstance(denominator, exp.Literal) and _is_safe_numeric_literal(
+            str(denominator.this)
+        ):
+            continue
+        if _has_case_zero_guard(without_comments, denominator_sql):
+            continue
+        risky.append(division.sql())
+    return risky
+
+
+def _division_by_zero_finding(
+    sql: str,
+    *,
+    dialect: str | None = None,
+) -> dict | None:
+    risky = _find_division_by_zero_risk(sql, dialect=dialect)
+    if not risky:
+        return None
+    return {
+        "rule_id": "division_by_zero",
+        "severity": "high",
+        "title": "Division without a zero-safe guard",
+        "evidence": "; ".join(risky),
+        "why_it_matters": (
+            "Dividing by a column or expression that can be zero raises a runtime "
+            "error on some engines or silently returns NULL on others, corrupting "
+            "downstream ratios and metrics."
+        ),
+        "recommendation": RULE_RECOMMENDATIONS["DIVISION_BY_ZERO"],
+        "confidence": "medium",
+    }
+
+
+def _integer_division_finding(
+    sql: str,
+    *,
+    dialect: str | None = None,
+) -> dict | None:
+    tree = _parse_sql_tree(sql, dialect=dialect)
+    if tree is None:
+        return None
+
+    risky = []
+    for division in tree.find_all(exp.Div):
+        expression_sql = division.sql()
+        normalized = expression_sql.upper()
+        if "NULLIF" in normalized:
+            continue
+        if any(marker in normalized for marker in ("1.0", "100.0", "FLOAT", "CAST")):
+            continue
+        if not isinstance(division.left, (exp.Sum, exp.Count)) and not isinstance(
+            division.right,
+            (exp.Sum, exp.Count),
+        ):
+            continue
+        risky.append(expression_sql)
+
+    if not risky:
+        return None
+    return {
+        "rule_id": "integer_division",
+        "severity": "medium",
+        "title": "Integer division may truncate decimal values",
+        "evidence": "; ".join(dict.fromkeys(risky)),
+        "why_it_matters": (
+            "When both aggregate operands are integers, SQL engines can truncate "
+            "the decimal portion of averages, rates, and percentages."
+        ),
+        "recommendation": RULE_RECOMMENDATIONS["INTEGER_DIVISION"],
+        "confidence": "medium",
+    }
+
+
+def _parse_sql_tree(
+    sql: str,
+    *,
+    dialect: str | None = None,
+) -> exp.Expression | None:
+    try:
+        return sqlglot.parse_one(strip_jinja(sql), read=dialect)
+    except (sqlglot.errors.ParseError, ValueError):
+        return None
+
+
+def _find_hardcoded_date_filters(sql: str) -> list[str]:
+    without_comments = _COMMENT_RE.sub(" ", sql)
+    where_clause = _extract_where_clause(without_comments)
+    if not where_clause:
+        return []
+    return [match.group(1) for match in _DATE_FILTER_RE.finditer(where_clause)]
+
+
+def _hardcoded_date_filter_finding(sql: str) -> dict | None:
+    dates = _find_hardcoded_date_filters(sql)
+    if not dates:
+        return None
+    return {
+        "rule_id": "hardcoded_date_filter",
+        "severity": "medium",
+        "title": "Hardcoded date literal in filter",
+        "evidence": f"WHERE clause compares against fixed date(s): {', '.join(sorted(set(dates)))}",
+        "why_it_matters": (
+            "A fixed date filter silently stops matching new data as time passes, "
+            "quietly excluding valid rows without any error."
+        ),
+        "recommendation": RULE_RECOMMENDATIONS["HARDCODED_DATE_FILTER"],
+        "confidence": "medium",
+    }
+
+
+def _has_null_guard(where_clause: str, column: str) -> bool:
+    pattern = re.compile(rf"{re.escape(column)}\s+is\s+null", re.IGNORECASE)
+    return bool(pattern.search(where_clause))
+
+
+def _find_not_equal_null_risk(sql: str) -> list[str]:
+    without_comments = _COMMENT_RE.sub(" ", sql)
+    where_clause = _extract_where_clause(without_comments)
+    if not where_clause:
+        return []
+    risky = []
+    for match in _NOT_EQUAL_RE.finditer(where_clause):
+        column = match.group(1).strip()
+        if _has_null_guard(where_clause, column):
+            continue
+        risky.append(column)
+    return risky
+
+
+def _not_equal_null_risk_finding(sql: str) -> dict | None:
+    columns = _find_not_equal_null_risk(sql)
+    if not columns:
+        return None
+    return {
+        "rule_id": "not_equal_null_risk",
+        "severity": "high",
+        "title": "Not-equal filter may silently exclude NULL rows",
+        "evidence": f"WHERE clause uses != / <> on: {', '.join(sorted(set(columns)))} without a NULL guard",
+        "why_it_matters": (
+            "Under SQL three-valued logic, `NULL != value` evaluates to UNKNOWN, "
+            "so rows with NULL in that column are silently dropped from the result."
+        ),
+        "recommendation": RULE_RECOMMENDATIONS["NOT_EQUAL_NULL_RISK"],
+        "confidence": "medium",
+    }
+
+
+def _severity(risk: str) -> Severity:
+    if risk == "critical":
+        return Severity.CRITICAL
+    if risk == "high":
+        return Severity.HIGH
+    if risk == "medium":
+        return Severity.MEDIUM
+    return Severity.LOW

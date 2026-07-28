@@ -1,18 +1,45 @@
+# Environment and secrets
 .env
+.env.*
+!.env.example
+.env.github-app
+!.env.github-app.example
+
+# Credentials and key files
+*.pem
+*.private-key.pem
+
+# GitHub App storage
+.relium/github-app/
+github-app-storage/
+
+# Virtual environments
 venv/
+.venv/
+
+# Python artifacts
 __pycache__/
-*.db
-metadata_history.db
-business_demo/db/*.db
-pipeline_demo/db/*.db
-pipeline_timestamp_demo/db/*.db
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
 
-*.db
-metadata_history.db
-business_demo/db/*.db
-pipeline_demo/db/*.db
-pipeline_timestamp_demo/db/*.db
+# Test and development
+.pytest_cache/
+.coverage
+htmlcov/
 
+# Git worktrees
+.worktrees/
+
+# Generated runtime artifacts
+relium_metadata.db
+pipeline_validation_report.json
+pipeline_validation_report.md
+*.relium/
+
+# Local SQLite database files
 *.db
 metadata_history.db
 business_demo/db/*.db

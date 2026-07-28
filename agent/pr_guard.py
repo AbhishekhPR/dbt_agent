@@ -1,13 +1,25 @@
-import re
-from pathlib import Path
-from typing import Iterable
+"""Static SQL/dbt PR guard checks, built on the current AST-analysis architecture.
 
+Scans changed (or all) dbt model SQL with agent.ast_analyzer, renders a
+Markdown report, and gates on a configurable severity threshold. Does not
+make network calls, does not call an LLM, and does not read or expose
+secrets.
+"""
+
+from pathlib import Path
+from typing import Any
+
+from agent.ast_analyzer import run_ast_analysis
 from agent.blast_radius import calculate_blast_radius
-from agent.sql_metadata_extractor import strip_jinja
-from agent.sql_risk_detector import detect_sql_risks, sql_files_to_scan
+from agent.logging_config import get_logger
+from agent.redaction import redact_text
+
+
+logger = get_logger(__name__)
 
 
 SEVERITY_ORDER = {
+    "clean": 0,
     "info": 0,
     "low": 1,
     "medium": 2,
@@ -15,43 +27,18 @@ SEVERITY_ORDER = {
     "critical": 4,
 }
 
-RISK_CONTEXT = {
-    "left_join_filter_risk": {
-        "why": (
-            "A LEFT JOIN should preserve rows from the left table. Filtering the "
-            "right-side table in the WHERE clause can remove unmatched rows and "
-            "silently change the business meaning of the model."
-        ),
-        "recommendation": (
-            "Move the right-table filter into the JOIN condition or explicitly "
-            "allow NULLs."
-        ),
-    },
-    "select_star_risk": {
-        "why": "New upstream columns can silently change downstream schemas.",
-        "recommendation": "Select explicit columns.",
-    },
-    "cross_join_risk": {
-        "why": "Cartesian products can multiply rows and inflate metrics.",
-        "recommendation": "Confirm this is intentional or replace it with a keyed join.",
-    },
-    "join_without_condition_risk": {
-        "why": "A join without ON or USING can multiply rows unexpectedly.",
-        "recommendation": "Add an explicit ON or USING condition.",
-    },
-    "division_by_zero_risk": {
-        "why": "Ratios can return NULLs or fail when the denominator is zero.",
-        "recommendation": "Use NULLIF around the denominator.",
-    },
-    "hardcoded_date_filter_risk": {
-        "why": "Fixed date filters can silently exclude valid data over time.",
-        "recommendation": "Confirm the filter is intentional or parameterize it.",
-    },
-    "not_equal_filter_risk": {
-        "why": "NOT EQUAL filters exclude NULLs unless NULLs are handled explicitly.",
-        "recommendation": "Confirm NULL handling or use explicit logic.",
-    },
+SEVERITY_HEALTH_SCORES = {
+    "clean": 0,
+    "info": 0,
+    "low": -5,
+    "medium": -15,
+    "high": -35,
+    "critical": -50,
 }
+
+
+class PrGuardError(ValueError):
+    """Raised when pr_guard is given invalid inputs."""
 
 
 def run_pr_guard(
@@ -61,211 +48,258 @@ def run_pr_guard(
     output: str = ".relium/pr_guard_report.md",
     github_comment: bool = False,
     comment_output: str = ".relium/pr_guard_comment.md",
-) -> dict:
+) -> dict[str, Any]:
+    """Run static SQL checks over changed (or all) models and write a report."""
     project = Path(project_path)
-    scanned_files = sql_files_to_scan(project_path, changed_files)
-    risks = detect_sql_risks(project_path, persist=False, changed_files=changed_files)
-    enriched = [_enrich_risk(project, risk) for risk in risks]
+    if not project.exists() or not project.is_dir():
+        raise PrGuardError(f"dbt project not found: {project_path}")
 
-    highest = _highest_severity(enriched)
-    safe_to_merge = not _has_blocking_risk(enriched, fail_on)
-    report = {
-        "project": project_path,
-        "files_scanned": len(scanned_files),
-        "risks_found": len(enriched),
-        "highest_severity": highest,
-        "safe_to_merge": safe_to_merge,
-        "risks": enriched,
-        "output": output,
-        "exit_code": 0 if safe_to_merge else 1,
-    }
-
-    output_path = Path(output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(render_report(report), encoding="utf-8")
-    if github_comment:
-        from agent.github_pr_commenter import post_or_update_pr_comment, render_pr_comment, write_pr_comment
-
-        comment_body = render_pr_comment(report)
-        write_pr_comment(report, comment_output)
-        report["comment_output"] = comment_output
-        report["github_comment_status"] = post_or_update_pr_comment(comment_body)
-    return report
-
-
-def render_report(report: dict) -> str:
-    safe = "YES" if report["safe_to_merge"] else "NO"
-    lines = [
-        "# Relium PR Guard Report",
-        "",
-        "## Summary",
-        "",
-        f"* Project: {report['project']}",
-        f"* Files scanned: {report['files_scanned']}",
-        f"* Risks found: {report['risks_found']}",
-        f"* Highest severity: {report['highest_severity']}",
-        f"* Safe to merge: {safe}",
-        "",
-        "## Risks",
-        "",
+    sql_files = _resolve_sql_files(project, changed_files)
+    model_reports = [
+        _model_report(project, model_name, sql_path)
+        for model_name, sql_path in sql_files
     ]
 
-    if not report["risks"]:
-        lines.append("No SQL transformation risks found.")
-        lines.append("")
-        return "\n".join(lines)
+    highest_severity = _highest_severity(model_reports)
+    exit_code = _exit_code(highest_severity, fail_on)
+    health = max(
+        0,
+        min(
+            100,
+            100
+            + sum(
+                SEVERITY_HEALTH_SCORES.get(
+                    str(model.get("overall_risk", "clean")).lower(),
+                    0,
+                )
+                for model in model_reports
+            ),
+        ),
+    )
 
-    for risk in report["risks"]:
-        lines.extend(
-            [
-                f"### [{risk['severity'].upper()}] {risk['model']}",
-                "",
-                f"File: {risk['file']}",
-                f"Risk: {_sentence(risk['message'])}",
-                f"Evidence: {risk['evidence']}",
-                f"Why it matters: {risk['why_it_matters']}",
-                f"Recommendation: {risk['recommendation']}",
-                "Suggested fix:",
-                "",
-                "```sql",
-                risk["suggested_fix"],
-                "```",
-                "",
-                "Affected downstream models:",
-                *_bullet_lines(risk["affected_downstream_models"]),
-                "",
-            ]
-        )
+    result: dict[str, Any] = {
+        "project_path": str(project),
+        "models_scanned": len(model_reports),
+        "changed_files_provided": bool(changed_files),
+        "highest_severity": highest_severity,
+        "decision": _decision_for_severity(highest_severity),
+        "health": health,
+        "fail_on": fail_on.lower(),
+        "passed": exit_code == 0,
+        "exit_code": exit_code,
+        "model_reports": model_reports,
+        "report_path": None,
+        "comment_path": None,
+        "github_comment_status": None,
+    }
 
+    report_path = Path(output)
+    _write_text(report_path, render_markdown_report(result))
+    result["report_path"] = str(report_path)
+
+    if github_comment:
+        comment_path = Path(comment_output)
+        _write_text(comment_path, render_pr_comment(result))
+        result["comment_path"] = str(comment_path)
+        result["github_comment_status"] = _github_comment_status()
+
+    return result
+
+
+def terminal_summary(report: dict[str, Any]) -> str:
+    """Short human-readable summary for CLI stdout."""
+    status = "PASSED" if report.get("passed") else "FAILED"
+    lines = [
+        f"PR Guard: {status}",
+        f"  Models scanned: {report.get('models_scanned', 0)}",
+        f"  Highest severity: {report.get('highest_severity', 'clean')}",
+        f"  Fail-on threshold: {report.get('fail_on', 'high')}",
+    ]
+    if report.get("report_path"):
+        lines.append(f"  Report written to: {report['report_path']}")
+    if report.get("comment_path"):
+        lines.append(f"  Comment markdown written to: {report['comment_path']}")
     return "\n".join(lines)
 
 
-def terminal_summary(report: dict) -> str:
-    safe = "YES" if report["safe_to_merge"] else "NO"
-    return "\n".join(
-        [
-            "Relium PR Guard",
-            "",
-            f"Project: {report['project']}",
-            f"Files scanned: {report['files_scanned']}",
-            f"Risks found: {report['risks_found']}",
-            f"Highest severity: {report['highest_severity']}",
-            f"Safe to merge: {safe}",
-            "",
-            f"Report written to {report['output']}",
-        ]
-    )
+def render_markdown_report(report: dict[str, Any]) -> str:
+    lines = [
+        "## Relium PR Guard",
+        "",
+        f"**Result:** {'PASSED' if report.get('passed') else 'FAILED'}",
+        f"**Models scanned:** {report.get('models_scanned', 0)}",
+        f"**Highest severity:** {report.get('highest_severity', 'clean')}",
+        f"**Fail-on threshold:** {report.get('fail_on', 'high')}",
+        "",
+    ]
+    model_reports = report.get("model_reports") or []
+    if not model_reports:
+        lines.append("No SQL models were scanned.")
+        return "\n".join(lines)
+
+    for model_report in model_reports:
+        lines.extend(_model_section_lines(model_report))
+    return "\n".join(lines)
 
 
-def _enrich_risk(project: Path, risk: dict) -> dict:
-    risk_type = risk.get("risk_type", "")
-    context = RISK_CONTEXT.get(
-        risk_type,
-        {
-            "why": "This pattern can make SQL transformation behavior harder to review.",
-            "recommendation": risk.get("recommendation", "Review this SQL carefully."),
-        },
+def render_pr_comment(report: dict[str, Any]) -> str:
+    decision = str(
+        report.get("decision")
+        or _decision_for_severity(str(report.get("highest_severity", "clean")))
     )
+    lines = [
+        f"### Relium PR Guard — {decision}",
+        "",
+        f"Decision: **{redact_text(decision)}**  ",
+        f"Health: **{report.get('health', 100)} / 100**  ",
+        f"Severity: **{redact_text(report.get('highest_severity', 'clean'))}**",
+        "",
+    ]
+    findings = _compact_findings(report)
+    if not findings:
+        lines.append("No material deployment risks detected.")
+        return "\n".join(lines)
+
+    current_model = None
+    for finding in findings:
+        model_name = redact_text(finding["model_name"])
+        if model_name != current_model:
+            lines.append(f"- Affected model: **{model_name}**")
+            current_model = model_name
+        lines.append(
+            f"  - **{redact_text(finding['title'])}** — "
+            f"{redact_text(finding['remediation'])}"
+        )
+    return "\n".join(lines)
+
+
+def _compact_findings(report: dict[str, Any], limit: int = 3) -> list[dict[str, str]]:
+    findings = []
+    for model_report in report.get("model_reports") or []:
+        model_name = str(model_report.get("model_name") or "unknown model")
+        for bug in model_report.get("bugs") or []:
+            findings.append(
+                {
+                    "model_name": model_name,
+                    "title": str(
+                        bug.get("category")
+                        or bug.get("description")
+                        or "SQL risk detected"
+                    ),
+                    "remediation": str(
+                        bug.get("recommendation")
+                        or bug.get("fix")
+                        or "Review and correct the affected SQL."
+                    ),
+                }
+            )
+            if len(findings) >= limit:
+                return findings
+    return findings
+
+
+def _model_section_lines(model_report: dict[str, Any]) -> list[str]:
+    lines = [
+        f"### {model_report.get('model_name')}",
+        f"- Risk: {model_report.get('overall_risk', 'clean')}",
+        f"- {model_report.get('summary', 'Found 0 potential issue(s)')}",
+    ]
+    blast_radius = model_report.get("blast_radius")
+    if blast_radius and blast_radius.get("total_affected"):
+        lines.append(f"- Blast radius: {blast_radius.get('summary')}")
+    bugs = model_report.get("bugs") or []
+    for bug in bugs:
+        lines.append(
+            f"  - [{bug.get('severity', '').upper()}] {bug.get('category')}: "
+            f"{bug.get('description')} — {bug.get('recommendation')}"
+        )
+    lines.append("")
+    return lines
+
+
+def _model_report(project: Path, model_name: str, sql_path: Path) -> dict[str, Any]:
+    sql_text = sql_path.read_text(encoding="utf-8")
+    report = run_ast_analysis(sql_text, model_name)
+    report["sql_path"] = str(sql_path)
+    report["blast_radius"] = _safe_blast_radius(project, model_name)
+    return report
+
+
+def _safe_blast_radius(project: Path, model_name: str) -> dict[str, Any] | None:
+    try:
+        return calculate_blast_radius(str(project), model_name)
+    except Exception as error:
+        logger.debug(f"Could not compute blast radius for {model_name}: {error}")
+        return None
+
+
+def _resolve_sql_files(project: Path, changed_files: list[str] | None) -> list[tuple[str, Path]]:
+    if changed_files:
+        resolved: list[tuple[str, Path]] = []
+        seen: set[str] = set()
+        for raw_path in changed_files:
+            if not str(raw_path).endswith(".sql"):
+                continue
+            candidate = Path(raw_path)
+            if not candidate.exists():
+                candidate = project / raw_path
+            if not candidate.exists() or not candidate.is_file():
+                continue
+            key = str(candidate.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            resolved.append((candidate.stem, candidate))
+        return resolved
+
+    models_path = project / "models"
+    if not models_path.exists():
+        return []
+    return [(sql_file.stem, sql_file) for sql_file in sorted(models_path.glob("**/*.sql"))]
+
+
+def _highest_severity(model_reports: list[dict[str, Any]]) -> str:
+    worst = "clean"
+    for model_report in model_reports:
+        risk = str(model_report.get("overall_risk", "clean")).lower()
+        if SEVERITY_ORDER.get(risk, 0) > SEVERITY_ORDER.get(worst, 0):
+            worst = risk
+    return worst
+
+
+def _exit_code(highest_severity: str, fail_on: str) -> int:
+    if highest_severity == "clean":
+        return 0
+    threshold = SEVERITY_ORDER.get(fail_on.lower(), SEVERITY_ORDER["high"])
+    found = SEVERITY_ORDER.get(highest_severity, 0)
+    return 1 if found >= threshold else 0
+
+
+def _decision_for_severity(highest_severity: str) -> str:
+    severity = str(highest_severity or "clean").lower()
+    if severity in {"high", "critical"}:
+        return "BLOCK"
+    if severity == "medium":
+        return "WARN"
+    return "ALLOW"
+
+
+def _github_comment_status() -> dict[str, Any]:
     return {
-        **risk,
-        "why_it_matters": context["why"],
-        "recommendation": context["recommendation"],
-        "suggested_fix": _suggested_fix(project, risk),
-        "affected_downstream_models": _affected_downstream_models(project, risk["model"]),
+        "posted": False,
+        "reason": "missing_environment",
+        "detail": (
+            "Posting a live PR comment requires an authenticated GitHub App "
+            "installation client (owner, repository, pull request number, "
+            "and an installation access token), which a local CLI invocation "
+            "does not have. Comment markdown was written locally instead. "
+            "Use the Relium GitHub App webhook flow (agent.github_app) to "
+            "post it automatically, or paste the file contents into the PR "
+            "by hand."
+        ),
     }
 
 
-def _suggested_fix(project: Path, risk: dict) -> str:
-    if risk.get("risk_type") != "left_join_filter_risk":
-        return "No automated fix available."
-
-    sql_path = project / risk["file"]
-    if not sql_path.exists():
-        return "Move the right-table filter into the JOIN condition."
-
-    sql = _normalize_sql(strip_jinja(sql_path.read_text(encoding="utf-8")))
-    alias_match = re.search(r"\bWHERE\s+([\w\"`]+)\.", risk.get("evidence", ""), re.IGNORECASE)
-    if not alias_match:
-        return "Move the right-table filter into the JOIN condition."
-
-    alias = alias_match.group(1).strip('"`')
-    join = _left_join_for_alias(sql, alias)
-    condition = _where_condition_for_alias(sql, alias)
-    if not join or not condition:
-        return "Move the right-table filter into the JOIN condition."
-
-    return f"LEFT JOIN {join['table']} {join['alias']}\n    ON {join['on']}\n   AND {condition}"
-
-
-def _affected_downstream_models(project: Path, model_name: str) -> list[str]:
-    blast = calculate_blast_radius(str(project), model_name)
-    affected: list[str] = []
-    for section in ("directly_affected", "indirectly_affected"):
-        for item in blast.get(section, []):
-            affected.append(item["model"])
-    return list(dict.fromkeys(affected))
-
-
-def _highest_severity(risks: list[dict]) -> str:
-    if not risks:
-        return "NONE"
-    return max(
-        (risk["severity"].lower() for risk in risks),
-        key=lambda severity: SEVERITY_ORDER.get(severity, -1),
-    ).upper()
-
-
-def _has_blocking_risk(risks: list[dict], fail_on: str) -> bool:
-    threshold = SEVERITY_ORDER[fail_on.lower()]
-    return any(SEVERITY_ORDER.get(risk["severity"].lower(), 0) >= threshold for risk in risks)
-
-
-def _bullet_lines(items: Iterable[str]) -> list[str]:
-    values = list(items)
-    if not values:
-        return ["- None found"]
-    return [f"- {item}" for item in values]
-
-
-def _sentence(text: str) -> str:
-    text = text.rstrip(".")
-    return f"{text}."
-
-
-def _normalize_sql(sql: str) -> str:
-    sql = re.sub(r"--.*?$", "", sql, flags=re.MULTILINE)
-    sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
-    return re.sub(r"\s+", " ", sql).strip()
-
-
-def _left_join_for_alias(sql: str, alias: str) -> dict | None:
-    pattern = re.compile(
-        rf"\bLEFT(?:\s+OUTER)?\s+JOIN\s+([\w\"`\.]+)\s+(?:AS\s+)?({re.escape(alias)})\s+\bON\b\s+"
-        r"(.*?)(?=\b(?:LEFT|RIGHT|INNER|FULL|OUTER|CROSS)?\s*JOIN\b|\bWHERE\b|\bGROUP\s+BY\b|\bHAVING\b|\bORDER\s+BY\b|\bLIMIT\b|$)",
-        re.IGNORECASE,
-    )
-    match = pattern.search(sql)
-    if not match:
-        return None
-    return {
-        "table": match.group(1).strip('"`'),
-        "alias": match.group(2).strip('"`'),
-        "on": match.group(3).strip(" ;"),
-    }
-
-
-def _where_condition_for_alias(sql: str, alias: str) -> str | None:
-    match = re.search(
-        r"\bWHERE\b\s+(.*?)(?=\bGROUP\s+BY\b|\bHAVING\b|\bORDER\s+BY\b|\bLIMIT\b|$)",
-        sql,
-        re.IGNORECASE,
-    )
-    if not match:
-        return None
-    conditions = re.split(r"\s+AND\s+", match.group(1), flags=re.IGNORECASE)
-    alias_pattern = re.compile(rf"\b{re.escape(alias)}\.", re.IGNORECASE)
-    for condition in conditions:
-        cleaned = condition.strip(" ();")
-        if alias_pattern.search(cleaned):
-            return cleaned
-    return None
+def _write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
