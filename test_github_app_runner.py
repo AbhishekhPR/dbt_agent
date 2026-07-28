@@ -25,10 +25,13 @@ class FakeClient:
     def __init__(self):
         self.comments = []
         self.checks = []
+        self.config_content = (
+            b"version: 1\nmanifest_path: build/manifest.json\n"
+        )
 
     def get_file(self, owner, repository, path, ref):
         if path == "relium.yml":
-            return b"version: 1\nmanifest_path: build/manifest.json\n"
+            return self.config_content
         return json.dumps({"nodes": {}}).encode()
 
     def compare_files(self, owner, repository, base, head):
@@ -38,12 +41,25 @@ class FakeClient:
         return self.comments
 
     def create_issue_comment(self, owner, repository, pull_number, body):
-        value = {"id": 1, "body": body}
+        value = {
+            "id": 1,
+            "body": body,
+            "performed_via_github_app": {"id": 123},
+        }
         self.comments.append(value)
         return value
 
     def update_issue_comment(self, owner, repository, comment_id, body):
-        return {"id": comment_id, "body": body}
+        value = {
+            "id": comment_id,
+            "body": body,
+            "performed_via_github_app": {"id": 123},
+        }
+        for index, comment in enumerate(self.comments):
+            if comment["id"] == comment_id:
+                self.comments[index] = value
+                break
+        return value
 
     def create_check_run(self, owner, repository, payload):
         self.checks.append(payload)
@@ -71,6 +87,214 @@ class GitHubAppRunnerTests(unittest.TestCase):
         )
         self.assertEqual(client.checks[0]["conclusion"], "success")
         self.assertIn("relium-github-app-review", client.comments[0]["body"])
+
+    def test_reviewed_block_comment_is_concise_actionable_and_sql_free(self):
+        from agent.github_app.runner import PullRequestReviewRunner
+        from agent.github_app.storage import RepositoryStorage
+
+        reviewer = Mock(return_value=_material_block_result())
+        with tempfile.TemporaryDirectory() as tmp:
+            client = FakeClient()
+            runner = PullRequestReviewRunner(
+                storage=RepositoryStorage(tmp),
+                reviewer=reviewer,
+            )
+            runner.run(_event("actionable-comment"), client, expected_app_id=123)
+
+        self.assertEqual(
+            client.comments[0]["body"],
+            "<!-- relium-github-app-review -->\n"
+            "### Relium PR Guard — BLOCK\n\n"
+            "This change may produce incorrect results in `revenue_refunds`.\n\n"
+            "#### Why Relium blocked this PR\n\n"
+            "**Division without a zero-safe guard**\n"
+            "The denominator may be zero, causing an error or NULL result.\n"
+            "**Fix:** Use `NULLIF(denominator, 0)` or an explicit `CASE` guard.\n\n"
+            "**Integer division may truncate decimal values**\n"
+            "Rates, averages, and percentages may lose their decimal portion.\n"
+            "**Fix:** Cast one operand to `DECIMAL` or `FLOAT`.\n\n"
+            "**Not-equal filter may silently exclude NULL rows**\n"
+            "Rows with NULL values may be removed unintentionally.\n"
+            "**Fix:** Handle NULL explicitly or use `IS DISTINCT FROM`.\n\n"
+            "Decision: BLOCK\n"
+            "Risk level: High\n"
+            "Affected model: `revenue_refunds`",
+        )
+        self.assertNotIn("select customer_secret", client.comments[0]["body"])
+        self.assertNotIn(
+            "Review the flagged pipeline signals",
+            client.comments[0]["body"],
+        )
+
+    def test_enforcement_mode_alone_controls_block_check_conclusion(self):
+        from agent.github_app.runner import PullRequestReviewRunner
+        from agent.github_app.storage import RepositoryStorage
+
+        scenarios = (
+            (
+                b"manifest_path: build/manifest.json\nmode: block\n",
+                "neutral",
+            ),
+            (
+                b"manifest_path: build/manifest.json\n"
+                b"mode: block\nenforcement_mode: shadow\n",
+                "neutral",
+            ),
+            (
+                b"manifest_path: build/manifest.json\n"
+                b"mode: warn\nenforcement_mode: enforce\n",
+                "failure",
+            ),
+        )
+        comments = []
+        for index, (config_content, expected_conclusion) in enumerate(scenarios):
+            with self.subTest(config=config_content):
+                with tempfile.TemporaryDirectory() as tmp:
+                    client = FakeClient()
+                    client.config_content = config_content
+                    response = PullRequestReviewRunner(
+                        storage=RepositoryStorage(tmp),
+                        reviewer=Mock(return_value=_material_block_result()),
+                    ).run(
+                        _event(f"enforcement-{index}"),
+                        client,
+                        expected_app_id=123,
+                    )
+                self.assertEqual(
+                    client.checks[0]["conclusion"],
+                    expected_conclusion,
+                )
+                comments.append(response["comment"]["body"])
+
+        self.assertEqual(len(set(comments)), 1)
+
+    def test_real_safe_review_is_allow_100_and_non_failing_in_shadow(self):
+        from agent.github_app.runner import PullRequestReviewRunner
+        from agent.github_app.storage import RepositoryStorage
+
+        client = FakeClient()
+        client.config_content = (
+            b"manifest_path: build/manifest.json\n"
+            b"enforcement_mode: shadow\n"
+        )
+        client.get_file = _repository_file_loader(
+            client,
+            _review_manifest(
+                "select customer_id, order_total from raw_orders "
+                "where order_status = 'completed'"
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            response = PullRequestReviewRunner(
+                storage=RepositoryStorage(tmp)
+            ).run(
+                _event("safe-shadow"),
+                client,
+                expected_app_id=123,
+            )
+
+        self.assertEqual(response["result"]["decision"], "ALLOW")
+        self.assertEqual(response["result"]["incident"]["health"], 100)
+        self.assertEqual(client.checks[0]["conclusion"], "success")
+        self.assertIn("### Relium PR Guard — ALLOW", response["comment"]["body"])
+        self.assertNotIn("Why Relium blocked", response["comment"]["body"])
+
+    def test_real_risky_review_is_block_65_with_sticky_identical_comments(self):
+        from agent.github_app.runner import PullRequestReviewRunner
+        from agent.github_app.storage import RepositoryStorage
+
+        risky_sql = (
+            "select customer_id, sum(order_total) / count(*) "
+            "as average_order_value from raw_orders "
+            "where order_status != 'cancelled' group by customer_id"
+        )
+        client = FakeClient()
+        client.get_file = _repository_file_loader(
+            client,
+            _review_manifest(risky_sql),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = PullRequestReviewRunner(storage=RepositoryStorage(tmp))
+            client.config_content = (
+                b"manifest_path: build/manifest.json\n"
+                b"enforcement_mode: shadow\n"
+            )
+            shadow = runner.run(
+                _event("risky-shadow"),
+                client,
+                expected_app_id=123,
+            )
+            client.config_content = (
+                b"manifest_path: build/manifest.json\n"
+                b"enforcement_mode: enforce\n"
+            )
+            enforce = runner.run(
+                _event("risky-enforce"),
+                client,
+                expected_app_id=123,
+            )
+
+        self.assertEqual(shadow["result"]["decision"], "BLOCK")
+        self.assertEqual(shadow["result"]["incident"]["health"], 65)
+        self.assertEqual(enforce["result"]["decision"], "BLOCK")
+        self.assertEqual(enforce["result"]["incident"]["health"], 65)
+        self.assertEqual(client.checks[0]["conclusion"], "neutral")
+        self.assertEqual(client.checks[1]["conclusion"], "failure")
+        self.assertEqual(shadow["comment"]["body"], enforce["comment"]["body"])
+        self.assertEqual(len(client.comments), 1)
+        self.assertIn(
+            "**Division without a zero-safe guard**",
+            enforce["comment"]["body"],
+        )
+        self.assertIn(
+            "**Fix:** Use `NULLIF(denominator, 0)` or an explicit `CASE` guard.",
+            enforce["comment"]["body"],
+        )
+        self.assertNotIn(risky_sql, enforce["comment"]["body"])
+
+    def test_non_ast_warn_uses_only_material_reasons_and_recommendation(self):
+        from agent.github_app.runner import PullRequestReviewRunner
+        from agent.github_app.storage import RepositoryStorage
+
+        result = {
+            "decision": "WARN",
+            "incident": {
+                "health": 85,
+                "severity": "MEDIUM",
+                "affected_models": ["customer_orders"],
+                "top_reasons": ["A required contract assumption changed."],
+                "recommendation": "Verify the changed contract with its owner.",
+            },
+            "material_findings": [],
+            "rendered": {
+                "markdown": (
+                    "Metadata checks were not evaluated.\n"
+                    "A required contract assumption changed."
+                )
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            client = FakeClient()
+            response = PullRequestReviewRunner(
+                storage=RepositoryStorage(tmp),
+                reviewer=Mock(return_value=result),
+            ).run(
+                _event("contract-warn"),
+                client,
+                expected_app_id=123,
+            )
+
+        comment = response["comment"]["body"]
+        self.assertNotIn("No material deployment risks detected.", comment)
+        self.assertEqual(
+            comment.count("A required contract assumption changed."),
+            1,
+        )
+        self.assertIn(
+            "**Recommendation:** Verify the changed contract with its owner.",
+            comment,
+        )
+        self.assertNotIn("Metadata checks were not evaluated.", comment)
 
     def test_duplicate_delivery_does_not_review_or_publish(self):
         from agent.github_app.runner import PullRequestReviewRunner
@@ -244,6 +468,77 @@ class GitHubAppRunnerTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             adapter.handle(event_name="pull_request", delivery_id="d-1", signature="bad", body=b"{}")
         factory.assert_not_called()
+
+
+def _material_block_result():
+    return {
+        "decision": "BLOCK",
+        "incident": {
+            "health": 65,
+            "severity": "HIGH",
+            "affected_models": ["revenue_refunds"],
+        },
+        "material_findings": [
+            {
+                "rule": "DIVISION_BY_ZERO",
+                "title": "Division without a zero-safe guard",
+                "impact": (
+                    "Dividing by a customer expression can fail. "
+                    "select customer_secret from raw_orders"
+                ),
+                "affected_model": "revenue_refunds",
+                "recommended_fix": "Use a safe denominator.",
+            },
+            {
+                "rule": "INTEGER_DIVISION",
+                "title": "Integer division may truncate decimal values",
+                "impact": "Integer division can truncate results.",
+                "affected_model": "revenue_refunds",
+                "recommended_fix": "Cast an operand.",
+            },
+            {
+                "rule": "NOT_EQUAL_NULL_RISK",
+                "title": "Not-equal filter may silently exclude NULL rows",
+                "impact": "NULL rows may be excluded.",
+                "affected_model": "revenue_refunds",
+                "recommended_fix": "Handle NULL explicitly.",
+            },
+        ],
+        "rendered": {
+            "markdown": (
+                "select customer_secret from raw_orders\n"
+                "Review the flagged pipeline signals before deployment."
+            )
+        },
+    }
+
+
+def _review_manifest(sql):
+    return {
+        "nodes": {
+            "model.analytics.revenue_refunds": {
+                "resource_type": "model",
+                "name": "revenue_refunds",
+                "unique_id": "model.analytics.revenue_refunds",
+                "original_file_path": "models/orders.sql",
+                "raw_code": sql,
+                "compiled_code": sql,
+                "columns": {
+                    "customer_id": {"name": "customer_id"},
+                    "revenue": {"name": "revenue"},
+                },
+            }
+        }
+    }
+
+
+def _repository_file_loader(client, manifest):
+    def get_file(owner, repository, path, ref):
+        if path == "relium.yml":
+            return client.config_content
+        return json.dumps(manifest).encode()
+
+    return get_file
 
 
 if __name__ == "__main__":

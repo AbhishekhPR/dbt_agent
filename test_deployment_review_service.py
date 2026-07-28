@@ -209,6 +209,25 @@ class DeploymentReviewServiceTests(unittest.TestCase):
                 for reason in result["incident"]["top_reasons"]
             )
         )
+        findings = result["material_findings"]
+        self.assertEqual(
+            [finding["title"] for finding in findings],
+            [
+                "Division without a zero-safe guard",
+                "Integer division may truncate decimal values",
+                "Not-equal filter may silently exclude NULL rows",
+            ],
+        )
+        self.assertEqual(
+            {finding["affected_model"] for finding in findings},
+            {"fct_revenue"},
+        )
+        self.assertTrue(
+            all(finding["recommended_fix"] for finding in findings)
+        )
+        serialized_findings = json.dumps(findings)
+        self.assertNotIn(risky_sql, serialized_findings)
+        self.assertNotIn("line_reference", serialized_findings)
 
     def test_harmless_revenue_linked_sql_is_allow(self):
         safe_sql = (

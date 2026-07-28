@@ -133,8 +133,9 @@ class GitHubAppPilotAssetTests(unittest.TestCase):
             "Missing manifest",
             "No changed dbt model",
             "Re-delivered webhook",
-            "BLOCK result in warn mode",
-            "BLOCK result in block mode",
+            "BLOCK result in shadow mode",
+            "BLOCK result in enforce mode",
+            "`mode` is deprecated",
         )
         for text in required:
             with self.subTest(text=text):
@@ -147,7 +148,6 @@ class GitHubAppPilotAssetTests(unittest.TestCase):
             config,
             {
                 "manifest_path": "target/manifest.json",
-                "mode": "warn",
                 "enforcement_mode": "shadow",
                 "enabled": True,
             },

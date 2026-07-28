@@ -27,9 +27,10 @@ from `previous_manifest.json`, then change the model to
 
 Use only a dedicated test repository. The SQL is static input for Relium's parser;
 do not execute it against a database. Exact decisions depend on the full manifest
-context, so verify the rendered evidence and then exercise both `mode: warn` and
-`mode: block` without changing detector scores or thresholds.
+context, so verify the rendered evidence without changing detector scores or
+thresholds.
 
-The workflow enforcement setting is separate: `enforcement_mode: shadow` keeps
-all decisions advisory, while `enforcement_mode: enforce` makes only BLOCK return
-a nonzero CI exit code. WARN remains advisory in both modes.
+`enforcement_mode: shadow` keeps BLOCK advisory, while
+`enforcement_mode: enforce` makes BLOCK fail the GitHub check and return a nonzero
+CI exit code. ALLOW and WARN remain non-failing. The legacy `mode` field is
+deprecated and does not control GitHub check enforcement.

@@ -89,6 +89,7 @@ def _review_project_context_change(
     )
 
     lifecycle = _deployment_lifecycle_metadata(review)
+    material_findings = _material_ast_findings(review.incident)
     incident = render_json(review.incident)
     cli_text = render_cli(review.incident)
     markdown = render_markdown(review.incident)
@@ -101,6 +102,7 @@ def _review_project_context_change(
         "decision": incident["decision"],
         "changed_files": _ordered_unique(list(changed_files or [])),
         "changed_models": [spec["name"] for spec in model_specs],
+        "material_findings": material_findings,
         "sql_sources": sql_sources,
         "deployment_lifecycle": lifecycle,
         "rendered": {
@@ -108,6 +110,50 @@ def _review_project_context_change(
             "markdown": f"{markdown}\n\n## Deployment History\n" + "\n".join(markdown_status),
         },
     }
+
+
+def _material_ast_findings(incident, limit: int = 3) -> list[dict[str, str]]:
+    findings = []
+    seen = set()
+    for signal in incident.signals:
+        if signal.component != "ast" or signal.score >= 0:
+            continue
+        metadata = dict(signal.metadata or {})
+        if metadata.get("ast_status") != "evaluated":
+            continue
+        model_name = str(metadata.get("model_name") or "unknown model")
+        for bug in metadata.get("bugs") or []:
+            if not isinstance(bug, dict):
+                continue
+            title = str(
+                bug.get("category")
+                or bug.get("description")
+                or "SQL risk detected"
+            )
+            key = (model_name, str(bug.get("rule") or ""), title)
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(
+                {
+                    "rule": str(bug.get("rule") or ""),
+                    "title": title,
+                    "impact": str(
+                        bug.get("impact")
+                        or bug.get("description")
+                        or "This SQL pattern may produce incorrect results."
+                    ),
+                    "affected_model": model_name,
+                    "recommended_fix": str(
+                        bug.get("recommendation")
+                        or bug.get("fix")
+                        or "Review and correct the affected SQL."
+                    ),
+                }
+            )
+            if len(findings) >= limit:
+                return findings
+    return findings
 
 
 def _hydrate_model_specs(

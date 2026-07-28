@@ -29,9 +29,20 @@ class GitHubAppConfigTests(unittest.TestCase):
     def test_loads_explicit_enforcement_mode(self):
         from agent.github_app.config import load_repository_config
 
-        config = load_repository_config("enforcement_mode: enforce\n")
+        config = load_repository_config(
+            "mode: warn\nenforcement_mode: enforce\n"
+        )
 
+        self.assertEqual(config.mode, "warn")
         self.assertEqual(config.enforcement_mode, "enforce")
+
+    def test_legacy_block_mode_does_not_enable_enforcement(self):
+        from agent.github_app.config import load_repository_config
+
+        config = load_repository_config("mode: block\n")
+
+        self.assertEqual(config.mode, "block")
+        self.assertEqual(config.enforcement_mode, "shadow")
 
     def test_rejects_unknown_versions_and_invalid_types(self):
         from agent.github_app.config import RepositoryConfigError, load_repository_config

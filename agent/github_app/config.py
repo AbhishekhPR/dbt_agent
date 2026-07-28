@@ -37,6 +37,8 @@ class RepositoryConfig:
     version: int = 1
     enabled: bool = True
     manifest_path: str = DEFAULT_MANIFEST_PATH
+    # Deprecated compatibility field. It no longer controls GitHub checks;
+    # enforcement_mode is authoritative and defaults to shadow.
     mode: str = "warn"
     enforcement_mode: str = "shadow"
 
