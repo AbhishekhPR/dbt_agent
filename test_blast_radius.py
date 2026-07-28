@@ -84,6 +84,133 @@ class BlastRadiusTests(unittest.TestCase):
         self.assertEqual(len(models_seen), len(set(models_seen)))
         self.assertIn("model_b", models_seen)
 
+    def test_to_signal_converts_high_blast_radius_to_high_signal(self):
+        from agent.blast_radius import to_signal
+        from agent.signals import Severity, Signal
+
+        result = {
+            "changed_table": "raw_customers",
+            "risk_level": "HIGH",
+            "directly_affected": [
+                {"model": "fct_customer_lifetime_value", "risk": "high"}
+            ],
+            "indirectly_affected": [
+                {
+                    "model": "dashboard_executive_metrics",
+                    "risk": "medium",
+                    "dependency_path": [
+                        "raw_customers",
+                        "fct_customer_lifetime_value",
+                        "dashboard_executive_metrics",
+                    ],
+                }
+            ],
+            "total_affected": 2,
+            "dashboard_count": 1,
+            "blast_radius_score": 80,
+            "dependency_depth": 2,
+        }
+
+        signal = to_signal(result)
+
+        self.assertIsInstance(signal, Signal)
+        self.assertEqual(signal.component, "blast_radius")
+        self.assertEqual(signal.severity, Severity.HIGH)
+        self.assertEqual(signal.confidence, 95)
+        self.assertEqual(signal.score, -25)
+        self.assertIn("Downstream models affected", signal.reasons)
+        self.assertIn("Executive dashboard affected", signal.reasons)
+
+    def test_to_signal_treats_no_downstream_models_as_neutral(self):
+        from agent.blast_radius import to_signal
+        from agent.signals import Severity
+
+        result = {
+            "changed_table": "raw_customers",
+            "risk_level": "LOW",
+            "directly_affected": [],
+            "indirectly_affected": [],
+            "total_affected": 0,
+        }
+
+        signal = to_signal(result)
+
+        self.assertEqual(signal.component, "blast_radius")
+        self.assertEqual(signal.severity, Severity.LOW)
+        self.assertEqual(signal.confidence, 75)
+        self.assertEqual(signal.score, 0)
+        self.assertEqual(signal.reasons, [])
+
+    def test_to_signal_preserves_a_genuine_low_blast_radius_finding(self):
+        from agent.blast_radius import to_signal
+        from agent.signals import Severity
+
+        signal = to_signal(
+            {
+                "changed_table": "raw_customers",
+                "risk_level": "LOW",
+                "directly_affected": [
+                    {
+                        "model": "dim_customers",
+                        "risk": "low",
+                    }
+                ],
+                "indirectly_affected": [],
+                "total_affected": 1,
+            }
+        )
+
+        self.assertEqual(signal.severity, Severity.LOW)
+        self.assertEqual(signal.score, -5)
+        self.assertEqual(signal.reasons, ["Downstream models affected"])
+
+    def test_to_signal_preserves_affected_models(self):
+        from agent.blast_radius import to_signal
+
+        result = {
+            "changed_table": "raw_customers",
+            "risk_level": "HIGH",
+            "directly_affected": [{"model": "fct_customer_lifetime_value"}],
+            "indirectly_affected": [{"model": "dashboard_executive_metrics"}],
+            "total_affected": 2,
+        }
+
+        signal = to_signal(result)
+
+        self.assertEqual(
+            signal.metadata["affected_models"],
+            ["fct_customer_lifetime_value", "dashboard_executive_metrics"],
+        )
+
+    def test_to_signal_preserves_metadata(self):
+        from agent.blast_radius import to_signal
+
+        result = {
+            "changed_table": "raw_customers",
+            "changed_model": "raw_customers",
+            "risk_level": "MEDIUM",
+            "directly_affected": [{"model": "fct_customer_lifetime_value"}],
+            "indirectly_affected": [],
+            "total_affected": 1,
+            "dashboard_count": 0,
+            "blast_radius_score": 45,
+            "dependency_depth": 1,
+        }
+
+        signal = to_signal(result)
+
+        self.assertEqual(
+            signal.metadata,
+            {
+                "changed_model": "raw_customers",
+                "affected_models": ["fct_customer_lifetime_value"],
+                "downstream_model_count": 1,
+                "dashboard_count": 0,
+                "blast_radius_score": 45,
+                "dependency_depth": 1,
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

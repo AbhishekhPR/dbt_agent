@@ -1,10 +1,30 @@
 import json
 import re
 from pathlib import Path
-from dotenv import load_dotenv
+
+from agent.signals import Signal
+
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    def load_dotenv(*args, **kwargs):
+        return False
 
 env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
+
+
+BLAST_RADIUS_SIGNAL_CONFIDENCE = {
+    "HIGH": 95,
+    "MEDIUM": 85,
+    "LOW": 75,
+}
+
+BLAST_RADIUS_SIGNAL_SCORES = {
+    "HIGH": -25,
+    "MEDIUM": -15,
+    "LOW": -5,
+}
 
 
 # ─────────────────────────────────────────
@@ -302,6 +322,85 @@ def _format_dependency_reason(path: list) -> str:
     return "Depends on " + " which depends on ".join(chain)
 
 
+def to_signal(blast_radius_result: dict) -> Signal:
+    severity = _blast_radius_signal_severity(blast_radius_result)
+    affected_models = _affected_model_names(blast_radius_result)
+    neutral = not affected_models
+
+    metadata = {
+        "changed_model": (
+            blast_radius_result.get("changed_model")
+            or blast_radius_result.get("changed_table")
+        ),
+        "affected_models": affected_models,
+        "downstream_model_count": blast_radius_result.get(
+            "total_affected",
+            len(affected_models),
+        ),
+    }
+    for field in ("dashboard_count", "blast_radius_score", "dependency_depth"):
+        if field in blast_radius_result:
+            metadata[field] = blast_radius_result.get(field)
+
+    return Signal(
+        component="blast_radius",
+        severity=severity,
+        confidence=BLAST_RADIUS_SIGNAL_CONFIDENCE[severity],
+        score=0 if neutral else BLAST_RADIUS_SIGNAL_SCORES[severity],
+        reasons=(
+            []
+            if neutral
+            else _blast_radius_signal_reasons(blast_radius_result, affected_models)
+        ),
+        metadata=metadata,
+    )
+
+
+def _blast_radius_signal_severity(result: dict) -> str:
+    explicit = result.get("severity") or result.get("risk_level")
+    if explicit:
+        return str(explicit).upper()
+
+    risks = [
+        str(item.get("risk", "")).upper()
+        for item in (
+            result.get("directly_affected", [])
+            + result.get("indirectly_affected", [])
+        )
+        if item.get("risk")
+    ]
+    if "HIGH" in risks:
+        return "HIGH"
+    if "MEDIUM" in risks:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _affected_model_names(result: dict) -> list[str]:
+    names = []
+    for item in result.get("directly_affected", []) + result.get("indirectly_affected", []):
+        model = item.get("model")
+        if model and model not in names:
+            names.append(model)
+    return names
+
+
+def _blast_radius_signal_reasons(result: dict, affected_models: list[str]) -> list[str]:
+    reasons = []
+    if affected_models:
+        reasons.append("Downstream models affected")
+    if any("dashboard" in model.lower() for model in affected_models):
+        reasons.append("Executive dashboard affected")
+    if any("critical" in model.lower() or "executive" in model.lower() for model in affected_models):
+        reasons.append("Critical business model affected")
+    if any(
+        len(item.get("dependency_path", [])) >= 3
+        for item in result.get("indirectly_affected", [])
+    ):
+        reasons.append("Large dependency chain detected")
+    return reasons
+
+
 # ─────────────────────────────────────────
 # PRETTY PRINTER
 # ─────────────────────────────────────────
@@ -309,7 +408,7 @@ def print_blast_radius(report: dict):
     """Pretty prints the blast radius report."""
 
     if "error" in report:
-        print(f"⚠️  {report['error']}")
+        print(report['error'])
         return
 
     changed_table = report.get("changed_table")
@@ -317,14 +416,14 @@ def print_blast_radius(report: dict):
     total = report.get("total_affected", 0)
 
     print(f"\n{'━' * 55}")
-    print(f"  💥 Blast radius for: {changed_table}")
+    print(f"  Blast radius for: {changed_table}")
     if changed_cols:
-        print(f"  📋 Changed columns:  {', '.join(changed_cols)}")
-    print(f"  📊 Total affected:   {total} model(s)")
+        print(f"  Changed columns:  {', '.join(changed_cols)}")
+    print(f"  Total affected:   {total} model(s)")
     print(f"{'━' * 55}")
 
     if total == 0:
-        print(f"\n  ✅ No models depend on '{changed_table}' — safe to change.\n")
+        print(f"\n  No models depend on '{changed_table}' — safe to change.\n")
         return
 
     direct = report.get("directly_affected", [])
@@ -336,7 +435,7 @@ def print_blast_radius(report: dict):
             print(f"    {risk_emoji} {item['model']}")
             print(f"       {item['reason']}")
             if cols:
-                print(f"       ⚠️  Will break on: {', '.join(cols)}")
+                print(f"       Will break on: {', '.join(cols)}")
             print()
 
     indirect = report.get("indirectly_affected", [])
@@ -357,7 +456,7 @@ def run_blast_radius(project_path: str, table: str, columns: str = None):
     """Main entry point called from CLI."""
     changed_cols = [c.strip() for c in columns.split(",")] if columns else []
 
-    print(f"\n🔍 Calculating blast radius for '{table}'...")
+    print(f"\nCalculating blast radius for '{table}'...")
     if changed_cols:
         print(f"   Changed columns: {changed_cols}")
 

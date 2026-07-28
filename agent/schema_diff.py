@@ -3,7 +3,6 @@ import os
 import sqlite3
 from pathlib import Path
 from dotenv import load_dotenv
-from matplotlib import table
 from agent.slack import send_slack_alert
 
 env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -177,34 +176,10 @@ def run_schema_diff(project_name: str, db_path: str):
         print(f"{severity_emoji} [{change['severity'].upper()}] {change['message']}")
         print(f"   Risk: {change['risk']}\n")
 
-        # Calculate and print blast radius
-        from agent.blast_radius import calculate_blast_radius, print_blast_radius
-        changed_col_names = []
-        for change in changes:
-            from agent.metrics_store import record_schema_change
-            record_schema_change(project_name, change["table"], change)
-            if change.get("type") in ("column_dropped", "column_renamed"):
-                col = change.get("column") or change.get("old_column", [])
-                if isinstance(col, list):
-                    changed_col_names.extend(col)
-                elif col:
-                    changed_col_names.append(col)
-
-        if changed_col_names:
-            blast_report = calculate_blast_radius(
-                project_path=str(Path(results_path).parent.parent)
-                    if hasattr(results_path, 'parent')
-                    else ".",
-                changed_table=table,
-                changed_columns=changed_col_names
-            )
-            print_blast_radius(blast_report)
-
         # Send Slack alert for critical and high changes
         if change["severity"] in ("critical", "high"):
             diagnosis = {
                 "root_cause": change["message"],
-                "affected_file": f"Table: {change['table']}",
                 "affected_file": f"Table: {change['table']}",
                 "affected_line": change["type"],
                 "explanation": change["risk"],

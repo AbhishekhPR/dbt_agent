@@ -32,4 +32,11 @@ stg_orders:
 """
 
 result = diagnose_failure(error_log, model_sql, upstream_schema)
-print(json.dumps(result, indent=2))
+
+
+def main():
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()
