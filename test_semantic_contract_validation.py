@@ -8,7 +8,7 @@ from agent.signals import Severity
 
 
 class SemanticContractValidationTests(unittest.TestCase):
-    def test_changed_model_touching_contract_creates_signal(self):
+    def test_changed_model_touching_contract_is_context_only(self):
         contract = _contract(
             "Revenue",
             related_models=["fct_payments"],
@@ -21,14 +21,16 @@ class SemanticContractValidationTests(unittest.TestCase):
         )
         signal = to_signal(result)
 
-        self.assertEqual(result["severity"], "MEDIUM")
+        self.assertEqual(result["severity"], "LOW")
+        self.assertEqual(result["score"], 0)
+        self.assertEqual(result["reasons"], [])
         self.assertEqual(signal.component, "semantic_contract")
-        self.assertEqual(signal.severity, Severity.MEDIUM)
-        self.assertIn("Revenue may be impacted by changed model fct_payments", result["reasons"])
+        self.assertEqual(signal.severity, Severity.LOW)
         self.assertEqual(result["metadata"]["contract_names"], ["Revenue"])
         self.assertEqual(result["metadata"]["impacted_models"], ["fct_payments"])
+        self.assertEqual(result["metadata"]["context_reasons"], [])
 
-    def test_impacted_kpi_creates_stronger_signal(self):
+    def test_impacted_kpi_association_does_not_create_contract_violation(self):
         contract = _contract("Revenue", related_models=["fct_payments"])
 
         touched_result = validate_semantic_contracts(
@@ -41,11 +43,44 @@ class SemanticContractValidationTests(unittest.TestCase):
             kpi_impact_report=_impact_report(),
         )
 
-        self.assertEqual(touched_result["severity"], "MEDIUM")
-        self.assertEqual(impacted_result["severity"], "HIGH")
-        self.assertGreater(impacted_result["confidence"], touched_result["confidence"])
-        self.assertEqual(impacted_result["score"], -30)
+        self.assertEqual(touched_result["severity"], "LOW")
+        self.assertEqual(impacted_result["severity"], "LOW")
+        self.assertEqual(impacted_result["score"], 0)
+        self.assertEqual(impacted_result["reasons"], [])
         self.assertEqual(impacted_result["metadata"]["impacted_kpis"], ["Revenue"])
+        self.assertEqual(impacted_result["metadata"]["context_reasons"], [])
+
+    def test_invariant_removal_is_an_independent_contract_risk(self):
+        contract = _contract(
+            "Revenue",
+            related_models=["fct_payments"],
+            invariants=[],
+        )
+
+        result = validate_semantic_contracts(
+            contracts=[contract],
+            changed_models=["fct_payments"],
+            metadata={
+                "contract_changes": {
+                    "Revenue": {
+                        "invariants": {
+                            "added": [],
+                            "removed": ["never negative"],
+                        }
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(result["severity"], "HIGH")
+        self.assertEqual(result["score"], -30)
+        self.assertIn("Revenue lost invariant never negative", result["reasons"])
+        self.assertEqual(
+            result["metadata"]["contract_changes"]["Revenue"]["invariants"][
+                "removed"
+            ],
+            ["never negative"],
+        )
 
     def test_negative_revenue_invariant_violation_is_high(self):
         contract = _contract(

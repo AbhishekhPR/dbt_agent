@@ -2,6 +2,9 @@ import re
 from pathlib import Path
 from typing import Any
 
+import sqlglot
+from sqlglot import expressions as exp
+
 from agent.signals import Severity, Signal
 from agent.sql_analyzer import analyze_sql_logic
 
@@ -13,6 +16,7 @@ RULE_RECOMMENDATIONS = {
     "COUNT_AFTER_JOIN": "Use COUNT(DISTINCT key) or deduplicate upstream before aggregating.",
     "MISSING_OR_RENAMED_COLUMNS": "Verify upstream schema and update column names or mappings.",
     "DIVISION_BY_ZERO": "Wrap the denominator in NULLIF(denominator, 0) or add an explicit CASE guard.",
+    "INTEGER_DIVISION": "Cast an operand to a floating-point type or multiply the numerator by 1.0.",
     "HARDCODED_DATE_FILTER": "Confirm the date is intentional or parameterize it (e.g. current_date - interval).",
     "NOT_EQUAL_NULL_RISK": "Add an explicit OR column IS NULL clause or use IS DISTINCT FROM instead of != / <>.",
 }
@@ -25,6 +29,7 @@ RULE_IDS = {
     "count_after_join": "COUNT_AFTER_JOIN",
     "missing_or_renamed_columns": "MISSING_OR_RENAMED_COLUMNS",
     "division_by_zero": "DIVISION_BY_ZERO",
+    "integer_division": "INTEGER_DIVISION",
     "hardcoded_date_filter": "HARDCODED_DATE_FILTER",
     "not_equal_null_risk": "NOT_EQUAL_NULL_RISK",
 }
@@ -42,7 +47,10 @@ SEVERITY_SCORES = {
 def run_ast_analysis(sql: str, model_name: str, dialect: str | None = None) -> dict:
     sql = sql or ""
     report = analyze_sql_logic(model_name, sql)
-    findings = list(report.get("findings", [])) + _additional_findings(sql)
+    findings = list(report.get("findings", [])) + _additional_findings(
+        sql,
+        dialect=dialect,
+    )
     bugs = [_bug_from_finding(finding) for finding in findings]
     overall_risk = _overall_risk(findings)
     return {
@@ -145,8 +153,6 @@ _WHERE_CLAUSE_RE = re.compile(
     r"\bwhere\b(.*?)(?:\bgroup\s+by\b|\border\s+by\b|\bhaving\b|\blimit\b|$)",
     re.IGNORECASE | re.DOTALL,
 )
-_DIVISION_RE = re.compile(r"/\s*(nullif\s*\([^)]*\)|[\w][\w\.\"]*)", re.IGNORECASE)
-_DIVISION_NUMERATOR_RE = re.compile(r"([\w\.\"\)]+)\s*/\s*$")
 _CASE_ZERO_GUARD_TEMPLATE = r"when\s+{}\s*(?:=\s*0|<=\s*0)\b"
 _DATE_FILTER_RE = re.compile(
     r"[\w\.\"]+\s*(?:=|<>|!=|>=|<=|>|<)\s*(?:date\s*|timestamp\s*)?'(\d{4}-\d{2}-\d{2})",
@@ -155,10 +161,15 @@ _DATE_FILTER_RE = re.compile(
 _NOT_EQUAL_RE = re.compile(r"([\w\.\"]+)\s*(?:!=|<>)\s*", re.IGNORECASE)
 
 
-def _additional_findings(sql: str) -> list[dict]:
+def _additional_findings(
+    sql: str,
+    *,
+    dialect: str | None = None,
+) -> list[dict]:
     findings = []
     for finder in (
-        _division_by_zero_finding,
+        lambda value: _division_by_zero_finding(value, dialect=dialect),
+        lambda value: _integer_division_finding(value, dialect=dialect),
         _hardcoded_date_filter_finding,
         _not_equal_null_risk_finding,
     ):
@@ -185,25 +196,38 @@ def _has_case_zero_guard(sql: str, denominator: str) -> bool:
     return bool(pattern.search(sql))
 
 
-def _find_division_by_zero_risk(sql: str) -> list[str]:
+def _find_division_by_zero_risk(
+    sql: str,
+    *,
+    dialect: str | None = None,
+) -> list[str]:
     without_comments = _COMMENT_RE.sub(" ", sql)
+    tree = _parse_sql_tree(without_comments, dialect=dialect)
+    if tree is None:
+        return []
+
     risky = []
-    for match in _DIVISION_RE.finditer(without_comments):
-        denominator = match.group(1).strip()
-        if denominator.lower().startswith("nullif("):
+    for division in tree.find_all(exp.Div):
+        denominator = division.right
+        denominator_sql = denominator.sql()
+        if "NULLIF" in denominator_sql.upper():
             continue
-        if _is_safe_numeric_literal(denominator):
+        if isinstance(denominator, exp.Literal) and _is_safe_numeric_literal(
+            str(denominator.this)
+        ):
             continue
-        if _has_case_zero_guard(without_comments, denominator):
+        if _has_case_zero_guard(without_comments, denominator_sql):
             continue
-        numerator_match = _DIVISION_NUMERATOR_RE.search(without_comments[: match.start() + 1])
-        numerator = numerator_match.group(1).strip() if numerator_match else "expression"
-        risky.append(f"{numerator} / {denominator}")
+        risky.append(division.sql())
     return risky
 
 
-def _division_by_zero_finding(sql: str) -> dict | None:
-    risky = _find_division_by_zero_risk(sql)
+def _division_by_zero_finding(
+    sql: str,
+    *,
+    dialect: str | None = None,
+) -> dict | None:
+    risky = _find_division_by_zero_risk(sql, dialect=dialect)
     if not risky:
         return None
     return {
@@ -219,6 +243,57 @@ def _division_by_zero_finding(sql: str) -> dict | None:
         "recommendation": RULE_RECOMMENDATIONS["DIVISION_BY_ZERO"],
         "confidence": "medium",
     }
+
+
+def _integer_division_finding(
+    sql: str,
+    *,
+    dialect: str | None = None,
+) -> dict | None:
+    tree = _parse_sql_tree(sql, dialect=dialect)
+    if tree is None:
+        return None
+
+    risky = []
+    for division in tree.find_all(exp.Div):
+        expression_sql = division.sql()
+        normalized = expression_sql.upper()
+        if "NULLIF" in normalized:
+            continue
+        if any(marker in normalized for marker in ("1.0", "100.0", "FLOAT", "CAST")):
+            continue
+        if not isinstance(division.left, (exp.Sum, exp.Count)) and not isinstance(
+            division.right,
+            (exp.Sum, exp.Count),
+        ):
+            continue
+        risky.append(expression_sql)
+
+    if not risky:
+        return None
+    return {
+        "rule_id": "integer_division",
+        "severity": "medium",
+        "title": "Integer division may truncate decimal values",
+        "evidence": "; ".join(dict.fromkeys(risky)),
+        "why_it_matters": (
+            "When both aggregate operands are integers, SQL engines can truncate "
+            "the decimal portion of averages, rates, and percentages."
+        ),
+        "recommendation": RULE_RECOMMENDATIONS["INTEGER_DIVISION"],
+        "confidence": "medium",
+    }
+
+
+def _parse_sql_tree(
+    sql: str,
+    *,
+    dialect: str | None = None,
+) -> exp.Expression | None:
+    try:
+        return sqlglot.parse_one(strip_jinja(sql), read=dialect)
+    except (sqlglot.errors.ParseError, ValueError):
+        return None
 
 
 def _find_hardcoded_date_filters(sql: str) -> list[str]:

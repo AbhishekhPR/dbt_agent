@@ -1,0 +1,66 @@
+{
+  "snapshots": [
+    {
+      "snapshot_id": "snap_history_aware_previous",
+      "deployment_id": "previous_deploy",
+      "created_at": "2026-07-02T00:00:00+00:00",
+      "changed_models": [
+        "fct_revenue"
+      ],
+      "semantic_context": {
+        "knowledge_report": {
+          "contracts": [
+            {
+              "kpi_name": "Revenue",
+              "description": "Revenue, gross merchandise value, order value, or payment volume.",
+              "business_meaning": "Represents completed customer payments.",
+              "related_models": [
+                "fct_revenue",
+                "stg_orders",
+                "stg_payments"
+              ],
+              "related_columns": [
+                "completed_payment_amount",
+                "gross_revenue",
+                "payment_amount"
+              ],
+              "upstream_sources": [
+                "orders",
+                "payments"
+              ],
+              "downstream_consumers": [],
+              "assumptions": [
+                "completed payments only",
+                "non-negative",
+                "currency consistent"
+              ],
+              "invariants": [
+                "never negative"
+              ],
+              "confidence": 100,
+              "metadata": {
+                "source": "history_aware_demo_fixture"
+              }
+            }
+          ],
+          "confidence": 100,
+          "metadata": {
+            "kpi_count": 1,
+            "source": "history_aware_demo_fixture"
+          }
+        }
+      },
+      "decision": {
+        "decision": "BLOCK",
+        "health": 20
+      },
+      "incident_summary": {
+        "incident_id": "INC-0001",
+        "decision": "BLOCK"
+      },
+      "metadata": {
+        "source": "history_aware_demo_fixture"
+      }
+    }
+  ]
+}

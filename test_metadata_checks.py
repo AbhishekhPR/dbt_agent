@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -59,6 +60,89 @@ class MetadataChecksTests(unittest.TestCase):
             get_freshness_timestamp(self.conn, "sample_model"),
             "2026-06-23T12:00:00",
         )
+
+    def test_freshness_prefers_source_watermark_over_model_build_time(self):
+        from agent.metadata_checks import get_freshness_timestamp
+
+        self.conn.execute(
+            """
+            CREATE TABLE watermark_model (
+                source_max_updated_at TEXT,
+                model_built_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        self.conn.executemany(
+            "INSERT INTO watermark_model VALUES (?, ?, ?)",
+            [
+                (
+                    "2026-06-20T08:00:00+00:00",
+                    "2026-06-24T12:00:00+00:00",
+                    "2026-06-24T12:00:00+00:00",
+                ),
+                (
+                    "2026-06-21T08:00:00+00:00",
+                    "2026-06-25T12:00:00+00:00",
+                    "2026-06-25T12:00:00+00:00",
+                ),
+            ],
+        )
+        self.conn.commit()
+
+        self.assertEqual(
+            get_freshness_timestamp(self.conn, "watermark_model"),
+            "2026-06-21T08:00:00+00:00",
+        )
+
+    def test_absolute_freshness_sla_evaluates_ok_stale_and_critical(self):
+        from agent.metadata_checks import evaluate_freshness_sla
+
+        now = datetime(2026, 6, 24, 12, 0, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            evaluate_freshness_sla(
+                "2026-06-24T10:00:00Z",
+                now=now,
+                stale_after_hours=6,
+                critical_after_hours=24,
+            )["status"],
+            "ok",
+        )
+        self.assertEqual(
+            evaluate_freshness_sla(
+                "2026-06-24T00:00:00Z",
+                now=now,
+                stale_after_hours=6,
+                critical_after_hours=24,
+            )["status"],
+            "stale",
+        )
+        critical = evaluate_freshness_sla(
+            "2026-06-23T00:00:00Z",
+            now=now,
+            stale_after_hours=6,
+            critical_after_hours=24,
+        )
+        self.assertEqual(critical["status"], "critical")
+        self.assertEqual(critical["age_hours"], 36.0)
+
+    def test_run_metadata_checks_reports_absolute_freshness_breach(self):
+        from agent.metadata_checks import run_metadata_checks
+
+        result = run_metadata_checks(
+            self.conn,
+            "sample_model",
+            ["customer_id"],
+            now=datetime(2026, 6, 25, 18, 0, tzinfo=timezone.utc),
+            stale_after_hours=6,
+            critical_after_hours=24,
+        )
+
+        self.assertEqual(result.freshness_status, "critical")
+        self.assertEqual(result.freshness_age_hours, 54.0)
+        self.assertEqual(result.freshness_column, "updated_at")
+        self.assertIn("Freshness SLA breached: critical", result.anomalies)
 
     def test_schema_column_count_works(self):
         from agent.metadata_checks import get_schema_column_count

@@ -241,24 +241,32 @@ class SemanticKPIInferenceTests(unittest.TestCase):
         self.assertEqual(lineage, original_lineage)
         self.assertEqual(semantic_graph, original_semantic_graph)
 
-    def test_high_confidence_impacted_kpis_become_high_signal(self):
+    def test_high_confidence_impact_is_high_context_but_neutral_signal(self):
         report = _impact_report(confidence=95)
 
         signal = to_signal(report)
 
         self.assertEqual(signal.component, "kpi_impact")
-        self.assertEqual(signal.severity, Severity.HIGH)
+        self.assertEqual(signal.severity, Severity.LOW)
         self.assertEqual(signal.confidence, 95)
-        self.assertEqual(signal.score, -30)
+        self.assertEqual(signal.score, 0)
+        self.assertEqual(signal.reasons, [])
+        self.assertEqual(signal.metadata["context_severity"], "HIGH")
+        self.assertIn(
+            "Revenue impacted by stg_orders, fct_orders",
+            signal.metadata["context_reasons"],
+        )
 
-    def test_impacted_kpis_below_high_threshold_become_medium_signal(self):
+    def test_medium_impact_is_medium_context_but_neutral_signal(self):
         report = _impact_report(confidence=85)
 
         signal = to_signal(report)
 
-        self.assertEqual(signal.severity, Severity.MEDIUM)
+        self.assertEqual(signal.severity, Severity.LOW)
         self.assertEqual(signal.confidence, 85)
-        self.assertEqual(signal.score, -15)
+        self.assertEqual(signal.score, 0)
+        self.assertEqual(signal.reasons, [])
+        self.assertEqual(signal.metadata["context_severity"], "MEDIUM")
 
     def test_no_impacted_kpis_becomes_low_signal(self):
         report = KPIImpactReport(
@@ -290,13 +298,17 @@ class SemanticKPIInferenceTests(unittest.TestCase):
             [["stg_orders", "fct_orders", "Revenue"]],
         )
 
-    def test_signal_reasons_include_semantic_path_explanation(self):
+    def test_context_reasons_include_semantic_path_explanation(self):
         signal = to_signal(_impact_report(confidence=95))
 
-        self.assertIn("Revenue impacted by stg_orders, fct_orders", signal.reasons)
+        self.assertEqual(signal.reasons, [])
+        self.assertIn(
+            "Revenue impacted by stg_orders, fct_orders",
+            signal.metadata["context_reasons"],
+        )
         self.assertIn(
             "Revenue is impacted through stg_orders → fct_orders → Revenue",
-            signal.reasons,
+            signal.metadata["context_reasons"],
         )
 
     def test_to_signal_does_not_mutate_report(self):

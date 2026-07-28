@@ -89,14 +89,23 @@ def infer_impacted_kpis(
 
 def to_signal(report: KPIImpactReport) -> Signal:
     impacted_kpis = list(report.impacted_kpis or [])
-    severity = _signal_severity(impacted_kpis, report.confidence)
+    context_severity = _signal_severity(impacted_kpis, report.confidence)
+    context_reasons = _signal_reasons(report)
+    metadata = _signal_metadata(report)
+    metadata.update(
+        {
+            "context_severity": context_severity,
+            "context_reasons": context_reasons,
+            "contextual_only": True,
+        }
+    )
     return Signal(
         component="kpi_impact",
-        severity=severity,
+        severity="LOW",
         confidence=report.confidence,
-        score=_signal_score(severity),
-        reasons=_signal_reasons(report),
-        metadata=_signal_metadata(report),
+        score=0,
+        reasons=[],
+        metadata=metadata,
     )
 
 
@@ -384,14 +393,6 @@ def _signal_severity(impacted_kpis: list[ImpactedKPI], confidence: int) -> str:
     if impacted_kpis:
         return "MEDIUM"
     return "LOW"
-
-
-def _signal_score(severity: str) -> int:
-    return {
-        "HIGH": -30,
-        "MEDIUM": -15,
-        "LOW": 0,
-    }[severity]
 
 
 def _signal_reasons(report: KPIImpactReport) -> list[str]:

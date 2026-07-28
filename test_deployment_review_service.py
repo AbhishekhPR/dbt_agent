@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from agent.ast_analyzer import run_ast_analysis
+from agent.decision_assembly import assemble_decision_incident
 from agent.deployment_review_service import review_manifest_change
 
 
@@ -169,6 +170,62 @@ class DeploymentReviewServiceTests(unittest.TestCase):
         reasons = " ".join(result["incident"]["top_reasons"])
         self.assertIn("zero", reasons.lower())
         self.assertIn("NULL", reasons)
+
+    def test_revenue_linked_risky_sql_is_penalized_only_by_ast(self):
+        risky_sql = (
+            "select customer_id, sum(order_total) / count(*) as average_order_value "
+            "from raw_orders where order_status != 'cancelled' group by customer_id"
+        )
+        captured = {}
+
+        def capture(signals, **kwargs):
+            captured["signals"] = list(signals)
+            return assemble_decision_incident(signals, **kwargs)
+
+        with patch(
+            "agent.pr_analysis.assemble_decision_incident",
+            side_effect=capture,
+        ):
+            result = _review(
+                _manifest(
+                    raw_code=risky_sql,
+                    compiled_code=risky_sql,
+                )
+            )
+
+        signals = {
+            signal.component: signal
+            for signal in captured["signals"]
+        }
+        self.assertEqual(signals["ast"].score, -35)
+        self.assertEqual(signals["kpi_impact"].score, 0)
+        self.assertEqual(signals["semantic_contract"].score, 0)
+        self.assertEqual(signals["kpi_impact"].reasons, [])
+        self.assertEqual(signals["semantic_contract"].reasons, [])
+        self.assertEqual(result["incident"]["health"], 65)
+        self.assertFalse(
+            any(
+                "Revenue" in reason
+                for reason in result["incident"]["top_reasons"]
+            )
+        )
+
+    def test_harmless_revenue_linked_sql_is_allow(self):
+        safe_sql = (
+            "select customer_id, order_total "
+            "from raw_orders where order_status = 'completed'"
+        )
+
+        result = _review(
+            _manifest(
+                raw_code=safe_sql,
+                compiled_code=safe_sql,
+            )
+        )
+
+        self.assertEqual(result["decision"], "ALLOW")
+        self.assertEqual(result["incident"]["health"], 100)
+        self.assertEqual(result["incident"]["top_reasons"], [])
 
 
 def _review(manifest):

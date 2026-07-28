@@ -184,7 +184,7 @@ class PrAnalysisTests(unittest.TestCase):
             100.0,
         )
 
-    def test_kpi_impact_signal_participates_in_deployment_decision(self):
+    def test_kpi_impact_signal_is_contextual_in_deployment_decision(self):
         changed_models = [
             {
                 "model_name": "stg_orders",
@@ -814,7 +814,9 @@ class PrAnalysisTests(unittest.TestCase):
 
         kpi_signal = _signal(incident, "kpi_impact")
 
-        self.assertEqual(kpi_signal.severity, Severity.HIGH)
+        self.assertEqual(kpi_signal.severity, Severity.LOW)
+        self.assertEqual(kpi_signal.score, 0)
+        self.assertEqual(kpi_signal.metadata["context_severity"], "HIGH")
         self.assertGreaterEqual(kpi_signal.confidence, 90)
         self.assertEqual(
             kpi_signal.metadata["changed_columns_by_model"],
@@ -833,7 +835,9 @@ class PrAnalysisTests(unittest.TestCase):
 
         kpi_signal = _signal(incident, "kpi_impact")
 
-        self.assertEqual(kpi_signal.severity, Severity.HIGH)
+        self.assertEqual(kpi_signal.severity, Severity.LOW)
+        self.assertEqual(kpi_signal.score, 0)
+        self.assertEqual(kpi_signal.metadata["context_severity"], "HIGH")
         self.assertEqual(kpi_signal.metadata["fallback_reason"], "changed columns unavailable")
 
     def test_old_snapshot_without_column_lineage_keeps_model_level_behavior(self):
@@ -851,7 +855,9 @@ class PrAnalysisTests(unittest.TestCase):
 
         kpi_signal = _signal(incident, "kpi_impact")
 
-        self.assertEqual(kpi_signal.severity, Severity.HIGH)
+        self.assertEqual(kpi_signal.severity, Severity.LOW)
+        self.assertEqual(kpi_signal.score, 0)
+        self.assertEqual(kpi_signal.metadata["context_severity"], "HIGH")
         self.assertEqual(kpi_signal.metadata["fallback_reason"], "changed columns unavailable")
 
     def test_pr_analysis_preserves_not_evaluated_assumption_verification(self):

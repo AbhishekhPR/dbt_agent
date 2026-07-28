@@ -2,7 +2,7 @@ import copy
 import json
 import unittest
 
-from agent.ast_analyzer import run_ast_analysis
+from agent.ast_analyzer import run_ast_analysis, to_signal
 
 
 class DivisionByZeroRiskTests(unittest.TestCase):
@@ -37,6 +37,74 @@ class DivisionByZeroRiskTests(unittest.TestCase):
 
         rules = [bug["rule"] for bug in report["bugs"]]
         self.assertNotIn("DIVISION_BY_ZERO", rules)
+
+
+class IntegerDivisionRiskTests(unittest.TestCase):
+    def test_aggregate_integer_division_is_flagged(self):
+        sql = (
+            "SELECT SUM(order_total) / COUNT(*) AS average_order_value "
+            "FROM raw_orders"
+        )
+        report = run_ast_analysis(sql, "average_order_value")
+
+        rules = [bug["rule"] for bug in report["bugs"]]
+        self.assertIn("INTEGER_DIVISION", rules)
+
+    def test_float_multiplier_prevents_integer_division_finding(self):
+        sql = (
+            "SELECT SUM(order_total) * 1.0 / COUNT(*) AS average_order_value "
+            "FROM raw_orders"
+        )
+        report = run_ast_analysis(sql, "average_order_value")
+
+        rules = [bug["rule"] for bug in report["bugs"]]
+        self.assertNotIn("INTEGER_DIVISION", rules)
+
+    def test_explicit_float_cast_prevents_integer_division_finding(self):
+        sql = (
+            "SELECT CAST(SUM(order_total) AS FLOAT) / COUNT(*) "
+            "AS average_order_value FROM raw_orders"
+        )
+        report = run_ast_analysis(sql, "average_order_value")
+
+        rules = [bug["rule"] for bug in report["bugs"]]
+        self.assertNotIn("INTEGER_DIVISION", rules)
+
+    def test_nullif_guarded_denominator_is_not_double_reported_as_integer_division(self):
+        sql = (
+            "SELECT SUM(order_total) / NULLIF(COUNT(*), 0) "
+            "AS average_order_value FROM raw_orders"
+        )
+        report = run_ast_analysis(sql, "average_order_value")
+
+        rules = [bug["rule"] for bug in report["bugs"]]
+        self.assertNotIn("INTEGER_DIVISION", rules)
+
+    def test_one_aggregate_expression_shows_both_risks_but_scores_ast_once(self):
+        sql = (
+            "SELECT SUM(order_total) / COUNT(*) AS average_order_value "
+            "FROM raw_orders"
+        )
+        report = run_ast_analysis(sql, "average_order_value")
+        findings = {
+            bug["rule"]: bug
+            for bug in report["bugs"]
+            if bug["rule"] in {"DIVISION_BY_ZERO", "INTEGER_DIVISION"}
+        }
+
+        self.assertEqual(
+            set(findings),
+            {"DIVISION_BY_ZERO", "INTEGER_DIVISION"},
+        )
+        self.assertEqual(
+            findings["DIVISION_BY_ZERO"]["line_reference"],
+            "SUM(order_total) / COUNT(*)",
+        )
+        self.assertEqual(
+            findings["INTEGER_DIVISION"]["line_reference"],
+            "SUM(order_total) / COUNT(*)",
+        )
+        self.assertEqual(to_signal(report).score, -35)
 
 
 class HardcodedDateFilterRiskTests(unittest.TestCase):
