@@ -5,6 +5,7 @@ from agent.github_app.checks import create_review_check
 from agent.github_app.client import GitHubNotFoundError
 from agent.github_app.comments import upsert_review_comment
 from agent.github_app.config import DEFAULT_MANIFEST_PATH, load_repository_config
+from agent.github_app.review_comment import render_review_comment
 
 
 class ReviewRunnerError(ValueError):
@@ -61,7 +62,7 @@ class PullRequestReviewRunner:
             return self._publish_neutral(
                 event,
                 client,
-                config.mode,
+                config.enforcement_mode,
                 status="missing_manifest",
                 message=message,
                 expected_app_id=expected_app_id,
@@ -86,7 +87,7 @@ class PullRequestReviewRunner:
             return self._publish_neutral(
                 event,
                 client,
-                config.mode,
+                config.enforcement_mode,
                 status="skipped",
                 message="Relium skipped analysis because this pull request changes no dbt models.",
                 expected_app_id=expected_app_id,
@@ -94,34 +95,56 @@ class PullRequestReviewRunner:
         return self._publish(
             event,
             client,
-            config.mode,
+            config.enforcement_mode,
             result,
             status="reviewed",
             expected_app_id=expected_app_id,
         )
 
     def _publish_neutral(
-        self, event, client, mode, *, status, message, expected_app_id
+        self,
+        event,
+        client,
+        enforcement_mode,
+        *,
+        status,
+        message,
+        expected_app_id,
     ):
         result = {"decision": "SKIPPED", "rendered": {"markdown": f"## Relium deployment review\n\n{message}"}}
         return self._publish(
             event,
             client,
-            mode,
+            enforcement_mode,
             result,
             status=status,
             expected_app_id=expected_app_id,
         )
 
-    def _publish(self, event, client, mode, result, *, status, expected_app_id):
+    def _publish(
+        self,
+        event,
+        client,
+        enforcement_mode,
+        result,
+        *,
+        status,
+        expected_app_id,
+    ):
         owner = event.repository.owner
         repository = event.repository.name
+        comment_body = render_review_comment(result)
+        check_result = dict(result)
+        check_result["rendered"] = {
+            **dict(result.get("rendered") or {}),
+            "markdown": comment_body,
+        }
         comment = upsert_review_comment(
             client,
             owner=owner,
             repository=repository,
             pull_number=event.pull_number,
-            body=result["rendered"]["markdown"],
+            body=comment_body,
             expected_app_id=expected_app_id,
         )
         check = create_review_check(
@@ -129,7 +152,7 @@ class PullRequestReviewRunner:
             owner=owner,
             repository=repository,
             head_sha=event.head_sha,
-            result=result,
-            mode=mode,
+            result=check_result,
+            enforcement_mode=enforcement_mode,
         )
         return {"status": status, "result": result, "comment": comment, "check": check}

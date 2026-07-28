@@ -137,10 +137,14 @@ Use this minimal `relium.yml`:
 
 ```yaml
 manifest_path: target/manifest.json
-mode: warn
 enforcement_mode: shadow
 enabled: true
 ```
+
+`enforcement_mode` is the sole GitHub check-enforcement setting. `shadow` is the
+safe default for repositories that omit it. The legacy `mode` is deprecated and
+accepted only for configuration compatibility; it does not change the GitHub
+check conclusion.
 
 The fixture in `demo/github_app_pilot/` contains previous/current manifests and
 safe/risky model examples. Copy only appropriate non-secret fixture material into
@@ -154,21 +158,22 @@ Delivery state is stored under `RELIUM_STORAGE_ROOT/<repository-id>/deliveries/`
 
 | Scenario | Webhook response | Expected PR comment | Check-run conclusion | Storage behavior |
 | --- | --- | --- | --- | --- |
-| 1. Valid PR with changed dbt model | `202 accepted` | One App-owned Relium review with the computed decision | `success` for ALLOW; `neutral` for BLOCK while mode is `warn` | Delivery becomes `complete` |
+| 1. Valid PR with changed dbt model | `202 accepted` | One App-owned Relium review with the computed decision | `success` for ALLOW; `neutral` for WARN or BLOCK in shadow mode | Delivery becomes `complete` |
 | 2. Missing manifest | `202 accepted` | Neutral message: `Relium could not find target/manifest.json. Run dbt compile before the Relium review.` | `neutral` | Delivery becomes `complete` |
 | 3. No changed dbt model | `202 accepted` | Neutral message explaining that no dbt models changed | `neutral` | Delivery becomes `complete` |
 | 4. Re-delivered webhook | `202 accepted` | No duplicate comment or publication | No additional check run | Existing completed delivery claim is preserved |
-| 5. BLOCK result in warn mode | `202 accepted` | Review shows the BLOCK decision and evidence | `neutral`, so it does not block merging | Delivery becomes `complete` |
-| 6. BLOCK result in block mode | `202 accepted` | Review shows the BLOCK decision and evidence | `failure` | Delivery becomes `complete` |
+| 5. BLOCK result in shadow mode | `202 accepted` | Review shows the BLOCK decision and actionable findings | `neutral`, so it does not block merging | Delivery becomes `complete` |
+| 6. BLOCK result in enforce mode | `202 accepted` | The same review comment as shadow mode | `failure` | Delivery becomes `complete` |
 
-`enforcement_mode` controls the workflow exit code. `shadow` is the safe default:
-ALLOW, WARN, and BLOCK remain advisory and exit zero. With `enforce`, BLOCK exits
-nonzero while ALLOW and WARN still exit zero.
+`enforcement_mode` controls both the GitHub check conclusion and the workflow exit
+code. In `shadow`, ALLOW succeeds while WARN and BLOCK remain advisory and
+non-failing. In `enforce`, BLOCK fails while ALLOW succeeds and WARN remains
+advisory.
 
-For scenario 6, change only `mode: warn` to `mode: block` in the test repository's
-`relium.yml`, then open or synchronize a new test pull request. Do not change
-Relium's decision thresholds to manufacture an outcome; use the risky fixture or a
-naturally blocking test change.
+For scenario 6, change only `enforcement_mode: shadow` to
+`enforcement_mode: enforce` in the test repository's `relium.yml`, then open or
+synchronize a new test pull request. Do not change Relium's decision thresholds to
+manufacture an outcome; use the risky fixture or a naturally blocking test change.
 
 ## I. Troubleshooting
 
