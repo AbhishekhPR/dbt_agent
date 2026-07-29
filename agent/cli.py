@@ -106,19 +106,43 @@ def watch(project):
 @click.option(
     '--project',
     required=True,
-    help='dbt project name (used for snapshot file)'
+    help='Stable project identity; snapshot filename is <PROJECT>.json.'
 )
 @click.option(
     '--db',
     required=True,
     help='Path to your SQLite database file'
 )
-def diff(project, db):
-    """Detect upstream schema changes before running dbt"""
+@click.option(
+    '--snapshot-dir',
+    required=True,
+    type=click.Path(path_type=Path, file_okay=False),
+    help='Directory containing persisted schema snapshots.'
+)
+@click.option(
+    '--update-snapshot',
+    is_flag=True,
+    default=False,
+    help='Creates or replaces the persisted schema snapshot.'
+)
+def diff(project, db, snapshot_dir, update_snapshot):
+    """Compare schemas locally and read-only by default.
 
-    from agent.schema_diff import run_schema_diff
+    An existing SQLite database and snapshot are required for comparison.
+    The database is opened read-only, and no notifications are sent.
+    """
 
-    run_schema_diff(project, db)
+    from agent.schema_diff import SchemaDiffError, run_schema_diff
+
+    try:
+        run_schema_diff(
+            project,
+            db,
+            snapshot_dir,
+            update_snapshot=update_snapshot,
+        )
+    except SchemaDiffError as error:
+        raise click.ClickException(str(error)) from error
 
 
 @cli.command()
