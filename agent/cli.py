@@ -29,13 +29,6 @@ def _validate_directory_exists(dir_path: str, description: str) -> Path:
     return path
 
 
-def run_simulation(*args, **kwargs):
-    """Lazy simulator entry point, kept patchable for CLI tests."""
-    from agent.simulator import run_simulation as _run_simulation
-
-    return _run_simulation(*args, **kwargs)
-
-
 def print_diagnosis(result: dict):
     """Reusable formatted diagnosis printer"""
     severity_color = {
@@ -235,43 +228,6 @@ def scan(project, changed_model, diff_base, verbose, output_format, output):
 
 
 @cli.command()
-@click.option('--project', required=True, help='dbt project name')
-@click.option('--db', required=True, help='Path to SQLite database')
-@click.option('--table', required=True, help='Table to simulate an incident on')
-@click.option(
-    '--type',
-    'anomaly_type',
-    required=True,
-    type=click.Choice(
-        [
-            "row_count_drop",
-            "row_count_spike",
-            "null_explosion",
-            "cardinality_explosion",
-            "duplicate_explosion",
-            "freshness_anomaly",
-            "schema_drift_added_column",
-            "schema_drift_removed_column",
-            "schema_drift_type_change",
-        ]
-    ),
-    help='Simulation type to apply'
-)
-@click.option('--no-restore', is_flag=True, help='Leave simulated DB and baseline changes in place')
-@click.option('--no-sync-baseline', is_flag=True, help='Use existing baseline instead of syncing before simulation')
-def simulate(project, db, table, anomaly_type, no_restore, no_sync_baseline):
-    """Simulate a local data quality incident and run the quality checker"""
-    run_simulation(
-        project,
-        db,
-        table,
-        anomaly_type,
-        restore_after=not no_restore,
-        sync_baseline=not no_sync_baseline,
-    )
-
-
-@cli.command()
 @click.option('--project', required=True, help='Path to your dbt project folder')
 @click.option('--dialect', default='sqlite', help='SQL dialect: sqlite, snowflake, bigquery, duckdb')
 def ast(project, dialect):
@@ -360,38 +316,6 @@ def ast(project, dialect):
     print(f"  Total bugs found: {total_bugs}")
     print(f"  Detection method: deterministic AST — no LLM, no false positives")
     print(f"{'━'*55}\n")
-
-@cli.command(name="sql_metadata")
-@click.option('--project', required=True, help='Path to your dbt project folder')
-@click.option('--dialect', default='sqlite', help='SQL dialect: sqlite, snowflake, bigquery, duckdb')
-def sql_metadata(project, dialect):
-    """Extract SQL metadata from dbt models and save it to SQLite."""
-    from agent.sql_metadata_extractor import extract_sql_metadata
-
-    reports = extract_sql_metadata(project, dialect)
-    if not reports:
-        print("No SQL models found or metadata extraction produced no output.")
-        return
-
-    print(f"\nSQL metadata extracted for {len(reports)} model(s). Stored in metadata.db")
-    for report in reports:
-        print(f"  - {report.get('model_name')} ({len(report.get('source_tables', []))} source tables, {len(report.get('joins', []))} joins)")
-
-@cli.command(name="sql_risks")
-@click.option('--project', required=True, help='Path to your dbt project folder')
-def sql_risks(project):
-    """Scan dbt model SQL for risky transformation logic."""
-    from agent.sql_risk_detector import detect_sql_risks
-
-    print("Scanning SQL models for risky transformation logic...\n")
-    risks = detect_sql_risks(project)
-    print(f"{len(risks)} risk(s) found.\n")
-    for risk in risks:
-        print(f"[{risk['severity'].upper()}] {risk['model']}")
-        print(risk["message"])
-        print(f"Evidence: {risk['evidence']}")
-        print(f"Recommendation: {risk['recommendation']}")
-        print()
 
 @cli.command(
     name="pr_guard",
@@ -1098,23 +1022,6 @@ def root_cause(project, table, anomaly, message):
     """Analyze likely root cause using local metadata only"""
     from agent.root_cause_engine import run_root_cause
     run_root_cause(project, table, anomaly, message)
-
-@cli.command()
-@click.option('--project', required=True)
-@click.option('--db', required=True)
-@click.option('--stale-hours', default=6, type=float,
-              help='Hours before table is considered stale')
-@click.option('--critical-hours', default=24, type=float,
-              help='Hours before table is considered critical')
-def freshness(project, db, stale_hours, critical_hours):
-    """Check how recently each table was updated"""
-    from agent.freshness import run_freshness_check
-    thresholds = {
-        "stale": stale_hours,
-        "critical": critical_hours
-    }
-    run_freshness_check(project, db, thresholds)
-
 
 @cli.command()
 @click.option('--project', required=True,
