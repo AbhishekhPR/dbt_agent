@@ -29,41 +29,6 @@ def _validate_directory_exists(dir_path: str, description: str) -> Path:
     return path
 
 
-def print_diagnosis(result: dict):
-    """Reusable formatted diagnosis printer"""
-    severity_color = {
-        'critical': 'red',
-        'high': 'yellow',
-        'medium': 'cyan',
-        'low': 'green'
-    }.get(result.get('severity', 'low'), 'white')
-
-    click.secho(f"  SEVERITY: {result['severity'].upper()}", fg=severity_color, bold=True)
-    click.echo("━" * 50)
-
-    click.secho("\nRoot Cause", bold=True)
-    click.echo(f"  {result['root_cause']}")
-
-    click.secho("\nAffected File", bold=True)
-    click.echo(f"  {result['affected_file']}: {result['affected_line']}")
-
-    click.secho("\nExplanation", bold=True)
-    click.echo(f"  {result['explanation']}")
-
-    click.secho("\nSuggested Fix", bold=True)
-    click.echo(f"  {result['suggested_fix']}")
-
-    click.secho("\n⚠️  Data Loss Risk", bold=True)
-    risk = result['data_loss_risk']
-
-    click.secho(
-        f"  {'YES — act immediately' if risk else 'No immediate data loss risk'}",
-        fg='red' if risk else 'green'
-    )
-
-    click.echo("\n" + "━" * 50 + "\n")
-
-
 @click.group()
 def cli():
     """dbt-agent — AI-powered dbt pipeline diagnostics"""
@@ -77,6 +42,7 @@ def cli():
 def diagnose(log, model, schema):
     """Diagnose a failed dbt pipeline run"""
     from agent.diagnose import diagnose_failure
+    from agent.presenters.diagnosis import render_diagnosis
 
     click.echo("\nAnalyzing pipeline failure...\n")
 
@@ -95,7 +61,7 @@ def diagnose(log, model, schema):
             upstream_schema
         )
 
-        print_diagnosis(result)
+        click.echo(render_diagnosis(result))
     except click.ClickException:
         raise
     except Exception as e:
@@ -105,11 +71,35 @@ def diagnose(log, model, schema):
 @cli.command()
 @click.option('--project', required=True, help='Path to your dbt project folder')
 def watch(project):
-    """Auto-diagnose failures from last dbt run"""
+    """Diagnose failures from the last dbt run without making changes."""
 
-    from agent.hooks import run_post_hook
+    from agent.hooks import RunResultsError, run_post_hook
+    from agent.presenters.diagnosis import render_diagnosis
 
-    run_post_hook(project)
+    try:
+        project_path = _validate_directory_exists(project, "dbt project")
+        report = run_post_hook(project_path)
+    except click.ClickException:
+        raise
+    except RunResultsError as error:
+        raise click.ClickException(str(error)) from error
+
+    if not report.diagnoses:
+        click.echo("No failed models found in the last dbt run.")
+    else:
+        click.echo(
+            f"Found {len(report.diagnoses)} failed model(s). "
+            "Running read-only diagnostics."
+        )
+        for diagnosis_result in report.diagnoses:
+            click.echo()
+            click.echo(render_diagnosis(diagnosis_result))
+
+    if report.malformed_entries:
+        click.echo(
+            f"Ignored {report.malformed_entries} malformed result "
+            "entry or entries."
+        )
 
 
 @cli.command()
@@ -233,7 +223,6 @@ def scan(project, changed_model, diff_base, verbose, output_format, output):
 def ast(project, dialect):
     """Deterministic AST analysis — zero false positives, instant results"""
     from agent.ast_analyzer import analyze_all_models_ast, run_ast_analysis
-    from agent.cli import print_diagnosis
     from agent.slack import send_slack_alert
 
     reports = analyze_all_models_ast(project, dialect)
