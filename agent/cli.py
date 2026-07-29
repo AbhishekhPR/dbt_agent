@@ -124,9 +124,8 @@ def diff(project, db):
 @cli.command()
 @click.option('--project', required=True, help='Path to your dbt project folder')
 def analyze(project):
-    """Deep SQL logic analysis — catches silent bugs dbt never will"""
+    """Run local, read-only SQL logic analysis. No notifications are sent."""
     from agent.sql_analyzer import analyze_all_models, print_analysis_report
-    from agent.slack import send_slack_alert
 
     reports = analyze_all_models(project)
 
@@ -137,27 +136,11 @@ def analyze(project):
     for report in reports:
         print_analysis_report(report)
 
-        # Alert on Slack for anything high or critical
         if report.get("overall_risk") in ("critical", "high"):
             critical_count += 1
-            for bug in report.get("bugs", []):
-                if bug.get("severity") in ("critical", "high"):
-                    diagnosis = {
-                        "root_cause": bug.get("description"),
-                        "affected_file": report.get("model_name"),
-                        "affected_line": bug.get("line_reference"),
-                        "explanation": bug.get("impact"),
-                        "suggested_fix": bug.get("fix"),
-                        "severity": bug.get("severity"),
-                        "data_loss_risk": report.get("data_loss_risk", False)
-                    }
-                    send_slack_alert(
-                        f"LOGIC BUG — {report.get('model_name')}",
-                        diagnosis
-                    )
 
     if critical_count > 0:
-        print(f"{critical_count} model(s) have critical/high logic bugs — Slack alerted.\n")
+        print(f"{critical_count} model(s) have critical/high logic bugs.\n")
     else:
         print("All models passed logic analysis.\n")
 
@@ -221,9 +204,8 @@ def scan(project, changed_model, diff_base, verbose, output_format, output):
 @click.option('--project', required=True, help='Path to your dbt project folder')
 @click.option('--dialect', default='sqlite', help='SQL dialect: sqlite, snowflake, bigquery, duckdb')
 def ast(project, dialect):
-    """Deterministic AST analysis — zero false positives, instant results"""
+    """Run local, read-only deterministic AST analysis. No notifications are sent."""
     from agent.ast_analyzer import analyze_all_models_ast, run_ast_analysis
-    from agent.slack import send_slack_alert
 
     reports = analyze_all_models_ast(project, dialect)
 
@@ -266,40 +248,8 @@ def ast(project, dialect):
             print(f"     Fix:    {bug.get('fix')}")
             print()
 
-            if bug.get("severity") in ("critical", "high"):
-                diagnosis = {
-                    "root_cause": bug.get("description"),
-                    "affected_file": report.get("model_name"),
-                    "affected_line": bug.get("line_reference"),
-                    "explanation": bug.get("impact"),
-                    "suggested_fix": bug.get("fix"),
-                    "severity": bug.get("severity"),
-                    "data_loss_risk": report.get("data_loss_risk", False)
-                }
-                send_slack_alert(
-                    f"AST BUG — {report.get('model_name')}",
-                    diagnosis
-                )
-
         print(f"  Data loss risk: {'YES' if report.get('data_loss_risk') else 'No'}")
         print()
-
-        # Slack alert for high/critical
-        for bug in bugs:
-            if bug.get("severity") in ("critical", "high"):
-                diagnosis = {
-                    "root_cause": bug.get("description"),
-                    "affected_file": report.get("model_name"),
-                    "affected_line": bug.get("line_reference"),
-                    "explanation": bug.get("impact"),
-                    "suggested_fix": bug.get("fix"),
-                    "severity": bug.get("severity"),
-                    "data_loss_risk": report.get("data_loss_risk", False)
-                }
-                send_slack_alert(
-                    f"AST BUG — {report.get('model_name')}",
-                    diagnosis
-                )
 
     print(f"\n{'━'*55}")
     print(f"  Total bugs found: {total_bugs}")
