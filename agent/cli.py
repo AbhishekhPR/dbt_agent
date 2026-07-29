@@ -170,22 +170,67 @@ def analyze(project):
 
 
 @cli.command()
-@click.option('--project', required=True, help='dbt project name')
-@click.option('--db', required=True, help='Path to SQLite database')
-def quality(project, db):
-    """Run data quality checks — catches row drops, null explosions, duplicates"""
-    from agent.quality_checker import run_quality_check
+@click.option(
+    '--project',
+    required=True,
+    help='Path to the dbt project directory being analysed.',
+)
+@click.option(
+    '--project-id',
+    required=True,
+    help=(
+        "Stable lowercase safe identity using letters, numbers, '-' or '_'; "
+        'baseline layout is '
+        '<BASELINE-DIR>/<PROJECT-ID>.json.'
+    ),
+)
+@click.option(
+    '--db',
+    required=True,
+    help='Path to an existing SQLite database file.',
+)
+@click.option(
+    '--baseline-dir',
+    required=True,
+    type=click.Path(
+        path_type=Path,
+        file_okay=False,
+    ),
+    help='Directory containing caller-selected persistent quality baselines.',
+)
+@click.option(
+    '--update-baseline',
+    is_flag=True,
+    default=False,
+    help='Creates or replaces the persisted project quality baseline.',
+)
+def quality(
+    project,
+    project_id,
+    db,
+    baseline_dir,
+    update_baseline,
+):
+    """Compare quality metrics locally and read-only by default.
+
+    An existing SQLite database and existing baseline are required for
+    comparison. The database is opened read-only. No Slack notification,
+    no AI explanation, and no network request is made.
+    """
+    from agent.quality_checker import QualityCheckError, run_quality_check
 
     try:
         _validate_directory_exists(project, "dbt project")
-        db_path = Path(db)
-        if not db_path.exists():
-            raise click.ClickException(f"SQLite database not found: {db}")
-        run_quality_check(project, db)
+        run_quality_check(
+            project_id,
+            db,
+            baseline_dir,
+            update_baseline=update_baseline,
+        )
     except click.ClickException:
         raise
-    except Exception as e:
-        raise click.ClickException(f"Quality check failed: {e}") from e
+    except QualityCheckError as error:
+        raise click.ClickException(str(error)) from error
 
 
 @cli.command()
