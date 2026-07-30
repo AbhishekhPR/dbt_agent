@@ -19,7 +19,7 @@ from agent.historical_reliability import to_signal as historical_reliability_to_
 from agent.incident import Incident
 from agent.metadata_checks import run_metadata_checks
 from agent.metadata_checks import to_signal as metadata_checks_to_signal
-from agent.metadata_drift import compare_last_run
+from agent.metadata_drift import DriftComparisonUnavailable, compare_last_run
 from agent.metadata_drift import to_signal as metadata_drift_to_signal
 from agent.semantic_context import build_semantic_context
 from agent.semantic_contract_validation import to_signal as semantic_contract_to_signal
@@ -38,6 +38,7 @@ def analyze_pr_with_history(
     metadata=None,
     events=None,
     outcomes=None,
+    metadata_db_path=None,
     **existing_options,
 ) -> Incident:
     history_enabled = history_store is not None
@@ -58,6 +59,7 @@ def analyze_pr_with_history(
         previous_snapshot=previous_snapshot,
         deployment_id=deployment_id,
         outcomes=copy.deepcopy(outcomes) if outcomes is not None else None,
+        metadata_db_path=metadata_db_path,
     )
 
     incident.metadata["history_enabled"] = history_enabled
@@ -77,19 +79,34 @@ def analyze_changed_models(
     previous_snapshot=None,
     deployment_id=None,
     outcomes=None,
+    metadata_db_path=None,
 ) -> Incident:
     model_specs = list(changed_models)
     signals = []
     affected_models = []
+    metadata_drift_statuses = []
 
     for model_spec in model_specs:
         model_name = _model_name(model_spec)
         affected_models.append(model_name)
+        drift_signal = _drift_signal(
+            model_spec,
+            model_name,
+            metadata_db_path=metadata_db_path,
+        )
+        metadata_drift_statuses.append(
+            {
+                "model_name": model_name,
+                "comparison_status": str(
+                    drift_signal.metadata.get("comparison_status") or "evaluated"
+                ),
+            }
+        )
 
         model_signals = [
             _ast_signal(model_spec, model_name),
             _metadata_signal(model_spec, model_name),
-            _drift_signal(model_spec, model_name),
+            drift_signal,
             _blast_radius_signal(model_spec, model_name),
             _historical_reliability_signal(model_spec),
         ]
@@ -105,6 +122,7 @@ def analyze_changed_models(
     metadata = {
         "model_count": len(model_specs),
         "models": list(affected_models),
+        "metadata_drift": metadata_drift_statuses,
     }
     sql_sources = [
         _sql_source_metadata(model_spec)
@@ -275,22 +293,34 @@ def _metadata_signal(model_spec: Any, model_name: str) -> Signal:
     return metadata_checks_to_signal(metadata_result)
 
 
-def _drift_signal(model_spec: Any, model_name: str) -> Signal:
+def _drift_signal(
+    model_spec: Any,
+    model_name: str,
+    *,
+    metadata_db_path=None,
+) -> Signal:
+    if metadata_db_path is None:
+        return metadata_drift_to_signal(_unavailable_drift(model_name))
+
     try:
         drift_result = compare_last_run(
-            _value(model_spec, "metadata_db_path"),
+            metadata_db_path,
             _value(model_spec, "project_name"),
             model_name,
         )
-    except ValueError:
-        drift_result = {
-            "project_name": _value(model_spec, "project_name"),
-            "model_name": model_name,
-            "comparison_status": "unavailable",
-            "drift_level": "LOW",
-            "report_text": "Metadata drift was not evaluated.",
-        }
+    except DriftComparisonUnavailable:
+        drift_result = _unavailable_drift(model_name)
     return metadata_drift_to_signal(drift_result)
+
+
+def _unavailable_drift(model_name: str) -> dict[str, Any]:
+    return {
+        "project_name": None,
+        "model_name": model_name,
+        "comparison_status": "unavailable",
+        "drift_level": "LOW",
+        "report_text": "Metadata drift was not evaluated.",
+    }
 
 
 def _blast_radius_signal(model_spec: Any, model_name: str) -> Signal:

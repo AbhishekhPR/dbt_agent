@@ -4,15 +4,6 @@ from pathlib import Path
 
 from agent.signals import Signal
 
-try:
-    from dotenv import load_dotenv
-except ModuleNotFoundError:
-    def load_dotenv(*args, **kwargs):
-        return False
-
-env_path = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(dotenv_path=env_path)
-
 
 BLAST_RADIUS_SIGNAL_CONFIDENCE = {
     "HIGH": 95,

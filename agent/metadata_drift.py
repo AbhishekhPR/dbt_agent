@@ -2,11 +2,8 @@ from datetime import datetime
 from pathlib import Path
 
 from agent.metadata_store import (
-    DEFAULT_METADATA_DB_PATH,
-    DriftRecord,
     fetch_latest_model_identity,
     fetch_recent_model_metrics,
-    insert_metric_drift,
 )
 from agent.signals import Signal
 
@@ -32,12 +29,15 @@ DRIFT_SIGNAL_METADATA_FIELDS = [
 ]
 
 
+class DriftComparisonUnavailable(ValueError):
+    """Raised when a valid metadata store lacks enough history to compare."""
+
+
 def compare_last_run(
-    db_path: str | Path | None = DEFAULT_METADATA_DB_PATH,
+    db_path: str | Path,
     project_name: str | None = None,
     model_name: str | None = None,
 ) -> dict:
-    db_path = db_path or DEFAULT_METADATA_DB_PATH
     resolved_project, resolved_model = _resolve_model_identity(
         db_path, project_name, model_name
     )
@@ -48,7 +48,7 @@ def compare_last_run(
         limit=2,
     )
     if len(recent_metrics) < 2:
-        raise ValueError(
+        raise DriftComparisonUnavailable(
             f"Need at least two metric runs for {resolved_project}/{resolved_model}."
         )
 
@@ -90,26 +90,10 @@ def compare_last_run(
         drift_level=drift_level,
     )
 
-    insert_metric_drift(
-        db_path,
-        DriftRecord(
-            project_name=resolved_project,
-            model_name=resolved_model,
-            current_scan_id=current["scan_id"],
-            previous_scan_id=previous["scan_id"],
-            row_count_change_pct=row_count_change_pct,
-            null_count_change_pct=null_count_change_pct,
-            duplicate_count_change_pct=duplicate_count_change_pct,
-            schema_column_count_change=schema_column_count_change,
-            freshness_regressed=freshness_regressed,
-            drift_level=drift_level,
-            report_text=report_text,
-        ),
-    )
-
     return {
         "project_name": resolved_project,
         "model_name": resolved_model,
+        "comparison_status": "evaluated",
         "current_scan_id": current["scan_id"],
         "previous_scan_id": previous["scan_id"],
         "row_count_change_pct": row_count_change_pct,
@@ -173,16 +157,15 @@ def _drift_signal_is_neutral(result: dict, drift_level: str) -> bool:
 
 
 def _resolve_model_identity(
-    db_path: str | Path | None,
+    db_path: str | Path,
     project_name: str | None,
     model_name: str | None,
 ) -> tuple[str, str]:
-    db_path = db_path or DEFAULT_METADATA_DB_PATH
     if project_name and model_name:
         return project_name, model_name
     latest = fetch_latest_model_identity(db_path)
     if not latest:
-        raise ValueError("No stored model metrics found.")
+        raise DriftComparisonUnavailable("No stored model metrics found.")
     latest_project, latest_model = latest
     return project_name or latest_project, model_name or latest_model
 

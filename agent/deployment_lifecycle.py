@@ -30,6 +30,7 @@ def review_deployment(
     events=None,
     auto_record=False,
     allow_blocked_recording=False,
+    metadata_db_path=None,
     **options,
 ) -> DeploymentReviewResult:
     previous_snapshot = _load_previous_snapshot(history_store)
@@ -40,6 +41,7 @@ def review_deployment(
         deployment_id=deployment_id,
         metadata=copy.deepcopy(metadata or {}),
         events=copy.deepcopy(events) if events is not None else None,
+        metadata_db_path=metadata_db_path,
         **copy.deepcopy(options),
     )
 
@@ -74,6 +76,7 @@ def review_deployment(
             "current_snapshot_id": _snapshot_id(current_snapshot),
             "auto_record": auto_record,
             "allow_blocked_recording": allow_blocked_recording,
+            "metadata_db_enabled": metadata_db_path is not None,
             "request_metadata": copy.deepcopy(metadata or {}),
             "options": copy.deepcopy(options),
         },
