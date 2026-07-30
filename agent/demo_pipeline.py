@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from pathlib import Path
 
@@ -11,20 +12,25 @@ from agent.metadata_checks import run_metadata_checks
 from agent.metadata_checks import to_signal as metadata_checks_to_signal
 from agent.metadata_drift import to_signal as metadata_drift_to_signal
 from agent.metadata_store import (
-    DEFAULT_METADATA_DB_PATH,
+    MetadataStoreError,
     ModelMetricRecord,
     ScanRunRecord,
     fetch_recent_model_metrics,
     insert_model_metrics,
     insert_scan_run,
 )
-from agent import slack_alerts
+from agent.pipeline_validation_report import write_pipeline_validation_report
 
 
-DEFAULT_WAREHOUSE_DB_PATH = Path(__file__).resolve().parent.parent / "demo_pipeline.db"
 PROJECT_NAME = "relium_demo"
 MODEL_NAME = "fct_customer_lifetime_value"
 DEFAULT_SCENARIO = "normal"
+DEMO_ARTIFACT_NAMES = {
+    "warehouse_db_path": "demo_pipeline.db",
+    "metadata_db_path": "relium_metadata.db",
+    "markdown_report_path": "pipeline_validation_report.md",
+    "json_report_path": "pipeline_validation_report.json",
+}
 SCENARIO_FIXTURES = {
     "normal": {
         "customers": [
@@ -97,28 +103,84 @@ WHERE c.is_deleted = 0
 """
 
 
+class DemoPipelineError(ValueError):
+    """Raised when an isolated demo workspace cannot be used safely."""
+
+
+def prepare_demo_workspace(workspace_path: str | Path) -> dict[str, Path]:
+    supplied = Path(workspace_path).expanduser()
+    absolute = Path(os.path.abspath(supplied))
+    if absolute.exists() and not absolute.is_dir():
+        raise DemoPipelineError(f"Demo workspace is not a directory: {supplied}")
+    if _has_redirecting_component(absolute):
+        raise DemoPipelineError(
+            f"Demo workspace may not use symbolic links or junctions: {supplied}"
+        )
+    try:
+        absolute.mkdir(parents=True, exist_ok=True)
+        workspace = absolute.resolve(strict=True)
+    except OSError as error:
+        raise DemoPipelineError(
+            f"Could not create demo workspace {supplied}: {error}"
+        ) from error
+
+    paths = {
+        key: workspace / filename
+        for key, filename in DEMO_ARTIFACT_NAMES.items()
+    }
+    for path in paths.values():
+        if path.parent != workspace or path.name not in DEMO_ARTIFACT_NAMES.values():
+            raise DemoPipelineError(f"Demo artifact escapes workspace: {path}")
+        if _is_redirecting_path(path):
+            raise DemoPipelineError(
+                f"Demo artifact may not be a symbolic link or junction: {path}"
+            )
+    paths["workspace_path"] = workspace
+    return paths
+
+
 def run_demo_pipeline(
-    metadata_db_path: str | Path | None = None,
-    warehouse_db_path: str | Path | None = None,
+    *,
+    metadata_db_path: str | Path,
+    warehouse_db_path: str | Path,
+    markdown_report_path: str | Path,
+    json_report_path: str | Path,
     scenario: str = DEFAULT_SCENARIO,
 ) -> dict:
-    metadata_db_path = metadata_db_path or DEFAULT_METADATA_DB_PATH
-    warehouse_path = Path(warehouse_db_path or DEFAULT_WAREHOUSE_DB_PATH)
-    warehouse_path.parent.mkdir(parents=True, exist_ok=True)
+    """Run one stateful demo entirely within four validated artifact paths.
 
-    conn = sqlite3.connect(warehouse_path)
+    Warehouse and metadata commits precede report replacement. A later report
+    failure does not roll back already committed demo database state.
+    """
+    if scenario not in SCENARIO_FIXTURES:
+        supported = ", ".join(sorted(SCENARIO_FIXTURES))
+        raise DemoPipelineError(
+            f"Unsupported demo scenario '{scenario}'. Expected one of: {supported}"
+        )
+    paths = _validate_artifact_paths(
+        metadata_db_path=metadata_db_path,
+        warehouse_db_path=warehouse_db_path,
+        markdown_report_path=markdown_report_path,
+        json_report_path=json_report_path,
+    )
+    metadata_db_path = paths["metadata_db_path"]
+    warehouse_path = paths["warehouse_db_path"]
+
     try:
-        raw_row_count = _load_demo_raw_tables(conn, scenario)
-        _build_demo_model(conn)
-        ast_report = run_ast_analysis(RISKY_MODEL_SQL, MODEL_NAME)
-        metadata_result = run_metadata_checks(conn, MODEL_NAME, ["customer_id"])
-    finally:
-        conn.close()
+        conn = sqlite3.connect(warehouse_path)
+        try:
+            raw_row_count = _load_demo_raw_tables(conn, scenario)
+            _build_demo_model(conn)
+            ast_report = run_ast_analysis(RISKY_MODEL_SQL, MODEL_NAME)
+            metadata_result = run_metadata_checks(conn, MODEL_NAME, ["customer_id"])
+        finally:
+            conn.close()
+    except sqlite3.Error as error:
+        raise DemoPipelineError(
+            f"Could not build demo warehouse {warehouse_path}: {error}"
+        ) from error
 
     severity = ast_report["overall_risk"].upper()
-    anomalies = list(metadata_result.anomalies)
-    if severity in {"HIGH", "CRITICAL"}:
-        anomalies.insert(0, "Deterministic AST scan found risky join logic")
     safe_to_continue = severity not in {"HIGH", "CRITICAL"} and not (
         metadata_result.null_count > 0 or metadata_result.duplicate_count > 0
     )
@@ -129,57 +191,46 @@ def run_demo_pipeline(
         metadata_result=metadata_result,
         safe_to_continue=safe_to_continue,
     )
-    scan_id = insert_scan_run(
-        metadata_db_path,
-        ScanRunRecord(
-            project_name=PROJECT_NAME,
-            model_name=MODEL_NAME,
-            risk_level=severity,
-            safe_to_merge=safe_to_continue,
-            affected_models=[],
-            report_text=validation_report_text,
-        ),
-    )
-    insert_model_metrics(
-        metadata_db_path,
-        ModelMetricRecord(
-            scan_id=scan_id,
-            project_name=PROJECT_NAME,
-            model_name=MODEL_NAME,
-            row_count=metadata_result.row_count,
-            null_count=metadata_result.null_count,
-            duplicate_count=metadata_result.duplicate_count,
-            freshness_timestamp=metadata_result.freshness_timestamp,
-            schema_column_count=metadata_result.schema_column_count,
-        ),
-    )
+    try:
+        scan_id = insert_scan_run(
+            metadata_db_path,
+            ScanRunRecord(
+                project_name=PROJECT_NAME,
+                model_name=MODEL_NAME,
+                risk_level=severity,
+                safe_to_merge=safe_to_continue,
+                affected_models=[],
+                report_text=validation_report_text,
+            ),
+        )
+        insert_model_metrics(
+            metadata_db_path,
+            ModelMetricRecord(
+                scan_id=scan_id,
+                project_name=PROJECT_NAME,
+                model_name=MODEL_NAME,
+                row_count=metadata_result.row_count,
+                null_count=metadata_result.null_count,
+                duplicate_count=metadata_result.duplicate_count,
+                freshness_timestamp=metadata_result.freshness_timestamp,
+                schema_column_count=metadata_result.schema_column_count,
+            ),
+        )
+    except (OSError, sqlite3.Error) as error:
+        raise DemoPipelineError(
+            f"Could not record demo metadata in {metadata_db_path}: {error}"
+        ) from error
 
-    reason = "LEFT JOIN filter can silently drop unmatched rows."
     recommendation = (
         "Review the SQL transformation before deployment. "
         "The current change may alter downstream analytics outputs."
     )
-    drift_result = _build_drift_signal(metadata_db_path)
-    slack_sent = slack_alerts.send_validation_alert(
-        project_name=PROJECT_NAME,
-        model_name=MODEL_NAME,
-        severity=severity,
-        reason=reason,
-        affected_models=[],
-        anomalies=anomalies,
-        safe_to_continue=safe_to_continue,
-        recommendation=recommendation,
-        static_analysis_text="Potential LEFT JOIN nullification detected.",
-        metadata_checks={
-            "row_count": metadata_result.row_count,
-            "null_count": metadata_result.null_count,
-            "duplicate_count": metadata_result.duplicate_count,
-            "freshness_timestamp": metadata_result.freshness_timestamp,
-            "schema_column_count": metadata_result.schema_column_count,
-        },
-        drift_result=drift_result,
-        emit_status=False,
-    )
+    try:
+        drift_result = _build_drift_signal(metadata_db_path)
+    except MetadataStoreError as error:
+        raise DemoPipelineError(
+            f"Could not read demo metadata from {metadata_db_path}: {error}"
+        ) from error
 
     result = {
         "project_name": PROJECT_NAME,
@@ -201,7 +252,6 @@ def run_demo_pipeline(
         "schema_column_count": metadata_result.schema_column_count,
         "safe_to_continue": safe_to_continue,
         "metadata_stored": True,
-        "slack_sent": slack_sent,
     }
     result["report_text"] = format_demo_pipeline_report(result)
     ast_signal = ast_to_signal(ast_report)
@@ -228,6 +278,11 @@ def run_demo_pipeline(
     )
     result["incident"] = incident
     result["incident_summary"] = summarize_pipeline_incident(incident)
+    write_pipeline_validation_report(
+        result,
+        paths["markdown_report_path"],
+        paths["json_report_path"],
+    )
     return result
 
 
@@ -356,3 +411,53 @@ def _build_drift_signal(metadata_db_path: str | Path) -> dict | None:
         "freshness_regressed": freshness_regressed,
         "drift_level": drift_level,
     }
+
+
+def _validate_artifact_paths(**artifact_paths) -> dict[str, Path]:
+    paths = {
+        key: Path(value).expanduser()
+        for key, value in artifact_paths.items()
+    }
+    for key, path in paths.items():
+        expected_name = DEMO_ARTIFACT_NAMES[key]
+        if path.name != expected_name:
+            raise DemoPipelineError(
+                f"Demo artifact must be named {expected_name}: {path}"
+            )
+        if _has_redirecting_component(path.parent) or _is_redirecting_path(path):
+            raise DemoPipelineError(
+                f"Demo artifact may not use symbolic links or junctions: {path}"
+            )
+    try:
+        parents = {path.parent.resolve(strict=True) for path in paths.values()}
+    except OSError as error:
+        raise DemoPipelineError(f"Could not resolve demo workspace: {error}") from error
+    if len(parents) != 1:
+        raise DemoPipelineError("All demo artifacts must share one workspace.")
+    workspace = parents.pop()
+    for key, path in paths.items():
+        expected_name = DEMO_ARTIFACT_NAMES[key]
+        resolved_parent = path.parent.resolve(strict=True)
+        if resolved_parent != workspace:
+            raise DemoPipelineError(
+                f"Demo artifact must be {workspace / expected_name}: {path}"
+            )
+        paths[key] = workspace / expected_name
+    return paths
+
+
+def _has_redirecting_component(path: Path) -> bool:
+    current = path
+    while True:
+        if current.exists() and _is_redirecting_path(current):
+            return True
+        if current.parent == current:
+            return False
+        current = current.parent
+
+
+def _is_redirecting_path(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    return bool(is_junction and is_junction())

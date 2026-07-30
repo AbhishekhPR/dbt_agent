@@ -2,7 +2,6 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from click.testing import CliRunner
 
@@ -263,30 +262,27 @@ class PipelineValidationReportTests(unittest.TestCase):
         self.assertIn("# Relium Deployment Decision", report)
 
     def test_demo_pipeline_command_writes_pipeline_validation_report(self):
-        from agent import demo_pipeline
         from agent.cli import cli
 
         runner = CliRunner()
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            metadata_db = tmp_path / "relium_metadata.db"
-            warehouse_db = tmp_path / "demo_warehouse.db"
+            workspace = tmp_path / "workspace"
 
-            with runner.isolated_filesystem(temp_dir=tmp), patch.object(
-                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
-            ), patch.object(
-                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-            ), patch(
-                "agent.slack_alerts.send_validation_alert",
-                return_value=False,
-            ):
+            with runner.isolated_filesystem(temp_dir=tmp):
                 result = runner.invoke(
                     cli,
-                    ["demo-pipeline", "--scenario", "normal"],
+                    [
+                        "demo-pipeline",
+                        "--workspace",
+                        str(workspace),
+                        "--scenario",
+                        "normal",
+                    ],
                 )
-                report_path = Path("pipeline_validation_report.md")
+                report_path = workspace / "pipeline_validation_report.md"
                 report_text = report_path.read_text(encoding="utf-8")
-                json_path = Path("pipeline_validation_report.json")
+                json_path = workspace / "pipeline_validation_report.json"
                 report_json = json.loads(json_path.read_text(encoding="utf-8"))
 
         self.assertEqual(result.exit_code, 0, result.output)

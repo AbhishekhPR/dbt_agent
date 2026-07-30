@@ -445,6 +445,16 @@ def blast(project, table, columns):
 
 @cli.command(name="demo-pipeline")
 @click.option(
+    "--workspace",
+    required=True,
+    type=click.Path(path_type=Path),
+    help=(
+        "Explicit local workspace for demo_pipeline.db, relium_metadata.db, "
+        "pipeline_validation_report.md, and pipeline_validation_report.json. "
+        "Reusing a workspace retains demo history for drift scenarios."
+    ),
+)
+@click.option(
     '--scenario',
     default='normal',
     show_default=True,
@@ -455,15 +465,33 @@ def blast(project, table, columns):
     help='Deterministic demo scenario to run.',
 )
 @click.option('--decision', is_flag=True, help='Show the internal Decision View.')
-def demo_pipeline(scenario, decision):
-    """Run Relium's local validation demo pipeline end to end."""
-    from agent.demo_pipeline import run_demo_pipeline
-    from agent.pipeline_validation_report import write_pipeline_validation_report
+def demo_pipeline(workspace, scenario, decision):
+    """Run locally in one workspace without sending notifications."""
+    from agent.demo_pipeline import (
+        DemoPipelineError,
+        prepare_demo_workspace,
+        run_demo_pipeline,
+    )
+    from agent.pipeline_validation_report import PipelineReportError
     from agent.presentation import render_cli
 
-    result = run_demo_pipeline(scenario=scenario)
-    write_pipeline_validation_report(result)
-    click.echo(f"Slack alert sent: {'YES' if result['slack_sent'] else 'NO'}")
+    try:
+        paths = prepare_demo_workspace(workspace)
+        result = run_demo_pipeline(
+            metadata_db_path=paths["metadata_db_path"],
+            warehouse_db_path=paths["warehouse_db_path"],
+            markdown_report_path=paths["markdown_report_path"],
+            json_report_path=paths["json_report_path"],
+            scenario=scenario,
+        )
+    except (DemoPipelineError, PipelineReportError) as error:
+        raise click.ClickException(str(error)) from error
+
+    click.echo(f"Demo workspace: {paths['workspace_path']}")
+    click.echo(f"Warehouse database: {paths['warehouse_db_path']}")
+    click.echo(f"Metadata database: {paths['metadata_db_path']}")
+    click.echo(f"Markdown report: {paths['markdown_report_path']}")
+    click.echo(f"JSON report: {paths['json_report_path']}")
     click.echo(result["report_text"])
     if decision:
         click.echo()
