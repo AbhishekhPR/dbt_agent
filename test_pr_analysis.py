@@ -53,7 +53,10 @@ class PrAnalysisTests(unittest.TestCase):
         ]
 
         with _patched_detectors() as calls:
-            incident = analyze_changed_models(changed_models)
+            incident = analyze_changed_models(
+                changed_models,
+                metadata_db_path="metrics.db",
+            )
 
         self.assertEqual(len(calls["ast"]), 2)
         self.assertEqual(len(calls["metadata"]), 2)
@@ -240,6 +243,12 @@ class PrAnalysisTests(unittest.TestCase):
                     "metadata": {
                         "model_count": 1,
                         "models": ["stg_orders"],
+                        "metadata_drift": [
+                            {
+                                "model_name": "stg_orders",
+                                "comparison_status": "unavailable",
+                            }
+                        ],
                     },
                 }
             ],

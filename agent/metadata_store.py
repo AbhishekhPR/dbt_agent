@@ -9,6 +9,10 @@ from pathlib import Path
 DEFAULT_METADATA_DB_PATH = Path(__file__).resolve().parent.parent / "relium_metadata.db"
 
 
+class MetadataStoreError(ValueError):
+    """Raised when persisted metadata cannot be read safely."""
+
+
 @dataclass
 class ScanRunRecord:
     project_name: str
@@ -172,35 +176,25 @@ def insert_model_metrics(
 
 
 def fetch_scan_run(db_path: str | Path, scan_id: str) -> dict:
-    path = initialize_metadata_db(db_path)
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    try:
-        row = conn.execute(
-            "SELECT * FROM relium_scan_runs WHERE scan_id = ?",
-            (scan_id,),
-        ).fetchone()
-        return dict(row) if row else {}
-    finally:
-        conn.close()
+    rows = _read_metadata_rows(
+        db_path,
+        "SELECT * FROM relium_scan_runs WHERE scan_id = ?",
+        (scan_id,),
+    )
+    return dict(rows[0]) if rows else {}
 
 
 def fetch_model_metrics(db_path: str | Path, scan_id: str) -> list[dict]:
-    path = initialize_metadata_db(db_path)
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = conn.execute(
-            """
-            SELECT * FROM relium_model_metrics
-            WHERE scan_id = ?
-            ORDER BY id ASC
-            """,
-            (scan_id,),
-        ).fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        conn.close()
+    rows = _read_metadata_rows(
+        db_path,
+        """
+        SELECT * FROM relium_model_metrics
+        WHERE scan_id = ?
+        ORDER BY id ASC
+        """,
+        (scan_id,),
+    )
+    return [dict(row) for row in rows]
 
 
 def insert_metric_drift(
@@ -244,21 +238,16 @@ def fetch_metric_drifts(
     project_name: str,
     model_name: str,
 ) -> list[dict]:
-    path = initialize_metadata_db(db_path)
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = conn.execute(
-            """
-            SELECT * FROM relium_metric_drifts
-            WHERE project_name = ? AND model_name = ?
-            ORDER BY id ASC
-            """,
-            (project_name, model_name),
-        ).fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        conn.close()
+    rows = _read_metadata_rows(
+        db_path,
+        """
+        SELECT * FROM relium_metric_drifts
+        WHERE project_name = ? AND model_name = ?
+        ORDER BY id ASC
+        """,
+        (project_name, model_name),
+    )
+    return [dict(row) for row in rows]
 
 
 def fetch_recent_model_metrics(
@@ -267,48 +256,93 @@ def fetch_recent_model_metrics(
     model_name: str | None = None,
     limit: int = 2,
 ) -> list[dict]:
-    path = initialize_metadata_db(db_path)
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    try:
-        sql = """
-            SELECT * FROM relium_model_metrics
-        """
-        params: list[object] = []
-        clauses = []
-        if project_name:
-            clauses.append("project_name = ?")
-            params.append(project_name)
-        if model_name:
-            clauses.append("model_name = ?")
-            params.append(model_name)
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY timestamp DESC, id DESC LIMIT ?"
-        params.append(limit)
-        rows = conn.execute(sql, tuple(params)).fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        conn.close()
+    sql = """
+        SELECT * FROM relium_model_metrics
+    """
+    params: list[object] = []
+    clauses = []
+    if project_name:
+        clauses.append("project_name = ?")
+        params.append(project_name)
+    if model_name:
+        clauses.append("model_name = ?")
+        params.append(model_name)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY timestamp DESC, id DESC LIMIT ?"
+    params.append(limit)
+    rows = _read_metadata_rows(db_path, sql, tuple(params))
+    return [dict(row) for row in rows]
 
 
 def fetch_latest_model_identity(db_path: str | Path) -> tuple[str, str] | None:
-    path = initialize_metadata_db(db_path)
-    conn = sqlite3.connect(path)
+    rows = _read_metadata_rows(
+        db_path,
+        """
+        SELECT project_name, model_name
+        FROM relium_model_metrics
+        ORDER BY timestamp DESC, id DESC
+        LIMIT 1
+        """,
+    )
+    if not rows:
+        return None
+    return rows[0][0], rows[0][1]
+
+
+def _read_metadata_rows(
+    db_path: str | Path,
+    query: str,
+    parameters: tuple = (),
+) -> list[sqlite3.Row]:
+    path = _metadata_db_path_for_read(db_path)
     try:
-        row = conn.execute(
-            """
-            SELECT project_name, model_name
-            FROM relium_model_metrics
-            ORDER BY timestamp DESC, id DESC
-            LIMIT 1
-            """
-        ).fetchone()
-        if not row:
-            return None
-        return row[0], row[1]
+        connection = sqlite3.connect(
+            f"{path.as_uri()}?mode=ro",
+            uri=True,
+        )
+    except sqlite3.Error as error:
+        raise MetadataStoreError(
+            f"Could not open metadata database read-only: {path}: {error}"
+        ) from error
+
+    connection.row_factory = sqlite3.Row
+    try:
+        return connection.execute(query, parameters).fetchall()
+    except sqlite3.Error as error:
+        raise MetadataStoreError(
+            f"Could not read metadata database: {path}: {error}"
+        ) from error
     finally:
-        conn.close()
+        connection.close()
+
+
+def _metadata_db_path_for_read(db_path: str | Path) -> Path:
+    if db_path is None or not str(db_path).strip():
+        raise MetadataStoreError("A metadata database path is required.")
+
+    supplied = Path(db_path).expanduser()
+    try:
+        path = supplied.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise MetadataStoreError(
+            f"Metadata database does not exist: {supplied}"
+        ) from error
+    except OSError as error:
+        raise MetadataStoreError(
+            f"Could not access metadata database: {supplied}: {error}"
+        ) from error
+
+    if not path.is_file():
+        raise MetadataStoreError(f"Metadata database is not a file: {supplied}")
+    try:
+        if path.stat().st_size == 0:
+            raise MetadataStoreError(f"Metadata database is empty: {supplied}")
+    except OSError as error:
+        raise MetadataStoreError(
+            f"Could not access metadata database: {supplied}: {error}"
+        ) from error
+    return path
 
 
 def _utc_now() -> str:

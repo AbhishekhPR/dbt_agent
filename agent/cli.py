@@ -29,6 +29,65 @@ def _validate_directory_exists(dir_path: str, description: str) -> Path:
     return path
 
 
+def _write_requested_report(output, rendered, description):
+    import os
+    import tempfile
+
+    output_path = Path(output)
+    temporary_path = None
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(rendered)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_path.replace(output_path)
+    except OSError as error:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise click.ClickException(
+            f"Could not write {description} to {output_path}: {error}"
+        ) from error
+
+
+def _append_metadata_drift_status(rendered, incident, output_format):
+    if output_format == "json":
+        return rendered
+    if isinstance(incident, dict):
+        metadata = incident.get("metadata") or {}
+    else:
+        metadata = getattr(incident, "metadata", {}) or {}
+    statuses = [
+        item
+        for item in metadata.get("metadata_drift", [])
+        if isinstance(item, dict) and item.get("comparison_status")
+    ]
+    if not statuses:
+        return rendered
+
+    lines = []
+    if len(statuses) == 1:
+        lines.append(f"Metadata Drift: {statuses[0]['comparison_status']}")
+    else:
+        lines.append("Metadata Drift:")
+        lines.extend(
+            f"- {item.get('model_name') or 'unknown'}: {item['comparison_status']}"
+            for item in statuses
+        )
+    return f"{rendered}\n\n" + "\n".join(lines)
+
+
 @click.group()
 def cli():
     """dbt-agent — AI-powered dbt pipeline diagnostics"""
@@ -563,8 +622,20 @@ def init_baseline_command(dbt_manifest, history_path, deployment_id):
     show_default=True,
     help="Path to Relium deployment outcomes JSON.",
 )
+@click.option(
+    "--metadata-db",
+    default=None,
+    help=(
+        "Existing metadata SQLite database to read for drift analysis. "
+        "Opened read-only; omitted means metadata drift is unavailable."
+    ),
+)
 @click.option("--deployment-id", default=None, help="Deployment identifier.")
-@click.option("--auto-record", is_flag=True, help="Record accepted snapshots.")
+@click.option(
+    "--auto-record",
+    is_flag=True,
+    help="Updates deployment history by recording eligible snapshots.",
+)
 @click.option(
     "--allow-blocked-recording",
     is_flag=True,
@@ -580,7 +651,11 @@ def init_baseline_command(dbt_manifest, history_path, deployment_id):
         "nonzero only for BLOCK. WARN remains advisory in both modes."
     ),
 )
-@click.option("--output", default=None, help="Write rendered review to this file.")
+@click.option(
+    "--output",
+    default=None,
+    help="Writes the rendered review to this file and may create its parent directory.",
+)
 @click.option(
     "--format",
     "output_format",
@@ -596,6 +671,7 @@ def review_deployment_command(
     changed_files,
     history_path,
     outcomes_path,
+    metadata_db,
     deployment_id,
     auto_record,
     allow_blocked_recording,
@@ -603,9 +679,8 @@ def review_deployment_command(
     output,
     output_format,
 ):
-    """Run a history-aware Relium deployment review."""
+    """Run a local review that is read-only unless a write option is supplied."""
     import json
-    from pathlib import Path
 
     from agent.dbt_context import load_manifest_from_path
     from agent.deployment_review_service import (
@@ -633,6 +708,7 @@ def review_deployment_command(
                 outcomes_path=outcomes_path,
                 auto_record=auto_record,
                 allow_blocked_recording=allow_blocked_recording,
+                metadata_db_path=metadata_db,
             )
         else:
             context_payload = _load_review_project_context(project_context, None)
@@ -648,8 +724,9 @@ def review_deployment_command(
                 outcomes_path=outcomes_path,
                 auto_record=auto_record,
                 allow_blocked_recording=allow_blocked_recording,
+                metadata_db_path=metadata_db,
             )
-    except ValueError as error:
+    except (ValueError, OSError) as error:
         message = str(error)
         if message == "At least one changed model is required.":
             if changed_files:
@@ -669,11 +746,14 @@ def review_deployment_command(
         rendered = json.dumps(payload, indent=2, sort_keys=True)
     else:
         rendered = service_result["rendered"][output_format]
+    rendered = _append_metadata_drift_status(
+        rendered,
+        service_result["incident"],
+        output_format,
+    )
 
     if output:
-        output_path = Path(output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(rendered, encoding="utf-8")
+        _write_requested_report(output, rendered, "deployment review")
         click.echo(f"Deployment review written to {output}")
     else:
         click.echo(rendered)
@@ -712,12 +792,24 @@ def review_deployment_command(
     help="Path to Relium deployment history JSON when --baseline-manifest is not provided.",
 )
 @click.option(
+    "--metadata-db",
+    default=None,
+    help=(
+        "Existing metadata SQLite database to read for drift analysis. "
+        "Opened read-only; omitted means metadata drift is unavailable."
+    ),
+)
+@click.option(
     "--deployment-id",
     default="historical-backtest",
     show_default=True,
     help="Historical deployment identifier.",
 )
-@click.option("--output", default=None, help="Write rendered backtest to this file.")
+@click.option(
+    "--output",
+    default=None,
+    help="Writes the rendered backtest to this file and may create its parent directory.",
+)
 @click.option(
     "--format",
     "output_format",
@@ -732,13 +824,12 @@ def backtest_deployment_command(
     changed_models,
     changed_files,
     history_path,
+    metadata_db,
     deployment_id,
     output,
     output_format,
 ):
-    """Replay a historical deployment through Relium's review logic."""
-    from pathlib import Path
-
+    """Replay a deployment locally without changing history or metadata."""
     from agent.backtest import backtest_deployment
 
     resolved_changed_models = _review_deployment_changed_models(
@@ -758,15 +849,19 @@ def backtest_deployment_command(
             history_path=history_path,
             changed_models=resolved_changed_models,
             deployment_id=deployment_id,
+            metadata_db_path=metadata_db,
         )
-    except ValueError as error:
+    except (ValueError, OSError) as error:
         raise click.ClickException(str(error)) from error
 
     rendered = _render_backtest_result(result, output_format)
+    rendered = _append_metadata_drift_status(
+        rendered,
+        result.incident,
+        output_format,
+    )
     if output:
-        output_path = Path(output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(rendered, encoding="utf-8")
+        _write_requested_report(output, rendered, "backtest")
         click.echo(f"Backtest written to {output}")
         return
 
@@ -1002,11 +1097,18 @@ def _snapshot_id(snapshot):
 
 
 @cli.command(name="compare-last-run")
-@click.option('--db', default=None, help='Path to metadata SQLite database')
+@click.option(
+    '--db',
+    required=True,
+    help=(
+        'Existing metadata SQLite database. Opened read-only; '
+        'the comparison does not record drift.'
+    ),
+)
 @click.option('--project', default=None, help='Project name to compare (optional)')
 @click.option('--model', default=None, help='Model name to compare (optional)')
 def compare_last_run(db, project, model):
-    """Compare the latest model metrics against the previous run."""
+    """Compare persisted metrics locally without changing metadata state."""
     from agent.metadata_drift import compare_last_run as compare_last_run_metrics
     from agent.metadata_drift import format_compare_last_run_report
 

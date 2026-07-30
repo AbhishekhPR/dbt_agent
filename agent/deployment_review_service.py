@@ -23,6 +23,7 @@ def review_manifest_change(
     outcomes_path=None,
     auto_record=False,
     allow_blocked_recording=False,
+    metadata_db_path=None,
 ) -> dict[str, Any]:
     manifest_copy = copy.deepcopy(manifest)
     if not isinstance(manifest_copy, dict):
@@ -48,6 +49,7 @@ def review_manifest_change(
         outcomes_path=outcomes_path,
         auto_record=auto_record,
         allow_blocked_recording=allow_blocked_recording,
+        metadata_db_path=metadata_db_path,
         require_model_match=True,
     )
 
@@ -62,6 +64,7 @@ def _review_project_context_change(
     outcomes_path=None,
     auto_record=False,
     allow_blocked_recording=False,
+    metadata_db_path=None,
     require_model_match=False,
 ) -> dict[str, Any]:
     context_copy = copy.deepcopy(project_context or {})
@@ -85,6 +88,7 @@ def _review_project_context_change(
         deployment_id=deployment_id,
         auto_record=auto_record,
         allow_blocked_recording=allow_blocked_recording,
+        metadata_db_path=metadata_db_path,
         **options,
     )
 

@@ -123,7 +123,7 @@ class MetadataDriftTests(unittest.TestCase):
             ),
         )
 
-    def test_compare_last_run_calculates_drift_and_stores_it(self):
+    def test_compare_last_run_calculates_drift_read_only(self):
         from agent.metadata_drift import compare_last_run
 
         self._seed_two_runs()
@@ -290,9 +290,8 @@ class MetadataDriftTests(unittest.TestCase):
         self.assertEqual(result["project_name"], "demo_project")
         self.assertEqual(result["model_name"], "fct_customer_lifetime_value")
 
-    def test_compare_last_run_cli_succeeds_with_no_arguments_after_demo_pipeline(self):
+    def test_compare_last_run_cli_uses_explicit_demo_metadata_database(self):
         from agent import demo_pipeline
-        from agent import metadata_drift
         from agent.cli import cli
 
         runner = CliRunner()
@@ -305,8 +304,6 @@ class MetadataDriftTests(unittest.TestCase):
                 demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
             ), patch.object(
                 demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-            ), patch.object(
-                metadata_drift, "DEFAULT_METADATA_DB_PATH", metadata_db
             ), patch(
                 "agent.slack_alerts.send_validation_alert",
                 return_value=False,
@@ -315,7 +312,11 @@ class MetadataDriftTests(unittest.TestCase):
                 self.assertEqual(first.exit_code, 0, first_output)
                 self.db_path = metadata_db
                 self._seed_second_run_for_demo_default_db()
-                result, output = invoke_cli(runner, cli, ["compare-last-run"])
+                result, output = invoke_cli(
+                    runner,
+                    cli,
+                    ["compare-last-run", "--db", str(metadata_db)],
+                )
 
             self.assertEqual(result.exit_code, 0, output)
             self.assertIn("Metadata Drift:", output)
@@ -374,9 +375,8 @@ class MetadataDriftTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, output)
         self.assertIn("Metadata Drift: HIGH", output)
 
-    def test_demo_pipeline_scenarios_produce_high_drift_and_store_records(self):
+    def test_demo_pipeline_scenarios_produce_high_drift_without_recording_it(self):
         from agent import demo_pipeline
-        from agent import metadata_drift
         from agent.cli import cli
 
         runner = CliRunner()
@@ -408,8 +408,6 @@ class MetadataDriftTests(unittest.TestCase):
                     demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
                 ), patch.object(
                     demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-                ), patch.object(
-                    metadata_drift, "DEFAULT_METADATA_DB_PATH", metadata_db
                 ), patch(
                     "agent.slack_alerts.send_validation_alert",
                     return_value=False,
@@ -431,7 +429,7 @@ class MetadataDriftTests(unittest.TestCase):
                     compare, compare_output = invoke_cli(
                         runner,
                         cli,
-                        ["compare-last-run"],
+                        ["compare-last-run", "--db", str(metadata_db)],
                     )
 
                 self.assertEqual(compare.exit_code, 0, compare_output)
@@ -451,12 +449,7 @@ class MetadataDriftTests(unittest.TestCase):
                 ).fetchall()
                 conn.close()
 
-                self.assertEqual(len(drift_rows), 1)
-                self.assertEqual(drift_rows[0][0], "HIGH")
-                self.assertIn(
-                    f"Row count change: {expected['row_count_change']}",
-                    drift_rows[0][1],
-                )
+                self.assertEqual(drift_rows, [])
 
 
 if __name__ == "__main__":

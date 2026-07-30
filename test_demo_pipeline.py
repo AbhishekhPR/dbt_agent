@@ -480,7 +480,6 @@ class DemoPipelineTests(unittest.TestCase):
 
     def test_duplicate_spike_sends_clear_high_drift_alert_text(self):
         from agent import demo_pipeline
-        from agent import metadata_drift
         from agent.cli import cli
 
         runner = CliRunner()
@@ -502,8 +501,6 @@ class DemoPipelineTests(unittest.TestCase):
                 demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
             ), patch.object(
                 demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-            ), patch.object(
-                metadata_drift, "DEFAULT_METADATA_DB_PATH", metadata_db
             ), patch.dict("os.environ", {"SLACK_WEBHOOK_URL": "https://example.test/hook"}), patch(
                 "urllib.request.urlopen",
                 side_effect=capture_payload,
@@ -543,7 +540,6 @@ class DemoPipelineTests(unittest.TestCase):
 
     def test_freshness_regression_sends_clear_high_drift_alert_text(self):
         from agent import demo_pipeline
-        from agent import metadata_drift
         from agent.cli import cli
 
         runner = CliRunner()
@@ -565,8 +561,6 @@ class DemoPipelineTests(unittest.TestCase):
                 demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
             ), patch.object(
                 demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-            ), patch.object(
-                metadata_drift, "DEFAULT_METADATA_DB_PATH", metadata_db
             ), patch.dict("os.environ", {"SLACK_WEBHOOK_URL": "https://example.test/hook"}), patch(
                 "urllib.request.urlopen",
                 side_effect=capture_payload,

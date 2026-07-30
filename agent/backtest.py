@@ -47,6 +47,7 @@ def backtest_deployment(
     history_path: str = ".relium/deployment_history.json",
     deployment_id: str | None = None,
     metadata: dict[str, Any] | None = None,
+    metadata_db_path: str | Path | None = None,
 ) -> BacktestResult:
     changed = [str(model) for model in list(changed_models or []) if str(model)]
     if not changed:
@@ -71,6 +72,7 @@ def backtest_deployment(
         },
         auto_record=False,
         allow_blocked_recording=False,
+        metadata_db_path=metadata_db_path,
     )
 
     return BacktestResult(
