@@ -1,12 +1,14 @@
 import json
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 from agent.presentation import render_markdown
 
 
-DEFAULT_REPORT_PATH = Path("pipeline_validation_report.md")
-DEFAULT_JSON_REPORT_PATH = Path("pipeline_validation_report.json")
+class PipelineReportError(ValueError):
+    """Raised when demo reports cannot be serialized or replaced safely."""
 
 
 def format_pipeline_validation_report(result: dict) -> str:
@@ -107,14 +109,80 @@ def format_pipeline_validation_report(result: dict) -> str:
 
 def write_pipeline_validation_report(
     result: dict,
-    path: str | Path = DEFAULT_REPORT_PATH,
-) -> Path:
+    markdown_path: str | Path,
+    json_path: str | Path,
+) -> tuple[Path, Path]:
     if not result.get("generated_timestamp"):
         result = {**result, "generated_timestamp": _generated_timestamp()}
-    report_path = Path(path)
-    report_path.write_text(format_pipeline_validation_report(result), encoding="utf-8")
-    write_pipeline_validation_json(result, DEFAULT_JSON_REPORT_PATH)
-    return report_path
+    try:
+        markdown = format_pipeline_validation_report(result)
+        json_text = (
+            json.dumps(
+                format_pipeline_validation_json(result),
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            + "\n"
+        )
+    except (TypeError, ValueError) as error:
+        raise PipelineReportError(f"Could not serialize demo reports: {error}") from error
+
+    markdown_target = Path(markdown_path)
+    json_target = Path(json_path)
+    try:
+        previous_markdown = (
+            markdown_target.read_bytes() if markdown_target.exists() else None
+        )
+        if json_target.exists():
+            json_target.read_bytes()
+    except OSError as error:
+        raise PipelineReportError(f"Could not read existing demo reports: {error}") from error
+
+    staged_markdown = None
+    staged_json = None
+    markdown_replaced = False
+    replacement_error = None
+    rollback_error = None
+    try:
+        staged_markdown = _stage_report(markdown_target, markdown)
+        staged_json = _stage_report(json_target, json_text)
+        os.replace(staged_markdown, markdown_target)
+        staged_markdown = None
+        markdown_replaced = True
+        os.replace(staged_json, json_target)
+        staged_json = None
+    except OSError as error:
+        replacement_error = error
+        if markdown_replaced:
+            try:
+                _restore_report(markdown_target, previous_markdown)
+            except OSError as restore_error:
+                rollback_error = restore_error
+    cleanup_errors = [
+        error
+        for error in (
+            _remove_staged_report(staged_markdown),
+            _remove_staged_report(staged_json),
+        )
+        if error is not None
+    ]
+    if replacement_error is not None:
+        message = f"Could not replace demo reports safely: {replacement_error}"
+        if rollback_error is not None:
+            message += f"; Markdown rollback also failed: {rollback_error}"
+        if cleanup_errors:
+            message += "; temporary report cleanup also failed: " + "; ".join(
+                str(error) for error in cleanup_errors
+            )
+        raise PipelineReportError(message) from replacement_error
+    if cleanup_errors:
+        raise PipelineReportError(
+            "Demo reports were replaced, but temporary report cleanup failed: "
+            + "; ".join(str(error) for error in cleanup_errors)
+        )
+
+    return markdown_target, json_target
 
 
 def format_pipeline_validation_json(result: dict) -> dict:
@@ -156,16 +224,72 @@ def format_pipeline_validation_json(result: dict) -> dict:
     }
 
 
-def write_pipeline_validation_json(
-    result: dict,
-    path: str | Path = DEFAULT_JSON_REPORT_PATH,
-) -> Path:
-    report_path = Path(path)
-    report_path.write_text(
-        json.dumps(format_pipeline_validation_json(result), indent=2) + "\n",
-        encoding="utf-8",
-    )
-    return report_path
+def _stage_report(target: Path, content: str) -> Path:
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return temporary_path
+    except OSError as error:
+        cleanup_error = _remove_staged_report(temporary_path)
+        if cleanup_error is not None:
+            raise OSError(
+                f"{error}; temporary report cleanup also failed: {cleanup_error}"
+            ) from error
+        raise
+
+
+def _restore_report(target: Path, previous: bytes | None) -> None:
+    if previous is None:
+        target.unlink(missing_ok=True)
+        return
+
+    temporary_path = None
+    restore_error = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".rollback.tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(previous)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, target)
+        temporary_path = None
+    except OSError as error:
+        restore_error = error
+    cleanup_error = _remove_staged_report(temporary_path)
+    if restore_error is not None:
+        message = str(restore_error)
+        if cleanup_error is not None:
+            message += f"; rollback cleanup also failed: {cleanup_error}"
+        raise OSError(message) from restore_error
+    if cleanup_error is not None:
+        raise cleanup_error
+
+
+def _remove_staged_report(path: Path | None) -> OSError | None:
+    if path is None:
+        return None
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as error:
+        return error
+    return None
 
 
 def _generated_timestamp() -> str:

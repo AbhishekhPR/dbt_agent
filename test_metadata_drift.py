@@ -291,32 +291,25 @@ class MetadataDriftTests(unittest.TestCase):
         self.assertEqual(result["model_name"], "fct_customer_lifetime_value")
 
     def test_compare_last_run_cli_uses_explicit_demo_metadata_database(self):
-        from agent import demo_pipeline
         from agent.cli import cli
 
         runner = CliRunner()
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            metadata_db = tmp_path / "relium_metadata.db"
-            warehouse_db = tmp_path / "demo_warehouse.db"
-
-            with patch.object(
-                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
-            ), patch.object(
-                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-            ), patch(
-                "agent.slack_alerts.send_validation_alert",
-                return_value=False,
-            ):
-                first, first_output = invoke_cli(runner, cli, ["demo-pipeline"])
-                self.assertEqual(first.exit_code, 0, first_output)
-                self.db_path = metadata_db
-                self._seed_second_run_for_demo_default_db()
-                result, output = invoke_cli(
-                    runner,
-                    cli,
-                    ["compare-last-run", "--db", str(metadata_db)],
-                )
+            workspace = Path(tmp) / "workspace"
+            metadata_db = workspace / "relium_metadata.db"
+            first, first_output = invoke_cli(
+                runner,
+                cli,
+                ["demo-pipeline", "--workspace", str(workspace)],
+            )
+            self.assertEqual(first.exit_code, 0, first_output)
+            self.db_path = metadata_db
+            self._seed_second_run_for_demo_default_db()
+            result, output = invoke_cli(
+                runner,
+                cli,
+                ["compare-last-run", "--db", str(metadata_db)],
+            )
 
             self.assertEqual(result.exit_code, 0, output)
             self.assertIn("Metadata Drift:", output)
@@ -376,7 +369,6 @@ class MetadataDriftTests(unittest.TestCase):
         self.assertIn("Metadata Drift: HIGH", output)
 
     def test_demo_pipeline_scenarios_produce_high_drift_without_recording_it(self):
-        from agent import demo_pipeline
         from agent.cli import cli
 
         runner = CliRunner()
@@ -400,37 +392,39 @@ class MetadataDriftTests(unittest.TestCase):
 
         for scenario, expected in expectations.items():
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
-                tmp_path = Path(tmp)
-                metadata_db = tmp_path / "relium_metadata.db"
-                warehouse_db = tmp_path / "demo_warehouse.db"
+                workspace = Path(tmp) / "workspace"
+                metadata_db = workspace / "relium_metadata.db"
+                first, first_output = invoke_cli(
+                    runner,
+                    cli,
+                    [
+                        "demo-pipeline",
+                        "--workspace",
+                        str(workspace),
+                        "--scenario",
+                        "normal",
+                    ],
+                )
+                self.assertEqual(first.exit_code, 0, first_output)
 
-                with patch.object(
-                    demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
-                ), patch.object(
-                    demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-                ), patch(
-                    "agent.slack_alerts.send_validation_alert",
-                    return_value=False,
-                ):
-                    first, first_output = invoke_cli(
-                        runner,
-                        cli,
-                        ["demo-pipeline", "--scenario", "normal"],
-                    )
-                    self.assertEqual(first.exit_code, 0, first_output)
+                second, second_output = invoke_cli(
+                    runner,
+                    cli,
+                    [
+                        "demo-pipeline",
+                        "--workspace",
+                        str(workspace),
+                        "--scenario",
+                        scenario,
+                    ],
+                )
+                self.assertEqual(second.exit_code, 0, second_output)
 
-                    second, second_output = invoke_cli(
-                        runner,
-                        cli,
-                        ["demo-pipeline", "--scenario", scenario],
-                    )
-                    self.assertEqual(second.exit_code, 0, second_output)
-
-                    compare, compare_output = invoke_cli(
-                        runner,
-                        cli,
-                        ["compare-last-run", "--db", str(metadata_db)],
-                    )
+                compare, compare_output = invoke_cli(
+                    runner,
+                    cli,
+                    ["compare-last-run", "--db", str(metadata_db)],
+                )
 
                 self.assertEqual(compare.exit_code, 0, compare_output)
                 self.assertIn(

@@ -1,11 +1,10 @@
-import json
 import io
 import sqlite3
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from click.testing import CliRunner
 
@@ -22,10 +21,40 @@ def invoke_cli(runner, cli, args):
     return result, output
 
 
+def _artifact_paths(root):
+    root = Path(root)
+    return {
+        "metadata_db_path": root / "relium_metadata.db",
+        "warehouse_db_path": root / "demo_pipeline.db",
+        "markdown_report_path": root / "pipeline_validation_report.md",
+        "json_report_path": root / "pipeline_validation_report.json",
+    }
+
+
+def _run_service(module, root, scenario="normal"):
+    return module.run_demo_pipeline(
+        scenario=scenario,
+        **_artifact_paths(root),
+    )
+
+
+def _cli_args(workspace, scenario="normal", decision=False):
+    args = [
+        "demo-pipeline",
+        "--workspace",
+        str(workspace),
+        "--scenario",
+        scenario,
+    ]
+    if decision:
+        args.append("--decision")
+    return args
+
+
 class DemoPipelineTests(unittest.TestCase):
     def test_risky_left_join_model_produces_high_risk(self):
-        from agent.demo_pipeline import RISKY_MODEL_SQL
         from agent.ast_analyzer import run_ast_analysis
+        from agent.demo_pipeline import RISKY_MODEL_SQL
 
         report = run_ast_analysis(RISKY_MODEL_SQL, "fct_customer_lifetime_value")
 
@@ -33,31 +62,19 @@ class DemoPipelineTests(unittest.TestCase):
         self.assertFalse(report["safe_to_run"])
 
     def test_demo_pipeline_command_completes_locally(self):
-        from agent import demo_pipeline
         from agent.cli import cli
 
         runner = CliRunner()
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            metadata_db = tmp_path / "relium_metadata.db"
-            warehouse_db = tmp_path / "demo_warehouse.db"
-
-            with patch.object(
-                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
-            ), patch.object(
-                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-            ), patch(
-                "agent.slack_alerts.send_validation_alert",
-                return_value=False,
-            ):
-                result, output = invoke_cli(
-                    runner,
-                    cli,
-                    ["demo-pipeline", "--scenario", "normal"],
-                )
+            workspace = Path(tmp) / "workspace"
+            result, output = invoke_cli(
+                runner,
+                cli,
+                _cli_args(workspace),
+            )
 
             self.assertEqual(result.exit_code, 0, output)
-            self.assertIn("Slack alert sent: NO", output)
+            self.assertNotIn("Slack", output)
             self.assertIn("Relium Demo Pipeline", output)
             self.assertIn("Scenario: normal", output)
             self.assertIn("Raw rows loaded:", output)
@@ -66,14 +83,16 @@ class DemoPipelineTests(unittest.TestCase):
             self.assertIn("Safe to continue: NO", output)
             self.assertIn("Metadata stored: YES", output)
 
-            conn = sqlite3.connect(metadata_db)
-            scan_runs = conn.execute(
-                "SELECT COUNT(*) FROM relium_scan_runs"
-            ).fetchone()[0]
-            metrics = conn.execute(
-                "SELECT COUNT(*) FROM relium_model_metrics"
-            ).fetchone()[0]
-            conn.close()
+            connection = sqlite3.connect(workspace / "relium_metadata.db")
+            try:
+                scan_runs = connection.execute(
+                    "SELECT COUNT(*) FROM relium_scan_runs"
+                ).fetchone()[0]
+                metrics = connection.execute(
+                    "SELECT COUNT(*) FROM relium_model_metrics"
+                ).fetchone()[0]
+            finally:
+                connection.close()
 
         self.assertEqual(scan_runs, 1)
         self.assertEqual(metrics, 1)
@@ -81,21 +100,10 @@ class DemoPipelineTests(unittest.TestCase):
     def test_run_demo_pipeline_returns_result_without_printing_report(self):
         from agent import demo_pipeline
 
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            metadata_db = tmp_path / "relium_metadata.db"
-            warehouse_db = tmp_path / "demo_warehouse.db"
-
-            with patch.object(
-                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
-            ), patch.object(
-                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-            ), patch.dict(
-                "os.environ",
-                {},
-                clear=True,
-            ), patch("builtins.print") as printed:
-                result = demo_pipeline.run_demo_pipeline(scenario="normal")
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "builtins.print"
+        ) as printed:
+            result = _run_service(demo_pipeline, tmp)
 
         printed.assert_not_called()
         self.assertEqual(result["scenario"], "normal")
@@ -106,19 +114,7 @@ class DemoPipelineTests(unittest.TestCase):
         from agent.incident import Incident
 
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            metadata_db = tmp_path / "relium_metadata.db"
-            warehouse_db = tmp_path / "demo_warehouse.db"
-
-            with patch.object(
-                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
-            ), patch.object(
-                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-            ), patch(
-                "agent.slack_alerts.send_validation_alert",
-                return_value=False,
-            ):
-                result = demo_pipeline.run_demo_pipeline(scenario="normal")
+            result = _run_service(demo_pipeline, tmp)
 
         self.assertIn("incident", result)
         self.assertIn("incident_summary", result)
@@ -128,19 +124,7 @@ class DemoPipelineTests(unittest.TestCase):
         from agent import demo_pipeline
 
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            metadata_db = tmp_path / "relium_metadata.db"
-            warehouse_db = tmp_path / "demo_warehouse.db"
-
-            with patch.object(
-                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
-            ), patch.object(
-                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-            ), patch(
-                "agent.slack_alerts.send_validation_alert",
-                return_value=False,
-            ):
-                result = demo_pipeline.run_demo_pipeline(scenario="normal")
+            result = _run_service(demo_pipeline, tmp)
 
         expected = {
             "project_name": "relium_demo",
@@ -158,28 +142,16 @@ class DemoPipelineTests(unittest.TestCase):
             "schema_column_count": 6,
             "safe_to_continue": False,
             "metadata_stored": True,
-            "slack_sent": False,
         }
         for key, value in expected.items():
             self.assertEqual(result[key], value, key)
+        self.assertNotIn("slack_sent", result)
 
     def test_demo_pipeline_visible_output_remains_identical(self):
         from agent import demo_pipeline
 
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            metadata_db = tmp_path / "relium_metadata.db"
-            warehouse_db = tmp_path / "demo_warehouse.db"
-
-            with patch.object(
-                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
-            ), patch.object(
-                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-            ), patch(
-                "agent.slack_alerts.send_validation_alert",
-                return_value=False,
-            ):
-                result = demo_pipeline.run_demo_pipeline(scenario="normal")
+            result = _run_service(demo_pipeline, tmp)
 
         self.assertEqual(
             result["report_text"],
@@ -206,20 +178,8 @@ class DemoPipelineTests(unittest.TestCase):
         from agent import demo_pipeline
 
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            metadata_db = tmp_path / "relium_metadata.db"
-            warehouse_db = tmp_path / "demo_warehouse.db"
-
-            with patch.object(
-                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
-            ), patch.object(
-                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-            ), patch(
-                "agent.slack_alerts.send_validation_alert",
-                return_value=False,
-            ):
-                first = demo_pipeline.run_demo_pipeline(scenario="normal")
-                second = demo_pipeline.run_demo_pipeline(scenario="duplicate-spike")
+            first = _run_service(demo_pipeline, tmp)
+            second = _run_service(demo_pipeline, tmp, "duplicate-spike")
 
         self.assertEqual(
             [signal.component for signal in first["incident"].signals],
@@ -234,136 +194,71 @@ class DemoPipelineTests(unittest.TestCase):
             ["ast", "metadata_checks", "metadata_drift"],
         )
 
-    def test_demo_pipeline_command_does_not_call_webhook_when_slack_is_mocked(self):
-        from agent import demo_pipeline
+    def test_demo_pipeline_command_does_not_call_webhook_when_configured(self):
         from agent.cli import cli
 
         runner = CliRunner()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            metadata_db = tmp_path / "relium_metadata.db"
-            warehouse_db = tmp_path / "demo_warehouse.db"
-
-            with patch.object(
-                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
-            ), patch.object(
-                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-            ), patch.dict(
-                "os.environ",
-                {"SLACK_WEBHOOK_URL": "https://hooks.slack.com/services/test"},
-            ), patch(
-                "agent.slack_alerts.send_validation_alert",
-                return_value=False,
-            ), patch("urllib.request.urlopen") as urlopen:
-                result, output = invoke_cli(runner, cli, ["demo-pipeline"])
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            "os.environ",
+            {"SLACK_WEBHOOK_URL": "https://hooks.slack.com/services/test"},
+        ), patch(
+            "urllib.request.urlopen",
+            side_effect=AssertionError("unexpected webhook"),
+        ) as urlopen:
+            workspace = Path(tmp) / "workspace"
+            result, output = invoke_cli(
+                runner,
+                cli,
+                _cli_args(workspace),
+            )
 
         self.assertEqual(result.exit_code, 0, output)
         urlopen.assert_not_called()
-        self.assertIn("Slack alert sent: NO", output)
+        self.assertNotIn("Slack", output)
         self.assertIn("Relium Demo Pipeline", output)
 
     def test_demo_pipeline_command_emits_only_through_click_output(self):
-        from agent import demo_pipeline
         from agent.cli import cli
 
         runner = CliRunner()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            metadata_db = tmp_path / "relium_metadata.db"
-            warehouse_db = tmp_path / "demo_warehouse.db"
-
-            with patch.object(
-                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
-            ), patch.object(
-                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-            ), patch(
-                "agent.slack_alerts.send_validation_alert",
-                return_value=False,
-            ), patch("builtins.print") as printed:
-                result, output = invoke_cli(
-                    runner,
-                    cli,
-                    ["demo-pipeline", "--scenario", "normal"],
-                )
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "builtins.print"
+        ) as printed:
+            result, output = invoke_cli(
+                runner,
+                cli,
+                _cli_args(Path(tmp) / "workspace"),
+            )
 
         self.assertEqual(result.exit_code, 0, output)
         printed.assert_not_called()
-        self.assertIn("Slack alert sent: NO", output)
         self.assertIn("Relium Demo Pipeline", output)
         self.assertIn("Scenario: normal", output)
 
-    def test_demo_pipeline_command_output_is_unchanged_without_decision_flag(self):
-        from agent import demo_pipeline
+    def test_demo_pipeline_command_output_without_decision_is_local_report(self):
         from agent.cli import cli
 
         runner = CliRunner()
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            metadata_db = tmp_path / "relium_metadata.db"
-            warehouse_db = tmp_path / "demo_warehouse.db"
-
-            with patch.object(
-                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
-            ), patch.object(
-                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-            ), patch(
-                "agent.slack_alerts.send_validation_alert",
-                return_value=False,
-            ):
-                result, output = invoke_cli(
-                    runner,
-                    cli,
-                    ["demo-pipeline", "--scenario", "normal"],
-                )
+            workspace = Path(tmp) / "workspace"
+            result, output = invoke_cli(runner, cli, _cli_args(workspace))
 
         self.assertEqual(result.exit_code, 0, output)
-        self.assertEqual(
-            output,
-            "\n".join(
-                [
-                    "Slack alert sent: NO",
-                    "Relium Demo Pipeline",
-                    "",
-                    "Scenario: normal",
-                    "Raw rows loaded: 7",
-                    "Model built: fct_customer_lifetime_value",
-                    "AST risk found: HIGH",
-                    "Row count: 2",
-                    "Null count: 0",
-                    "Duplicate customer_id count: 1",
-                    "Freshness timestamp: 2026-06-21T12:00:00",
-                    "Schema columns: 6",
-                    "Safe to continue: NO",
-                    "Metadata stored: YES",
-                    "",
-                ]
-            ),
-        )
+        self.assertIn(f"Demo workspace: {workspace.resolve()}", output)
+        self.assertIn("Relium Demo Pipeline", output)
         self.assertNotIn("Relium Deployment Decision", output)
+        self.assertNotIn("Slack", output)
 
     def test_demo_pipeline_command_decision_flag_adds_decision_view(self):
-        from agent import demo_pipeline
         from agent.cli import cli
 
         runner = CliRunner()
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            metadata_db = tmp_path / "relium_metadata.db"
-            warehouse_db = tmp_path / "demo_warehouse.db"
-
-            with patch.object(
-                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
-            ), patch.object(
-                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-            ), patch(
-                "agent.slack_alerts.send_validation_alert",
-                return_value=False,
-            ):
-                result, output = invoke_cli(
-                    runner,
-                    cli,
-                    ["demo-pipeline", "--scenario", "normal", "--decision"],
-                )
+            result, output = invoke_cli(
+                runner,
+                cli,
+                _cli_args(Path(tmp) / "workspace", decision=True),
+            )
 
         self.assertEqual(result.exit_code, 0, output)
         self.assertIn("Relium Demo Pipeline", output)
@@ -376,7 +271,6 @@ class DemoPipelineTests(unittest.TestCase):
         self.assertIn("- metadata_checks", output)
 
     def test_demo_pipeline_command_decision_flag_supports_demo_scenarios(self):
-        from agent import demo_pipeline
         from agent.cli import cli
 
         runner = CliRunner()
@@ -389,201 +283,100 @@ class DemoPipelineTests(unittest.TestCase):
 
         for scenario in scenarios:
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
-                tmp_path = Path(tmp)
-                metadata_db = tmp_path / "relium_metadata.db"
-                warehouse_db = tmp_path / "demo_warehouse.db"
+                result, output = invoke_cli(
+                    runner,
+                    cli,
+                    _cli_args(Path(tmp) / "workspace", scenario, decision=True),
+                )
 
-                with patch.object(
-                    demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
-                ), patch.object(
-                    demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-                ), patch(
-                    "agent.slack_alerts.send_validation_alert",
-                    return_value=False,
-                ):
-                    result, output = invoke_cli(
-                        runner,
-                        cli,
-                        ["demo-pipeline", "--scenario", scenario, "--decision"],
-                    )
-
-            self.assertEqual(result.exit_code, 0, output)
-            self.assertIn(f"Scenario: {scenario}", output)
-            self.assertIn("Relium Deployment Decision", output)
-            self.assertIn("Signals Considered:", output)
+                self.assertEqual(result.exit_code, 0, output)
+                self.assertIn(f"Scenario: {scenario}", output)
+                self.assertIn("Relium Deployment Decision", output)
+                self.assertIn("Signals Considered:", output)
 
     def test_demo_pipeline_command_accepts_deterministic_scenarios(self):
-        from agent import demo_pipeline
         from agent.cli import cli
 
         runner = CliRunner()
         scenarios = {
-            "normal": {
-                "row_count": 2,
-                "duplicate_count": 1,
-                "freshness_timestamp": "2026-06-21T12:00:00",
-            },
-            "row-drop": {
-                "row_count": 1,
-                "duplicate_count": 0,
-                "freshness_timestamp": "2026-06-20T12:00:00",
-            },
-            "duplicate-spike": {
-                "row_count": 6,
-                "duplicate_count": 5,
-                "freshness_timestamp": "2026-06-24T12:00:00",
-            },
-            "freshness-regression": {
-                "row_count": 2,
-                "duplicate_count": 1,
-                "freshness_timestamp": "2026-06-19T12:00:00",
-            },
+            "normal": (2, 1, "2026-06-21T12:00:00"),
+            "row-drop": (1, 0, "2026-06-20T12:00:00"),
+            "duplicate-spike": (6, 5, "2026-06-24T12:00:00"),
+            "freshness-regression": (2, 1, "2026-06-19T12:00:00"),
         }
 
         for scenario, expected in scenarios.items():
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
-                tmp_path = Path(tmp)
-                metadata_db = tmp_path / "relium_metadata.db"
-                warehouse_db = tmp_path / "demo_warehouse.db"
-
-                with patch.object(
-                    demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
-                ), patch.object(
-                    demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-                ), patch(
-                    "agent.slack_alerts.send_validation_alert",
-                    return_value=False,
-                ):
-                    result, output = invoke_cli(
-                        runner,
-                        cli,
-                        ["demo-pipeline", "--scenario", scenario],
-                    )
+                result, output = invoke_cli(
+                    runner,
+                    cli,
+                    _cli_args(Path(tmp) / "workspace", scenario),
+                )
 
                 self.assertEqual(result.exit_code, 0, output)
-                self.assertIn("Slack alert sent: NO", output)
-                self.assertIn("Relium Demo Pipeline", output)
+                self.assertNotIn("Slack", output)
                 self.assertIn(f"Scenario: {scenario}", output)
-                self.assertIn("Raw rows loaded:", output)
-                self.assertIn("Model built: fct_customer_lifetime_value", output)
-                self.assertIn("AST risk found: HIGH", output)
-                self.assertIn(f"Row count: {expected['row_count']}", output)
+                self.assertIn(f"Row count: {expected[0]}", output)
                 self.assertIn(
-                    f"Duplicate customer_id count: {expected['duplicate_count']}",
+                    f"Duplicate customer_id count: {expected[1]}",
                     output,
                 )
                 self.assertIn(
-                    f"Freshness timestamp: {expected['freshness_timestamp']}",
+                    f"Freshness timestamp: {expected[2]}",
                     output,
                 )
                 self.assertIn("Metadata stored: YES", output)
 
-    def test_duplicate_spike_sends_clear_high_drift_alert_text(self):
-        from agent import demo_pipeline
+    def test_duplicate_spike_renders_high_drift_locally(self):
         from agent.cli import cli
 
         runner = CliRunner()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            metadata_db = tmp_path / "relium_metadata.db"
-            warehouse_db = tmp_path / "demo_warehouse.db"
-            sent_payloads = []
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "urllib.request.urlopen",
+            side_effect=AssertionError("unexpected webhook"),
+        ):
+            workspace = Path(tmp) / "workspace"
+            baseline, baseline_output = invoke_cli(
+                runner,
+                cli,
+                _cli_args(workspace),
+            )
+            drift_run, drift_output = invoke_cli(
+                runner,
+                cli,
+                _cli_args(workspace, "duplicate-spike", decision=True),
+            )
 
-            def capture_payload(request):
-                sent_payloads.append(json.loads(request.data.decode("utf-8")))
-                response = MagicMock()
-                response.status = 200
-                response.__enter__.return_value = response
-                response.__exit__.return_value = False
-                return response
+        self.assertEqual(baseline.exit_code, 0, baseline_output)
+        self.assertEqual(drift_run.exit_code, 0, drift_output)
+        self.assertIn("Metadata Drift", drift_output)
+        self.assertIn("- metadata_drift", drift_output)
+        self.assertNotIn("Slack", drift_output)
 
-            with patch.object(
-                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
-            ), patch.object(
-                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-            ), patch.dict("os.environ", {"SLACK_WEBHOOK_URL": "https://example.test/hook"}), patch(
-                "urllib.request.urlopen",
-                side_effect=capture_payload,
-            ):
-                baseline, baseline_output = invoke_cli(
-                    runner,
-                    cli,
-                    ["demo-pipeline", "--scenario", "normal"],
-                )
-                self.assertEqual(baseline.exit_code, 0, baseline_output)
-                drift_run, drift_output = invoke_cli(
-                    runner,
-                    cli,
-                    ["demo-pipeline", "--scenario", "duplicate-spike"],
-                )
-
-            self.assertEqual(drift_run.exit_code, 0, drift_output)
-            self.assertEqual(len(sent_payloads), 2)
-            alert_text = json.dumps(sent_payloads[-1])
-            payload_text = sent_payloads[-1]["text"]
-            self.assertIn("Relium Pipeline Risk Alert", alert_text)
-            self.assertIn("Project: relium_demo", alert_text)
-            self.assertIn("Model: fct_customer_lifetime_value", alert_text)
-            self.assertIn("Risk: HIGH", alert_text)
-            self.assertIn("Safe to continue: NO", alert_text)
-            self.assertIn("Static analysis", alert_text)
-            self.assertIn("Metadata checks", alert_text)
-            self.assertIn("Duplicate customer_id count: 5", alert_text)
-            self.assertIn("Drift detection", alert_text)
-            self.assertIn("Row count change: +200%", alert_text)
-            self.assertIn("Duplicate count change: +400%", alert_text)
-            self.assertIn("Metadata Drift: HIGH", alert_text)
-            self.assertIn("\n\nStatic analysis:\n", payload_text)
-            self.assertIn("\n\nMetadata checks:\n", payload_text)
-            self.assertIn("\n\nDrift detection:\n", payload_text)
-            self.assertIn("\n\nRecommendation:\n", payload_text)
-
-    def test_freshness_regression_sends_clear_high_drift_alert_text(self):
-        from agent import demo_pipeline
+    def test_freshness_regression_renders_high_drift_locally(self):
         from agent.cli import cli
 
         runner = CliRunner()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            metadata_db = tmp_path / "relium_metadata.db"
-            warehouse_db = tmp_path / "demo_warehouse.db"
-            sent_payloads = []
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "urllib.request.urlopen",
+            side_effect=AssertionError("unexpected webhook"),
+        ):
+            workspace = Path(tmp) / "workspace"
+            baseline, baseline_output = invoke_cli(
+                runner,
+                cli,
+                _cli_args(workspace),
+            )
+            drift_run, drift_output = invoke_cli(
+                runner,
+                cli,
+                _cli_args(workspace, "freshness-regression", decision=True),
+            )
 
-            def capture_payload(request):
-                sent_payloads.append(json.loads(request.data.decode("utf-8")))
-                response = MagicMock()
-                response.status = 200
-                response.__enter__.return_value = response
-                response.__exit__.return_value = False
-                return response
-
-            with patch.object(
-                demo_pipeline, "DEFAULT_METADATA_DB_PATH", metadata_db
-            ), patch.object(
-                demo_pipeline, "DEFAULT_WAREHOUSE_DB_PATH", warehouse_db
-            ), patch.dict("os.environ", {"SLACK_WEBHOOK_URL": "https://example.test/hook"}), patch(
-                "urllib.request.urlopen",
-                side_effect=capture_payload,
-            ):
-                baseline, baseline_output = invoke_cli(
-                    runner,
-                    cli,
-                    ["demo-pipeline", "--scenario", "normal"],
-                )
-                self.assertEqual(baseline.exit_code, 0, baseline_output)
-                drift_run, drift_output = invoke_cli(
-                    runner,
-                    cli,
-                    ["demo-pipeline", "--scenario", "freshness-regression"],
-                )
-
-            self.assertEqual(drift_run.exit_code, 0, drift_output)
-            self.assertEqual(len(sent_payloads), 2)
-            alert_text = json.dumps(sent_payloads[-1])
-            self.assertIn("Relium Pipeline Risk Alert", alert_text)
-            self.assertIn("Drift detection", alert_text)
-            self.assertIn("Freshness regression: YES", alert_text)
-            self.assertIn("Metadata Drift: HIGH", alert_text)
+        self.assertEqual(baseline.exit_code, 0, baseline_output)
+        self.assertEqual(drift_run.exit_code, 0, drift_output)
+        self.assertIn("- metadata_drift", drift_output)
+        self.assertNotIn("Slack", drift_output)
 
 
 if __name__ == "__main__":
