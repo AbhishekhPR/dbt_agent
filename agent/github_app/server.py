@@ -82,12 +82,14 @@ def build_application(settings, *, client_factory=None, logger=None, sleep=time.
         ),
         sleep=sleep,
         logger=logger,
+        job_store=storage,
     )
     jobs = BoundedJobQueue(
         retrying_processor,
         worker_count=settings.worker_count,
         capacity=settings.queue_capacity,
         logger=logger,
+        job_store=storage,
     )
     app = create_http_app(
         webhook_secret=settings.webhook_secret,
@@ -96,6 +98,7 @@ def build_application(settings, *, client_factory=None, logger=None, sleep=time.
         shutdown_timeout_seconds=settings.shutdown_timeout_seconds,
         clock=time.time,
         logger=logger,
+        job_store=storage,
     )
     app.state.job_queue = jobs
     return app

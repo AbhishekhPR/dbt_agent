@@ -1,7 +1,7 @@
 import json
 
 from agent.deployment_review_service import review_manifest_change
-from agent.github_app.checks import create_review_check
+from agent.github_app.checks import CHECK_NAME, create_review_check
 from agent.github_app.client import GitHubNotFoundError
 from agent.github_app.comments import upsert_review_comment
 from agent.github_app.config import DEFAULT_MANIFEST_PATH, load_repository_config
@@ -74,12 +74,47 @@ class PullRequestReviewRunner:
         if not isinstance(manifest, dict):
             raise ReviewRunnerError("Manifest must be a JSON object.")
 
+        try:
+            base_manifest_content = client.get_file(
+                owner, repository, config.manifest_path, event.base_sha
+            )
+        except GitHubNotFoundError:
+            base_manifest_content = None
+        previous_manifest = None
+        if base_manifest_content is not None:
+            try:
+                previous_manifest = json.loads(base_manifest_content.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ReviewRunnerError("Base manifest must contain valid UTF-8 JSON.") from exc
+            if not isinstance(previous_manifest, dict):
+                raise ReviewRunnerError("Base manifest must be a JSON object.")
+
         changed_files = client.compare_files(owner, repository, event.base_sha, event.head_sha)
+        if not getattr(changed_files, "complete", True):
+            return self._publish_neutral(
+                event,
+                client,
+                config.enforcement_mode,
+                status="large_pr",
+                message=(
+                    "Relium could not safely enumerate every changed file in this pull "
+                    "request. The review was skipped because GitHub may have truncated "
+                    "the compare response."
+                ),
+                expected_app_id=expected_app_id,
+            )
         try:
             result = self.reviewer(
                 manifest=manifest,
+                previous_manifest=previous_manifest,
                 changed_files=changed_files,
                 deployment_id=f"github:{event.repository.id}:{event.head_sha}",
+                manifest_source={
+                    "base": "github" if previous_manifest is not None else "unavailable",
+                    "head": "github",
+                },
+                base_sha=event.base_sha,
+                head_sha=event.head_sha,
             )
         except ValueError as exc:
             if str(exc) != "At least one changed model is required.":
@@ -139,20 +174,102 @@ class PullRequestReviewRunner:
             **dict(result.get("rendered") or {}),
             "markdown": comment_body,
         }
-        comment = upsert_review_comment(
-            client,
-            owner=owner,
-            repository=repository,
-            pull_number=event.pull_number,
-            body=comment_body,
-            expected_app_id=expected_app_id,
+        publication_id = f"review-{event.repository.id}-{event.head_sha}-{enforcement_mode}"
+        journal = self.storage.get_publication_journal(
+            event.repository.id,
+            publication_id,
         )
-        check = create_review_check(
-            client,
-            owner=owner,
-            repository=repository,
-            head_sha=event.head_sha,
-            result=check_result,
-            enforcement_mode=enforcement_mode,
-        )
+        comment_entry = journal.get("comment")
+        if comment_entry and comment_entry.get("state") == "complete":
+            comment = comment_entry.get("value") or {
+                "id": comment_entry.get("id"),
+                "body": comment_body,
+            }
+        else:
+            if not comment_entry:
+                self.storage.record_publication_step(
+                    event.repository.id,
+                    publication_id,
+                    "comment",
+                    {"state": "started"},
+                )
+            comment = upsert_review_comment(
+                client,
+                owner=owner,
+                repository=repository,
+                pull_number=event.pull_number,
+                body=comment_body,
+                expected_app_id=expected_app_id,
+            )
+            self.storage.record_publication_step(
+                event.repository.id,
+                publication_id,
+                "comment",
+                {"state": "complete", "value": comment},
+            )
+
+        check_entry = journal.get("check")
+        if check_entry and check_entry.get("state") == "complete":
+            check = check_entry.get("value") or {"id": check_entry.get("id")}
+        else:
+            if not check_entry:
+                self.storage.record_publication_step(
+                    event.repository.id,
+                    publication_id,
+                    "check",
+                    {"state": "started"},
+                )
+            check = self._reconcile_check(
+                client,
+                owner=owner,
+                repository=repository,
+                head_sha=event.head_sha,
+                publication_id=publication_id,
+                result=check_result,
+                enforcement_mode=enforcement_mode,
+                reconcile=bool(check_entry),
+            )
+            self.storage.record_publication_step(
+                event.repository.id,
+                publication_id,
+                "check",
+                {"state": "complete", "value": check},
+            )
         return {"status": status, "result": result, "comment": comment, "check": check}
+
+    @staticmethod
+    def _reconcile_check(
+        client,
+        *,
+        owner,
+        repository,
+        head_sha,
+        publication_id,
+        result,
+        enforcement_mode,
+        reconcile,
+    ):
+        list_runs = getattr(client, "list_check_runs", None)
+        if reconcile and list_runs is not None:
+            for check in list_runs(
+                owner,
+                repository,
+                head_sha=head_sha,
+                check_name=CHECK_NAME,
+            ):
+                if (
+                    isinstance(check, dict)
+                    and check.get("name") == CHECK_NAME
+                    and str(check.get("head_sha", "")) == str(head_sha)
+                    and str(check.get("external_id", "")) == publication_id
+                ):
+                    return check
+        return create_review_check(
+            client,
+            owner=owner,
+            repository=repository,
+            head_sha=head_sha,
+            result=result,
+            enforcement_mode=enforcement_mode,
+            external_id=publication_id,
+        )

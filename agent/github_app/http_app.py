@@ -19,6 +19,7 @@ def create_http_app(
     shutdown_timeout_seconds: float,
     clock,
     logger=None,
+    job_store=None,
 ):
     if max_body_bytes <= 0:
         raise ValueError("Maximum webhook body size must be positive.")
@@ -87,7 +88,15 @@ def create_http_app(
             event_name=event_name,
             raw_body=raw_body,
             received_at=clock(),
+            repository_id=event.repository.id,
         )
+        if job_store is not None:
+            persisted = job_store.persist_verified_job(event.repository.id, job)
+            if not persisted:
+                return JSONResponse(
+                    {"status": "duplicate", "delivery_id": delivery_id},
+                    status_code=202,
+                )
         if not job_queue.enqueue(job):
             return JSONResponse({"status": "unavailable"}, status_code=503)
         return JSONResponse(

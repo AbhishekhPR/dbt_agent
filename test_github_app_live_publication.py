@@ -160,7 +160,7 @@ class GitHubAppLivePublicationTests(unittest.TestCase):
         repository_file_requests = [
             request for request in requests if "/contents/" in request[1]
         ]
-        self.assertEqual(len(repository_file_requests), 2)
+        self.assertEqual(len(repository_file_requests), 3)
         self.assertTrue(
             all(
                 accept == "application/vnd.github.raw+json"

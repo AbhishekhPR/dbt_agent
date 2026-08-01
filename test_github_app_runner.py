@@ -82,8 +82,12 @@ class GitHubAppRunnerTests(unittest.TestCase):
         self.assertEqual(response["status"], "reviewed")
         reviewer.assert_called_once_with(
             manifest={"nodes": {}},
+            previous_manifest={"nodes": {}},
             changed_files=["models/orders.sql"],
             deployment_id="github:12:head",
+            manifest_source={"base": "github", "head": "github"},
+            base_sha="base",
+            head_sha="head",
         )
         self.assertEqual(client.checks[0]["conclusion"], "success")
         self.assertIn("relium-github-app-review", client.comments[0]["body"])
