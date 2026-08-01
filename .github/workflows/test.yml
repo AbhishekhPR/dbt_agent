@@ -3,6 +3,9 @@ name: Run Relium Tests
 on:
   push:
     branches: [main, develop]
+
+permissions:
+  contents: read
   pull_request:
     branches: [main, develop]
 
@@ -24,14 +27,14 @@ jobs:
         uses: actions/cache@v3
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.lock') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install --require-hashes -r requirements.lock
 
       - name: Run tests
         run: |

@@ -1,0 +1,45 @@
+name: Dependency and Security Gates
+
+on:
+  push:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install locked production dependencies
+        run: python -m pip install --require-hashes -r requirements.lock
+
+      - name: Install security tooling
+        run: python -m pip install pip-audit bandit
+
+      - name: Verify dependency consistency
+        run: python -m pip check
+
+      - name: Dependency audit
+        run: python -m pip_audit -r requirements.lock --strict
+
+      - name: Bandit high-severity gate
+        run: python -m bandit -r agent main.py -lll
+
+      - name: Secret scan
+        run: |
+          python -m pip install detect-secrets
+          detect-secrets scan --baseline .secrets.baseline --all-files --exclude-files '^\.git/'
+          detect-secrets scan --all-files --exclude-files '^\.git/' > current-secrets.json
+          python -c "import json, pathlib, sys; data=json.loads(pathlib.Path('current-secrets.json').read_text()); verified=[(f, x.get('line_number'), x.get('type')) for f, xs in data.get('results', {}).items() for x in xs if x.get('is_verified')]; print(verified); sys.exit(bool(verified))"
