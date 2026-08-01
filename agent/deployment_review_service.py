@@ -8,6 +8,9 @@ from agent.deployment_history import DeploymentHistoryStore
 from agent.deployment_lifecycle import review_deployment
 from agent.deployment_outcomes import DeploymentOutcomeStore
 from agent.presentation import render_cli, render_json, render_markdown
+from agent.deployment_snapshot import create_deployment_snapshot
+from agent.pr_analysis import compare_manifest_sql
+from agent.semantic_context import build_semantic_context
 
 
 CONTRACT_VERSION = "1"
@@ -24,6 +27,10 @@ def review_manifest_change(
     auto_record=False,
     allow_blocked_recording=False,
     metadata_db_path=None,
+    previous_manifest=None,
+    manifest_source=None,
+    base_sha=None,
+    head_sha=None,
 ) -> dict[str, Any]:
     manifest_copy = copy.deepcopy(manifest)
     if not isinstance(manifest_copy, dict):
@@ -40,6 +47,24 @@ def review_manifest_change(
     if not resolved_models:
         raise ValueError("At least one changed model is required.")
 
+    analysis_metadata = {
+        "manifest_source": copy.deepcopy(manifest_source or {"head": "unknown"}),
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "semantic_comparison_evaluated": previous_manifest is not None,
+        "semantic_comparison_status": "evaluated" if previous_manifest is not None else "unavailable",
+    }
+    previous_snapshot = _manifest_snapshot(
+        previous_manifest,
+        resolved_models,
+        deployment_id,
+        analysis_metadata,
+    )
+    manifest_comparison = compare_manifest_sql(
+        previous_manifest,
+        manifest_copy,
+        resolved_models,
+    )
     return _review_project_context_change(
         project_context=project_context,
         changed_files=list(changed_files or []),
@@ -50,6 +75,9 @@ def review_manifest_change(
         auto_record=auto_record,
         allow_blocked_recording=allow_blocked_recording,
         metadata_db_path=metadata_db_path,
+        metadata=analysis_metadata,
+        previous_snapshot=previous_snapshot,
+        manifest_comparison=manifest_comparison,
         require_model_match=True,
     )
 
@@ -65,6 +93,9 @@ def _review_project_context_change(
     auto_record=False,
     allow_blocked_recording=False,
     metadata_db_path=None,
+    metadata=None,
+    previous_snapshot=None,
+    manifest_comparison=None,
     require_model_match=False,
 ) -> dict[str, Any]:
     context_copy = copy.deepcopy(project_context or {})
@@ -89,6 +120,9 @@ def _review_project_context_change(
         auto_record=auto_record,
         allow_blocked_recording=allow_blocked_recording,
         metadata_db_path=metadata_db_path,
+        metadata=metadata,
+        previous_snapshot=previous_snapshot,
+        manifest_comparison=manifest_comparison,
         **options,
     )
 
@@ -108,12 +142,35 @@ def _review_project_context_change(
         "changed_models": [spec["name"] for spec in model_specs],
         "material_findings": material_findings,
         "sql_sources": sql_sources,
+        "semantic_comparison": {
+            "evaluated": bool((metadata or {}).get("semantic_comparison_evaluated")),
+            "status": (metadata or {}).get("semantic_comparison_status", "unknown"),
+            "base_sha": (metadata or {}).get("base_sha"),
+            "head_sha": (metadata or {}).get("head_sha"),
+            "manifest_source": copy.deepcopy((metadata or {}).get("manifest_source", {})),
+        },
         "deployment_lifecycle": lifecycle,
         "rendered": {
             "cli": f"{cli_text}\n\nDeployment History\n" + "\n".join(cli_status),
             "markdown": f"{markdown}\n\n## Deployment History\n" + "\n".join(markdown_status),
         },
     }
+
+
+def _manifest_snapshot(manifest, changed_models, deployment_id, metadata):
+    if manifest is None:
+        return None
+    context = extract_project_context_from_manifest(copy.deepcopy(manifest))
+    semantic_context = build_semantic_context(
+        project_context=context,
+        changed_models=list(changed_models or []),
+    )
+    return create_deployment_snapshot(
+        deployment_id=f"{deployment_id}:base",
+        changed_models=list(changed_models or []),
+        semantic_context=semantic_context,
+        metadata={"source": "trusted_manifest", **copy.deepcopy(metadata or {})},
+    ).to_dict()
 
 
 def _material_ast_findings(incident, limit: int = 3) -> list[dict[str, str]]:

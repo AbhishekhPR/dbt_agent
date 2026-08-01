@@ -101,6 +101,7 @@ def _serializable(value):
         return {
             str(key): _serializable(item)
             for key, item in value.items()
+            if str(key) not in {"raw_code", "compiled_code", "sql"}
         }
     if isinstance(value, (list, tuple)):
         return [_serializable(item) for item in value]
