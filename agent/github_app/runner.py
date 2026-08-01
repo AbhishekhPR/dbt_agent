@@ -13,9 +13,16 @@ class ReviewRunnerError(ValueError):
 
 
 class PullRequestReviewRunner:
-    def __init__(self, *, storage, reviewer=review_manifest_change):
+    def __init__(
+        self,
+        *,
+        storage,
+        reviewer=review_manifest_change,
+        slack_publisher=None,
+    ):
         self.storage = storage
         self.reviewer = reviewer
+        self.slack_publisher = slack_publisher
 
     def run(self, event, client, *, expected_app_id):
         if not self.storage.claim_delivery(event.repository.id, event.delivery_id):
@@ -235,7 +242,119 @@ class PullRequestReviewRunner:
                 "check",
                 {"state": "complete", "value": check},
             )
-        return {"status": status, "result": result, "comment": comment, "check": check}
+        slack = self._publish_slack(event, publication_id, result)
+        return {
+            "status": status,
+            "result": result,
+            "comment": comment,
+            "check": check,
+            "slack": slack,
+        }
+
+    def _publish_slack(self, event, publication_id, result):
+        if self.slack_publisher is None:
+            return {
+                "state": "disabled",
+                "publication_id": publication_id,
+            }
+        try:
+            journal = self.storage.get_publication_journal(
+                event.repository.id,
+                publication_id,
+            )
+            existing = journal.get("slack")
+            if isinstance(existing, dict):
+                return self._reconcile_slack_state(event, publication_id, existing)
+            classification = self.slack_publisher.classify(result)
+            if classification != "publish":
+                outcome = {
+                    "state": "skipped",
+                    "publication_id": publication_id,
+                    "reason": classification,
+                }
+                if self.storage.claim_publication_step(
+                    event.repository.id,
+                    publication_id,
+                    "slack",
+                    outcome,
+                ):
+                    return _safe_slack_result(outcome, publication_id)
+                existing = self.storage.get_publication_journal(
+                    event.repository.id,
+                    publication_id,
+                ).get("slack")
+                return self._reconcile_slack_state(
+                    event, publication_id, existing
+                )
+            intent = {"state": "started", "publication_id": publication_id}
+            if not self.storage.claim_publication_step(
+                event.repository.id,
+                publication_id,
+                "slack",
+                intent,
+            ):
+                existing = self.storage.get_publication_journal(
+                    event.repository.id,
+                    publication_id,
+                ).get("slack")
+                return self._reconcile_slack_state(
+                    event, publication_id, existing
+                )
+        except Exception:
+            return {
+                "state": "failed",
+                "publication_id": publication_id,
+                "error_category": "slack_state",
+            }
+        try:
+            published = self.slack_publisher.publish(
+                publication_id=publication_id,
+                repository=event.repository.full_name,
+                pull_number=event.pull_number,
+                result=result,
+                pull_url=(
+                    f"https://github.com/{event.repository.owner}/"
+                    f"{event.repository.name}/pull/{event.pull_number}"
+                ),
+            )
+            outcome = _safe_slack_result(published, publication_id)
+        except Exception:
+            outcome = {
+                "state": "failed",
+                "publication_id": publication_id,
+                "error_category": "slack_publication",
+            }
+        try:
+            self.storage.record_publication_step(
+                event.repository.id,
+                publication_id,
+                "slack",
+                outcome,
+            )
+        except Exception:
+            return {
+                "state": "failed",
+                "publication_id": publication_id,
+                "error_category": "slack_state",
+            }
+        return outcome
+
+    def _reconcile_slack_state(self, event, publication_id, existing):
+        if isinstance(existing, dict) and existing.get("state") == "started":
+            outcome = {
+                "state": "indeterminate",
+                "publication_id": publication_id,
+                "reason": "prior_attempt_cannot_be_reconciled",
+            }
+            resolved = self.storage.transition_publication_step(
+                event.repository.id,
+                publication_id,
+                "slack",
+                expected_state="started",
+                value=outcome,
+            )
+            return _safe_slack_result(resolved, publication_id)
+        return _safe_slack_result(existing, publication_id)
 
     @staticmethod
     def _reconcile_check(
@@ -273,3 +392,38 @@ class PullRequestReviewRunner:
             enforcement_mode=enforcement_mode,
             external_id=publication_id,
         )
+
+
+def _safe_slack_result(value, publication_id):
+    if not isinstance(value, dict):
+        return {
+            "state": "failed",
+            "publication_id": publication_id,
+            "error_category": "slack_result",
+        }
+    state = value.get("state")
+    if state not in {"complete", "skipped", "failed", "indeterminate"}:
+        state = "failed"
+    result = {"state": state, "publication_id": publication_id}
+    attempts = value.get("attempts")
+    if isinstance(attempts, int) and not isinstance(attempts, bool) and attempts >= 0:
+        result["attempts"] = attempts
+    for key in ("reason", "error_category"):
+        item = value.get(key)
+        if isinstance(item, str) and item in {
+            "decision_not_configured_for_slack",
+            "decision_not_alertable",
+            "prior_attempt_cannot_be_reconciled",
+            "slack_http",
+            "slack_rate_limit",
+            "slack_server",
+            "slack_network",
+            "slack_transport",
+            "slack_publication",
+            "slack_result",
+            "slack_state",
+        }:
+            result[key] = item
+    if state == "failed" and "error_category" not in result:
+        result["error_category"] = "slack_result"
+    return result

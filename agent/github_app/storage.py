@@ -184,12 +184,45 @@ class RepositoryStorage:
         )
 
     def record_publication_step(self, repository_id: int, publication_id: str, step: str, value) -> None:
-        if step not in {"comment", "check"}:
-            raise StorageError("Unknown publication step.")
+        _validate_publication_step(step)
         path = self._publication_path(repository_id, publication_id)
-        payload = self._read_json(path) or {}
-        payload[step] = value
-        _atomic_json_write(path, payload)
+        with self._write_lock:
+            payload = self._read_json(path) or {}
+            payload[step] = value
+            _atomic_json_write(path, payload)
+
+    def claim_publication_step(self, repository_id: int, publication_id: str, step: str, value) -> bool:
+        """Atomically store a publication step only when it has no prior state."""
+        _validate_publication_step(step)
+        path = self._publication_path(repository_id, publication_id)
+        with self._write_lock:
+            payload = self._read_json(path) or {}
+            if step in payload:
+                return False
+            payload[step] = value
+            _atomic_json_write(path, payload)
+            return True
+
+    def transition_publication_step(
+        self,
+        repository_id: int,
+        publication_id: str,
+        step: str,
+        *,
+        expected_state: str,
+        value,
+    ):
+        """Replace a step only while its persisted state matches expectation."""
+        _validate_publication_step(step)
+        path = self._publication_path(repository_id, publication_id)
+        with self._write_lock:
+            payload = self._read_json(path) or {}
+            current = payload.get(step)
+            if not isinstance(current, dict) or current.get("state") != expected_state:
+                return current
+            payload[step] = value
+            _atomic_json_write(path, payload)
+            return value
 
     def get_publication_journal(self, repository_id: int, publication_id: str) -> dict:
         return self._read_json(self._publication_path(repository_id, publication_id)) or {}
@@ -267,6 +300,11 @@ def _safe_key(value, label: str) -> str:
     if value in {".", ".."}:
         raise StorageError(f"Unsafe {label}.")
     return value
+
+
+def _validate_publication_step(step: str) -> None:
+    if step not in {"comment", "check", "slack"}:
+        raise StorageError("Unknown publication step.")
 
 
 def _write_json_stream(stream, payload) -> None:

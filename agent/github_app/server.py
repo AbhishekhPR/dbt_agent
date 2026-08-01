@@ -13,11 +13,13 @@ from agent.github_app.jobs import BoundedJobQueue, RetryPolicy, RetryingJobProce
 from agent.github_app.runner import PullRequestReviewRunner
 from agent.github_app.service import WebhookProcessingService
 from agent.github_app.settings import SettingsError, load_settings
+from agent.github_app.slack import SlackPublicationSink
 from agent.github_app.storage import RepositoryStorage
 
 
 _LOG_FIELDS = (
     "delivery_id",
+    "publication_id",
     "event_name",
     "repository",
     "pull_number",
@@ -61,7 +63,21 @@ def configure_logging(level=logging.INFO) -> None:
 def build_application(settings, *, client_factory=None, logger=None, sleep=time.sleep):
     logger = logger or logging.getLogger("relium.github_app")
     storage = RepositoryStorage(settings.storage_root)
-    runner = PullRequestReviewRunner(storage=storage)
+    slack_publisher = None
+    if settings.slack_webhook_url:
+        slack_publisher = SlackPublicationSink(
+            settings.slack_webhook_url,
+            notify_warn=settings.slack_notify_warn,
+            max_retries=settings.slack_max_retries,
+            retry_base_seconds=settings.slack_retry_base_seconds,
+            timeout_seconds=settings.request_timeout_seconds,
+            sleep=sleep,
+            logger=logger,
+        )
+    runner = PullRequestReviewRunner(
+        storage=storage,
+        slack_publisher=slack_publisher,
+    )
     if client_factory is None:
         client_factory = partial(
             GitHubClient, timeout=settings.request_timeout_seconds

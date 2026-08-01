@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 
 def _environment(root):
@@ -61,6 +61,40 @@ class GitHubAppServerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             app = build_application(load_settings(_environment(root)))
         self.assertFalse(app.state.started)
+
+    def test_build_application_injects_optional_slack_sink(self):
+        from agent.github_app.server import build_application
+        from agent.github_app.settings import load_settings
+
+        with tempfile.TemporaryDirectory() as root:
+            environment = _environment(root)
+            environment.update(
+                {
+                    "RELIUM_SLACK_WEBHOOK_URL": "https://hooks.slack.com/services/redacted",
+                    "RELIUM_SLACK_NOTIFY_WARN": "true",
+                    "RELIUM_SLACK_MAX_RETRIES": "4",
+                    "RELIUM_SLACK_RETRY_BASE_SECONDS": "0.5",
+                }
+            )
+            with (
+                patch("agent.github_app.server.SlackPublicationSink") as sink_type,
+                patch("agent.github_app.server.PullRequestReviewRunner") as runner_type,
+            ):
+                build_application(load_settings(environment))
+
+        sink_type.assert_called_once_with(
+            "https://hooks.slack.com/services/redacted",
+            notify_warn=True,
+            max_retries=4,
+            retry_base_seconds=0.5,
+            timeout_seconds=10.0,
+            sleep=ANY,
+            logger=ANY,
+        )
+        runner_type.assert_called_once_with(
+            storage=ANY,
+            slack_publisher=sink_type.return_value,
+        )
 
     def test_safe_json_formatter_includes_only_allowed_fields(self):
         from agent.github_app.server import SafeJsonFormatter
