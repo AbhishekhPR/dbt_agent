@@ -31,9 +31,10 @@ def review_deployment(
     auto_record=False,
     allow_blocked_recording=False,
     metadata_db_path=None,
+    previous_snapshot=None,
     **options,
 ) -> DeploymentReviewResult:
-    previous_snapshot = _load_previous_snapshot(history_store)
+    previous_snapshot = copy.deepcopy(previous_snapshot) if previous_snapshot is not None else _load_previous_snapshot(history_store)
     incident = analyze_pr_with_history(
         changed_models=copy.deepcopy(list(changed_models or [])),
         project_context=copy.deepcopy(project_context or {}),
@@ -42,6 +43,7 @@ def review_deployment(
         metadata=copy.deepcopy(metadata or {}),
         events=copy.deepcopy(events) if events is not None else None,
         metadata_db_path=metadata_db_path,
+        previous_snapshot=previous_snapshot,
         **copy.deepcopy(options),
     )
 

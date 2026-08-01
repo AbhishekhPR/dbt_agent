@@ -7,6 +7,18 @@ import urllib.request
 
 MAX_REPOSITORY_FILE_BYTES = 100 * 1024 * 1024
 _RAW_GITHUB_MEDIA_TYPE = "application/vnd.github.raw+json"
+_CHECK_RUNS_PER_PAGE = 100
+# GitHub limits this endpoint to check runs from the 1,000 most recent check
+# suites for a git reference. Ten full pages therefore cover its usable range.
+_MAX_CHECK_RUN_PAGES = 10
+
+
+class ChangedFiles(list):
+    """Changed files plus an explicit completeness flag for GitHub compare limits."""
+
+    def __init__(self, values=(), *, complete=True):
+        super().__init__(values)
+        self.complete = bool(complete)
 
 
 class GitHubAPIError(RuntimeError):
@@ -199,15 +211,49 @@ class GitHubClient:
             operation="compare_commits",
             route_template="/repos/{owner}/{repo}/compare/{base}...{head}",
         )
-        return [item["filename"] for item in response.get("files", [])]
+        files = response.get("files", []) if isinstance(response, dict) else []
+        if not isinstance(files, list):
+            raise GitHubAPIError(
+                "GitHub compare response did not contain a file list.",
+                operation="compare_commits",
+                http_method="GET",
+                route_template="/repos/{owner}/{repo}/compare/{base}...{head}",
+                message_category="invalid_response",
+            )
+        names = [
+            item["filename"]
+            for item in files
+            if isinstance(item, dict) and isinstance(item.get("filename"), str)
+        ]
+        # GitHub's compare endpoint returns at most 300 files. Exactly 300 is
+        # therefore explicitly treated as potentially truncated.
+        return ChangedFiles(names, complete=len(files) < 300)
 
     def list_issue_comments(self, owner, repository, pull_number):
-        return self._request(
+        path = f"/repos/{owner}/{repository}/issues/{pull_number}/comments"
+        first = self._request(
             "GET",
-            f"/repos/{owner}/{repository}/issues/{pull_number}/comments",
+            path,
             operation="list_issue_comments",
             route_template="/repos/{owner}/{repo}/issues/{pull_number}/comments",
         )
+        if not isinstance(first, list):
+            return first
+        comments = list(first)
+        page = 2
+        while len(first) == 100:
+            page_result = self._request(
+                "GET",
+                f"{path}?page={page}&per_page=100",
+                operation="list_issue_comments",
+                route_template="/repos/{owner}/{repo}/issues/{pull_number}/comments",
+            )
+            if not isinstance(page_result, list):
+                break
+            comments.extend(page_result)
+            first = page_result
+            page += 1
+        return comments
 
     def create_issue_comment(self, owner, repository, pull_number, body):
         return self._request(
@@ -234,6 +280,63 @@ class GitHubClient:
             payload,
             operation="create_check_run",
             route_template="/repos/{owner}/{repo}/check-runs",
+        )
+
+    def list_check_runs(self, owner, repository, *, head_sha, check_name):
+        """List existing runs so an ambiguous publication can be reconciled."""
+        route_template = "/repos/{owner}/{repo}/commits/{ref}/check-runs"
+        path = f"/repos/{owner}/{repository}/commits/{head_sha}/check-runs"
+        encoded_name = urllib.parse.quote(str(check_name), safe="")
+        check_runs = []
+        seen_pages = set()
+        expected_total = 0
+        for page in range(1, _MAX_CHECK_RUN_PAGES + 1):
+            response = self._request(
+                "GET",
+                (
+                    f"{path}?check_name={encoded_name}&filter=all"
+                    f"&per_page={_CHECK_RUNS_PER_PAGE}&page={page}"
+                ),
+                operation="list_check_runs",
+                route_template=route_template,
+            )
+            if not isinstance(response, dict):
+                raise _invalid_check_run_page(route_template)
+            page_runs = response.get("check_runs")
+            total_count = response.get("total_count")
+            if (
+                not isinstance(page_runs, list)
+                or isinstance(total_count, bool)
+                or not isinstance(total_count, int)
+                or total_count < 0
+            ):
+                raise _invalid_check_run_page(route_template)
+            if not page_runs:
+                return check_runs
+            fingerprint = json.dumps(
+                page_runs,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if fingerprint in seen_pages:
+                raise GitHubAPIError(
+                    "GitHub check-run pagination repeated a page.",
+                    operation="list_check_runs",
+                    http_method="GET",
+                    route_template=route_template,
+                    message_category="invalid_response",
+                )
+            seen_pages.add(fingerprint)
+            check_runs.extend(page_runs)
+            expected_total = max(expected_total, total_count)
+            if len(check_runs) >= expected_total:
+                return check_runs
+        raise GitHubAPIError(
+            "GitHub check-run pagination exceeded the supported endpoint limit.",
+            operation="list_check_runs",
+            http_method="GET",
+            route_template=route_template,
+            message_category="invalid_response",
         )
 
     def _request(
@@ -312,6 +415,16 @@ def _safe_header(headers, name):
         return None
     sanitized = value.replace("\r", "").replace("\n", "").strip()
     return sanitized[:500] or None
+
+
+def _invalid_check_run_page(route_template):
+    return GitHubAPIError(
+        "GitHub check-run response did not contain a valid total_count and check_runs list.",
+        operation="list_check_runs",
+        http_method="GET",
+        route_template=route_template,
+        message_category="invalid_response",
+    )
 
 
 def _message_category(status_code):

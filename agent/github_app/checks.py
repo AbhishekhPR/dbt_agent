@@ -15,10 +15,11 @@ def build_check_run_payload(
     head_sha: str,
     result: dict,
     enforcement_mode="shadow",
+    external_id=None,
 ) -> dict:
     markdown = str(result.get("rendered", {}).get("markdown", ""))
     decision = str(result.get("decision", "unknown"))
-    return {
+    payload = {
         "name": CHECK_NAME,
         "head_sha": head_sha,
         "status": "completed",
@@ -31,6 +32,9 @@ def build_check_run_payload(
             "summary": markdown[:65535],
         },
     }
+    if external_id:
+        payload["external_id"] = str(external_id)
+    return payload
 
 
 def create_review_check(
@@ -41,6 +45,7 @@ def create_review_check(
     head_sha: str,
     result: dict,
     enforcement_mode="shadow",
+    external_id=None,
 ):
     return client.create_check_run(
         owner,
@@ -49,5 +54,6 @@ def create_review_check(
             head_sha=head_sha,
             result=result,
             enforcement_mode=enforcement_mode,
+            external_id=external_id,
         ),
     )

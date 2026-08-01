@@ -135,7 +135,42 @@ def discover_kpis(project_context: dict) -> list[DiscoveredKPI]:
             )
         )
 
+    discovered.extend(_declared_metric_kpis(context, discovered))
     return sorted(discovered, key=lambda kpi: (-kpi.confidence, kpi.name))
+
+
+def _declared_metric_kpis(context: dict, existing: list[DiscoveredKPI]) -> list[DiscoveredKPI]:
+    """Keep arbitrary declared metric identities instead of only keyword categories."""
+    existing_names = {kpi.name for kpi in existing}
+    declared = []
+    metrics = context.get("dbt_metrics") or context.get("metrics") or []
+    for metric in metrics if isinstance(metrics, list) else []:
+        if not isinstance(metric, dict) or not metric.get("name"):
+            continue
+        semantics = metric.get("declared_semantics")
+        if not isinstance(semantics, dict) or not semantics:
+            continue
+        name = str(metric["name"])
+        if name in existing_names:
+            continue
+        model = metric.get("model")
+        declared.append(
+            DiscoveredKPI(
+                name=name,
+                description=str(metric.get("description") or metric.get("label") or name),
+                related_models=[str(model)] if model else [],
+                related_columns=[str(value) for value in semantics.get("related_columns", [])],
+                confidence=95,
+                reasons=["dbt metric supplies an explicit Relium semantic declaration"],
+                metadata={
+                    "declared_metric": True,
+                    "declared_semantics": dict(semantics),
+                    "matched_sources": ["dbt_metrics"],
+                },
+            )
+        )
+        existing_names.add(name)
+    return declared
 
 
 def _observations(context: dict) -> list[tuple[str, str, str]]:

@@ -59,14 +59,27 @@ def _contract_for_kpi(
     upstream_models = _nodes_of_type(semantic_graph, upstream, "model")
     upstream_sources = _nodes_of_type(semantic_graph, upstream, "source")
     related_models = _ordered_unique([*list(kpi.related_models or []), *upstream_models])
-    related_columns = _ordered_unique(list(kpi.related_columns or []))
-    assumptions = _assumptions(kpi, project_context)
-    invariants = _invariants(kpi, project_context)
+    declared = _declared_semantics(kpi)
+    related_columns = _ordered_unique(
+        [*list(kpi.related_columns or []), *list(declared.get("related_columns", []))]
+    )
+    assumptions = (
+        list(declared["assumptions"])
+        if "assumptions" in declared
+        else _assumptions(kpi, project_context)
+    )
+    invariants = (
+        list(declared["invariants"])
+        if "invariants" in declared
+        else _invariants(kpi, project_context)
+    )
 
     return SemanticContract(
         kpi_name=kpi.name,
         description=kpi.description,
-        business_meaning=_business_meaning(kpi, project_context),
+        business_meaning=str(
+            declared.get("business_meaning") or _business_meaning(kpi, project_context)
+        ),
         related_models=related_models,
         related_columns=related_columns,
         upstream_sources=upstream_sources,
@@ -88,8 +101,14 @@ def _contract_for_kpi(
             "kpi_confidence": kpi.confidence,
             "evidence_reasons": list(kpi.reasons or []),
             "matched_sources": list((kpi.metadata or {}).get("matched_sources", [])),
+            "declared_semantics": bool(declared),
         },
     )
+
+
+def _declared_semantics(kpi: DiscoveredKPI) -> dict[str, Any]:
+    value = (kpi.metadata or {}).get("declared_semantics")
+    return dict(value) if isinstance(value, dict) else {}
 
 
 def _business_meaning(kpi: DiscoveredKPI, project_context: dict[str, Any]) -> str:

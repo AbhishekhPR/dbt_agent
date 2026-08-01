@@ -1,4 +1,5 @@
 import copy
+import re
 from pathlib import Path
 from typing import Any
 
@@ -39,12 +40,14 @@ def analyze_pr_with_history(
     events=None,
     outcomes=None,
     metadata_db_path=None,
+    previous_snapshot=None,
+    manifest_comparison=None,
     **existing_options,
 ) -> Incident:
     history_enabled = history_store is not None
-    previous_snapshot = None
+    previous_snapshot = copy.deepcopy(previous_snapshot)
 
-    if history_store is not None:
+    if previous_snapshot is None and history_store is not None:
         loaded_snapshot = history_store.load_latest_snapshot()
         if loaded_snapshot is not None:
             previous_snapshot = copy.deepcopy(loaded_snapshot)
@@ -60,6 +63,7 @@ def analyze_pr_with_history(
         deployment_id=deployment_id,
         outcomes=copy.deepcopy(outcomes) if outcomes is not None else None,
         metadata_db_path=metadata_db_path,
+        manifest_comparison=manifest_comparison,
     )
 
     incident.metadata["history_enabled"] = history_enabled
@@ -68,6 +72,7 @@ def analyze_pr_with_history(
         incident.metadata["previous_snapshot_id"] = _snapshot_id(previous_snapshot)
     if metadata is not None:
         incident.metadata["request_metadata"] = copy.deepcopy(metadata)
+        incident.metadata.update(copy.deepcopy(metadata))
     if existing_options:
         incident.metadata["analysis_options"] = copy.deepcopy(existing_options)
     return incident
@@ -80,6 +85,7 @@ def analyze_changed_models(
     deployment_id=None,
     outcomes=None,
     metadata_db_path=None,
+    manifest_comparison=None,
 ) -> Incident:
     model_specs = list(changed_models)
     signals = []
@@ -172,8 +178,18 @@ def analyze_changed_models(
             )
 
     semantic_signals = _semantic_signals(semantic_context)
+    manifest_signal = _manifest_comparison_signal(manifest_comparison)
     if semantic_diff is not None:
         semantic_signals.append(_source_signal(semantic_diff_to_signal(semantic_diff)))
+    if manifest_signal is not None and not _declared_semantics_available(manifest_comparison):
+        semantic_signals.append(manifest_signal)
+    semantic_signals = [
+        _with_semantic_audit_metadata(
+            signal,
+            manifest_comparison=manifest_comparison,
+        )
+        for signal in semantic_signals
+    ]
 
     signals.extend(semantic_signals)
     metadata["signal_count"] = len(signals)
@@ -185,6 +201,8 @@ def analyze_changed_models(
         semantic_diff=semantic_diff,
     )
     metadata["sql_sources"] = sql_sources
+    if manifest_comparison is not None:
+        metadata["manifest_comparison"] = copy.deepcopy(manifest_comparison)
 
     return assemble_decision_incident(
         signals,
@@ -493,6 +511,12 @@ def _add_semantic_metadata(
             )
         )
 
+    metadata["semantic_findings"] = [
+        _semantic_finding_metadata(signal)
+        for signal in semantic_signals
+        if signal.score < 0 and _semantic_finding_owner(signal)
+    ]
+
 
 def _source_signal(signal: Signal) -> Signal:
     return Signal(
@@ -505,6 +529,287 @@ def _source_signal(signal: Signal) -> Signal:
             **dict(signal.metadata),
             "source_component": signal.component,
         },
+    )
+
+
+def _declared_semantics_available(manifest_comparison) -> bool:
+    return bool(
+        isinstance(manifest_comparison, dict)
+        and manifest_comparison.get("declared_semantic_evidence_available")
+    )
+
+
+def _with_semantic_audit_metadata(
+    signal: Signal,
+    *,
+    manifest_comparison,
+) -> Signal:
+    comparison = manifest_comparison if isinstance(manifest_comparison, dict) else {}
+    metadata = dict(signal.metadata or {})
+    owner = _semantic_finding_owner(signal)
+    fallback_used = owner == "semantic_refund_fallback"
+    metadata.update(
+        {
+            "finding_owner": owner,
+            "finding_type": _semantic_finding_type(signal, owner),
+            "evidence_source": _semantic_evidence_source(owner),
+            "base_manifest_available": bool(
+                comparison.get("base_manifest_available")
+            ),
+            "head_manifest_available": bool(
+                comparison.get("head_manifest_available")
+            ),
+            "semantic_comparison_evaluated": bool(
+                comparison.get("semantic_comparison_evaluated")
+            ),
+            "fallback_used": fallback_used,
+        }
+    )
+    if fallback_used:
+        metadata["fallback_scope"] = (
+            "refund_adjustment_subtraction_from_net_or_gross_business_expression"
+        )
+    return Signal(
+        component=signal.component,
+        severity=signal.severity,
+        confidence=signal.confidence,
+        score=signal.score,
+        reasons=list(signal.reasons),
+        metadata=metadata,
+    )
+
+
+def _semantic_finding_owner(signal: Signal) -> str | None:
+    metadata = dict(signal.metadata or {})
+    explicit = metadata.get("finding_owner")
+    if explicit in {
+        "semantic_contract",
+        "semantic_diff",
+        "kpi_definition",
+        "semantic_refund_fallback",
+    }:
+        return str(explicit)
+    return {
+        "semantic_contract": "semantic_contract",
+        "semantic_diff": "semantic_diff",
+        "kpi_impact": "kpi_definition",
+        "assumption_verification": "semantic_contract",
+    }.get(signal.component)
+
+
+def _semantic_finding_type(signal: Signal, owner: str | None) -> str:
+    explicit = (signal.metadata or {}).get("finding_type")
+    if explicit:
+        return str(explicit)
+    if owner == "semantic_refund_fallback":
+        return "refund_adjustment_subtraction_removed"
+    if signal.component == "semantic_diff":
+        if (signal.metadata or {}).get("added_kpis") or (signal.metadata or {}).get("removed_kpis"):
+            return "kpi_definition_change"
+        if (signal.metadata or {}).get("contract_changes"):
+            return "declared_contract_or_invariant_change"
+        return "semantic_snapshot_change"
+    return {
+        "semantic_contract": "semantic_contract_violation",
+        "kpi_impact": "kpi_definition_impact",
+        "assumption_verification": "semantic_contract_assumption",
+    }.get(signal.component, "semantic_finding")
+
+
+def _semantic_evidence_source(owner: str | None) -> str:
+    return {
+        "semantic_contract": "declared_semantic_contract",
+        "semantic_diff": "trusted_base_head_semantic_snapshots",
+        "kpi_definition": "declared_kpi_definition",
+        "semantic_refund_fallback": "trusted_base_head_manifest_sql",
+    }.get(owner, "semantic_analysis")
+
+
+def _semantic_finding_metadata(signal: Signal) -> dict:
+    metadata = dict(signal.metadata or {})
+    finding = {
+        "component": signal.component,
+        "severity": signal.severity,
+        "finding_owner": metadata["finding_owner"],
+        "finding_type": metadata["finding_type"],
+        "evidence_source": metadata["evidence_source"],
+        "base_manifest_available": bool(metadata["base_manifest_available"]),
+        "head_manifest_available": bool(metadata["head_manifest_available"]),
+        "semantic_comparison_evaluated": bool(
+            metadata["semantic_comparison_evaluated"]
+        ),
+        "fallback_used": bool(metadata["fallback_used"]),
+    }
+    if metadata.get("fallback_scope"):
+        finding["fallback_scope"] = str(metadata["fallback_scope"])
+    return finding
+
+
+def _manifest_comparison_signal(comparison) -> Signal | None:
+    if not comparison or not comparison.get("evaluated"):
+        return None
+    changes = list(comparison.get("material_sql_changes") or [])
+    if not changes:
+        return None
+    return Signal(
+        component="semantic_diff",
+        severity="HIGH",
+        confidence=95,
+        score=-35,
+        reasons=[
+            f"Trusted base/head manifest SQL changed for {change['model_name']}."
+            for change in changes
+        ],
+        metadata={
+            "semantic_comparison": "evaluated",
+            "manifest_sql_changes": copy.deepcopy(changes),
+            **copy.deepcopy(changes[0]),
+        },
+    )
+
+
+def compare_manifest_sql(previous_manifest, current_manifest, changed_models) -> dict:
+    """Compare trusted manifest SQL using the secondary refund fallback only.
+
+    Declared contracts, invariants, and KPI definitions take precedence. When
+    they are absent, this deliberately narrow fallback detects removal of a
+    refund/adjustment subtraction from a net/gross business expression. It is
+    not arbitrary SQL semantic equivalence.
+    """
+    base_available = isinstance(previous_manifest, dict)
+    head_available = isinstance(current_manifest, dict)
+    evaluated = base_available and head_available
+    declared_available = _manifest_declared_semantics_available(
+        previous_manifest,
+        current_manifest,
+        changed_models,
+    )
+    audit = {
+        "evaluated": evaluated,
+        "base_manifest_available": base_available,
+        "head_manifest_available": head_available,
+        "semantic_comparison_evaluated": evaluated,
+        "declared_semantic_evidence_available": declared_available,
+        "material_sql_changes": [],
+    }
+    if not evaluated or declared_available:
+        return audit
+    previous_nodes = _manifest_model_nodes(previous_manifest)
+    current_nodes = _manifest_model_nodes(current_manifest)
+    changes = []
+    for name in list(changed_models or []):
+        previous = previous_nodes.get(name)
+        current = current_nodes.get(name)
+        if not previous or not current:
+            continue
+        previous_sql = _canonical_sql(previous.get("raw_code") or previous.get("compiled_code") or previous.get("sql"))
+        current_sql = _canonical_sql(current.get("raw_code") or current.get("compiled_code") or current.get("sql"))
+        if (
+            previous_sql
+            and current_sql
+            and previous_sql != current_sql
+            and _material_sql_delta(previous_sql, current_sql)
+        ):
+            changes.append(
+                {
+                    "model_name": str(name),
+                    "finding_owner": "semantic_refund_fallback",
+                    "finding_type": "refund_adjustment_subtraction_removed",
+                    "evidence_source": "trusted_base_head_manifest_sql",
+                    "base_manifest_available": base_available,
+                    "head_manifest_available": head_available,
+                    "semantic_comparison_evaluated": evaluated,
+                    "fallback_used": True,
+                    "fallback_scope": (
+                        "refund_adjustment_subtraction_from_net_or_gross_business_expression"
+                    ),
+                }
+            )
+    audit["material_sql_changes"] = changes
+    return audit
+
+
+def _manifest_declared_semantics_available(
+    previous_manifest,
+    current_manifest,
+    changed_models,
+) -> bool:
+    changed = {str(value) for value in list(changed_models or [])}
+    for manifest in (previous_manifest, current_manifest):
+        if not isinstance(manifest, dict):
+            continue
+        metrics = manifest.get("metrics")
+        for metric in metrics.values() if isinstance(metrics, dict) else []:
+            if not isinstance(metric, dict):
+                continue
+            config = metric.get("config") if isinstance(metric.get("config"), dict) else {}
+            meta = metric.get("meta") if isinstance(metric.get("meta"), dict) else {}
+            if not meta and isinstance(config.get("meta"), dict):
+                meta = config["meta"]
+            relium = meta.get("relium") if isinstance(meta.get("relium"), dict) else {}
+            if not relium:
+                continue
+            dependencies = (metric.get("depends_on") or {}).get("nodes", [])
+            dependency_names = {
+                str(value).rsplit(".", 1)[-1]
+                for value in dependencies
+            }
+            if not changed or changed.intersection(dependency_names) or changed.intersection(dependencies):
+                return True
+    return False
+
+
+def _manifest_model_nodes(manifest) -> dict[str, dict]:
+    nodes = (manifest or {}).get("nodes") if isinstance(manifest, dict) else {}
+    result = {}
+    for key, value in (nodes.items() if isinstance(nodes, dict) else []):
+        if not isinstance(value, dict) or value.get("resource_type") not in {None, "model"}:
+            continue
+        name = str(value.get("name") or str(key).rsplit(".", 1)[-1])
+        result[name] = value
+        result[str(value.get("unique_id") or key)] = value
+    return result
+
+
+def _canonical_sql(value) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    text = re.sub(r"/\*.*?\*/", " ", value, flags=re.S)
+    text = re.sub(r"--[^\n]*", " ", text)
+    text = re.sub(r"\{\{.*?\}\}", "dbt_ref", text, flags=re.S)
+    try:
+        import sqlglot
+
+        return sqlglot.parse_one(text).sql(dialect="sqlite")
+    except Exception:
+        return " ".join(text.lower().split())
+
+
+def _material_sql_delta(previous_sql: str, current_sql: str) -> bool:
+    """Detect removal of a refund adjustment from a net/gross KPI expression.
+
+    This is a deliberately narrow, syntax-independent fallback for manifests
+    that do not carry a declared contract, invariant, or KPI definition. It
+    examines removal of a refund/adjustment subtraction from a net/gross
+    business expression, not model names or one exact SQL spelling. It is not arbitrary SQL semantic equivalence.
+    Declared contracts, invariants, and KPI
+    definitions take precedence.
+    """
+    return _has_refund_adjustment(previous_sql) and not _has_refund_adjustment(current_sql)
+
+
+def _has_refund_adjustment(sql: str) -> bool:
+    if not isinstance(sql, str):
+        return False
+    # Parentheses and COALESCE are deliberately accepted; comments and casing
+    # have already been normalised by _canonical_sql.
+    return bool(
+        re.search(
+            r"\b(?:gross|net|total|revenue|sales|income|amount)[a-z0-9_]*\s*-\s*"
+            r"(?:\(\s*)?(?:coalesce\s*\(\s*)?refund[a-z0-9_.]*",
+            sql,
+            flags=re.I,
+        )
     )
 
 

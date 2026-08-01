@@ -132,16 +132,36 @@ def _extract_metrics(manifest: dict, id_names: dict[str, str], id_types: dict[st
         if unique_id in seen:
             continue
         seen.add(unique_id)
-        metrics.append(
-            {
+        declared_semantics = _metric_declared_semantics(metric)
+        extracted_metric = {
                 "name": _name(metric, unique_id),
                 "label": metric.get("label"),
                 "type": metric.get("type"),
                 "description": str(metric.get("description") or ""),
                 "model": _metric_model(metric, id_names, id_types),
-            }
-        )
+        }
+        if declared_semantics:
+            extracted_metric["declared_semantics"] = declared_semantics
+        metrics.append(extracted_metric)
     return sorted(metrics, key=lambda metric: metric["name"])
+
+
+def _metric_declared_semantics(metric: dict) -> dict:
+    """Return explicitly declared Relium KPI/contract evidence from a dbt metric."""
+    config = metric.get("config") if isinstance(metric.get("config"), dict) else {}
+    meta = metric.get("meta") if isinstance(metric.get("meta"), dict) else {}
+    if not meta and isinstance(config.get("meta"), dict):
+        meta = config["meta"]
+    relium = meta.get("relium") if isinstance(meta.get("relium"), dict) else {}
+    declared = {}
+    business_meaning = relium.get("business_meaning")
+    if business_meaning:
+        declared["business_meaning"] = str(business_meaning)
+    for field_name in ("invariants", "assumptions", "related_columns"):
+        values = _string_list(relium.get(field_name))
+        if values:
+            declared[field_name] = values
+    return declared
 
 
 def _extract_exposures(manifest: dict, id_names: dict[str, str]) -> list[dict]:

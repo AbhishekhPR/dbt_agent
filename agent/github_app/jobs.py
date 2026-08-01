@@ -24,6 +24,13 @@ class WebhookJob:
     raw_body: bytes = field(repr=False)
     received_at: float
     attempt: int = 0
+    state: str = "verified_pending"
+    owner: str | None = None
+    claimed_at: float | None = None
+    lease_expires_at: float | None = None
+    retry_at: float | None = None
+    last_error: str | None = None
+    repository_id: int | None = None
 
     def __post_init__(self):
         if not isinstance(self.delivery_id, str) or not self.delivery_id.strip():
@@ -42,6 +49,15 @@ class WebhookJob:
             or self.attempt < 0
         ):
             raise WebhookJobError("Webhook attempt must be zero or greater.")
+        if self.state not in {
+            "verified_pending",
+            "claimed",
+            "processing",
+            "retry_at",
+            "complete",
+            "dead_letter",
+        }:
+            raise WebhookJobError("Webhook job state is invalid.")
         object.__setattr__(self, "delivery_id", self.delivery_id.strip())
         object.__setattr__(self, "event_name", self.event_name.strip())
         object.__setattr__(self, "raw_body", bytes(bytearray(self.raw_body)))
@@ -96,11 +112,12 @@ def safe_error_category(error: Exception) -> str:
 
 
 class RetryingJobProcessor:
-    def __init__(self, processor, policy: RetryPolicy, *, sleep=time.sleep, logger=None):
+    def __init__(self, processor, policy: RetryPolicy, *, sleep=time.sleep, logger=None, job_store=None):
         self.processor = processor
         self.policy = policy
         self.sleep = sleep
         self.logger = logger or logging.getLogger(__name__)
+        self.job_store = job_store
 
     def __call__(self, job: WebhookJob):
         current = job
@@ -108,9 +125,26 @@ class RetryingJobProcessor:
             try:
                 return self.processor(current)
             except Exception as exc:
-                if not is_retryable_error(exc) or current.attempt >= self.policy.max_retries:
+                retryable = is_retryable_error(exc)
+                if not retryable or current.attempt >= self.policy.max_retries:
+                    if self.job_store is not None and current.repository_id is not None:
+                        self.job_store.fail_job(
+                            current.repository_id,
+                            current.delivery_id,
+                            attempt=current.attempt + 1,
+                            last_error=safe_error_category(exc),
+                            dead_letter=True,
+                        )
                     raise
                 delay = self.policy.delay_for_attempt(current.attempt)
+                if self.job_store is not None and current.repository_id is not None:
+                    self.job_store.fail_job(
+                        current.repository_id,
+                        current.delivery_id,
+                        attempt=current.attempt + 1,
+                        last_error=safe_error_category(exc),
+                        retry_at=time.time() + delay,
+                    )
                 self.logger.warning(
                     "webhook_job_retry",
                     extra={
@@ -137,6 +171,8 @@ class BoundedJobQueue:
         capacity: int,
         clock=time.monotonic,
         logger=None,
+        job_store=None,
+        lease_seconds: float = 300.0,
     ):
         if isinstance(worker_count, bool) or worker_count <= 0:
             raise ValueError("Worker count must be positive.")
@@ -147,6 +183,8 @@ class BoundedJobQueue:
         self.capacity = capacity
         self.clock = clock
         self.logger = logger or logging.getLogger(__name__)
+        self.job_store = job_store
+        self.lease_seconds = float(lease_seconds)
         self._queue = queue.Queue(maxsize=capacity)
         self._lock = threading.Lock()
         self._threads = []
@@ -178,6 +216,12 @@ class BoundedJobQueue:
                 )
                 self._threads.append(thread)
                 thread.start()
+            if self.job_store is not None:
+                for job in self.job_store.recover_all_jobs(now=time.time()):
+                    try:
+                        self._queue.put_nowait(job)
+                    except queue.Full:
+                        break
 
     def enqueue(self, job: WebhookJob) -> bool:
         with self._lock:
@@ -215,9 +259,35 @@ class BoundedJobQueue:
             try:
                 if item is _STOP:
                     return
+                if self.job_store is not None and item.repository_id is not None:
+                    if not self.job_store.claim_job(
+                        item.repository_id,
+                        item.delivery_id,
+                        owner=threading.current_thread().name,
+                        now=time.time(),
+                        lease_seconds=self.lease_seconds,
+                    ):
+                        continue
+                    self.job_store.mark_processing(
+                        item.repository_id,
+                        item.delivery_id,
+                        owner=threading.current_thread().name,
+                    )
                 try:
                     self.processor(item)
+                    if self.job_store is not None and item.repository_id is not None:
+                        self.job_store.complete_job(item.repository_id, item.delivery_id)
                 except Exception as exc:
+                    if self.job_store is not None and item.repository_id is not None:
+                        record = self.job_store.get_job(item.repository_id, item.delivery_id) or {}
+                        if record.get("state") != "dead_letter":
+                            self.job_store.fail_job(
+                                item.repository_id,
+                                item.delivery_id,
+                                attempt=max(item.attempt + 1, int(record.get("attempt") or 0)),
+                                last_error=safe_error_category(exc),
+                                dead_letter=True,
+                            )
                     self.logger.error(
                         "webhook_job_failed",
                         extra={
