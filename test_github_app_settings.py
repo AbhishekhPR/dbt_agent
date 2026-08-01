@@ -30,6 +30,10 @@ class GitHubAppSettingsTests(unittest.TestCase):
         self.assertEqual(settings.host, "0.0.0.0")
         self.assertEqual(settings.port, 8000)
         self.assertEqual(settings.max_body_bytes, 2 * 1024 * 1024)
+        self.assertIsNone(settings.slack_webhook_url)
+        self.assertFalse(settings.slack_notify_warn)
+        self.assertEqual(settings.slack_max_retries, 2)
+        self.assertEqual(settings.slack_retry_base_seconds, 1.0)
         with self.assertRaises(dataclasses.FrozenInstanceError):
             settings.port = 9000
 
@@ -47,6 +51,10 @@ class GitHubAppSettingsTests(unittest.TestCase):
                     RELIUM_HOST="127.0.0.1",
                     RELIUM_PORT="9000",
                     RELIUM_MAX_BODY_BYTES="4096",
+                    RELIUM_SLACK_WEBHOOK_URL="https://hooks.slack.com/services/redacted",
+                    RELIUM_SLACK_NOTIFY_WARN="true",
+                    RELIUM_SLACK_MAX_RETRIES="4",
+                    RELIUM_SLACK_RETRY_BASE_SECONDS="0.5",
                 )
             )
         self.assertEqual(
@@ -58,8 +66,24 @@ class GitHubAppSettingsTests(unittest.TestCase):
                 settings.host,
                 settings.port,
                 settings.max_body_bytes,
+                settings.slack_webhook_url,
+                settings.slack_notify_warn,
+                settings.slack_max_retries,
+                settings.slack_retry_base_seconds,
             ),
-            (4, 12, 0, 0.25, "127.0.0.1", 9000, 4096),
+            (
+                4,
+                12,
+                0,
+                0.25,
+                "127.0.0.1",
+                9000,
+                4096,
+                "https://hooks.slack.com/services/redacted",
+                True,
+                4,
+                0.5,
+            ),
         )
 
     def test_missing_required_variables_fail_by_name(self):
@@ -90,6 +114,8 @@ class GitHubAppSettingsTests(unittest.TestCase):
             "RELIUM_RETRY_BASE_SECONDS": "0",
             "RELIUM_PORT": "70000",
             "RELIUM_MAX_BODY_BYTES": "0",
+            "RELIUM_SLACK_MAX_RETRIES": "-1",
+            "RELIUM_SLACK_RETRY_BASE_SECONDS": "0",
         }
         with tempfile.TemporaryDirectory() as root:
             for name, value in invalid.items():
@@ -98,6 +124,49 @@ class GitHubAppSettingsTests(unittest.TestCase):
                         load_settings(self._environment(root, **{name: value}))
                     self.assertIn(name, str(raised.exception))
                     self.assertNotIn(value, str(raised.exception))
+
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaisesRegex(SettingsError, "RELIUM_SLACK_MAX_RETRIES"):
+                load_settings(
+                    self._environment(root, RELIUM_SLACK_MAX_RETRIES="11")
+                )
+            with self.assertRaisesRegex(
+                SettingsError, "RELIUM_SLACK_RETRY_BASE_SECONDS"
+            ):
+                load_settings(
+                    self._environment(root, RELIUM_SLACK_RETRY_BASE_SECONDS="11")
+                )
+
+    def test_invalid_slack_webhook_is_rejected_without_echoing_value(self):
+        from agent.github_app.settings import SettingsError, load_settings
+
+        invalid = (
+            "http://hooks.slack.com/services/private-value",
+            "https://example.invalid/services/private-value",
+        )
+        with tempfile.TemporaryDirectory() as root:
+            for value in invalid:
+                with self.subTest(value=value):
+                    with self.assertRaises(SettingsError) as raised:
+                        load_settings(
+                            self._environment(root, RELIUM_SLACK_WEBHOOK_URL=value)
+                        )
+                    self.assertIn("RELIUM_SLACK_WEBHOOK_URL", str(raised.exception))
+                    self.assertNotIn("private-value", str(raised.exception))
+
+    def test_invalid_slack_boolean_fails_without_echoing_value(self):
+        from agent.github_app.settings import SettingsError, load_settings
+
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(SettingsError) as raised:
+                load_settings(
+                    self._environment(
+                        root,
+                        RELIUM_SLACK_NOTIFY_WARN="secret-invalid-boolean",
+                    )
+                )
+        self.assertIn("RELIUM_SLACK_NOTIFY_WARN", str(raised.exception))
+        self.assertNotIn("secret-invalid-boolean", str(raised.exception))
 
     def test_missing_private_key_is_safe(self):
         from agent.github_app.settings import SettingsError, load_settings
@@ -115,10 +184,16 @@ class GitHubAppSettingsTests(unittest.TestCase):
         from agent.github_app.settings import load_settings
 
         with tempfile.TemporaryDirectory() as root:
-            settings = load_settings(self._environment(root))
+            settings = load_settings(
+                self._environment(
+                    root,
+                    RELIUM_SLACK_WEBHOOK_URL="https://hooks.slack.com/services/private-value",
+                )
+            )
         rendered = repr(settings)
         self.assertNotIn("webhook-secret-value", rendered)
         self.assertNotIn("test-private-key", rendered)
+        self.assertNotIn("private-value", rendered)
 
     def test_storage_root_must_not_be_a_file(self):
         from agent.github_app.settings import SettingsError, load_settings

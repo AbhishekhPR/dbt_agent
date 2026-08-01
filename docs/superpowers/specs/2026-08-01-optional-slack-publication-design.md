@@ -24,8 +24,10 @@ from object representations and logs.
 ## Publication state and idempotency
 
 The journal accepts `comment`, `check`, and `slack` steps. Before the first
-network request, the Slack step is persisted as `started` with only safe
-metadata. A completed or skipped step is reused on delivery replay. A
+network request, the Slack step is atomically claimed and persisted as
+`started` with only safe metadata. Concurrent redeliveries have exactly one
+claim winner. Decisions that cannot alert are persisted directly as `skipped`
+without creating a send window. A completed or skipped step is reused on delivery replay. A
 previously started step is treated as indeterminate and is not blindly sent
 again, preserving the at-most-one behavior for duplicate deliveries when an
 incoming webhook cannot be reconciled remotely.
@@ -54,8 +56,8 @@ escaped.
 
 ## Retry and failure handling
 
-The transport uses a finite attempt count with exponential delay capped by
-configuration. HTTP 429, HTTP 5xx, timeout, and connection errors are
+The transport uses at most six attempts with exponential delay capped at ten
+seconds. HTTP 429, HTTP 5xx, timeout, and connection errors are
 retryable. Other HTTP responses fail immediately. Retry logs contain only the
 publication identity, attempt number, and safe error category.
 
@@ -65,10 +67,10 @@ through the GitHub delivery path.
 
 ## Configuration
 
-- `RELIUM_SLACK_WEBHOOK_URL`: optional; absence disables Slack.
+- `RELIUM_SLACK_WEBHOOK_URL`: optional Slack or Slack Gov HTTPS incoming-webhook URL; absence disables Slack.
 - `RELIUM_SLACK_NOTIFY_WARN`: optional boolean, default false.
-- `RELIUM_SLACK_MAX_RETRIES`: optional non-negative integer, default 2.
-- `RELIUM_SLACK_RETRY_BASE_SECONDS`: optional positive number, default 1.
+- `RELIUM_SLACK_MAX_RETRIES`: optional integer from 0 through 5, default 2.
+- `RELIUM_SLACK_RETRY_BASE_SECONDS`: optional number greater than 0 and no more than 10, default 1.
 
 BLOCK alerts are enabled whenever the webhook is configured. WARN alerts
 require the explicit boolean. ALLOW remains silent.

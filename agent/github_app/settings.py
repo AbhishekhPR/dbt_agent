@@ -1,5 +1,6 @@
 import math
 import os
+import urllib.parse
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,6 +26,10 @@ class GitHubAppSettings:
     max_body_bytes: int = 2 * 1024 * 1024
     request_timeout_seconds: float = 10.0
     shutdown_timeout_seconds: float = 10.0
+    slack_webhook_url: str | None = field(default=None, repr=False)
+    slack_notify_warn: bool = False
+    slack_max_retries: int = 2
+    slack_retry_base_seconds: float = 1.0
 
 
 def load_settings(environ: Mapping[str, str] | None = None) -> GitHubAppSettings:
@@ -80,6 +85,24 @@ def load_settings(environ: Mapping[str, str] | None = None) -> GitHubAppSettings
             default=str(2 * 1024 * 1024),
             minimum=1,
         ),
+        slack_webhook_url=_slack_webhook_url(values),
+        slack_notify_warn=_boolean(
+            values, "RELIUM_SLACK_NOTIFY_WARN", default="false"
+        ),
+        slack_max_retries=_integer(
+            values,
+            "RELIUM_SLACK_MAX_RETRIES",
+            default="2",
+            minimum=0,
+            maximum=5,
+        ),
+        slack_retry_base_seconds=_number(
+            values,
+            "RELIUM_SLACK_RETRY_BASE_SECONDS",
+            default="1",
+            minimum_exclusive=0,
+            maximum=10,
+        ),
     )
 
 
@@ -88,6 +111,48 @@ def _required(values: Mapping[str, str], name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise SettingsError(f"{name} is required.")
     return value
+
+
+def _optional(values: Mapping[str, str], name: str) -> str | None:
+    value = values.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise SettingsError(f"{name} must be text when configured.")
+    return value.strip() or None
+
+
+def _slack_webhook_url(values: Mapping[str, str]) -> str | None:
+    name = "RELIUM_SLACK_WEBHOOK_URL"
+    value = _optional(values, name)
+    if value is None:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(value)
+        valid = (
+            parsed.scheme == "https"
+            and parsed.hostname in {"hooks.slack.com", "hooks.slack-gov.com"}
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.port in {None, 443}
+            and parsed.path.startswith("/services/")
+            and bool(parsed.path.removeprefix("/services/").strip("/"))
+            and not parsed.params
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except (TypeError, ValueError):
+        valid = False
+    if not valid:
+        raise SettingsError(f"{name} must be a valid Slack HTTPS webhook URL.")
+    return value
+
+
+def _boolean(values: Mapping[str, str], name: str, *, default: str) -> bool:
+    raw = values.get(name, default)
+    if not isinstance(raw, str) or raw.strip().lower() not in {"true", "false"}:
+        raise SettingsError(f"{name} must be true or false.")
+    return raw.strip().lower() == "true"
 
 
 def _integer(
@@ -118,6 +183,7 @@ def _number(
     *,
     default: str,
     minimum_exclusive: float,
+    maximum: float | None = None,
 ) -> float:
     raw = values.get(name, default)
     try:
@@ -125,6 +191,8 @@ def _number(
     except (TypeError, ValueError):
         raise SettingsError(f"{name} must be a valid number.") from None
     if not math.isfinite(value) or value <= minimum_exclusive:
+        raise SettingsError(f"{name} is outside the allowed range.")
+    if maximum is not None and value > maximum:
         raise SettingsError(f"{name} is outside the allowed range.")
     return value
 

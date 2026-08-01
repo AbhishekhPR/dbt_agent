@@ -61,10 +61,26 @@ Set these environment variables before startup:
 - `RELIUM_HOST`: bind address; default `0.0.0.0`.
 - `RELIUM_PORT`: bind port; default `8000`.
 - `RELIUM_MAX_BODY_BYTES`: webhook body limit; default `2097152`.
+- `RELIUM_SLACK_WEBHOOK_URL`: optional Slack or Slack Gov HTTPS incoming
+  webhook. If absent, Slack output is disabled.
+- `RELIUM_SLACK_NOTIFY_WARN`: send WARN reviews as well as BLOCK; default
+  `false`.
+- `RELIUM_SLACK_MAX_RETRIES`: retry count after the initial Slack attempt,
+  from `0` through `5`; default `2`.
+- `RELIUM_SLACK_RETRY_BASE_SECONDS`: Slack exponential backoff base greater
+  than `0` and no more than `10`; default `1`. Each delay is capped at ten
+  seconds.
 
 Settings are loaded only by the explicit server entrypoint. Secrets and private-key
 contents are excluded from settings representations, responses, and operational
 logs.
+
+Slack is a secondary output. GitHub comment/check publication completes first,
+and Slack state is then recorded in the same repository-scoped publication
+journal. Slack failure cannot roll back or fail completed GitHub publication.
+ALLOW and neutral results remain silent. Payloads contain a bounded repository,
+model, health, finding count, optional KPI, and GitHub review link; they never
+contain SQL or finding evidence.
 
 ## GitHub App configuration
 
