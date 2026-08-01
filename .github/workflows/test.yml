@@ -3,11 +3,11 @@ name: Run Relium Tests
 on:
   push:
     branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
 
 permissions:
   contents: read
-  pull_request:
-    branches: [main, develop]
 
 jobs:
   test:

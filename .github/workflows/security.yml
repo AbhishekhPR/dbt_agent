@@ -3,11 +3,11 @@ name: Dependency and Security Gates
 on:
   push:
     branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
 
 permissions:
   contents: read
-  pull_request:
-    branches: [main, develop]
 
 jobs:
   security:
