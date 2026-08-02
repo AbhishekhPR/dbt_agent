@@ -382,13 +382,74 @@ class GitHubCompletenessTests(unittest.TestCase):
             def __exit__(self, *args):
                 return False
 
+        requests = []
+
         def transport(request):
+            requests.append(request.full_url)
             if "page=2" in request.full_url:
                 return Response([{"id": 201, "body": "owned"}])
+            if "per_page=100" not in request.full_url:
+                return Response([{"id": i, "body": "default-page"} for i in range(30)])
             return Response([{"id": i, "body": "other"} for i in range(100)])
 
         comments = GitHubClient(transport=transport).list_issue_comments("a", "r", 1)
         self.assertEqual(comments[-1]["id"], 201)
+        self.assertIn("page=1", requests[0])
+        self.assertIn("per_page=100", requests[0])
+        self.assertEqual(len(requests), 2)
+
+    def test_live_shaped_page_two_owned_marker_is_updated_not_duplicated(self):
+        from agent.github_app.client import GitHubClient
+        from agent.github_app.comments import upsert_review_comment
+
+        class Response:
+            status = 200
+            headers = {}
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def read(self):
+                return json.dumps(self.payload).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        writes = []
+        marker = "<!-- relium-github-app-review -->"
+
+        def transport(request):
+            if request.method == "PATCH":
+                writes.append((request.method, request.full_url))
+                return Response({"id": 5159337517, "body": marker})
+            if request.method == "POST":
+                writes.append((request.method, request.full_url))
+                return Response({"id": 5159354458, "body": marker})
+            if "page=2" in request.full_url:
+                return Response([
+                    {
+                        "id": 5159337517,
+                        "body": f"{marker}\nold review",
+                        "performed_via_github_app": {"id": 4456468},
+                    }
+                ])
+            return Response([{"id": index, "body": "sentinel"} for index in range(100)])
+
+        result = upsert_review_comment(
+            GitHubClient("token", transport=transport),
+            owner="AbhishekhPR",
+            repository="relium-e2e-dbt",
+            pull_number=15,
+            body="updated review",
+            expected_app_id=4456468,
+        )
+
+        self.assertEqual(result["id"], 5159337517)
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0][0], "PATCH")
 
 
 class PublicationCrashTests(unittest.TestCase):
