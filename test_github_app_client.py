@@ -195,6 +195,38 @@ class GitHubAppClientTests(unittest.TestCase):
                     requests[0].get_header("Authorization"), f"Bearer {token}"
                 )
 
+    def test_installation_token_request_inherits_minimal_permissions(self):
+        from agent.github_app.client import GitHubClient
+
+        requests = []
+
+        def transport(request):
+            requests.append(request)
+            return _Response(
+                201,
+                {
+                    "token": "installation-secret",
+                    "permissions": {
+                        "checks": "write",
+                        "contents": "read",
+                        "issues": "write",
+                        "metadata": "read",
+                        "pull_requests": "read",
+                    },
+                },
+            )
+
+        GitHubClient(transport=transport).create_installation_access_token(
+            9, "app-jwt-secret"
+        )
+
+        self.assertEqual(requests[0].method, "POST")
+        self.assertEqual(
+            requests[0].selector,
+            "/app/installations/9/access_tokens",
+        )
+        self.assertIsNone(requests[0].data)
+
     def test_403_preserves_only_safe_operation_diagnostics(self):
         from agent.github_app.client import GitHubAPIError, GitHubClient
 

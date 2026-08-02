@@ -6,6 +6,7 @@ import time
 import urllib.error
 from dataclasses import dataclass, field, replace
 
+from agent.github_app.auth import AuthenticationError
 from agent.github_app.client import GitHubAPIError, safe_github_error_fields
 
 
@@ -95,6 +96,8 @@ def is_retryable_error(error: Exception) -> bool:
 
 
 def safe_error_category(error: Exception) -> str:
+    if isinstance(error, AuthenticationError):
+        return "configuration"
     if isinstance(error, GitHubAPIError):
         status = error.status_code
         if status == 429:

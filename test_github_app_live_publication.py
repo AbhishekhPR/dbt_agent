@@ -73,9 +73,11 @@ class GitHubAppLivePublicationTests(unittest.TestCase):
                     {
                         "token": STATELESS_TOKEN,
                         "permissions": {
+                            "checks": "write",
                             "contents": "read",
                             "issues": "write",
-                            "checks": "write",
+                            "metadata": "read",
+                            "pull_requests": "read",
                         },
                     },
                 )

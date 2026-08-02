@@ -444,7 +444,16 @@ class GitHubAppRunnerTests(unittest.TestCase):
         }).encode()
         signature = "sha256=" + hmac.new(b"secret", body, hashlib.sha256).hexdigest()
         installation_client = Mock()
-        installation_client.create_installation_access_token.return_value = {"token": "token"}
+        installation_client.create_installation_access_token.return_value = {
+            "token": "token",
+            "permissions": {
+                "checks": "write",
+                "contents": "read",
+                "issues": "write",
+                "metadata": "read",
+                "pull_requests": "read",
+            },
+        }
         scoped_client = Mock()
         installation_client.with_token.return_value = scoped_client
         runner = Mock()

@@ -87,9 +87,14 @@ contain SQL or finding evidence.
 Grant only the permissions used by Phase 1:
 
 - repository contents: read;
-- pull requests or issues: write, for the sticky review comment;
+- pull requests: read;
+- issues: write, for the sticky review comment;
 - checks: write, for the Relium check run;
 - metadata: read.
+
+Installation tokens inherit this minimal permission set. The server rejects a
+token before publication if GitHub returns a missing, downgraded, or additional
+permission.
 
 Subscribe to the **Pull request** webhook event. Configure the webhook URL as
 `https://<service-host>/github/webhook`, use JSON content type, and set the same
