@@ -233,7 +233,7 @@ class GitHubClient:
         path = f"/repos/{owner}/{repository}/issues/{pull_number}/comments"
         first = self._request(
             "GET",
-            path,
+            f"{path}?page=1&per_page=100",
             operation="list_issue_comments",
             route_template="/repos/{owner}/{repo}/issues/{pull_number}/comments",
         )
