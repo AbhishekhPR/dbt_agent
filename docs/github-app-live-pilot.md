@@ -20,15 +20,16 @@ Set repository permissions exactly as follows:
 
 - Contents: Read
 - Issues: Read and write
-- Pull requests: Read
+- Pull requests: Read and write
 - Checks: Read and write
 - Metadata: Read
 
 Subscribe to **Pull request** and no other event for this pilot. GitHub represents
 pull-request discussion comments through the Issues API, so Issues write access is
-required even though Relium comments on a pull request. Pull requests read access
-allows the App to receive and inspect the pull-request event; Checks write access
-allows it to publish the Relium check run.
+required even though Relium comments on a pull request. Pull requests write access
+allows the App to publish on pull-request subjects as well as receive and inspect
+the pull-request event; Checks write access allows it to publish the Relium check
+run.
 
 Generate the webhook secret with a local password manager or a command such as
 `openssl rand -hex 32`. Place it only in the ignored local environment file below;

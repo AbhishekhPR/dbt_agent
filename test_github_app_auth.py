@@ -9,7 +9,7 @@ APPROVED_INSTALLATION_PERMISSIONS = {
     "contents": "read",
     "issues": "write",
     "metadata": "read",
-    "pull_requests": "read",
+    "pull_requests": "write",
 }
 
 
@@ -77,7 +77,7 @@ class GitHubAppAuthTests(unittest.TestCase):
             REQUIRED_INSTALLATION_TOKEN_PERMISSIONS["contents"], "read"
         )
         self.assertEqual(
-            REQUIRED_INSTALLATION_TOKEN_PERMISSIONS["pull_requests"], "read"
+            REQUIRED_INSTALLATION_TOKEN_PERMISSIONS["pull_requests"], "write"
         )
         client = Mock()
         client.create_installation_access_token.return_value = {

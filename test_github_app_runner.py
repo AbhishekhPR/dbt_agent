@@ -451,7 +451,7 @@ class GitHubAppRunnerTests(unittest.TestCase):
                 "contents": "read",
                 "issues": "write",
                 "metadata": "read",
-                "pull_requests": "read",
+                "pull_requests": "write",
             },
         }
         scoped_client = Mock()

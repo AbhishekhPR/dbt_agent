@@ -87,7 +87,7 @@ contain SQL or finding evidence.
 Grant only the permissions used by Phase 1:
 
 - repository contents: read;
-- pull requests: read;
+- pull requests: write, for pull-request subject comments;
 - issues: write, for the sticky review comment;
 - checks: write, for the Relium check run;
 - metadata: read.
