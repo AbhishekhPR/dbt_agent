@@ -10,7 +10,7 @@ APPROVED_INSTALLATION_PERMISSIONS = {
     "contents": "read",
     "issues": "write",
     "metadata": "read",
-    "pull_requests": "read",
+    "pull_requests": "write",
 }
 
 
