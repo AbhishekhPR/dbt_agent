@@ -7,6 +7,15 @@ class AuthenticationError(ValueError):
     """Raised when GitHub App credentials or token responses are invalid."""
 
 
+REQUIRED_INSTALLATION_TOKEN_PERMISSIONS = {
+    "checks": "write",
+    "contents": "read",
+    "issues": "write",
+    "metadata": "read",
+    "pull_requests": "read",
+}
+
+
 def create_app_jwt(app_id, private_key_pem, *, now=None, signer=None) -> str:
     if isinstance(app_id, bool) or not str(app_id).isdigit() or int(app_id) <= 0:
         raise AuthenticationError("GitHub App id must be a positive integer.")
@@ -27,7 +36,35 @@ def get_installation_token(client, installation_id: int, app_jwt: str) -> str:
     token = response.get("token") if isinstance(response, dict) else None
     if not isinstance(token, str) or not token:
         raise AuthenticationError("GitHub did not return an installation token.")
+    _validate_installation_token_permissions(response.get("permissions"))
     return token
+
+
+def _validate_installation_token_permissions(permissions) -> None:
+    if not isinstance(permissions, dict) or not permissions:
+        raise AuthenticationError(
+            "GitHub did not return an installation token permission map."
+        )
+    required = [
+        f"{name}:{level}"
+        for name, level in REQUIRED_INSTALLATION_TOKEN_PERMISSIONS.items()
+        if permissions.get(name) != level
+    ]
+    unapproved = sorted(
+        set(permissions) - set(REQUIRED_INSTALLATION_TOKEN_PERMISSIONS)
+    )
+    if not required and not unapproved:
+        return
+    details = []
+    if required:
+        details.append("required " + ", ".join(required))
+    if unapproved:
+        details.append("unapproved " + ", ".join(unapproved))
+    raise AuthenticationError(
+        "GitHub installation token permissions do not match the approved minimal set: "
+        + "; ".join(details)
+        + "."
+    )
 
 
 def _encode_json(value) -> str:

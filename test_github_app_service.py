@@ -5,6 +5,15 @@ import unittest
 from unittest.mock import Mock
 
 
+APPROVED_INSTALLATION_PERMISSIONS = {
+    "checks": "write",
+    "contents": "read",
+    "issues": "write",
+    "metadata": "read",
+    "pull_requests": "read",
+}
+
+
 def _body():
     return json.dumps(
         {
@@ -132,7 +141,8 @@ class GitHubAppServiceTests(unittest.TestCase):
 
         installation_client = Mock()
         installation_client.create_installation_access_token.return_value = {
-            "token": "installation-token"
+            "token": "installation-token",
+            "permissions": APPROVED_INSTALLATION_PERMISSIONS,
         }
         scoped_client = Mock()
         installation_client.with_token.return_value = scoped_client
@@ -155,6 +165,47 @@ class GitHubAppServiceTests(unittest.TestCase):
         runner.run.assert_called_once_with(
             runner.run.call_args.args[0], scoped_client, expected_app_id=123
         )
+
+    def test_missing_issues_write_fails_before_live_publication_and_logs_no_secrets(self):
+        from agent.github_app.adapter import GitHubAppAdapter
+        from agent.github_app.auth import AuthenticationError
+        from agent.github_app.service import WebhookProcessingService
+
+        installation_client = Mock()
+        permissions = dict(APPROVED_INSTALLATION_PERMISSIONS)
+        permissions["issues"] = "read"
+        installation_client.create_installation_access_token.return_value = {
+            "token": "installation-token-secret",
+            "permissions": permissions,
+        }
+        runner = Mock()
+        logger = Mock()
+        adapter = GitHubAppAdapter(
+            webhook_secret="webhook-secret",
+            app_id=123,
+            private_key="private-key-secret",
+            runner=runner,
+            client_factory=Mock(return_value=installation_client),
+            jwt_factory=Mock(return_value="app-jwt-secret"),
+        )
+
+        with self.assertRaisesRegex(AuthenticationError, "issues:write"):
+            WebhookProcessingService(adapter, logger=logger).process(_job())
+
+        installation_client.with_token.assert_not_called()
+        runner.run.assert_not_called()
+        self.assertEqual(
+            logger.error.call_args.kwargs["extra"]["error_category"],
+            "configuration",
+        )
+        logged = str(logger.error.call_args)
+        for secret in (
+            "installation-token-secret",
+            "app-jwt-secret",
+            "webhook-secret",
+            "private-key-secret",
+        ):
+            self.assertNotIn(secret, logged)
 
     def test_existing_adapter_handle_still_verifies_signature(self):
         from agent.github_app.adapter import GitHubAppAdapter
