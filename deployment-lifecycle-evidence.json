@@ -1,0 +1,8 @@
+{
+  "local_transition_tests": "PASS",
+  "outbox_atomicity": "PASS",
+  "tenant_isolation": "PASS",
+  "postgres_authoritative_target": true,
+  "filesystem_pilot_retained": true,
+  "live_validation": "BLOCKED BY CREDENTIALS"
+}
