@@ -1,14 +1,23 @@
 import copy
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import yaml
 
+from agent.evidence_policy import EvidencePolicyVersion, default_policy
+
 
 DEFAULT_MANIFEST_PATH = "target/manifest.json"
 _ALLOWED_KEYS = frozenset(
-    {"version", "enabled", "manifest_path", "mode", "enforcement_mode"}
+    {
+        "version",
+        "enabled",
+        "manifest_path",
+        "mode",
+        "enforcement_mode",
+        "evidence_policy",
+    }
 )
 
 
@@ -41,6 +50,7 @@ class RepositoryConfig:
     # enforcement_mode is authoritative and defaults to shadow.
     mode: str = "warn"
     enforcement_mode: str = "shadow"
+    evidence_policy: EvidencePolicyVersion = field(default_factory=default_policy)
 
 
 def load_repository_config(content) -> RepositoryConfig:
@@ -89,12 +99,26 @@ def load_repository_config(content) -> RepositoryConfig:
         raise RepositoryConfigError(
             "Repository config enforcement_mode must be shadow or enforce."
         )
+    try:
+        if values.get("evidence_policy") is None:
+            evidence_policy = default_policy()
+        else:
+            policy_payload = values["evidence_policy"]
+            parsed_policy = EvidencePolicyVersion.from_mapping(policy_payload)
+            requirements = dict(default_policy().requirements)
+            requirements.update(parsed_policy.requirements)
+            evidence_policy = EvidencePolicyVersion.create(
+                parsed_policy.version, requirements
+            )
+    except (TypeError, ValueError) as exc:
+        raise RepositoryConfigError(str(exc)) from exc
     return RepositoryConfig(
         version=version,
         enabled=enabled,
         manifest_path=manifest_path,
         mode=mode,
         enforcement_mode=enforcement_mode,
+        evidence_policy=evidence_policy,
     )
 
 

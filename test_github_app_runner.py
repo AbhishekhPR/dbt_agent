@@ -606,6 +606,59 @@ class GitHubAppRunnerTests(unittest.TestCase):
         )
         reviewer.assert_not_called()
 
+    def test_missing_required_manifest_has_incomplete_coverage_and_shadow_warn(self):
+        from agent.github_app.client import GitHubNotFoundError
+        from agent.github_app.runner import PullRequestReviewRunner
+        from agent.github_app.storage import RepositoryStorage
+
+        client = FakeClient()
+        original = client.get_file
+
+        def get_file(owner, repository, path, ref):
+            if path == "build/manifest.json":
+                raise GitHubNotFoundError("missing", status_code=404)
+            return original(owner, repository, path, ref)
+
+        client.get_file = get_file
+        with tempfile.TemporaryDirectory() as tmp:
+            response = PullRequestReviewRunner(
+                storage=RepositoryStorage(tmp)
+            ).run(_event("missing-required-policy"), client, expected_app_id=123)
+
+        self.assertEqual(response["result"]["decision"], "WARN")
+        self.assertEqual(response["result"]["health"], 100)
+        self.assertEqual(response["result"]["coverage"], "INCOMPLETE")
+        self.assertEqual(client.checks[0]["conclusion"], "neutral")
+
+    def test_missing_required_manifest_blocks_enforce(self):
+        from agent.github_app.client import GitHubNotFoundError
+        from agent.github_app.runner import PullRequestReviewRunner
+        from agent.github_app.storage import RepositoryStorage
+
+        client = FakeClient()
+        client.config_content = (
+            b"version: 1\nenforcement_mode: enforce\n"
+            b"manifest_path: build/manifest.json\n"
+        )
+
+        def get_file(owner, repository, path, ref):
+            if path == "relium.yml":
+                return client.config_content
+            if path == "build/manifest.json":
+                raise GitHubNotFoundError("missing", status_code=404)
+            return json.dumps({"nodes": {}}).encode()
+
+        client.get_file = get_file
+        with tempfile.TemporaryDirectory() as tmp:
+            response = PullRequestReviewRunner(
+                storage=RepositoryStorage(tmp)
+            ).run(_event("missing-required-enforce"), client, expected_app_id=123)
+
+        self.assertEqual(response["result"]["decision"], "BLOCK")
+        self.assertEqual(response["result"]["health"], 100)
+        self.assertEqual(response["result"]["coverage"], "INCOMPLETE")
+        self.assertEqual(client.checks[0]["conclusion"], "failure")
+
     def test_missing_config_uses_defaults_and_missing_manifest_is_actionable(self):
         from agent.github_app.client import GitHubNotFoundError
         from agent.github_app.runner import PullRequestReviewRunner

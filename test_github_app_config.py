@@ -36,6 +36,20 @@ class GitHubAppConfigTests(unittest.TestCase):
         self.assertEqual(config.mode, "warn")
         self.assertEqual(config.enforcement_mode, "enforce")
 
+    def test_partial_evidence_policy_overrides_preserve_default_requirements(self):
+        from agent.github_app.config import load_repository_config
+
+        config = load_repository_config(
+            "evidence_policy:\n"
+            "  version: team-v2\n"
+            "  sources:\n"
+            "    slack: disabled\n"
+        )
+
+        self.assertEqual(config.evidence_policy.version, "team-v2")
+        self.assertEqual(config.evidence_policy.requirements["slack"].value, "disabled")
+        self.assertEqual(config.evidence_policy.requirements["head_manifest"].value, "required")
+
     def test_legacy_block_mode_does_not_enable_enforcement(self):
         from agent.github_app.config import load_repository_config
 

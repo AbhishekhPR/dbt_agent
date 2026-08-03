@@ -1,6 +1,7 @@
 import json
 
 from agent.deployment_review_service import review_manifest_change
+from agent.evidence_policy import EvidenceState, evaluate_evidence_policy
 from agent.github_app.checks import CHECK_NAME, create_review_check
 from agent.github_app.client import GitHubNotFoundError
 from agent.github_app.comments import upsert_review_comment
@@ -73,6 +74,8 @@ class PullRequestReviewRunner:
                 status="missing_manifest",
                 message=message,
                 expected_app_id=expected_app_id,
+                evidence_policy=config.evidence_policy,
+                missing_evidence="head_manifest",
             )
         try:
             manifest = json.loads(manifest_content.decode("utf-8"))
@@ -152,8 +155,31 @@ class PullRequestReviewRunner:
         status,
         message,
         expected_app_id,
+        evidence_policy=None,
+        missing_evidence=None,
     ):
-        result = {"decision": "SKIPPED", "rendered": {"markdown": f"## Relium deployment review\n\n{message}"}}
+        result = {
+            "decision": "SKIPPED",
+            "rendered": {"markdown": f"## Relium deployment review\n\n{message}"},
+        }
+        if evidence_policy is not None and missing_evidence is not None:
+            coverage = evaluate_evidence_policy(
+                mode=enforcement_mode,
+                policy=evidence_policy,
+                evidence={missing_evidence: EvidenceState.MISSING},
+                health=100,
+            )
+            result.update(coverage.to_dict())
+            result["evidence_reasons"] = [message, *coverage.reasons]
+            result["incident"] = {
+                "decision": coverage.decision,
+                "health": coverage.health,
+                "severity": "LOW",
+                "confidence": 0,
+                "top_reasons": [message, *coverage.reasons],
+                "recommendation": "Provide the required evidence before relying on this review.",
+                "affected_models": [],
+            }
         return self._publish(
             event,
             client,
