@@ -7,6 +7,7 @@ from sqlglot import expressions as exp
 
 from agent.signals import Severity, Signal
 from agent.sql_analyzer import analyze_sql_logic
+from agent.sql_detectors import run_sql_detectors
 
 
 RULE_RECOMMENDATIONS = {
@@ -44,12 +45,40 @@ SEVERITY_SCORES = {
 }
 
 
-def run_ast_analysis(sql: str, model_name: str, dialect: str | None = None) -> dict:
+def run_ast_analysis(
+    sql: str,
+    model_name: str,
+    dialect: str | None = None,
+    *,
+    base_sql: str | None = None,
+    detector_metadata: dict | None = None,
+    sql_source: str = "raw",
+) -> dict:
     sql = sql or ""
     report = analyze_sql_logic(model_name, sql)
     findings = list(report.get("findings", [])) + _additional_findings(
         sql,
         dialect=dialect,
+    )
+    findings.extend(
+        {
+            "rule_id": item["finding_type"],
+            "severity": item["severity"],
+            "title": item["finding_type"],
+            "evidence": item["evidence"],
+            "why_it_matters": item["limitations"],
+            "recommendation": item["remediation"],
+            "confidence": "medium",
+            "detector": item,
+        }
+        for item in run_sql_detectors(
+            sql,
+            model_name=model_name,
+            base_sql=base_sql,
+            metadata=detector_metadata,
+            dialect=dialect,
+            source=sql_source,
+        )
     )
     bugs = [_bug_from_finding(finding) for finding in findings]
     overall_risk = _overall_risk(findings)

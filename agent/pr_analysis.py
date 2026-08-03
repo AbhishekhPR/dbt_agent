@@ -282,7 +282,20 @@ def _ast_signal(model_spec: Any, model_name: str) -> Signal | None:
     if not isinstance(sql, str) or not sql.strip():
         return None
 
-    ast_result = run_ast_analysis(sql, model_name)
+    ast_result = run_ast_analysis(
+        sql,
+        model_name,
+        base_sql=_value(model_spec, "base_sql"),
+        detector_metadata=_value(model_spec, "detector_metadata")
+        or {
+            "declared_grain": _value(model_spec, "declared_grain", []),
+            "relationships": _value(model_spec, "relationships", {}),
+            "unique_keys": _value(model_spec, "unique_keys", {}),
+            "incremental": _value(model_spec, "incremental", False),
+            "required_lookback_days": _value(model_spec, "required_lookback_days"),
+        },
+        sql_source=_value(model_spec, "sql_source", "raw"),
+    )
     signal = ast_to_signal(ast_result)
     signal.metadata.update(
         {
