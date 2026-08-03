@@ -58,7 +58,7 @@ def _relation_names(sql: str) -> list[str]:
 def _cross_join(sql: str, metadata: dict[str, Any]) -> dict[str, Any] | None:
     approved = {str(value).lower() for value in metadata.get("approved_cartesian_relations", [])}
     explicit = re.search(r'\bcross\s+join\s+([\w\.\"]+)', sql, re.I)
-    implicit = bool(re.search(r'\bfrom\s+[^,]+,\s*[\w\.\"]+', sql, re.I))
+    implicit = bool(re.search(r'\bfrom\s+[\w\.\"]+(?:\s+\w+)?\s*,\s*[\w\.\"]+', sql, re.I))
     if explicit and explicit.group(1).lower().strip('"') in approved:
         return None
     if explicit or implicit:
