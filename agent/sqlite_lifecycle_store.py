@@ -102,6 +102,10 @@ class SQLiteLifecycleStore:
         row = self.connection.execute("SELECT policy_version, detector_version, threshold_version FROM configuration_versions WHERE organization_id=? AND repository_id=? AND environment=?", (organization_id, repository_id, environment)).fetchone()
         return dict(row) if row else {}
 
+    def list_lineage(self, organization_id, repository_id, environment):
+        self._tenant(organization_id, repository_id, environment, allow_disconnected=True)
+        return [json.loads(row["payload"]) | {"lineage_id": row["lineage_id"]} for row in self.connection.execute("SELECT lineage_id, payload FROM lineage_records WHERE organization_id=? AND repository_id=? AND environment=?", (organization_id, repository_id, environment))]
+
     def delete_tenant(self, organization_id):
         now = datetime.now(timezone.utc).isoformat()
         self.connection.execute("INSERT OR REPLACE INTO retention_tombstones VALUES (?, ?)", (organization_id, now))
