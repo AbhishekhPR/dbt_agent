@@ -16,6 +16,23 @@ from agent.signals import Severity, Signal
 
 
 class PrAnalysisTests(unittest.TestCase):
+    def test_cardinality_observation_becomes_attributed_signal(self):
+        incident = analyze_changed_models([{
+            "model_name": "customers",
+            "sql": "select customer_id from customers",
+            "cardinality_observation": {
+                "model_identity": "customers", "declared_grain": ["customer_id"],
+                "key_columns": ["customer_id"], "current_distinct_key_count": 1,
+                "previous_distinct_key_count": 100, "current_row_count": 100,
+                "previous_row_count": 100, "historical_baseline_window": [100, 100],
+                "sample_size": 100, "deployment_id": "dep-cardinality",
+            },
+        }])
+        cardinality = [signal for signal in incident.signals if signal.component == "cardinality"]
+        self.assertEqual(len(cardinality), 1)
+        self.assertEqual(cardinality[0].metadata["evaluation_status"], "CRITICAL")
+        self.assertEqual(cardinality[0].metadata["cardinality"]["deployment_id"], "dep-cardinality")
+
     def test_multiple_models_are_analyzed_and_one_incident_is_created(self):
         changed_models = [
             {
