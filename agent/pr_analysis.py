@@ -11,6 +11,7 @@ from agent.blast_radius import to_signal as blast_radius_to_signal
 from agent.business_metrics import calculate_operational_metrics
 from agent.business_metrics import evaluate_metric_reliability
 from agent.business_metrics import to_signal as business_metrics_to_signal
+from agent.cardinality_collapse import evaluate_cardinality_collapse
 from agent.decision_assembly import assemble_decision_incident
 from agent.deployment_outcomes import analyze_outcome_history
 from agent.deployment_outcomes import outcome_history_to_signal
@@ -112,6 +113,7 @@ def analyze_changed_models(
         model_signals = [
             _ast_signal(model_spec, model_name),
             _metadata_signal(model_spec, model_name),
+            _cardinality_signal(model_spec),
             drift_signal,
             _blast_radius_signal(model_spec, model_name),
             _historical_reliability_signal(model_spec),
@@ -282,7 +284,22 @@ def _ast_signal(model_spec: Any, model_name: str) -> Signal | None:
     if not isinstance(sql, str) or not sql.strip():
         return None
 
-    ast_result = run_ast_analysis(sql, model_name)
+    detector_metadata = _value(model_spec, "detector_metadata")
+    if detector_metadata is None:
+        candidate_metadata = {
+            "declared_grain": _value(model_spec, "declared_grain", []),
+            "relationships": _value(model_spec, "relationships", {}),
+            "unique_keys": _value(model_spec, "unique_keys", {}),
+            "incremental": _value(model_spec, "incremental", False),
+            "required_lookback_days": _value(model_spec, "required_lookback_days"),
+        }
+        detector_metadata = candidate_metadata if any(candidate_metadata.values()) else None
+    options = {}
+    if _value(model_spec, "base_sql") is not None:
+        options["base_sql"] = _value(model_spec, "base_sql")
+    if detector_metadata is not None:
+        options["detector_metadata"] = detector_metadata
+    ast_result = run_ast_analysis(sql, model_name, **options)
     signal = ast_to_signal(ast_result)
     signal.metadata.update(
         {
@@ -309,6 +326,24 @@ def _metadata_signal(model_spec: Any, model_name: str) -> Signal:
         list(_value(model_spec, "key_columns", []) or []),
     )
     return metadata_checks_to_signal(metadata_result)
+
+
+def _cardinality_signal(model_spec: Any) -> Signal | None:
+    observation = _value(model_spec, "cardinality_observation")
+    if not isinstance(observation, dict):
+        return None
+    result = evaluate_cardinality_collapse(observation)
+    status = result.get("status")
+    severity = {"CRITICAL": "critical", "WARN": "high", "HEALTHY": "low"}.get(status, "low")
+    score = {"CRITICAL": -50, "WARN": -35}.get(status, 0)
+    return Signal(
+        component="cardinality",
+        severity=severity,
+        confidence=90 if status in {"CRITICAL", "WARN", "HEALTHY"} else 0,
+        score=score,
+        reasons=list(result.get("reasons") or [result.get("reason", "Cardinality evidence not evaluated.")]),
+        metadata={"evaluation_status": status, "cardinality": result},
+    )
 
 
 def _drift_signal(

@@ -1,0 +1,8 @@
+{
+  "scenario": "PR-review-deployment-monitoring-anomaly-RCA-resolution",
+  "runs": 2,
+  "normalized_evidence_equal": true,
+  "status": "PASS",
+  "warehouse": "SQLite deterministic adapter",
+  "slack": "BLOCKED BY CREDENTIALS"
+}

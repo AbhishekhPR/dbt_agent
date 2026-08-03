@@ -1,4 +1,14 @@
+from agent.rca_engine import build_rca
+
+
 def analyze_root_cause(anomaly: dict) -> dict:
+    if any(key in anomaly for key in ("deployments", "sql_findings", "lineage")):
+        return build_rca(
+            anomaly=anomaly,
+            deployments=list(anomaly.get("deployments") or []),
+            sql_findings=list(anomaly.get("sql_findings") or []),
+            lineage=dict(anomaly.get("lineage") or {}),
+        )
     table = anomaly.get("table") or anomaly.get("affected_file") or "unknown"
     message = anomaly.get("message") or anomaly.get("explanation") or "Anomaly detected"
     return {

@@ -6,6 +6,14 @@ from agent.ast_analyzer import run_ast_analysis, to_signal
 
 
 class DivisionByZeroRiskTests(unittest.TestCase):
+    def test_supported_detector_registry_is_connected_to_ast_reports(self):
+        report = run_ast_analysis(
+            "select * from customers c join orders o on c.id = o.customer_id",
+            "customers",
+            base_sql="select * from customers c left join orders o on c.id = o.customer_id",
+        )
+        self.assertIn("C06_LEFT_TO_INNER_JOIN", [bug["rule"] for bug in report["bugs"]])
+
     def test_unguarded_division_is_flagged(self):
         sql = "SELECT revenue / orders_count AS avg_order_value FROM fct_orders"
         report = run_ast_analysis(sql, "fct_orders")

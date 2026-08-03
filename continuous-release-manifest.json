@@ -1,0 +1,11 @@
+{
+  "release": "continuous-pipeline-functional-e2e",
+  "verdict": "CONTINUOUS PIPELINE FUNCTIONAL E2E PASSED",
+  "backend_worktree": "continuous-pipeline",
+  "authoritative_store": "postgresql-target",
+  "local_store": "sqlite-deterministic",
+  "live_github": "BLOCKED BY CREDENTIALS",
+  "real_warehouse": "BLOCKED BY CREDENTIALS",
+  "real_slack": "BLOCKED BY CREDENTIALS",
+  "universal_sql_semantics_claim": false
+}
