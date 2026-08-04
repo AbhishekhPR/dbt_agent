@@ -14,6 +14,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    services:
+      postgres:
+        image: postgres:18
+        # These are the container's bootstrap ADMINISTRATOR credentials, used
+        # only to provision the unprivileged relium_validation role below. The
+        # application test run never uses them.
+        env:
+          POSTGRES_USER: relium_ci_admin
+          POSTGRES_PASSWORD: relium_ci_admin_password  # pragma: allowlist secret -- ephemeral CI-only service-container password, not a real credential
+          POSTGRES_DB: relium_ci_admin
+        ports:
+          - 5432:5432
+        # The job does not start until pg_isready reports the server accepting
+        # connections, so no additional readiness polling is needed.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -36,6 +56,85 @@ jobs:
           python -m pip install --upgrade pip
           pip install --require-hashes -r requirements.lock
 
+      - name: Install PostgreSQL 18 client tools
+        # ubuntu-latest ships an older postgresql-client than the postgres:18
+        # service container; pg_dump needs to match the server's major version.
+        # The PGDG package installs to /usr/lib/postgresql/18/bin rather than
+        # replacing /usr/bin/pg_dump, so put it first on PATH explicitly.
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-18
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+
+      - name: Verify PostgreSQL client and server major versions match
+        # Guards against silent drift between the runner's client tools and the
+        # service container: a mismatched pg_dump refuses to dump the server,
+        # which previously failed the backup/restore test.
+        run: |
+          set -euo pipefail
+          server_major="$(psql -h 127.0.0.1 -U relium_ci_admin -d relium_ci_admin -tAc 'SHOW server_version_num' | cut -c1-2)"
+          echo "server major version: ${server_major}"
+          for tool in psql pg_dump pg_restore; do
+            tool_path="$(command -v "${tool}")"
+            tool_major="$("${tool}" --version | awk '{print $3}' | cut -d. -f1)"
+            echo "${tool} -> ${tool_path} (major ${tool_major})"
+            if [ "${tool_major}" != "${server_major}" ]; then
+              echo "::error::${tool} major version ${tool_major} does not match server major version ${server_major}"
+              exit 1
+            fi
+          done
+        env:
+          PGPASSWORD: relium_ci_admin_password  # pragma: allowlist secret -- ephemeral CI-only service-container password, not a real credential
+
+      - name: Provision least-privileged PostgreSQL application role
+        # The service container's POSTGRES_USER is a superuser by design of the
+        # official postgres image. Create a genuinely non-superuser application
+        # role/database on top of it so the security suite exercises the real
+        # least-privilege posture instead of the container's bootstrap admin.
+        # Administrative credentials are used only here; the test step below
+        # connects exclusively as the unprivileged application role.
+        run: |
+          psql -h 127.0.0.1 -U relium_ci_admin -d relium_ci_admin -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE relium_validation WITH LOGIN PASSWORD 'relium_validation_ci_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 10;
+          CREATE DATABASE relium_validation OWNER relium_validation;
+          REVOKE ALL ON DATABASE relium_validation FROM PUBLIC;
+          GRANT CONNECT, TEMP ON DATABASE relium_validation TO relium_validation;
+          SQL
+        env:
+          PGPASSWORD: relium_ci_admin_password  # pragma: allowlist secret -- ephemeral CI-only service-container password, not a real credential
+
+      - name: Verify the application role is genuinely least-privileged
+        # Fails the job before any test runs if the provisioning step ever stops
+        # producing an unprivileged role, so the least-privilege assertion can
+        # never pass merely because CI handed the tests an administrator.
+        run: |
+          set -euo pipefail
+          psql -h 127.0.0.1 -U relium_ci_admin -d relium_ci_admin -c \
+            "SELECT rolname, rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, rolconnlimit FROM pg_roles WHERE rolname='relium_validation'"
+          verdict="$(psql -h 127.0.0.1 -U relium_ci_admin -d relium_ci_admin -tAc \
+            "SELECT CASE WHEN rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls THEN 'LEAST_PRIVILEGED' ELSE 'OVER_PRIVILEGED' END FROM pg_roles WHERE rolname='relium_validation'")"
+          echo "verdict: ${verdict}"
+          if [ "${verdict}" != "LEAST_PRIVILEGED" ]; then
+            echo "::error::relium_validation is not a least-privileged login role"
+            exit 1
+          fi
+        env:
+          PGPASSWORD: relium_ci_admin_password  # pragma: allowlist secret -- ephemeral CI-only service-container password, not a real credential
+
+      - name: Verify the application DSN authenticates as the unprivileged role
+        run: |
+          set -euo pipefail
+          dsn_user="$(psql -h 127.0.0.1 -U relium_validation -d relium_validation -tAc 'SELECT current_user')"
+          echo "application DSN authenticates as: ${dsn_user}"
+          if [ "${dsn_user}" != "relium_validation" ]; then
+            echo "::error::application DSN did not authenticate as relium_validation"
+            exit 1
+          fi
+        env:
+          PGPASSWORD: relium_validation_ci_password  # pragma: allowlist secret -- ephemeral CI-only application-role password, not a real credential
+
       - name: Run tests
         run: |
           python -m unittest discover -s . -p "test_*.py" -v
@@ -44,6 +143,7 @@ jobs:
           GROQ_API_KEY: ""
           SLACK_WEBHOOK_URL: ""
           ENABLE_AI_EXPLAINER: "false"
+          RELIUM_TEST_POSTGRES_DSN: "postgresql://relium_validation:relium_validation_ci_password@127.0.0.1:5432/relium_validation"  # pragma: allowlist secret
 
       - name: Test summary
         if: always()
