@@ -173,7 +173,7 @@ class PostgresTenantIsolationTests(unittest.TestCase):
         anomaly_a = self.store.create_anomaly("org-a", "repo-a", "prod", deployment_id="dep-a", kind="k", payload={})
         incident_a = self.store.create_incident("org-a", "repo-a", "prod", deployment_id="dep-a", anomaly_id=anomaly_a["anomaly_id"])
         self.assertEqual(self.store.anomalies("org-b", "repo-b", "prod"), [])
-        self.assertIsNone(self.store.get_incident("nonexistent-in-org-b"))
+        self.assertIsNone(self.store.get_incident("org-b", "repo-b", "nonexistent-in-org-b"))
         # incident lookup by ID is possible (incidents are globally-unique keys), but
         # listing is always tenant-scoped, so org-b's queries never surface org-a's rows.
         self.assertEqual(
@@ -259,7 +259,8 @@ class PostgresOutboxConcurrencyTests(unittest.TestCase):
     def test_attempts_and_dead_letter_survive_restart(self):
         self.store.create_deployment("org-1", "repo-1", "prod", {"deployment_id": "dep-dl"})
         event = self.store.claim_outbox("org-1", "repo-1", "prod", "worker-1")
-        self.store.fail_outbox(event["event_id"], error="boom", max_attempts=1, retry_backoff_seconds=0)
+        self.store.fail_outbox("org-1", "repo-1", event["event_id"], error="boom",
+                               max_attempts=1, retry_backoff_seconds=0)
         self.store.close()
         # Simulate a process restart: fresh connection, fresh store instance.
         reconnected = self.Store(DSN)
@@ -323,7 +324,7 @@ class PostgresMonitoringAndRcaTests(unittest.TestCase):
         from agent.postgres_lifecycle_store import PostgresLifecycleStore
 
         resumed = PostgresLifecycleStore(DSN)
-        rcas = resumed.rca_for_incident(incident["incident_id"])
+        rcas = resumed.rca_for_incident("org-1", "repo-1", incident["incident_id"])
         self.assertEqual(len(rcas), 1)
         self.assertEqual(rcas[0]["primary_cause"]["model"], "x")
         resumed.close()

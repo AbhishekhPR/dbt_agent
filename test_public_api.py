@@ -690,7 +690,7 @@ class DashboardApiTests(PublicApiTestCase):
         with self.pool.acquire() as store:
             gh = store.record_delivery(self.org, self.repo, self.env, channel="github",
                                        event_key="pr-1", payload={"body": "x"})
-            store.mark_delivered(gh["journal_id"], remote_id="gh-1")
+            store.mark_delivered(self.org, self.repo, gh["journal_id"], remote_id="gh-1")
             store.record_delivery(self.org, self.repo, self.env, channel="dashboard",
                                   event_key="dash-1", payload={})
         body = self.client.get("/api/delivery-status", headers=self.auth).json()
