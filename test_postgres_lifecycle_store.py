@@ -457,12 +457,15 @@ class PostgresRetentionAndSecurityTests(unittest.TestCase):
 
     def test_application_role_is_not_a_postgresql_superuser_and_is_least_privileged(self):
         row = self.store.connection.execute(
-            "SELECT rolsuper, rolcreatedb, rolcreaterole, rolbypassrls FROM pg_roles WHERE rolname = current_user"
+            "SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls "
+            "FROM pg_roles WHERE rolname = current_user"
         ).fetchone()
-        self.assertFalse(row["rolsuper"])
-        self.assertFalse(row["rolcreatedb"])
-        self.assertFalse(row["rolcreaterole"])
-        self.assertFalse(row["rolbypassrls"])
+        self.assertTrue(row["rolcanlogin"], "application role must be able to log in")
+        self.assertFalse(row["rolsuper"], "application role must not be a superuser")
+        self.assertFalse(row["rolcreatedb"], "application role must not have CREATEDB")
+        self.assertFalse(row["rolcreaterole"], "application role must not have CREATEROLE")
+        self.assertFalse(row["rolreplication"], "application role must not have replication rights")
+        self.assertFalse(row["rolbypassrls"], "application role must not bypass RLS")
 
 
 if __name__ == "__main__":
