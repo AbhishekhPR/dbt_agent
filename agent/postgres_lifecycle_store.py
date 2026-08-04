@@ -83,19 +83,10 @@ class PostgresLifecycleStore:
                 (organization_id, now),
             )
             row = cur.fetchone()
-            # Junction tables with no organization_id column of their own: scope the
-            # delete through their parent table instead.
-            self.connection.execute(
-                "DELETE FROM rca_evidence_links WHERE rca_id IN "
-                "(SELECT rca_id FROM rca_reports WHERE organization_id=%s)",
-                (organization_id,),
-            )
-            self.connection.execute(
-                "DELETE FROM lineage_edges WHERE lineage_id IN "
-                "(SELECT lineage_id FROM lineage_records WHERE organization_id=%s)",
-                (organization_id,),
-            )
+            # Junction tables now carry the tenant themselves, so they are deleted
+            # by the same direct predicate as every other tenant-scoped table.
             for table in (
+                "rca_evidence_links", "lineage_edges",
                 "rca_reports", "incidents", "anomalies",
                 "monitoring_observations", "metadata_baselines", "kpi_impact",
                 "lineage_records", "outbox_dead_letters", "outbox_events",
@@ -179,8 +170,11 @@ class PostgresLifecycleStore:
     def create_deployment(self, organization_id, repository_id, environment, payload):
         self._tenant(organization_id, repository_id, environment)
         deployment_id = payload["deployment_id"]
+        # Scoped: an identifier owned by another tenant must not resolve here.
         existing = self.connection.execute(
-            "SELECT payload, status FROM deployments WHERE deployment_id=%s", (deployment_id,)
+            "SELECT payload, status FROM deployments "
+            "WHERE organization_id=%s AND repository_id=%s AND deployment_id=%s",
+            (organization_id, repository_id, deployment_id),
         ).fetchone()
         if existing:
             return {"deployment_id": deployment_id, **existing["payload"], "status": existing["status"]}
@@ -218,12 +212,14 @@ class PostgresLifecycleStore:
             raise ValueError(f"Invalid deployment transition {row['status']} -> {to_status}")
         with self.connection.transaction():
             next_seq = self.connection.execute(
-                "SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM deployment_transitions WHERE deployment_id=%s",
-                (deployment_id,),
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM deployment_transitions "
+                "WHERE organization_id=%s AND repository_id=%s AND deployment_id=%s",
+                (organization_id, repository_id, deployment_id),
             ).fetchone()["next"]
             self.connection.execute(
-                "UPDATE deployments SET status=%s, updated_at=now() WHERE deployment_id=%s",
-                (to_status, deployment_id),
+                "UPDATE deployments SET status=%s, updated_at=now() "
+                "WHERE organization_id=%s AND repository_id=%s AND deployment_id=%s",
+                (to_status, organization_id, repository_id, deployment_id),
             )
             self.connection.execute(
                 "INSERT INTO deployment_transitions "
@@ -242,7 +238,9 @@ class PostgresLifecycleStore:
     def transitions(self, organization_id, repository_id, environment, deployment_id):
         self._tenant(organization_id, repository_id, environment, allow_disconnected=True)
         rows = self.connection.execute(
-            "SELECT * FROM deployment_transitions WHERE deployment_id=%s ORDER BY sequence", (deployment_id,)
+            "SELECT * FROM deployment_transitions "
+            "WHERE organization_id=%s AND repository_id=%s AND deployment_id=%s ORDER BY sequence",
+            (organization_id, repository_id, deployment_id),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -266,8 +264,8 @@ class PostgresLifecycleStore:
             lease_expires = datetime.now(timezone.utc) + timedelta(seconds=OUTBOX_LEASE_SECONDS)
             self.connection.execute(
                 "UPDATE outbox_events SET state='CLAIMED', lease_owner=%s, lease_expires_at=%s, attempts=attempts+1 "
-                "WHERE event_id=%s AND state='PENDING'",
-                (worker, lease_expires, row["event_id"]),
+                "WHERE organization_id=%s AND repository_id=%s AND event_id=%s AND state='PENDING'",
+                (worker, lease_expires, organization_id, repository_id, row["event_id"]),
             )
         return dict(row)
 
@@ -279,16 +277,20 @@ class PostgresLifecycleStore:
             (organization_id, repository_id, environment),
         )
 
-    def complete_outbox(self, event_id):
+    def complete_outbox(self, organization_id, repository_id, event_id):
         self.connection.execute(
-            "UPDATE outbox_events SET state='COMPLETED', completed_at=now() WHERE event_id=%s AND state='CLAIMED'",
-            (event_id,),
+            "UPDATE outbox_events SET state='COMPLETED', completed_at=now() "
+            "WHERE organization_id=%s AND repository_id=%s AND event_id=%s AND state='CLAIMED'",
+            (organization_id, repository_id, event_id),
         )
 
-    def fail_outbox(self, event_id, *, error, max_attempts=5, retry_backoff_seconds=30):
+    def fail_outbox(self, organization_id, repository_id, event_id, *, error,
+                    max_attempts=5, retry_backoff_seconds=30):
         with self.connection.transaction():
             row = self.connection.execute(
-                "SELECT * FROM outbox_events WHERE event_id=%s FOR UPDATE", (event_id,)
+                "SELECT * FROM outbox_events "
+                "WHERE organization_id=%s AND repository_id=%s AND event_id=%s FOR UPDATE",
+                (organization_id, repository_id, event_id),
             ).fetchone()
             if not row or row["state"] in ("DEAD_LETTER", "COMPLETED"):
                 return
@@ -298,8 +300,9 @@ class PostgresLifecycleStore:
                 next_attempt = datetime.now(timezone.utc) + timedelta(seconds=retry_backoff_seconds)
                 self.connection.execute(
                     "UPDATE outbox_events SET state='PENDING', lease_owner=NULL, lease_expires_at=NULL, "
-                    "next_attempt_at=%s, last_error=%s WHERE event_id=%s",
-                    (next_attempt, str(error)[:2000], event_id),
+                    "next_attempt_at=%s, last_error=%s "
+                    "WHERE organization_id=%s AND repository_id=%s AND event_id=%s",
+                    (next_attempt, str(error)[:2000], organization_id, repository_id, event_id),
                 )
 
     def _dead_letter(self, row, error):
@@ -311,8 +314,9 @@ class PostgresLifecycleStore:
              row["deployment_id"], row["event_type"], self._Jsonb(row["payload"]), row["attempts"], str(error)[:2000]),
         )
         self.connection.execute(
-            "UPDATE outbox_events SET state='DEAD_LETTER', last_error=%s WHERE event_id=%s",
-            (str(error)[:2000], row["event_id"]),
+            "UPDATE outbox_events SET state='DEAD_LETTER', last_error=%s "
+            "WHERE organization_id=%s AND repository_id=%s AND event_id=%s",
+            (str(error)[:2000], row["organization_id"], row["repository_id"], row["event_id"]),
         )
 
     def dead_letters(self, organization_id, repository_id, environment):
@@ -409,9 +413,10 @@ class PostgresLifecycleStore:
             )
             for upstream, downstream in edges:
                 self.connection.execute(
-                    "INSERT INTO lineage_edges (lineage_id, upstream_model, downstream_model) VALUES (%s, %s, %s) "
-                    "ON CONFLICT DO NOTHING",
-                    (lineage_id, upstream, downstream),
+                    "INSERT INTO lineage_edges "
+                    "(lineage_id, upstream_model, downstream_model, organization_id, repository_id) "
+                    "VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                    (lineage_id, upstream, downstream, organization_id, repository_id),
                 )
         return lineage_id
 
@@ -457,24 +462,30 @@ class PostgresLifecycleStore:
             row = self.connection.execute(
                 "INSERT INTO incidents (incident_id, organization_id, repository_id, environment, deployment_id, anomaly_id, status) "
                 "VALUES (%s, %s, %s, %s, %s, %s, 'open') "
-                "ON CONFLICT (incident_id) DO NOTHING RETURNING *",
+                "ON CONFLICT (organization_id, repository_id, incident_id) DO NOTHING RETURNING *",
                 (incident_id, organization_id, repository_id, environment, deployment_id, anomaly_id),
             ).fetchone()
             if row is None:
                 row = self.connection.execute(
-                    "SELECT * FROM incidents WHERE incident_id=%s", (incident_id,)
+                    "SELECT * FROM incidents "
+                    "WHERE organization_id=%s AND repository_id=%s AND incident_id=%s",
+                    (organization_id, repository_id, incident_id),
                 ).fetchone()
         return dict(row)
 
-    def update_incident_status(self, incident_id, status):
+    def update_incident_status(self, organization_id, repository_id, incident_id, status):
         """Idempotent: setting the same status twice is a no-op, not an error."""
         self.connection.execute(
-            "UPDATE incidents SET status=%s, updated_at=now() WHERE incident_id=%s AND status != %s",
-            (status, incident_id, status),
+            "UPDATE incidents SET status=%s, updated_at=now() "
+            "WHERE organization_id=%s AND repository_id=%s AND incident_id=%s AND status != %s",
+            (status, organization_id, repository_id, incident_id, status),
         )
 
-    def get_incident(self, incident_id):
-        row = self.connection.execute("SELECT * FROM incidents WHERE incident_id=%s", (incident_id,)).fetchone()
+    def get_incident(self, organization_id, repository_id, incident_id):
+        row = self.connection.execute(
+            "SELECT * FROM incidents WHERE organization_id=%s AND repository_id=%s AND incident_id=%s",
+            (organization_id, repository_id, incident_id),
+        ).fetchone()
         return dict(row) if row else None
 
     def create_rca(self, incident_id, organization_id, repository_id, environment, *, status, primary_cause=None,
@@ -503,22 +514,30 @@ class PostgresLifecycleStore:
                     ),
                 ).fetchone()
                 for evidence_id, role in evidence_links:
+                    # Composite foreign keys make a cross-tenant evidence link
+                    # impossible to insert, not merely discouraged.
                     self.connection.execute(
-                        "INSERT INTO rca_evidence_links (rca_id, evidence_id, role) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
-                        (rca_id, evidence_id, role),
+                        "INSERT INTO rca_evidence_links "
+                        "(rca_id, evidence_id, role, organization_id, repository_id) "
+                        "VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                        (rca_id, evidence_id, role, organization_id, repository_id),
                     )
         except self._psycopg.errors.UniqueViolation:
             # The transaction block already rolled back on the way out; the
             # connection is clean, so this read runs in a fresh statement.
             existing = self.connection.execute(
-                "SELECT * FROM rca_reports WHERE incident_id=%s AND status='completed'", (incident_id,)
+                "SELECT * FROM rca_reports WHERE organization_id=%s AND repository_id=%s "
+                "AND incident_id=%s AND status='completed'",
+                (organization_id, repository_id, incident_id),
             ).fetchone()
             return dict(existing)
         return dict(row)
 
-    def rca_for_incident(self, incident_id):
+    def rca_for_incident(self, organization_id, repository_id, incident_id):
         rows = self.connection.execute(
-            "SELECT * FROM rca_reports WHERE incident_id=%s ORDER BY created_at", (incident_id,)
+            "SELECT * FROM rca_reports WHERE organization_id=%s AND repository_id=%s "
+            "AND incident_id=%s ORDER BY created_at",
+            (organization_id, repository_id, incident_id),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -541,17 +560,19 @@ class PostgresLifecycleStore:
                 ).fetchone()
         return dict(row)
 
-    def mark_delivered(self, journal_id, *, remote_id):
+    def mark_delivered(self, organization_id, repository_id, journal_id, *, remote_id):
         self.connection.execute(
             "UPDATE delivery_journal SET status='PUBLISHED', remote_id=%s, reconciled_at=now(), "
-            "attempts=attempts+1, updated_at=now() WHERE journal_id=%s",
-            (remote_id, journal_id),
+            "attempts=attempts+1, updated_at=now() "
+            "WHERE organization_id=%s AND repository_id=%s AND journal_id=%s",
+            (remote_id, organization_id, repository_id, journal_id),
         )
 
-    def mark_delivery_failed(self, journal_id):
+    def mark_delivery_failed(self, organization_id, repository_id, journal_id):
         self.connection.execute(
-            "UPDATE delivery_journal SET status='FAILED', attempts=attempts+1, updated_at=now() WHERE journal_id=%s",
-            (journal_id,),
+            "UPDATE delivery_journal SET status='FAILED', attempts=attempts+1, updated_at=now() "
+            "WHERE organization_id=%s AND repository_id=%s AND journal_id=%s",
+            (organization_id, repository_id, journal_id),
         )
 
     def deliveries(self, organization_id, repository_id, environment, *, channel=None):
@@ -619,9 +640,12 @@ class PostgresLifecycleStore:
 
     # -- idempotent event receipts -------------------------------------------
 
-    def get_event_receipt(self, event_id):
+    def get_event_receipt(self, organization_id, repository_id, event_id):
+        """Idempotency keys are per tenant: the same key in two tenants is two keys."""
         row = self.connection.execute(
-            "SELECT * FROM event_receipts WHERE event_id=%s", (event_id,)
+            "SELECT * FROM event_receipts "
+            "WHERE organization_id=%s AND repository_id=%s AND event_id=%s",
+            (organization_id, repository_id, event_id),
         ).fetchone()
         return dict(row) if row else None
 
@@ -633,7 +657,7 @@ class PostgresLifecycleStore:
             "(event_id, organization_id, repository_id, environment, status, response, "
             "payload_hash, resource_kind, resource_id) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-            "ON CONFLICT (event_id) DO NOTHING RETURNING *",
+            "ON CONFLICT (organization_id, repository_id, event_id) DO NOTHING RETURNING *",
             (event_id, organization_id, repository_id, environment, status,
              self._Jsonb(response), payload_hash, resource_kind, resource_id),
         ).fetchone()
@@ -649,13 +673,15 @@ class PostgresLifecycleStore:
             "INSERT INTO reviews (review_id, organization_id, repository_id, environment, "
             "pull_number, commit_sha, decision, enforcement_mode, risk_score, evidence_coverage, payload) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
-            "ON CONFLICT (review_id) DO NOTHING RETURNING *",
+            "ON CONFLICT (organization_id, repository_id, review_id) DO NOTHING RETURNING *",
             (review_id, organization_id, repository_id, environment, pull_number, commit_sha,
              decision, enforcement_mode, risk_score, evidence_coverage, self._Jsonb(payload or {})),
         ).fetchone()
         if row is None:
             row = self.connection.execute(
-                "SELECT * FROM reviews WHERE review_id=%s", (review_id,)
+                "SELECT * FROM reviews "
+                "WHERE organization_id=%s AND repository_id=%s AND review_id=%s",
+                (organization_id, repository_id, review_id),
             ).fetchone()
         return dict(row)
 
@@ -785,8 +811,9 @@ class PostgresLifecycleStore:
         for record in records:
             edges = self.connection.execute(
                 "SELECT upstream_model, downstream_model FROM lineage_edges "
-                "WHERE lineage_id=%s ORDER BY upstream_model, downstream_model",
-                (record["lineage_id"],),
+                "WHERE organization_id=%s AND repository_id=%s AND lineage_id=%s "
+                "ORDER BY upstream_model, downstream_model",
+                (organization_id, repository_id, record["lineage_id"]),
             ).fetchall()
             record["edges"] = [dict(e) for e in edges]
         return records
