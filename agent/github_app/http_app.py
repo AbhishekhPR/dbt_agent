@@ -79,7 +79,24 @@ def create_http_app(
                     store.connection.execute("SELECT 1")
                     applied = applied_versions(store.connection)
                     pending = pending_migrations(set(applied))
-                    return applied, [p.name for p in pending], store.outbox_stats()
+                    stats = store.outbox_stats()
+                    # Surface whether the durable outbox is actually being
+                    # consumed, so a live run can tell a stalled worker from an
+                    # idle one rather than inferring it.
+                    backlog = store.connection.execute(
+                        "SELECT COUNT(*) AS ready, MIN(next_attempt_at) AS oldest "
+                        "FROM outbox_events WHERE state='PENDING' AND next_attempt_at <= now()"
+                    ).fetchone()
+                    stalled = store.connection.execute(
+                        "SELECT COUNT(*) AS c FROM outbox_events "
+                        "WHERE state='CLAIMED' AND lease_expires_at < now()"
+                    ).fetchone()["c"]
+                    stats["ready_now"] = backlog["ready"]
+                    stats["oldest_ready_at"] = (
+                        backlog["oldest"].isoformat() if backlog["oldest"] else None
+                    )
+                    stats["expired_claims"] = stalled
+                    return applied, [p.name for p in pending], stats
 
             try:
                 applied, pending, outbox = await run_in_threadpool(probe)
