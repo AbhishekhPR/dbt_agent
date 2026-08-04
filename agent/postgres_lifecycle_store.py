@@ -1,12 +1,25 @@
-"""PostgreSQL authoritative lifecycle-store boundary.
+"""PostgreSQL authoritative lifecycle-store adapter.
 
-The local SQLite store implements the same contract for deterministic tests;
-this adapter refuses to operate without an explicitly supplied DSN.
+Implements the same externally-visible contract as
+``agent.sqlite_lifecycle_store.SQLiteLifecycleStore`` (used for deterministic
+local unit tests) plus the extended continuous-pipeline entities: monitoring,
+anomalies, incidents, RCA, lineage edges, KPI impact, outbox recovery and
+dead-lettering, delivery journals and audit events.
+
+This adapter refuses to operate without an explicitly supplied DSN and never
+falls back to SQLite, an in-memory store, or filesystem/JSON storage.
 """
+from __future__ import annotations
 
-from pathlib import Path
+import hashlib
+import json
+import uuid
+from datetime import datetime, timedelta, timezone
 
-from agent.sqlite_lifecycle_store import SQLiteLifecycleStore
+from agent.lifecycle_models import ALLOWED_TRANSITIONS
+from agent.postgres_migrate import apply_migrations
+
+OUTBOX_LEASE_SECONDS = 300
 
 
 class PostgresLifecycleStore:
@@ -17,9 +30,565 @@ class PostgresLifecycleStore:
             raise RuntimeError("POSTGRES lifecycle store is BLOCKED BY CREDENTIALS")
         try:
             import psycopg
+            from psycopg.rows import dict_row
+            from psycopg.types.json import Jsonb
         except ImportError as exc:
             raise RuntimeError("PostgreSQL lifecycle store requires psycopg") from exc
-        self.connection = psycopg.connect(dsn)
-        self.connection.execute(Path(__file__).with_name("lifecycle_schema.sql").read_text(encoding="utf-8"))
-        self.connection.commit()
+        self._psycopg = psycopg
+        self._Jsonb = Jsonb
+        # autocommit=True: every statement commits immediately and read-only
+        # methods never leave the connection idle-in-transaction (which would
+        # otherwise hold locks and starve concurrent DDL/other connections).
+        # Multi-statement operations that must be atomic use an explicit
+        # `with self.connection.transaction():` block instead.
+        self.connection = psycopg.connect(dsn, row_factory=dict_row, autocommit=True)
+        apply_migrations(self.connection)
 
+    # -- schema / tenant lifecycle -----------------------------------------
+
+    def ensure_schema(self):
+        apply_migrations(self.connection)
+
+    def ensure_tenant(self, organization_id, repository_id, environment):
+        with self.connection.transaction():
+            self.connection.execute(
+                "INSERT INTO organizations (organization_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                (organization_id,),
+            )
+            self.connection.execute(
+                "INSERT INTO repositories (organization_id, repository_id) VALUES (%s, %s) "
+                "ON CONFLICT DO NOTHING",
+                (organization_id, repository_id),
+            )
+            self.connection.execute(
+                "INSERT INTO environments (organization_id, repository_id, environment, connected) "
+                "VALUES (%s, %s, %s, TRUE) "
+                "ON CONFLICT (organization_id, repository_id, environment) DO UPDATE SET connected = TRUE",
+                (organization_id, repository_id, environment),
+            )
+
+    def disconnect_repository(self, organization_id, repository_id):
+        self.connection.execute(
+            "UPDATE environments SET connected = FALSE WHERE organization_id=%s AND repository_id=%s",
+            (organization_id, repository_id),
+        )
+
+    def delete_tenant(self, organization_id):
+        now = datetime.now(timezone.utc)
+        with self.connection.transaction():
+            cur = self.connection.execute(
+                "INSERT INTO retention_tombstones (organization_id, deleted_at) VALUES (%s, %s) "
+                "ON CONFLICT (organization_id) DO UPDATE SET deleted_at = EXCLUDED.deleted_at "
+                "RETURNING deleted_at",
+                (organization_id, now),
+            )
+            row = cur.fetchone()
+            # Junction tables with no organization_id column of their own: scope the
+            # delete through their parent table instead.
+            self.connection.execute(
+                "DELETE FROM rca_evidence_links WHERE rca_id IN "
+                "(SELECT rca_id FROM rca_reports WHERE organization_id=%s)",
+                (organization_id,),
+            )
+            self.connection.execute(
+                "DELETE FROM lineage_edges WHERE lineage_id IN "
+                "(SELECT lineage_id FROM lineage_records WHERE organization_id=%s)",
+                (organization_id,),
+            )
+            for table in (
+                "rca_reports", "incidents", "anomalies",
+                "monitoring_observations", "metadata_baselines", "kpi_impact",
+                "lineage_records", "outbox_dead_letters", "outbox_events",
+                "deployment_transitions", "deployments", "evidence", "configuration_versions",
+                "delivery_journal", "environments", "repositories",
+            ):
+                self.connection.execute(f"DELETE FROM {table} WHERE organization_id=%s", (organization_id,))
+            # Audit events are retained across tenant deletion for compliance; they are
+            # keyed by the tombstoned organization_id so they remain attributable.
+        return {"organization_id": organization_id, "deleted_at": row["deleted_at"].isoformat()}
+
+    def _tenant(self, organization_id, repository_id, environment, *, allow_disconnected=False):
+        row = self.connection.execute(
+            "SELECT connected FROM environments WHERE organization_id=%s AND repository_id=%s AND environment=%s",
+            (organization_id, repository_id, environment),
+        ).fetchone()
+        if not row or (not allow_disconnected and not row["connected"]):
+            raise ValueError("Unknown, disconnected, or unauthorized tenant")
+
+    # -- configuration / policy / detector versions -------------------------
+
+    def record_versions(self, organization_id, repository_id, environment, *, policy, detector, threshold):
+        self._tenant(organization_id, repository_id, environment)
+        self.connection.execute(
+            "INSERT INTO configuration_versions "
+            "(organization_id, repository_id, environment, policy_version, detector_version, threshold_version) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            (organization_id, repository_id, environment, policy, detector, threshold),
+        )
+        return {"policy_version": policy, "detector_version": detector, "threshold_version": threshold}
+
+    def latest_versions(self, organization_id, repository_id, environment):
+        self._tenant(organization_id, repository_id, environment, allow_disconnected=True)
+        row = self.connection.execute(
+            "SELECT policy_version, detector_version, threshold_version FROM configuration_versions "
+            "WHERE organization_id=%s AND repository_id=%s AND environment=%s "
+            "ORDER BY created_at DESC, configuration_version_id DESC LIMIT 1",
+            (organization_id, repository_id, environment),
+        ).fetchone()
+        return dict(row) if row else {}
+
+    # -- evidence -------------------------------------------------------------
+
+    def append_evidence(self, organization_id, repository_id, environment, payload, *, evidence_id=None):
+        self._tenant(organization_id, repository_id, environment)
+        evidence_id = evidence_id or str(uuid.uuid4())
+        serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(serialized.encode()).hexdigest()
+        with self.connection.transaction():
+            existing = self.connection.execute(
+                "SELECT 1 FROM evidence WHERE evidence_id=%s", (evidence_id,)
+            ).fetchone()
+            if existing:
+                raise ValueError("Evidence references are immutable")
+            self.connection.execute(
+                "INSERT INTO evidence (evidence_id, organization_id, repository_id, environment, payload, content_hash) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (evidence_id, organization_id, repository_id, environment, self._Jsonb(payload), digest),
+            )
+        return {"evidence_id": evidence_id, "hash": digest, "payload": payload}
+
+    def list_evidence(self, organization_id, repository_id, environment):
+        try:
+            self._tenant(organization_id, repository_id, environment, allow_disconnected=True)
+        except ValueError:
+            tombstoned = self.connection.execute(
+                "SELECT 1 FROM retention_tombstones WHERE organization_id=%s", (organization_id,)
+            ).fetchone()
+            if not tombstoned:
+                raise
+            return []
+        rows = self.connection.execute(
+            "SELECT evidence_id, content_hash AS hash, payload FROM evidence "
+            "WHERE organization_id=%s AND repository_id=%s AND environment=%s",
+            (organization_id, repository_id, environment),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- deployment lifecycle --------------------------------------------------
+
+    def create_deployment(self, organization_id, repository_id, environment, payload):
+        self._tenant(organization_id, repository_id, environment)
+        deployment_id = payload["deployment_id"]
+        existing = self.connection.execute(
+            "SELECT payload, status FROM deployments WHERE deployment_id=%s", (deployment_id,)
+        ).fetchone()
+        if existing:
+            return {"deployment_id": deployment_id, **existing["payload"], "status": existing["status"]}
+        with self.connection.transaction():
+            self.connection.execute(
+                "INSERT INTO deployments "
+                "(deployment_id, organization_id, repository_id, environment, reviewed_sha, merge_sha, manifest_hash, payload, status) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    deployment_id, organization_id, repository_id, environment,
+                    payload.get("reviewed_sha"), payload.get("merge_sha"), payload.get("manifest_hash"),
+                    self._Jsonb(payload), "reviewed",
+                ),
+            )
+            self.connection.execute(
+                "INSERT INTO outbox_events (event_id, organization_id, repository_id, environment, deployment_id, event_type, payload) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (str(uuid.uuid4()), organization_id, repository_id, environment, deployment_id,
+                 "deployment.reviewed", self._Jsonb(payload)),
+            )
+        return {"deployment_id": deployment_id, **payload, "status": "reviewed"}
+
+    def append_transition(self, organization_id, repository_id, environment, deployment_id, to_status):
+        self._tenant(organization_id, repository_id, environment)
+        row = self.connection.execute(
+            "SELECT status FROM deployments WHERE deployment_id=%s AND organization_id=%s "
+            "AND repository_id=%s AND environment=%s",
+            (deployment_id, organization_id, repository_id, environment),
+        ).fetchone()
+        if not row:
+            raise ValueError("Unknown deployment")
+        if to_status == row["status"]:
+            return
+        if to_status not in ALLOWED_TRANSITIONS.get(row["status"], set()):
+            raise ValueError(f"Invalid deployment transition {row['status']} -> {to_status}")
+        with self.connection.transaction():
+            next_seq = self.connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM deployment_transitions WHERE deployment_id=%s",
+                (deployment_id,),
+            ).fetchone()["next"]
+            self.connection.execute(
+                "UPDATE deployments SET status=%s, updated_at=now() WHERE deployment_id=%s",
+                (to_status, deployment_id),
+            )
+            self.connection.execute(
+                "INSERT INTO deployment_transitions "
+                "(deployment_id, organization_id, repository_id, environment, from_status, to_status, sequence) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (deployment_id, organization_id, repository_id, environment, row["status"], to_status, next_seq),
+            )
+            self.connection.execute(
+                "INSERT INTO outbox_events (event_id, organization_id, repository_id, environment, deployment_id, event_type, payload) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (organization_id, repository_id, environment, deployment_id, event_type) DO NOTHING",
+                (str(uuid.uuid4()), organization_id, repository_id, environment, deployment_id,
+                 f"deployment.{to_status}", self._Jsonb({"deployment_id": deployment_id, "status": to_status})),
+            )
+
+    def transitions(self, organization_id, repository_id, environment, deployment_id):
+        self._tenant(organization_id, repository_id, environment, allow_disconnected=True)
+        rows = self.connection.execute(
+            "SELECT * FROM deployment_transitions WHERE deployment_id=%s ORDER BY sequence", (deployment_id,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- transactional outbox --------------------------------------------------
+
+    def claim_outbox(self, organization_id, repository_id, environment, worker):
+        self._tenant(organization_id, repository_id, environment, allow_disconnected=True)
+        self._recover_expired_claims(organization_id, repository_id, environment)
+        # The SELECT ... FOR UPDATE SKIP LOCKED and the UPDATE that claims the
+        # winning row must share one transaction: the row lock only prevents a
+        # concurrent claim for as long as the transaction holding it is open.
+        with self.connection.transaction():
+            row = self.connection.execute(
+                "SELECT * FROM outbox_events WHERE organization_id=%s AND repository_id=%s AND environment=%s "
+                "AND state='PENDING' AND next_attempt_at <= now() "
+                "ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED",
+                (organization_id, repository_id, environment),
+            ).fetchone()
+            if not row:
+                return None
+            lease_expires = datetime.now(timezone.utc) + timedelta(seconds=OUTBOX_LEASE_SECONDS)
+            self.connection.execute(
+                "UPDATE outbox_events SET state='CLAIMED', lease_owner=%s, lease_expires_at=%s, attempts=attempts+1 "
+                "WHERE event_id=%s AND state='PENDING'",
+                (worker, lease_expires, row["event_id"]),
+            )
+        return dict(row)
+
+    def _recover_expired_claims(self, organization_id, repository_id, environment):
+        self.connection.execute(
+            "UPDATE outbox_events SET state='PENDING', lease_owner=NULL, lease_expires_at=NULL "
+            "WHERE organization_id=%s AND repository_id=%s AND environment=%s "
+            "AND state='CLAIMED' AND lease_expires_at < now()",
+            (organization_id, repository_id, environment),
+        )
+
+    def complete_outbox(self, event_id):
+        self.connection.execute(
+            "UPDATE outbox_events SET state='COMPLETED', completed_at=now() WHERE event_id=%s AND state='CLAIMED'",
+            (event_id,),
+        )
+
+    def fail_outbox(self, event_id, *, error, max_attempts=5, retry_backoff_seconds=30):
+        with self.connection.transaction():
+            row = self.connection.execute(
+                "SELECT * FROM outbox_events WHERE event_id=%s FOR UPDATE", (event_id,)
+            ).fetchone()
+            if not row or row["state"] in ("DEAD_LETTER", "COMPLETED"):
+                return
+            if row["attempts"] >= max_attempts:
+                self._dead_letter(row, error)
+            else:
+                next_attempt = datetime.now(timezone.utc) + timedelta(seconds=retry_backoff_seconds)
+                self.connection.execute(
+                    "UPDATE outbox_events SET state='PENDING', lease_owner=NULL, lease_expires_at=NULL, "
+                    "next_attempt_at=%s, last_error=%s WHERE event_id=%s",
+                    (next_attempt, str(error)[:2000], event_id),
+                )
+
+    def _dead_letter(self, row, error):
+        self.connection.execute(
+            "INSERT INTO outbox_dead_letters "
+            "(event_id, organization_id, repository_id, environment, deployment_id, event_type, payload, attempts, last_error) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (row["event_id"], row["organization_id"], row["repository_id"], row["environment"],
+             row["deployment_id"], row["event_type"], self._Jsonb(row["payload"]), row["attempts"], str(error)[:2000]),
+        )
+        self.connection.execute(
+            "UPDATE outbox_events SET state='DEAD_LETTER', last_error=%s WHERE event_id=%s",
+            (str(error)[:2000], row["event_id"]),
+        )
+
+    def dead_letters(self, organization_id, repository_id, environment):
+        rows = self.connection.execute(
+            "SELECT * FROM outbox_dead_letters WHERE organization_id=%s AND repository_id=%s AND environment=%s "
+            "ORDER BY created_at",
+            (organization_id, repository_id, environment),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- monitoring / anomalies --------------------------------------------------
+
+    def record_metadata_baseline(self, organization_id, repository_id, environment, model, baseline):
+        self._tenant(organization_id, repository_id, environment)
+        self.connection.execute(
+            "INSERT INTO metadata_baselines (organization_id, repository_id, environment, model, baseline) "
+            "VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (organization_id, repository_id, environment, model) "
+            "DO UPDATE SET baseline=EXCLUDED.baseline, created_at=now()",
+            (organization_id, repository_id, environment, model, self._Jsonb(baseline)),
+        )
+
+    def append_observation(self, organization_id, repository_id, environment, *, deployment_id, model, metric, payload, observation_id=None):
+        self._tenant(organization_id, repository_id, environment, allow_disconnected=True)
+        observation_id = observation_id or str(uuid.uuid4())
+        self.connection.execute(
+            "INSERT INTO monitoring_observations "
+            "(observation_id, organization_id, repository_id, environment, deployment_id, model, metric, payload) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            (observation_id, organization_id, repository_id, environment, deployment_id, model, metric, self._Jsonb(payload)),
+        )
+        return observation_id
+
+    def observations(self, organization_id, repository_id, environment, *, deployment_id=None):
+        if deployment_id:
+            rows = self.connection.execute(
+                "SELECT * FROM monitoring_observations WHERE organization_id=%s AND repository_id=%s "
+                "AND environment=%s AND deployment_id=%s ORDER BY observed_at",
+                (organization_id, repository_id, environment, deployment_id),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM monitoring_observations WHERE organization_id=%s AND repository_id=%s "
+                "AND environment=%s ORDER BY observed_at",
+                (organization_id, repository_id, environment),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_anomaly(self, organization_id, repository_id, environment, *, deployment_id, kind, payload, anomaly_id=None):
+        """Idempotent: a second anomaly of the same kind for the same deployment returns the first."""
+        self._tenant(organization_id, repository_id, environment, allow_disconnected=True)
+        anomaly_id = anomaly_id or str(uuid.uuid4())
+        with self.connection.transaction():
+            row = self.connection.execute(
+                "INSERT INTO anomalies (anomaly_id, organization_id, repository_id, environment, deployment_id, kind, payload) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (organization_id, repository_id, environment, deployment_id, kind) DO NOTHING "
+                "RETURNING *",
+                (anomaly_id, organization_id, repository_id, environment, deployment_id, kind, self._Jsonb(payload)),
+            ).fetchone()
+            if row is None:
+                row = self.connection.execute(
+                    "SELECT * FROM anomalies WHERE organization_id=%s AND repository_id=%s AND environment=%s "
+                    "AND deployment_id=%s AND kind=%s",
+                    (organization_id, repository_id, environment, deployment_id, kind),
+                ).fetchone()
+        return dict(row)
+
+    def anomalies(self, organization_id, repository_id, environment, *, deployment_id=None):
+        if deployment_id:
+            rows = self.connection.execute(
+                "SELECT * FROM anomalies WHERE organization_id=%s AND repository_id=%s AND environment=%s "
+                "AND deployment_id=%s ORDER BY created_at",
+                (organization_id, repository_id, environment, deployment_id),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM anomalies WHERE organization_id=%s AND repository_id=%s AND environment=%s ORDER BY created_at",
+                (organization_id, repository_id, environment),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- lineage / KPI impact --------------------------------------------------
+
+    def record_lineage(self, organization_id, repository_id, environment, model, payload, *, edges=(), completeness=None, lineage_id=None):
+        self._tenant(organization_id, repository_id, environment)
+        lineage_id = lineage_id or str(uuid.uuid4())
+        with self.connection.transaction():
+            self.connection.execute(
+                "INSERT INTO lineage_records (lineage_id, organization_id, repository_id, environment, model, payload, completeness) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (organization_id, repository_id, environment, lineage_id) DO NOTHING",
+                (lineage_id, organization_id, repository_id, environment, model, self._Jsonb(payload), completeness),
+            )
+            for upstream, downstream in edges:
+                self.connection.execute(
+                    "INSERT INTO lineage_edges (lineage_id, upstream_model, downstream_model) VALUES (%s, %s, %s) "
+                    "ON CONFLICT DO NOTHING",
+                    (lineage_id, upstream, downstream),
+                )
+        return lineage_id
+
+    def list_lineage(self, organization_id, repository_id, environment):
+        self._tenant(organization_id, repository_id, environment, allow_disconnected=True)
+        rows = self.connection.execute(
+            "SELECT lineage_id, payload FROM lineage_records "
+            "WHERE organization_id=%s AND repository_id=%s AND environment=%s",
+            (organization_id, repository_id, environment),
+        ).fetchall()
+        return [dict(row["payload"], lineage_id=row["lineage_id"]) for row in rows]
+
+    def record_kpi_impact(self, organization_id, repository_id, environment, *, deployment_id, kpi_name, impact, kpi_impact_id=None):
+        self._tenant(organization_id, repository_id, environment, allow_disconnected=True)
+        kpi_impact_id = kpi_impact_id or str(uuid.uuid4())
+        self.connection.execute(
+            "INSERT INTO kpi_impact (kpi_impact_id, organization_id, repository_id, environment, deployment_id, kpi_name, impact) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (kpi_impact_id, organization_id, repository_id, environment, deployment_id, kpi_name, self._Jsonb(impact)),
+        )
+        return kpi_impact_id
+
+    def kpi_impacts(self, organization_id, repository_id, environment, *, deployment_id=None):
+        if deployment_id:
+            rows = self.connection.execute(
+                "SELECT * FROM kpi_impact WHERE organization_id=%s AND repository_id=%s AND environment=%s "
+                "AND deployment_id=%s ORDER BY created_at",
+                (organization_id, repository_id, environment, deployment_id),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM kpi_impact WHERE organization_id=%s AND repository_id=%s AND environment=%s ORDER BY created_at",
+                (organization_id, repository_id, environment),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- incidents / RCA --------------------------------------------------
+
+    def create_incident(self, organization_id, repository_id, environment, *, deployment_id, anomaly_id, incident_id=None):
+        self._tenant(organization_id, repository_id, environment, allow_disconnected=True)
+        incident_id = incident_id or str(uuid.uuid4())
+        with self.connection.transaction():
+            row = self.connection.execute(
+                "INSERT INTO incidents (incident_id, organization_id, repository_id, environment, deployment_id, anomaly_id, status) "
+                "VALUES (%s, %s, %s, %s, %s, %s, 'open') "
+                "ON CONFLICT (incident_id) DO NOTHING RETURNING *",
+                (incident_id, organization_id, repository_id, environment, deployment_id, anomaly_id),
+            ).fetchone()
+            if row is None:
+                row = self.connection.execute(
+                    "SELECT * FROM incidents WHERE incident_id=%s", (incident_id,)
+                ).fetchone()
+        return dict(row)
+
+    def update_incident_status(self, incident_id, status):
+        """Idempotent: setting the same status twice is a no-op, not an error."""
+        self.connection.execute(
+            "UPDATE incidents SET status=%s, updated_at=now() WHERE incident_id=%s AND status != %s",
+            (status, incident_id, status),
+        )
+
+    def get_incident(self, incident_id):
+        row = self.connection.execute("SELECT * FROM incidents WHERE incident_id=%s", (incident_id,)).fetchone()
+        return dict(row) if row else None
+
+    def create_rca(self, incident_id, organization_id, repository_id, environment, *, status, primary_cause=None,
+                    alternative_causes=(), contributing_factors=(), downstream_symptoms=(),
+                    unrelated_concurrent_changes=(), confidence=None, unevaluated_evidence=(),
+                    evidence_links=(), rca_id=None):
+        """Idempotent: only one COMPLETED RCA is retained per incident (a unique partial index enforces it)."""
+        self._tenant(organization_id, repository_id, environment, allow_disconnected=True)
+        rca_id = rca_id or str(uuid.uuid4())
+        try:
+            # The insert and its evidence links share a transaction so a link
+            # failure can't leave an RCA report with partial evidence attached.
+            with self.connection.transaction():
+                row = self.connection.execute(
+                    "INSERT INTO rca_reports "
+                    "(rca_id, incident_id, organization_id, repository_id, environment, status, primary_cause, "
+                    "alternative_causes, contributing_factors, downstream_symptoms, unrelated_concurrent_changes, "
+                    "confidence, unevaluated_evidence) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
+                    (
+                        rca_id, incident_id, organization_id, repository_id, environment, status,
+                        self._Jsonb(primary_cause) if primary_cause is not None else None,
+                        self._Jsonb(list(alternative_causes)), self._Jsonb(list(contributing_factors)),
+                        self._Jsonb(list(downstream_symptoms)), self._Jsonb(list(unrelated_concurrent_changes)),
+                        confidence, self._Jsonb(list(unevaluated_evidence)),
+                    ),
+                ).fetchone()
+                for evidence_id, role in evidence_links:
+                    self.connection.execute(
+                        "INSERT INTO rca_evidence_links (rca_id, evidence_id, role) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                        (rca_id, evidence_id, role),
+                    )
+        except self._psycopg.errors.UniqueViolation:
+            # The transaction block already rolled back on the way out; the
+            # connection is clean, so this read runs in a fresh statement.
+            existing = self.connection.execute(
+                "SELECT * FROM rca_reports WHERE incident_id=%s AND status='completed'", (incident_id,)
+            ).fetchone()
+            return dict(existing)
+        return dict(row)
+
+    def rca_for_incident(self, incident_id):
+        rows = self.connection.execute(
+            "SELECT * FROM rca_reports WHERE incident_id=%s ORDER BY created_at", (incident_id,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- delivery journal --------------------------------------------------
+
+    def record_delivery(self, organization_id, repository_id, environment, *, channel, event_key, payload, journal_id=None):
+        journal_id = journal_id or str(uuid.uuid4())
+        with self.connection.transaction():
+            row = self.connection.execute(
+                "INSERT INTO delivery_journal (journal_id, organization_id, repository_id, environment, channel, event_key, payload) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (organization_id, repository_id, environment, channel, event_key) DO NOTHING RETURNING *",
+                (journal_id, organization_id, repository_id, environment, channel, event_key, self._Jsonb(payload)),
+            ).fetchone()
+            if row is None:
+                row = self.connection.execute(
+                    "SELECT * FROM delivery_journal WHERE organization_id=%s AND repository_id=%s AND environment=%s "
+                    "AND channel=%s AND event_key=%s",
+                    (organization_id, repository_id, environment, channel, event_key),
+                ).fetchone()
+        return dict(row)
+
+    def mark_delivered(self, journal_id, *, remote_id):
+        self.connection.execute(
+            "UPDATE delivery_journal SET status='PUBLISHED', remote_id=%s, reconciled_at=now(), "
+            "attempts=attempts+1, updated_at=now() WHERE journal_id=%s",
+            (remote_id, journal_id),
+        )
+
+    def mark_delivery_failed(self, journal_id):
+        self.connection.execute(
+            "UPDATE delivery_journal SET status='FAILED', attempts=attempts+1, updated_at=now() WHERE journal_id=%s",
+            (journal_id,),
+        )
+
+    def deliveries(self, organization_id, repository_id, environment, *, channel=None):
+        if channel:
+            rows = self.connection.execute(
+                "SELECT * FROM delivery_journal WHERE organization_id=%s AND repository_id=%s "
+                "AND environment=%s AND channel=%s",
+                (organization_id, repository_id, environment, channel),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM delivery_journal WHERE organization_id=%s AND repository_id=%s AND environment=%s",
+                (organization_id, repository_id, environment),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- audit --------------------------------------------------
+
+    def append_audit(self, organization_id, repository_id, *, actor, event_type, reference_type=None, reference_id=None, payload=None):
+        self.connection.execute(
+            "INSERT INTO audit_events (organization_id, repository_id, actor, event_type, reference_type, reference_id, payload) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (organization_id, repository_id, actor, event_type, reference_type, reference_id, self._Jsonb(payload or {})),
+        )
+
+    def audit_events(self, organization_id, repository_id=None):
+        if repository_id:
+            rows = self.connection.execute(
+                "SELECT * FROM audit_events WHERE organization_id=%s AND repository_id=%s ORDER BY created_at",
+                (organization_id, repository_id),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM audit_events WHERE organization_id=%s ORDER BY created_at",
+                (organization_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def close(self):
+        self.connection.close()
