@@ -30,6 +30,9 @@ class GitHubAppSettings:
     slack_notify_warn: bool = False
     slack_max_retries: int = 2
     slack_retry_base_seconds: float = 1.0
+    # Public lifecycle/dashboard API. Absent DSN leaves the API unregistered.
+    database_url: str | None = field(default=None, repr=False)
+    api_pool_size: int = 5
 
 
 def load_settings(environ: Mapping[str, str] | None = None) -> GitHubAppSettings:
@@ -103,7 +106,26 @@ def load_settings(environ: Mapping[str, str] | None = None) -> GitHubAppSettings
             minimum_exclusive=0,
             maximum=10,
         ),
+        database_url=_database_url(values),
+        api_pool_size=_integer(
+            values, "RELIUM_API_POOL_SIZE", default="5", minimum=1, maximum=50
+        ),
     )
+
+
+def _database_url(values: Mapping[str, str]) -> str | None:
+    value = values.get("RELIUM_DATABASE_URL")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise SettingsError("RELIUM_DATABASE_URL must be non-empty text when set.")
+    value = value.strip()
+    if not value.startswith(("postgresql://", "postgres://")):
+        raise SettingsError(
+            "RELIUM_DATABASE_URL must be a PostgreSQL DSN; the public API has no "
+            "SQLite or in-memory fallback."
+        )
+    return value
 
 
 def _required(values: Mapping[str, str], name: str) -> str:

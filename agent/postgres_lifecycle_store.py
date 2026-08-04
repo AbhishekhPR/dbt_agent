@@ -590,5 +590,313 @@ class PostgresLifecycleStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    # -- service tokens (public API authentication) -------------------------
+
+    def create_service_token(self, token_id, secret_hash, organization_id, repository_id,
+                             *, environment=None, description=None, expires_at=None):
+        """Persist a token's hash. The secret itself is never stored."""
+        self.connection.execute(
+            "INSERT INTO api_service_tokens "
+            "(token_id, secret_hash, organization_id, repository_id, environment, description, expires_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (token_id, secret_hash, organization_id, repository_id, environment, description, expires_at),
+        )
+        return token_id
+
+    def get_service_token(self, token_id):
+        row = self.connection.execute(
+            "SELECT token_id, secret_hash, organization_id, repository_id, environment, "
+            "expires_at, revoked_at FROM api_service_tokens WHERE token_id=%s",
+            (token_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def revoke_service_token(self, token_id):
+        self.connection.execute(
+            "UPDATE api_service_tokens SET revoked_at=now() WHERE token_id=%s AND revoked_at IS NULL",
+            (token_id,),
+        )
+
+    # -- idempotent event receipts -------------------------------------------
+
+    def get_event_receipt(self, event_id):
+        row = self.connection.execute(
+            "SELECT * FROM event_receipts WHERE event_id=%s", (event_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def record_event_receipt(self, event_id, organization_id, repository_id, environment,
+                             *, status, response, payload_hash, resource_kind=None, resource_id=None):
+        """Claim an idempotency key. Returns None if the key is already taken."""
+        row = self.connection.execute(
+            "INSERT INTO event_receipts "
+            "(event_id, organization_id, repository_id, environment, status, response, "
+            "payload_hash, resource_kind, resource_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (event_id) DO NOTHING RETURNING *",
+            (event_id, organization_id, repository_id, environment, status,
+             self._Jsonb(response), payload_hash, resource_kind, resource_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    # -- reviews ---------------------------------------------------------------
+
+    def create_review(self, organization_id, repository_id, environment, *, review_id,
+                      decision, pull_number=None, commit_sha=None, enforcement_mode=None,
+                      risk_score=None, evidence_coverage=None, payload=None):
+        self._tenant(organization_id, repository_id, environment, allow_disconnected=True)
+        row = self.connection.execute(
+            "INSERT INTO reviews (review_id, organization_id, repository_id, environment, "
+            "pull_number, commit_sha, decision, enforcement_mode, risk_score, evidence_coverage, payload) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (review_id) DO NOTHING RETURNING *",
+            (review_id, organization_id, repository_id, environment, pull_number, commit_sha,
+             decision, enforcement_mode, risk_score, evidence_coverage, self._Jsonb(payload or {})),
+        ).fetchone()
+        if row is None:
+            row = self.connection.execute(
+                "SELECT * FROM reviews WHERE review_id=%s", (review_id,)
+            ).fetchone()
+        return dict(row)
+
+    def get_review(self, organization_id, repository_id, review_id):
+        row = self.connection.execute(
+            "SELECT * FROM reviews WHERE review_id=%s AND organization_id=%s AND repository_id=%s",
+            (review_id, organization_id, repository_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_reviews(self, organization_id, repository_id, *, environment=None, limit=25, offset=0):
+        return self._paged(
+            "reviews", "review_id", organization_id, repository_id,
+            environment=environment, limit=limit, offset=offset,
+        )
+
+    # -- tenant-scoped paginated reads ----------------------------------------
+
+    def _paged(self, table, id_column, organization_id, repository_id, *, environment=None,
+               limit=25, offset=0, extra_sql="", extra_params=()):
+        """Deterministically ordered, tenant-scoped page plus a total count.
+
+        ``table`` and ``id_column`` are internal identifiers chosen by this
+        module, never caller input; all caller-supplied values are bound.
+        """
+        where = "organization_id=%s AND repository_id=%s"
+        params = [organization_id, repository_id]
+        if environment is not None:
+            where += " AND environment=%s"
+            params.append(environment)
+        if extra_sql:
+            where += extra_sql
+            params.extend(extra_params)
+
+        total = self.connection.execute(
+            f"SELECT COUNT(*) AS total FROM {table} WHERE {where}", tuple(params)
+        ).fetchone()["total"]
+        rows = self.connection.execute(
+            f"SELECT * FROM {table} WHERE {where} "
+            f"ORDER BY created_at DESC, {id_column} ASC LIMIT %s OFFSET %s",
+            tuple(params) + (limit, offset),
+        ).fetchall()
+        return {"total": total, "items": [dict(r) for r in rows]}
+
+    def get_deployment(self, organization_id, repository_id, deployment_id):
+        row = self.connection.execute(
+            "SELECT * FROM deployments WHERE deployment_id=%s AND organization_id=%s AND repository_id=%s",
+            (deployment_id, organization_id, repository_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_deployments(self, organization_id, repository_id, *, environment=None,
+                         status=None, limit=25, offset=0):
+        extra_sql, extra_params = ("", ())
+        if status is not None:
+            extra_sql, extra_params = (" AND status=%s", (status,))
+        return self._paged(
+            "deployments", "deployment_id", organization_id, repository_id,
+            environment=environment, limit=limit, offset=offset,
+            extra_sql=extra_sql, extra_params=extra_params,
+        )
+
+    def list_anomalies(self, organization_id, repository_id, *, environment=None,
+                       deployment_id=None, limit=25, offset=0):
+        extra_sql, extra_params = ("", ())
+        if deployment_id is not None:
+            extra_sql, extra_params = (" AND deployment_id=%s", (deployment_id,))
+        return self._paged(
+            "anomalies", "anomaly_id", organization_id, repository_id,
+            environment=environment, limit=limit, offset=offset,
+            extra_sql=extra_sql, extra_params=extra_params,
+        )
+
+    def get_anomaly(self, organization_id, repository_id, anomaly_id):
+        row = self.connection.execute(
+            "SELECT * FROM anomalies WHERE anomaly_id=%s AND organization_id=%s AND repository_id=%s",
+            (anomaly_id, organization_id, repository_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_incident_scoped(self, organization_id, repository_id, incident_id):
+        row = self.connection.execute(
+            "SELECT * FROM incidents WHERE incident_id=%s AND organization_id=%s AND repository_id=%s",
+            (incident_id, organization_id, repository_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_incidents(self, organization_id, repository_id, *, environment=None, limit=25, offset=0):
+        return self._paged(
+            "incidents", "incident_id", organization_id, repository_id,
+            environment=environment, limit=limit, offset=offset,
+        )
+
+    def list_observations(self, organization_id, repository_id, *, environment=None,
+                          deployment_id=None, limit=25, offset=0):
+        extra_sql, extra_params = ("", ())
+        if deployment_id is not None:
+            extra_sql, extra_params = (" AND deployment_id=%s", (deployment_id,))
+        where = "organization_id=%s AND repository_id=%s"
+        params = [organization_id, repository_id]
+        if environment is not None:
+            where += " AND environment=%s"
+            params.append(environment)
+        where += extra_sql
+        params.extend(extra_params)
+        total = self.connection.execute(
+            f"SELECT COUNT(*) AS total FROM monitoring_observations WHERE {where}", tuple(params)
+        ).fetchone()["total"]
+        rows = self.connection.execute(
+            f"SELECT * FROM monitoring_observations WHERE {where} "
+            "ORDER BY observed_at DESC, observation_id ASC LIMIT %s OFFSET %s",
+            tuple(params) + (limit, offset),
+        ).fetchall()
+        return {"total": total, "items": [dict(r) for r in rows]}
+
+    def lineage_for_model(self, organization_id, repository_id, model, *, environment=None):
+        where = "organization_id=%s AND repository_id=%s AND model=%s"
+        params = [organization_id, repository_id, model]
+        if environment is not None:
+            where += " AND environment=%s"
+            params.append(environment)
+        rows = self.connection.execute(
+            f"SELECT * FROM lineage_records WHERE {where} ORDER BY created_at DESC, lineage_id ASC",
+            tuple(params),
+        ).fetchall()
+        records = [dict(r) for r in rows]
+        for record in records:
+            edges = self.connection.execute(
+                "SELECT upstream_model, downstream_model FROM lineage_edges "
+                "WHERE lineage_id=%s ORDER BY upstream_model, downstream_model",
+                (record["lineage_id"],),
+            ).fetchall()
+            record["edges"] = [dict(e) for e in edges]
+        return records
+
+    def kpi_impact_for_kpi(self, organization_id, repository_id, kpi_name, *, environment=None,
+                           limit=25, offset=0):
+        return self._paged(
+            "kpi_impact", "kpi_impact_id", organization_id, repository_id,
+            environment=environment, limit=limit, offset=offset,
+            extra_sql=" AND kpi_name=%s", extra_params=(kpi_name,),
+        )
+
+    def repository_settings(self, organization_id, repository_id):
+        environments = self.connection.execute(
+            "SELECT environment, connected, created_at FROM environments "
+            "WHERE organization_id=%s AND repository_id=%s ORDER BY environment",
+            (organization_id, repository_id),
+        ).fetchall()
+        return {
+            "organization_id": organization_id,
+            "repository_id": repository_id,
+            "environments": [dict(r) for r in environments],
+        }
+
+    def evidence_coverage(self, organization_id, repository_id, *, environment=None):
+        """Coverage counts derived from stored evidence, never fabricated."""
+        where = "organization_id=%s AND repository_id=%s"
+        params = [organization_id, repository_id]
+        if environment is not None:
+            where += " AND environment=%s"
+            params.append(environment)
+        evidence_total = self.connection.execute(
+            f"SELECT COUNT(*) AS total FROM evidence WHERE {where}", tuple(params)
+        ).fetchone()["total"]
+        observation_total = self.connection.execute(
+            f"SELECT COUNT(*) AS total FROM monitoring_observations WHERE {where}", tuple(params)
+        ).fetchone()["total"]
+        baseline_total = self.connection.execute(
+            f"SELECT COUNT(*) AS total FROM metadata_baselines WHERE {where}", tuple(params)
+        ).fetchone()["total"]
+        incomplete = self.connection.execute(
+            f"SELECT COUNT(*) AS total FROM monitoring_observations "
+            f"WHERE {where} AND (evidence_coverage IS NULL OR evidence_coverage <> 'COMPLETE')",
+            tuple(params),
+        ).fetchone()["total"]
+        if observation_total == 0 and baseline_total == 0:
+            state = "UNKNOWN"
+        elif incomplete == 0:
+            state = "COMPLETE"
+        else:
+            state = "INCOMPLETE"
+        return {
+            "coverage": state,
+            "evidence_records": evidence_total,
+            "observations": observation_total,
+            "baselines": baseline_total,
+            "observations_missing_complete_evidence": incomplete,
+        }
+
+    def monitoring_status(self, organization_id, repository_id, *, environment=None):
+        where = "organization_id=%s AND repository_id=%s"
+        params = [organization_id, repository_id]
+        if environment is not None:
+            where += " AND environment=%s"
+            params.append(environment)
+        latest = self.connection.execute(
+            f"SELECT MAX(observed_at) AS latest FROM monitoring_observations WHERE {where}",
+            tuple(params),
+        ).fetchone()["latest"]
+        observations = self.connection.execute(
+            f"SELECT COUNT(*) AS total FROM monitoring_observations WHERE {where}", tuple(params)
+        ).fetchone()["total"]
+        open_anomalies = self.connection.execute(
+            f"SELECT COUNT(*) AS total FROM anomalies WHERE {where}", tuple(params)
+        ).fetchone()["total"]
+        open_incidents = self.connection.execute(
+            f"SELECT COUNT(*) AS total FROM incidents WHERE {where} AND status <> 'resolved'",
+            tuple(params),
+        ).fetchone()["total"]
+        coverage = self.evidence_coverage(organization_id, repository_id, environment=environment)
+        # Missing evidence degrades coverage, never health.
+        if open_incidents > 0:
+            health = "DEGRADED"
+        elif open_anomalies > 0:
+            health = "ANOMALOUS"
+        elif observations > 0:
+            health = "HEALTHY"
+        else:
+            health = "UNKNOWN"
+        return {
+            "health": health,
+            "observations": observations,
+            "anomalies": open_anomalies,
+            "unresolved_incidents": open_incidents,
+            "latest_observation_at": latest,
+            "evidence_coverage": coverage["coverage"],
+        }
+
+    def outbox_stats(self, organization_id=None, repository_id=None):
+        if organization_id and repository_id:
+            rows = self.connection.execute(
+                "SELECT state, COUNT(*) AS total FROM outbox_events "
+                "WHERE organization_id=%s AND repository_id=%s GROUP BY state",
+                (organization_id, repository_id),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT state, COUNT(*) AS total FROM outbox_events GROUP BY state"
+            ).fetchall()
+        return {row["state"]: row["total"] for row in rows}
+
     def close(self):
         self.connection.close()

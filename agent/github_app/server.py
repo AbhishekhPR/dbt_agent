@@ -107,6 +107,16 @@ def build_application(settings, *, client_factory=None, logger=None, sleep=time.
         logger=logger,
         job_store=storage,
     )
+    store_pool = None
+    if settings.database_url:
+        from agent.api.pool import StorePool
+        from agent.postgres_lifecycle_store import PostgresLifecycleStore
+
+        store_pool = StorePool(
+            lambda: PostgresLifecycleStore(settings.database_url),
+            size=settings.api_pool_size,
+        )
+
     app = create_http_app(
         webhook_secret=settings.webhook_secret,
         job_queue=jobs,
@@ -115,6 +125,7 @@ def build_application(settings, *, client_factory=None, logger=None, sleep=time.
         clock=time.time,
         logger=logger,
         job_store=storage,
+        store_pool=store_pool,
     )
     app.state.job_queue = jobs
     return app
