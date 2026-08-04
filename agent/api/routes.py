@@ -16,7 +16,12 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from agent.api.auth import AuthenticationError, AuthorizationError, ServiceTokenAuthenticator, bearer_token
-from agent.api.service import ConflictError, LifecycleService, NotFoundError
+from agent.api.service import (
+    ConflictError,
+    LifecycleService,
+    NotFoundError,
+    scoped_integrity_error,
+)
 from agent.api.validation import (
     ValidationError,
     isoformat,
@@ -130,7 +135,23 @@ def create_api_routes(*, store_pool, authenticator_factory=None):
                 return _json({"status": "not_found"}, 404, request_id)
             except ConflictError as exc:
                 return _json({"status": "conflict", "detail": str(exc)}, 409, request_id)
-            except Exception:
+            except Exception as exc:
+                # A database integrity error is an expected outcome of tenant
+                # scoping, not an internal fault. Translate it to the documented
+                # non-disclosing response instead of leaking a 500.
+                if type(exc).__name__ in ("UniqueViolation", "ForeignKeyViolation",
+                                          "IntegrityError", "CheckViolation",
+                                          "ExclusionViolation"):
+                    translated = scoped_integrity_error(exc)
+                    logger.info(
+                        "api_scoped_integrity_conflict",
+                        extra={"error_category": "scoped_conflict",
+                               "route_template": request.url.path},
+                    )
+                    if isinstance(translated, NotFoundError):
+                        return _json({"status": "not_found"}, 404, request_id)
+                    return _json({"status": "conflict", "detail": str(translated)},
+                                 409, request_id)
                 logger.error(
                     "api_request_failed",
                     extra={"error_category": "internal", "route_template": request.url.path},
