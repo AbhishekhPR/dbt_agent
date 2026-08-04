@@ -2,10 +2,12 @@ import logging
 from contextlib import asynccontextmanager
 
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from agent.api.routes import create_api_routes
 from agent.github_app.jobs import WebhookJob
 from agent.github_app.signatures import verify_webhook_signature
 from agent.github_app.webhooks import WebhookPayloadError, parse_webhook
@@ -20,7 +22,15 @@ def create_http_app(
     clock,
     logger=None,
     job_store=None,
+    store_pool=None,
 ):
+    """Build the served application.
+
+    ``store_pool`` enables the public lifecycle and dashboard API. When it is
+    absent (deployments that only run the GitHub App), the /api routes are not
+    registered and /readyz reports the API as disabled -- the webhook and health
+    behaviour are unchanged either way.
+    """
     if max_body_bytes <= 0:
         raise ValueError("Maximum webhook body size must be positive.")
     logger = logger or logging.getLogger(__name__)
@@ -49,6 +59,50 @@ def create_http_app(
         if request.app.state.started and job_queue.is_running:
             return JSONResponse({"status": "ok"})
         return JSONResponse({"status": "unavailable"}, status_code=503)
+
+    async def readiness(request):
+        """Read-only readiness probe. Never mutates lifecycle data."""
+        worker_running = bool(request.app.state.started and job_queue.is_running)
+        checks = {
+            "worker": "ok" if worker_running else "unavailable",
+            "configuration": "ok",
+        }
+        if store_pool is None:
+            checks["database"] = "disabled"
+            checks["migrations"] = "disabled"
+            checks["public_api"] = "disabled"
+        else:
+            def probe():
+                from agent.postgres_migrate import applied_versions, pending_migrations
+
+                with store_pool.acquire() as store:
+                    store.connection.execute("SELECT 1")
+                    applied = applied_versions(store.connection)
+                    pending = pending_migrations(set(applied))
+                    return applied, [p.name for p in pending], store.outbox_stats()
+
+            try:
+                applied, pending, outbox = await run_in_threadpool(probe)
+                checks["database"] = "ok"
+                checks["migrations"] = "current" if not pending else "pending"
+                checks["applied_migrations"] = applied
+                checks["public_api"] = "ok"
+                checks["outbox"] = outbox
+            except Exception:
+                logger.error("readiness_probe_failed", extra={"error_category": "database"})
+                checks["database"] = "unavailable"
+                checks["migrations"] = "unknown"
+                checks["public_api"] = "unavailable"
+
+        ready = (
+            worker_running
+            and checks.get("database") in {"ok", "disabled"}
+            and checks.get("migrations") in {"current", "disabled"}
+        )
+        return JSONResponse(
+            {"status": "ready" if ready else "unavailable", "checks": checks},
+            status_code=200 if ready else 503,
+        )
 
     async def webhook(request):
         signature = request.headers.get("X-Hub-Signature-256")
@@ -107,16 +161,22 @@ def create_http_app(
         logger.error("http_request_failed", extra={"error_category": "internal"})
         return JSONResponse({"status": "unavailable"}, status_code=500)
 
+    routes = [
+        Route("/healthz", health, methods=["GET"]),
+        Route("/readyz", readiness, methods=["GET"]),
+        Route("/github/webhook", webhook, methods=["POST"]),
+    ]
+    if store_pool is not None:
+        routes.extend(create_api_routes(store_pool=store_pool))
+
     app = Starlette(
         debug=False,
-        routes=[
-            Route("/healthz", health, methods=["GET"]),
-            Route("/github/webhook", webhook, methods=["POST"]),
-        ],
+        routes=routes,
         lifespan=lifespan,
         exception_handlers={Exception: unexpected_error},
     )
     app.state.started = False
+    app.state.store_pool = store_pool
     return app
 
 
