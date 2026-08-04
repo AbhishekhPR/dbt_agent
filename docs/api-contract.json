@@ -1,0 +1,166 @@
+{
+  "contract_version": "1.0.0",
+  "dashboard_resources": {
+    "anomaly_list": "/api/anomalies",
+    "delivery_status": "/api/delivery-status",
+    "deployment_detail": "/api/deployments/{deployment_id}",
+    "deployment_list": "/api/deployments",
+    "evidence_coverage": "/api/evidence-coverage",
+    "incident_detail": "/api/incidents/{incident_id}",
+    "incident_rca": "/api/incidents/{incident_id}/rca",
+    "kpi_impact": "/api/kpis/{kpi}/impact",
+    "model_lineage": "/api/models/{model}/lineage",
+    "monitoring_status": "/api/monitoring",
+    "repository_settings": "/api/repositories/{repository}/settings",
+    "review_detail": "/api/reviews/{review_id}",
+    "review_list": "/api/reviews"
+  },
+  "mandatory_routes": [
+    "GET /api/anomalies",
+    "GET /api/delivery-status",
+    "GET /api/deployments",
+    "GET /api/deployments/{deployment_id}",
+    "GET /api/evidence-coverage",
+    "GET /api/incidents",
+    "GET /api/incidents/{incident_id}",
+    "GET /api/incidents/{incident_id}/rca",
+    "GET /api/kpis/{kpi}/impact",
+    "GET /api/models/{model}/lineage",
+    "GET /api/monitoring",
+    "GET /api/monitoring/observations",
+    "GET /api/repositories/{repository}/settings",
+    "GET /api/reviews",
+    "GET /api/reviews/{review_id}",
+    "GET /healthz",
+    "GET /readyz",
+    "POST /api/anomalies",
+    "POST /api/deployments/events",
+    "POST /api/incidents",
+    "POST /api/monitoring/baselines",
+    "POST /api/monitoring/observations",
+    "POST /api/reviews",
+    "POST /github/webhook"
+  ],
+  "routes": [
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/anomalies"
+    },
+    {
+      "authentication": "service-token",
+      "method": "POST",
+      "path": "/api/anomalies"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/delivery-status"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/deployments"
+    },
+    {
+      "authentication": "service-token",
+      "method": "POST",
+      "path": "/api/deployments/events"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/deployments/{deployment_id}"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/evidence-coverage"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/incidents"
+    },
+    {
+      "authentication": "service-token",
+      "method": "POST",
+      "path": "/api/incidents"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/incidents/{incident_id}"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/incidents/{incident_id}/rca"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/kpis/{kpi}/impact"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/models/{model}/lineage"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/monitoring"
+    },
+    {
+      "authentication": "service-token",
+      "method": "POST",
+      "path": "/api/monitoring/baselines"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/monitoring/observations"
+    },
+    {
+      "authentication": "service-token",
+      "method": "POST",
+      "path": "/api/monitoring/observations"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/repositories/{repository}/settings"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/reviews"
+    },
+    {
+      "authentication": "service-token",
+      "method": "POST",
+      "path": "/api/reviews"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/reviews/{review_id}"
+    },
+    {
+      "authentication": "github-webhook-signature",
+      "method": "POST",
+      "path": "/github/webhook"
+    },
+    {
+      "authentication": "none",
+      "method": "GET",
+      "path": "/healthz"
+    },
+    {
+      "authentication": "none",
+      "method": "GET",
+      "path": "/readyz"
+    }
+  ]
+}

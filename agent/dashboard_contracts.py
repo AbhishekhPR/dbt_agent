@@ -9,6 +9,12 @@ DASHBOARD_RESOURCES = {
     "model_lineage": "/api/models/{model}/lineage",
     "kpi_impact": "/api/kpis/{kpi}/impact",
     "repository_settings": "/api/repositories/{repository}/settings",
+    # Added by the public API release. The program requires dashboard reads for
+    # RCA, evidence coverage and delivery status, which the original contract
+    # named nowhere; the ten resources above are unchanged for compatibility.
+    "incident_rca": "/api/incidents/{incident_id}/rca",
+    "evidence_coverage": "/api/evidence-coverage",
+    "delivery_status": "/api/delivery-status",
 }
 
 
