@@ -51,6 +51,30 @@ jobs:
           python -m pip install --upgrade pip
           pip install --require-hashes -r requirements.lock
 
+      - name: Install PostgreSQL 18 client tools
+        # ubuntu-latest ships an older postgresql-client than the postgres:18
+        # service container; pg_dump needs to match the server's major version.
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-18
+
+      - name: Provision least-privileged PostgreSQL test role
+        # The service container's POSTGRES_USER is a superuser by design of the
+        # official postgres image; create a genuinely non-superuser application
+        # role/database on top of it so the security suite exercises the real
+        # least-privilege posture instead of the container's bootstrap admin.
+        run: |
+          PGPASSWORD=relium_ci_password psql -h 127.0.0.1 -U relium_ci -d relium_ci -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE relium_ci_app WITH LOGIN PASSWORD 'relium_ci_app_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 10;
+          CREATE DATABASE relium_ci_app OWNER relium_ci_app;
+          REVOKE ALL ON DATABASE relium_ci_app FROM PUBLIC;
+          GRANT CONNECT, TEMP ON DATABASE relium_ci_app TO relium_ci_app;
+          SQL
+        env:
+          PGPASSWORD: relium_ci_password  # pragma: allowlist secret -- ephemeral CI-only service-container password, not a real credential
+
       - name: Run tests
         run: |
           python -m unittest discover -s . -p "test_*.py" -v
@@ -59,7 +83,7 @@ jobs:
           GROQ_API_KEY: ""
           SLACK_WEBHOOK_URL: ""
           ENABLE_AI_EXPLAINER: "false"
-          RELIUM_TEST_POSTGRES_DSN: "postgresql://relium_ci:relium_ci_password@127.0.0.1:5432/relium_ci"  # pragma: allowlist secret
+          RELIUM_TEST_POSTGRES_DSN: "postgresql://relium_ci_app:relium_ci_app_password@127.0.0.1:5432/relium_ci_app"  # pragma: allowlist secret
 
       - name: Test summary
         if: always()
