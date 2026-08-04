@@ -54,11 +54,19 @@ jobs:
       - name: Install PostgreSQL 18 client tools
         # ubuntu-latest ships an older postgresql-client than the postgres:18
         # service container; pg_dump needs to match the server's major version.
+        # The PGDG package installs to /usr/lib/postgresql/18/bin rather than
+        # replacing /usr/bin/pg_dump, so put it first on PATH explicitly.
         run: |
           sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
           curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
           sudo apt-get update
           sudo apt-get install -y postgresql-client-18
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+
+      - name: Verify pg_dump matches the server major version
+        run: |
+          which pg_dump
+          pg_dump --version
 
       - name: Provision least-privileged PostgreSQL test role
         # The service container's POSTGRES_USER is a superuser by design of the
