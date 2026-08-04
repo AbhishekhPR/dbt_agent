@@ -755,6 +755,14 @@ class PostgresLifecycleStore:
             extra_sql=extra_sql, extra_params=extra_params,
         )
 
+    def get_rca(self, organization_id, repository_id, rca_id):
+        row = self.connection.execute(
+            "SELECT * FROM rca_reports "
+            "WHERE organization_id=%s AND repository_id=%s AND rca_id=%s",
+            (organization_id, repository_id, rca_id),
+        ).fetchone()
+        return dict(row) if row else None
+
     def get_anomaly(self, organization_id, repository_id, anomaly_id):
         row = self.connection.execute(
             "SELECT * FROM anomalies WHERE anomaly_id=%s AND organization_id=%s AND repository_id=%s",
