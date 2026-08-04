@@ -29,7 +29,27 @@ class ConflictError(Exception):
 
 
 class NotFoundError(Exception):
-    """The resource does not exist within the caller's authorized scope."""
+    """The resource does not exist within the caller's authorized scope.
+
+    Also raised for a resource that exists in another tenant, so an
+    out-of-scope resource is indistinguishable from an absent one.
+    """
+
+
+def scoped_integrity_error(exc) -> Exception:
+    """Translate a database integrity error into a documented HTTP outcome.
+
+    Composite tenant keys mean a violation here is either a same-tenant
+    conflict or a reference the caller is not entitled to. Neither may escape
+    as a raw 500, and neither may disclose which of the two it was.
+    """
+    name = type(exc).__name__
+    if name == "ForeignKeyViolation":
+        # The referenced resource is absent from the caller's scope.
+        return NotFoundError("referenced resource not found in scope")
+    if name == "UniqueViolation":
+        return ConflictError("resource already exists")
+    return ConflictError("request conflicts with existing state")
 
 
 class LifecycleService:
@@ -47,12 +67,12 @@ class LifecycleService:
         raises ConflictError rather than silently returning a stale result.
         """
         digest = payload_digest(payload)
-        existing = self.store.get_event_receipt(key)
+        # Receipts are keyed per tenant, so another tenant's use of the same key
+        # is simply invisible here rather than something to compare against.
+        existing = self.store.get_event_receipt(
+            scope.organization_id, scope.repository_id, key
+        )
         if existing is not None:
-            if existing["organization_id"] != scope.organization_id or \
-               existing["repository_id"] != scope.repository_id:
-                # Never disclose that another tenant owns this key.
-                raise NotFoundError("unknown idempotency key")
             if existing.get("payload_hash") != digest:
                 raise ConflictError(
                     "idempotency key was already used with a different payload"
@@ -65,7 +85,9 @@ class LifecycleService:
         )
         if claimed is None:
             # Lost a concurrent race for the same key; re-read the winner.
-            existing = self.store.get_event_receipt(key)
+            existing = self.store.get_event_receipt(
+                scope.organization_id, scope.repository_id, key
+            )
             if existing is None:
                 raise ConflictError("idempotency key contention")
             if existing.get("payload_hash") != digest:
@@ -75,10 +97,12 @@ class LifecycleService:
             return existing, True
         return claimed, False
 
-    def _finalize(self, key, response, *, resource_id=None):
+    def _finalize(self, scope, key, response, *, resource_id=None):
         self.store.connection.execute(
-            "UPDATE event_receipts SET response=%s, resource_id=%s WHERE event_id=%s",
-            (self.store._Jsonb(response), resource_id, key),
+            "UPDATE event_receipts SET response=%s, resource_id=%s "
+            "WHERE organization_id=%s AND repository_id=%s AND event_id=%s",
+            (self.store._Jsonb(response), resource_id,
+             scope.organization_id, scope.repository_id, key),
         )
 
     # -- deployment lifecycle -------------------------------------------------
@@ -123,6 +147,11 @@ class LifecycleService:
             current = self.store.get_deployment(
                 scope.organization_id, scope.repository_id, deployment_id
             )
+            if current is None:
+                # The deployment is not present in the caller's scope. Report
+                # the same absence as any other out-of-scope resource rather
+                # than dereferencing nothing and surfacing a 500.
+                raise NotFoundError("unknown deployment")
             status = current["status"]
             # Only claim a transition when the state actually moved. Replaying
             # the current status is an accepted no-op, not an applied change.
@@ -146,7 +175,7 @@ class LifecycleService:
         }
         if deferred:
             response["deferred_reason"] = deferred
-        self._finalize(idempotency_key, response, resource_id=deployment_id)
+        self._finalize(scope, idempotency_key, response, resource_id=deployment_id)
         return response, True
 
     # -- monitoring -----------------------------------------------------------
@@ -177,7 +206,7 @@ class LifecycleService:
             "observed_at": isoformat(observed_at),
             "evidence_coverage": evidence_coverage,
         }
-        self._finalize(idempotency_key, response, resource_id=model)
+        self._finalize(scope, idempotency_key, response, resource_id=model)
         return response, True
 
     def submit_observation(self, scope, *, environment, deployment_id, model, metric,
@@ -221,7 +250,7 @@ class LifecycleService:
             "late": late,
             "evidence_coverage": evidence_coverage,
         }
-        self._finalize(idempotency_key, response, resource_id=observation_id)
+        self._finalize(scope, idempotency_key, response, resource_id=observation_id)
         return response, True
 
     # -- anomalies -------------------------------------------------------------
@@ -265,7 +294,7 @@ class LifecycleService:
             "severity": severity,
             "environment": environment,
         }
-        self._finalize(idempotency_key, response, resource_id=record["anomaly_id"])
+        self._finalize(scope, idempotency_key, response, resource_id=record["anomaly_id"])
         return response, True
 
     # -- incidents and RCA -----------------------------------------------------
@@ -309,7 +338,7 @@ class LifecycleService:
             "rca_state": "queued",
             "environment": environment,
         }
-        self._finalize(idempotency_key, response, resource_id=incident["incident_id"])
+        self._finalize(scope, idempotency_key, response, resource_id=incident["incident_id"])
         return response, True
 
     # -- reads -----------------------------------------------------------------
@@ -320,7 +349,7 @@ class LifecycleService:
         )
         if incident is None:
             raise NotFoundError("unknown incident")
-        reports = self.store.rca_for_incident(incident_id)
+        reports = self.store.rca_for_incident(scope.organization_id, scope.repository_id, incident_id)
         completed = next((r for r in reports if r["status"] == "completed"), None)
         rca = completed or (reports[-1] if reports else None)
 
@@ -378,7 +407,7 @@ class LifecycleService:
         )
         if incident is None:
             raise NotFoundError("unknown incident")
-        reports = self.store.rca_for_incident(incident_id)
+        reports = self.store.rca_for_incident(scope.organization_id, scope.repository_id, incident_id)
         completed = next((r for r in reports if r["status"] == "completed"), None)
         rca = completed or (reports[-1] if reports else None)
         return {"incident_id": incident_id, **self._rca_view(rca)}
