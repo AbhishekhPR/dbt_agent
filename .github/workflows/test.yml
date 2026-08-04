@@ -14,6 +14,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: relium_ci
+          POSTGRES_PASSWORD: relium_ci_password  # pragma: allowlist secret -- ephemeral CI-only service-container password, not a real credential
+          POSTGRES_DB: relium_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -44,6 +59,7 @@ jobs:
           GROQ_API_KEY: ""
           SLACK_WEBHOOK_URL: ""
           ENABLE_AI_EXPLAINER: "false"
+          RELIUM_TEST_POSTGRES_DSN: "postgresql://relium_ci:relium_ci_password@127.0.0.1:5432/relium_ci"  # pragma: allowlist secret
 
       - name: Test summary
         if: always()
