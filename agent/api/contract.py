@@ -114,7 +114,12 @@ def contract_drift(app) -> dict:
 def write_contract(app, path) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    # An explicit LF newline matters: the contract is a checked-in artifact
+    # compared byte for byte by the drift test and by `git diff --check`, so
+    # it must not pick up platform line endings from whoever regenerated it.
     target.write_text(
-        json.dumps(build_contract(app), indent=2, sort_keys=True), encoding="utf-8"
+        json.dumps(build_contract(app), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
     )
     return target
