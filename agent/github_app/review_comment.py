@@ -28,6 +28,12 @@ def render_review_comment(result: dict) -> str:
     decision = str(result.get("decision") or "UNKNOWN").upper()
     if decision == "SKIPPED":
         return str(result.get("rendered", {}).get("markdown", "")).strip()
+    # A review that has not reached a verdict renders its own body. The
+    # verdict template below assumes a decision exists and would present an
+    # unfinished review as though it had been decided.
+    if result.get("final") is False:
+        return redact_text(
+            str(result.get("rendered", {}).get("markdown", "")).strip())
 
     incident = dict(result.get("incident") or {})
     severity = str(incident.get("severity") or "LOW").title()

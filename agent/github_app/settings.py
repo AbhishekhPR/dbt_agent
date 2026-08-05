@@ -32,6 +32,11 @@ class GitHubAppSettings:
     slack_retry_base_seconds: float = 1.0
     # Public lifecycle/dashboard API. Absent DSN leaves the API unregistered.
     database_url: str | None = field(default=None, repr=False)
+    # Metadata review defaults ON whenever a database is configured. A
+    # deployment that wants filesystem-only review must say so explicitly
+    # rather than get it by accident.
+    metadata_review_enabled: bool = True
+    metadata_review_environment: str = "production"
     api_pool_size: int = 5
 
 
@@ -107,10 +112,26 @@ def load_settings(environ: Mapping[str, str] | None = None) -> GitHubAppSettings
             maximum=10,
         ),
         database_url=_database_url(values),
+        metadata_review_enabled=_metadata_review_enabled(values),
+        metadata_review_environment=values.get(
+            "RELIUM_METADATA_REVIEW_ENVIRONMENT", "production"),
         api_pool_size=_integer(
             values, "RELIUM_API_POOL_SIZE", default="5", minimum=1, maximum=50
         ),
     )
+
+
+def _metadata_review_enabled(values: Mapping[str, str]) -> bool:
+    """Metadata review follows the database unless explicitly disabled.
+
+    Returning True with no database is intentional: build_review_lifecycle
+    then fails loudly instead of starting in a degraded mode that looks
+    healthy.
+    """
+    raw = values.get("RELIUM_METADATA_REVIEW_ENABLED")
+    if raw is None:
+        return bool(_database_url(values))
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _database_url(values: Mapping[str, str]) -> str | None:

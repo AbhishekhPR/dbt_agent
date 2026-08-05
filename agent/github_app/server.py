@@ -11,6 +11,7 @@ from agent.github_app.client import GitHubClient
 from agent.github_app.http_app import create_http_app
 from agent.github_app.jobs import BoundedJobQueue, RetryPolicy, RetryingJobProcessor
 from agent.github_app.runner import PullRequestReviewRunner
+from agent.metadata_evidence.service import build_review_lifecycle
 from agent.github_app.service import WebhookProcessingService
 from agent.github_app.settings import SettingsError, load_settings
 from agent.github_app.slack import SlackPublicationSink
@@ -74,9 +75,31 @@ def build_application(settings, *, client_factory=None, logger=None, sleep=time.
             sleep=sleep,
             logger=logger,
         )
+    # The store pool is built before the runner so the served review path can
+    # receive an explicit lifecycle dependency. Release 1 built the pool after
+    # the runner and never passed it, which is why genuine webhooks never
+    # reached PostgreSQL.
+    store_pool = None
+    if settings.database_url:
+        from agent.api.pool import StorePool
+        from agent.postgres_lifecycle_store import PostgresLifecycleStore
+
+        store_pool = StorePool(
+            lambda: PostgresLifecycleStore(settings.database_url),
+            size=settings.api_pool_size,
+        )
+
+    lifecycle = build_review_lifecycle(
+        store_pool,
+        metadata_review_enabled=settings.metadata_review_enabled,
+        environment=settings.metadata_review_environment,
+    )
+    logger.info("review lifecycle mode: %s", lifecycle.mode)
+
     runner = PullRequestReviewRunner(
         storage=storage,
         slack_publisher=slack_publisher,
+        lifecycle=lifecycle,
     )
     if client_factory is None:
         client_factory = partial(
@@ -107,16 +130,6 @@ def build_application(settings, *, client_factory=None, logger=None, sleep=time.
         logger=logger,
         job_store=storage,
     )
-    store_pool = None
-    if settings.database_url:
-        from agent.api.pool import StorePool
-        from agent.postgres_lifecycle_store import PostgresLifecycleStore
-
-        store_pool = StorePool(
-            lambda: PostgresLifecycleStore(settings.database_url),
-            size=settings.api_pool_size,
-        )
-
     app = create_http_app(
         webhook_secret=settings.webhook_secret,
         job_queue=jobs,
@@ -126,6 +139,7 @@ def build_application(settings, *, client_factory=None, logger=None, sleep=time.
         logger=logger,
         job_store=storage,
         store_pool=store_pool,
+        review_lifecycle_mode=lifecycle.mode,
     )
     app.state.job_queue = jobs
     return app

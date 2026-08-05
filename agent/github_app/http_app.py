@@ -23,6 +23,7 @@ def create_http_app(
     logger=None,
     job_store=None,
     store_pool=None,
+    review_lifecycle_mode=None,
 ):
     """Build the served application.
 
@@ -67,6 +68,10 @@ def create_http_app(
             "worker": "ok" if worker_running else "unavailable",
             "configuration": "ok",
         }
+        if review_lifecycle_mode is not None:
+            # Which review lifecycle is actually active. Sanitized: a mode
+            # name only, never a connection detail.
+            checks["review_lifecycle"] = review_lifecycle_mode
         if store_pool is None:
             checks["database"] = "disabled"
             checks["migrations"] = "disabled"

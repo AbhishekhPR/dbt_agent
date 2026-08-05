@@ -91,10 +91,17 @@ class GitHubAppServerTests(unittest.TestCase):
             sleep=ANY,
             logger=ANY,
         )
+        # The runner receives the review lifecycle as an explicit dependency.
+        # Asserting it here keeps the composition root honest: Release 1
+        # shipped a runner with no lifecycle at all and nothing noticed.
         runner_type.assert_called_once_with(
             storage=ANY,
             slack_publisher=sink_type.return_value,
+            lifecycle=ANY,
         )
+        lifecycle = runner_type.call_args.kwargs["lifecycle"]
+        self.assertTrue(hasattr(lifecycle, "begin"))
+        self.assertTrue(hasattr(lifecycle, "mode"))
 
     def test_safe_json_formatter_includes_only_allowed_fields(self):
         from agent.github_app.server import SafeJsonFormatter
