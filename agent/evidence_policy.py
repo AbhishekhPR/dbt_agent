@@ -21,6 +21,16 @@ class EvidenceState(str, Enum):
     NOT_EVALUATED = "NOT EVALUATED"
     UNSUPPORTED = "UNSUPPORTED"
     BLOCKED_BY_CREDENTIALS = "BLOCKED BY CREDENTIALS"
+    # Evidence that was collected but is older than policy allows. It is
+    # deliberately NOT EVALUATED-equivalent and deliberately not MISSING:
+    # the distinction matters when explaining a decision, and treating stale
+    # production state as current is the specific failure this release exists
+    # to prevent. Because it is not EVALUATED, a required stale source still
+    # yields coverage INCOMPLETE and WARN/BLOCK by mode.
+    STALE = "STALE"
+    # Required evidence that has been requested and is still outstanding. A
+    # review in this state has not failed; it has not finished.
+    PENDING = "PENDING"
 
 
 class EvidenceRequirement(str, Enum):
