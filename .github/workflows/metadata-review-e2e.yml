@@ -18,9 +18,13 @@ on:
   workflow_dispatch:
     inputs:
       commit:
-        description: "Exact release commit to validate"
+        description: "Release commit whose application code is under test"
         required: true
         default: "2d5cacb74c9a9267c4e487ca7f9c805bac6643ae"
+      harness_ref:
+        description: "Ref providing the E2E harness (must contain scripts/e2e/)"
+        required: true
+        default: "main"
       enforcement_mode:
         description: "Policy mode for the primary scenario"
         required: true
@@ -66,18 +70,32 @@ jobs:
       EVIDENCE_DIR: ${{ github.workspace }}/e2e-evidence
 
     steps:
-      - name: Check out the exact release commit
+      # The harness (scripts/e2e/) was added AFTER the release commit, so
+      # checking out the release alone yields a tree with no driver - that is
+      # exactly how the first run failed. Check out the harness ref instead and
+      # PROVE the application code is byte-identical to the release under test.
+      - name: Check out the harness ref
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.commit }}
+          ref: ${{ inputs.harness_ref }}
           fetch-depth: 0
 
-      - name: Verify the commit and clean worktree
+      - name: Prove the application code equals the release under test
         run: |
           HEAD_SHA="$(git rev-parse HEAD)"
-          echo "head=$HEAD_SHA"
-          [ "$HEAD_SHA" = "${{ inputs.commit }}" ] || { echo "COMMIT MISMATCH"; exit 1; }
+          echo "harness_ref_head=$HEAD_SHA"
           [ -z "$(git status --porcelain)" ] || { echo "WORKTREE NOT CLEAN"; exit 1; }
+          test -f scripts/e2e/metadata_review_e2e.py || {
+            echo "HARNESS MISSING at ${{ inputs.harness_ref }}"; exit 1; }
+          git cat-file -e "${{ inputs.commit }}^{commit}" || {
+            echo "release commit not present"; exit 1; }
+          RELEASE_TREE="$(git rev-parse ${{ inputs.commit }}:agent)"
+          HEAD_TREE="$(git rev-parse HEAD:agent)"
+          echo "agent tree @release=$RELEASE_TREE"
+          echo "agent tree @head   =$HEAD_TREE"
+          [ "$RELEASE_TREE" = "$HEAD_TREE" ] || {
+            echo "APPLICATION CODE DIFFERS FROM THE RELEASE UNDER TEST"; exit 1; }
+          echo "application code is byte-identical to ${{ inputs.commit }}"
 
       - uses: actions/setup-python@v5
         with:
@@ -172,11 +190,19 @@ jobs:
           RELIUM_GITHUB_APP_ID: ${{ secrets.RELIUM_E2E_APP_ID }}
           RELIUM_E2E_INSTALLATION_ID: ${{ secrets.RELIUM_E2E_INSTALLATION_ID }}
         run: |
-          python scripts/e2e/metadata_review_e2e.py "$EVIDENCE_DIR" --cleanup-only || true
+          # No `|| true`: a cleanup failure MUST fail the workflow. The first
+          # run masked a cleanup that could not even find its own script.
+          set -o pipefail
+          rc=0
+          python scripts/e2e/metadata_review_e2e.py "$EVIDENCE_DIR" --cleanup-only || rc=$?
           pkill -f cloudflared || true
           pkill -f "uvicorn" || true
           pkill -f "lifecycle_worker" || true
           echo "listeners still up:"; (ss -ltnp | grep -E ':(8000|8080|8791)' || echo none)
+          if [ $rc -ne 0 ]; then
+            echo "CLEANUP FAILED (rc=$rc) - failing the workflow"
+            exit $rc
+          fi
 
       - name: Scrub evidence of anything secret-shaped
         if: always()
