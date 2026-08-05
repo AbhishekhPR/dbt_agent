@@ -10,6 +10,14 @@ each mandatory operation has a call path from main().
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# The repository root must be importable for `agent...` imports.
+_ROOT = Path(__file__).resolve().parents[2]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 import base64
 import json
 import os

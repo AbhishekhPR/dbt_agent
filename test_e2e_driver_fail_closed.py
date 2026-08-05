@@ -217,6 +217,33 @@ class StateFieldTests(unittest.TestCase):
         self.assertIn('state.get("cleanup_done")', body)
 
 
+class ImportPathTests(unittest.TestCase):
+    """Run 2 failed with ModuleNotFoundError: No module named 'agent'.
+
+    sys.path[0] is the script's own directory, so the repository root must be
+    added explicitly or every `agent...` import fails at the first stage.
+    """
+
+    def test_driver_puts_the_repository_root_on_sys_path(self):
+        source = _source(DRIVER)
+        self.assertIn("REPO_ROOT = Path(__file__).resolve().parents[2]", source)
+        self.assertIn("sys.path.insert(0, str(REPO_ROOT))", source)
+
+    def test_helper_modules_also_reach_the_repository_root(self):
+        for path in (LIVE, VERIFY):
+            with self.subTest(module=path.name):
+                source = _source(path)
+                self.assertIn("parents[2]", source,
+                              f"{path.name} cannot import agent modules")
+
+    def test_repo_root_is_inserted_before_agent_imports_are_used(self):
+        source = _source(DRIVER)
+        root = source.index("sys.path.insert(0, str(REPO_ROOT))")
+        first_agent = source.index("from agent.")
+        self.assertLess(root, first_agent,
+                        "the repository root must be on sys.path before agent imports")
+
+
 class ProhibitedContentTests(unittest.TestCase):
     def test_no_todo_pass_or_mocked_success_in_the_live_path(self):
         for path in (DRIVER, LIVE, VERIFY, STAGES):

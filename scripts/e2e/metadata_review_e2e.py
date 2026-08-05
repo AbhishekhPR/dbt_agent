@@ -33,6 +33,11 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+# Both the harness directory AND the repository root must be importable:
+# sys.path[0] is the script's own directory, so `import agent...` fails
+# without the root even when the process is launched from it.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(Path(__file__).parent))
 
 import live_flow as lf                                    # noqa: E402
@@ -312,7 +317,7 @@ def main() -> int:
         return 0 if result.get("cleanup_passed") else 1
 
     arm()   # armed BEFORE the mutation flag can ever be set
-    workdir = Path(__file__).resolve().parents[2]
+    workdir = REPO_ROOT
     dsn = os.environ["RELIUM_DATABASE_URL"]
     owner, repo_name = REPO.split("/")
     mode = os.environ.get("RELIUM_ENFORCEMENT_MODE", "enforce")
