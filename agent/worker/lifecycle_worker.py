@@ -68,6 +68,10 @@ class JobContext:
         self.repository_id = event["repository_id"]
         self.environment = event["environment"]
         self.payload = event.get("payload") or {}
+        # A job's subject is either a deployment or a review. Handlers read the
+        # subject rather than assuming a deployment.
+        self.subject_type = event.get("subject_type") or "deployment"
+        self.subject_id = event.get("subject_id") or event.get("deployment_id")
 
 
 @registry.register("incident.rca_requested")
@@ -105,6 +109,13 @@ for _event in ("deployment.reviewed", "deployment.approved", "deployment.deploym
                "deployment.post_deployment_anomaly", "deployment.rolled_back",
                "deployment.incident_open", "deployment.incident_resolved"):
     _register_lifecycle_ack(_event)
+
+
+# Review recomputation runs on this same worker and this same outbox. It is
+# registered here so the supported event set stays inspectable in one place.
+from agent.metadata_evidence.recompute import register as _register_recompute  # noqa: E402
+
+_register_recompute(registry)
 
 
 class WorkerState:

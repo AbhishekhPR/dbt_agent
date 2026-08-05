@@ -15,6 +15,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from agent.api.collector_routes import COLLECTOR_ROUTES, build_handlers
 from agent.api.auth import AuthenticationError, AuthorizationError, ServiceTokenAuthenticator, bearer_token
 from agent.api.service import (
     ConflictError,
@@ -438,6 +439,8 @@ def create_api_routes(*, store_pool, authenticator_factory=None):
             entries.sort(key=lambda e: e["event_key"])
         return 200, {"environment": environment, "channels": channels}
 
+    _collector = build_handlers()
+
     routes = [
         Route("/api/deployments/events", handler(post_deployment_event, write=True), methods=["POST"]),
         Route("/api/monitoring/baselines", handler(post_baseline, write=True), methods=["POST"]),
@@ -460,6 +463,13 @@ def create_api_routes(*, store_pool, authenticator_factory=None):
         Route("/api/repositories/{repository}/settings", handler(repository_settings, write=False), methods=["GET"]),
         Route("/api/evidence-coverage", handler(evidence_coverage, write=False), methods=["GET"]),
         Route("/api/delivery-status", handler(delivery_status, write=False), methods=["GET"]),
+
+        # Collector control and metadata snapshot surface. Registered on the
+        # same application, behind the same authentication and tenant scoping.
+        *[
+            Route(path, handler(_collector[name], write=write), methods=[method])
+            for method, path, name, write in COLLECTOR_ROUTES
+        ],
     ]
     return routes
 
