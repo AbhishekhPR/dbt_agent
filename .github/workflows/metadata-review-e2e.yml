@@ -1,0 +1,198 @@
+name: metadata-review-e2e
+
+# Manually triggered, one-time genuine GitHub metadata-review E2E on a fresh
+# ephemeral Linux runner.
+#
+# This exists because the local Windows/WSL host was disqualified as the E2E
+# host: the Windows PostgreSQL cluster crashed, Windows-to-WSL forwarding
+# failed, and the WSL VM restarted repeatedly under load. Root causes were
+# never established and NO product defect was found. Everything here -
+# PostgreSQL, API, worker, tunnel - runs on ONE Linux host, so no cross-OS
+# forwarding is involved.
+#
+# It is workflow_dispatch only. It never runs on push or pull_request,
+# because it repoints the dedicated Relium E2E App webhook and must only ever
+# happen deliberately.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Exact release commit to validate"
+        required: true
+        default: "2d5cacb74c9a9267c4e487ca7f9c805bac6643ae"
+      enforcement_mode:
+        description: "Policy mode for the primary scenario"
+        required: true
+        default: "enforce"
+        type: choice
+        options: [enforce, shadow]
+      run_variants:
+        description: "Run variants A-G after the primary scenario"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never allow two runs to repoint the same webhook simultaneously.
+  group: metadata-review-e2e
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: bootstrap_only_not_used_by_the_app
+          POSTGRES_DB: postgres
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      RELIUM_E2E_REPOSITORY: AbhishekhPR/relium-e2e-dbt
+      RELIUM_E2E_APP_SLUG: relium-e2e
+      EVIDENCE_DIR: ${{ github.workspace }}/e2e-evidence
+
+    steps:
+      - name: Check out the exact release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+          fetch-depth: 0
+
+      - name: Verify the commit and clean worktree
+        run: |
+          HEAD_SHA="$(git rev-parse HEAD)"
+          echo "head=$HEAD_SHA"
+          [ "$HEAD_SHA" = "${{ inputs.commit }}" ] || { echo "COMMIT MISMATCH"; exit 1; }
+          [ -z "$(git status --porcelain)" ] || { echo "WORKTREE NOT CLEAN"; exit 1; }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install the hash-locked dependency set
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip check
+
+      - name: Install PostgreSQL 18 client tools
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-18
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+
+      - name: Provision migration and least-privileged application roles
+        env:
+          PGPASSWORD: bootstrap_only_not_used_by_the_app
+        run: |
+          # Bootstrap uses the container superuser. The application NEVER does.
+          APP_PW="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 32)"
+          MIG_PW="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 32)"
+          psql -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 -q <<SQL
+          CREATE ROLE relium_migrator LOGIN PASSWORD '${MIG_PW}' CREATEDB;
+          CREATE DATABASE relium_e2e OWNER relium_migrator;
+          CREATE ROLE relium_app LOGIN PASSWORD '${APP_PW}'
+            NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+            CONNECTION LIMIT 20;
+          SQL
+          psql -h 127.0.0.1 -U postgres -d relium_e2e -v ON_ERROR_STOP=1 -q <<SQL
+          GRANT CONNECT ON DATABASE relium_e2e TO relium_app;
+          ALTER DATABASE relium_e2e OWNER TO relium_app;
+          ALTER SCHEMA public OWNER TO relium_app;
+          SQL
+          # Masked so the DSN can never surface in logs or evidence.
+          echo "::add-mask::${APP_PW}"
+          echo "::add-mask::${MIG_PW}"
+          echo "RELIUM_DATABASE_URL=postgresql://relium_app:${APP_PW}@127.0.0.1:5432/relium_e2e" >> "$GITHUB_ENV"
+
+      - name: Assert the application role is least-privileged
+        env:
+          PGPASSWORD: bootstrap_only_not_used_by_the_app
+        run: |
+          VERDICT="$(psql -h 127.0.0.1 -U postgres -tAc "
+            SELECT CASE WHEN NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole
+                         AND NOT rolreplication AND NOT rolbypassrls
+                        THEN 'LEAST_PRIVILEGED' ELSE 'OVER_PRIVILEGED' END
+              FROM pg_roles WHERE rolname='relium_app'")"
+          echo "app role: $VERDICT"
+          [ "$VERDICT" = "LEAST_PRIVILEGED" ] || exit 1
+
+      - name: Write the dedicated App private key to a protected path
+        env:
+          RELIUM_GITHUB_PRIVATE_KEY: ${{ secrets.RELIUM_E2E_PRIVATE_KEY }}
+        run: |
+          # Outside the workspace so it can never be collected as an artifact.
+          install -m 700 -d "$RUNNER_TEMP/relium-secrets"
+          printf '%s' "$RELIUM_GITHUB_PRIVATE_KEY" > "$RUNNER_TEMP/relium-secrets/app.pem"
+          chmod 600 "$RUNNER_TEMP/relium-secrets/app.pem"
+          test -s "$RUNNER_TEMP/relium-secrets/app.pem" || { echo "private key secret is empty"; exit 1; }
+          echo "RELIUM_GITHUB_PRIVATE_KEY_PATH=$RUNNER_TEMP/relium-secrets/app.pem" >> "$GITHUB_ENV"
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL -o /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Run the genuine metadata-review E2E
+        id: e2e
+        env:
+          RELIUM_GITHUB_APP_ID: ${{ secrets.RELIUM_E2E_APP_ID }}
+          RELIUM_GITHUB_WEBHOOK_SECRET: ${{ secrets.RELIUM_E2E_WEBHOOK_SECRET }}
+          RELIUM_E2E_INSTALLATION_ID: ${{ secrets.RELIUM_E2E_INSTALLATION_ID }}
+          RELIUM_ENFORCEMENT_MODE: ${{ inputs.enforcement_mode }}
+          RELIUM_RUN_VARIANTS: ${{ inputs.run_variants }}
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          python scripts/e2e/metadata_review_e2e.py "$EVIDENCE_DIR"
+
+      # Cleanup is a separate ALWAYS step so it runs on success, failure,
+      # cancellation and timeout. The driver also registers its own
+      # finally-style cleanup; this is the outer guarantee.
+      - name: Mandatory cleanup (restore webhook, stop everything)
+        if: always()
+        env:
+          RELIUM_GITHUB_APP_ID: ${{ secrets.RELIUM_E2E_APP_ID }}
+          RELIUM_E2E_INSTALLATION_ID: ${{ secrets.RELIUM_E2E_INSTALLATION_ID }}
+        run: |
+          python scripts/e2e/metadata_review_e2e.py "$EVIDENCE_DIR" --cleanup-only || true
+          pkill -f cloudflared || true
+          pkill -f "uvicorn" || true
+          pkill -f "lifecycle_worker" || true
+          echo "listeners still up:"; (ss -ltnp | grep -E ':(8000|8080|8791)' || echo none)
+
+      - name: Scrub evidence of anything secret-shaped
+        if: always()
+        run: |
+          # Refuse to publish evidence containing credential material.
+          if grep -rIlE 'BEGIN [A-Z ]*PRIVATE KEY|gh[pousr]_[A-Za-z0-9]{20,}|postgresql://[^ ]*:[^ ]*@' \
+               "$EVIDENCE_DIR" 2>/dev/null; then
+            echo "SECRET-SHAPED CONTENT FOUND IN EVIDENCE - not uploading"
+            exit 1
+          fi
+          echo "evidence scrub: clean"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metadata-review-e2e-evidence
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: warn
