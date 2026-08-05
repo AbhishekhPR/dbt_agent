@@ -42,6 +42,15 @@ MANDATORY_ROUTES = {
     ("GET", "/api/repositories/{repository}/settings"),
     ("GET", "/api/evidence-coverage"),
     ("GET", "/api/delivery-status"),
+    # metadata evidence plane
+    ("GET", "/api/collection-requests"),
+    ("GET", "/api/collection-requests/{request_id}"),
+    ("POST", "/api/collection-requests/{request_id}/acknowledge"),
+    ("POST", "/api/collection-requests/{request_id}/failure"),
+    ("POST", "/api/metadata-snapshots"),
+    ("GET", "/api/metadata-snapshots/{snapshot_id}"),
+    ("GET", "/api/reviews/{review_id}/evidence-coverage"),
+    ("POST", "/api/collectors"),
 }
 
 AUTHENTICATION = {

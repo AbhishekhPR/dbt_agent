@@ -22,6 +22,15 @@ from agent.postgres_migrate import apply_migrations
 OUTBOX_LEASE_SECONDS = 300
 
 
+class SnapshotConflict(ValueError):
+    """An idempotency key was replayed with a different payload.
+
+    Store-level so the persistence layer does not depend on the API layer;
+    the HTTP boundary translates it to 409.
+    """
+
+
+
 def _bounded_text(value, limit: int = 256):
     """Never persist an unbounded text value from a warehouse.
 
@@ -1327,7 +1336,10 @@ class PostgresLifecycleStore:
         ).fetchone()
         if existing is not None:
             if existing["payload_hash"] != payload_hash:
-                raise ValueError(
+                # A conflicting replay must never overwrite accepted evidence.
+                # ConflictError so the API boundary reports 409 rather than a
+                # generic failure.
+                raise SnapshotConflict(
                     "idempotency key already used with a different payload")
             return dict(existing), False
 

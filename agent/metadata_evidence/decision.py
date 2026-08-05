@@ -430,14 +430,28 @@ def _relation_findings(targets, index):
             continue
 
         # -- case 2: external relation missing ------------------------------
+        # Only an EXTERNAL dependency is required to exist. An internal
+        # relation - one the pull request modifies but does not newly create -
+        # is not part of the targeted collection request, so its absence means
+        # "not collected", not "not there". Blocking on evidence that was
+        # never requested would be a false failure.
         if entry is None or not entry["relation"].get("exists_in_production", True):
-            findings.append(Finding(
-                code="relation.missing_in_production", severity="block",
-                category="production", relation=name,
-                message=(f"{name} is an external production dependency but was "
-                         f"not found in the warehouse."),
-                detail={"dependency_kind": kind},
-            ))
+            if kind == "external":
+                findings.append(Finding(
+                    code="relation.missing_in_production", severity="block",
+                    category="production", relation=name,
+                    message=(f"{name} is an external production dependency but was "
+                             f"not found in the warehouse."),
+                    detail={"dependency_kind": kind},
+                ))
+            else:
+                findings.append(Finding(
+                    code="relation.not_collected", severity="info",
+                    category="production", relation=name,
+                    message=(f"{name} was not part of the targeted collection "
+                             f"request, so its production state was not evaluated."),
+                    detail={"dependency_kind": kind},
+                ))
             continue
 
         relation = entry["relation"]

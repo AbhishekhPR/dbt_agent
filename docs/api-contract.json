@@ -17,6 +17,8 @@
   },
   "mandatory_routes": [
     "GET /api/anomalies",
+    "GET /api/collection-requests",
+    "GET /api/collection-requests/{request_id}",
     "GET /api/delivery-status",
     "GET /api/deployments",
     "GET /api/deployments/{deployment_id}",
@@ -25,17 +27,23 @@
     "GET /api/incidents/{incident_id}",
     "GET /api/incidents/{incident_id}/rca",
     "GET /api/kpis/{kpi}/impact",
+    "GET /api/metadata-snapshots/{snapshot_id}",
     "GET /api/models/{model}/lineage",
     "GET /api/monitoring",
     "GET /api/monitoring/observations",
     "GET /api/repositories/{repository}/settings",
     "GET /api/reviews",
     "GET /api/reviews/{review_id}",
+    "GET /api/reviews/{review_id}/evidence-coverage",
     "GET /healthz",
     "GET /readyz",
     "POST /api/anomalies",
+    "POST /api/collection-requests/{request_id}/acknowledge",
+    "POST /api/collection-requests/{request_id}/failure",
+    "POST /api/collectors",
     "POST /api/deployments/events",
     "POST /api/incidents",
+    "POST /api/metadata-snapshots",
     "POST /api/monitoring/baselines",
     "POST /api/monitoring/observations",
     "POST /api/reviews",
@@ -51,6 +59,31 @@
       "authentication": "service-token",
       "method": "POST",
       "path": "/api/anomalies"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/collection-requests"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/collection-requests/{request_id}"
+    },
+    {
+      "authentication": "service-token",
+      "method": "POST",
+      "path": "/api/collection-requests/{request_id}/acknowledge"
+    },
+    {
+      "authentication": "service-token",
+      "method": "POST",
+      "path": "/api/collection-requests/{request_id}/failure"
+    },
+    {
+      "authentication": "service-token",
+      "method": "POST",
+      "path": "/api/collectors"
     },
     {
       "authentication": "service-token",
@@ -104,6 +137,16 @@
     },
     {
       "authentication": "service-token",
+      "method": "POST",
+      "path": "/api/metadata-snapshots"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/metadata-snapshots/{snapshot_id}"
+    },
+    {
+      "authentication": "service-token",
       "method": "GET",
       "path": "/api/models/{model}/lineage"
     },
@@ -146,6 +189,11 @@
       "authentication": "service-token",
       "method": "GET",
       "path": "/api/reviews/{review_id}"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/reviews/{review_id}/evidence-coverage"
     },
     {
       "authentication": "github-webhook-signature",

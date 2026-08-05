@@ -450,8 +450,13 @@ CREATE TABLE IF NOT EXISTS review_evidence_coverage (
     FOREIGN KEY (organization_id, repository_id, review_id)
         REFERENCES reviews (organization_id, repository_id, review_id) ON DELETE CASCADE,
     CHECK (requirement IN ('required', 'optional', 'disabled')),
+    -- Mirrors agent/evidence_policy.py EvidenceState. STALE and PENDING are
+    -- deliberately distinct from MISSING: "collected but too old" and
+    -- "requested and still outstanding" are different facts, and a review
+    -- that is merely waiting has not failed.
     CHECK (state IN ('EVALUATED', 'MISSING', 'FAILED', 'NOT EVALUATED',
-                     'UNSUPPORTED', 'STALE', 'BLOCKED BY CREDENTIALS')),
+                     'UNSUPPORTED', 'STALE', 'PENDING',
+                     'BLOCKED BY CREDENTIALS')),
     -- which of the three product states this source belongs to
     CHECK (evidence_state_group IS NULL
            OR evidence_state_group IN ('base_code', 'head_code', 'production'))
