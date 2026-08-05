@@ -7,6 +7,8 @@ from agent.github_app.client import GitHubNotFoundError
 from agent.github_app.comments import upsert_review_comment
 from agent.github_app.config import DEFAULT_MANIFEST_PATH, load_repository_config
 from agent.github_app.review_comment import render_review_comment
+from agent.metadata_evidence.service import DisabledReviewLifecycle
+from agent.metadata_evidence.waiting_publication import render_waiting_result
 
 
 class ReviewRunnerError(ValueError):
@@ -20,10 +22,15 @@ class PullRequestReviewRunner:
         storage,
         reviewer=review_manifest_change,
         slack_publisher=None,
+        lifecycle=None,
     ):
         self.storage = storage
         self.reviewer = reviewer
         self.slack_publisher = slack_publisher
+        # The review lifecycle is an explicit dependency. The runner never
+        # opens a database connection itself; it holds this or it holds the
+        # inert compatibility object.
+        self.lifecycle = lifecycle or DisabledReviewLifecycle()
 
     def run(self, event, client, *, expected_app_id):
         if not self.storage.claim_delivery(event.repository.id, event.delivery_id):
@@ -137,13 +144,85 @@ class PullRequestReviewRunner:
                 message="Relium skipped analysis because this pull request changes no dbt models.",
                 expected_app_id=expected_app_id,
             )
-        return self._publish(
+        # ---- authoritative PostgreSQL review lifecycle -------------------
+        # This is the connection Release 1 was missing: the served webhook
+        # path now records the review, and decides whether production
+        # evidence is required, before anything is published to GitHub.
+        outcome = self._begin_lifecycle(
+            event,
+            config,
+            manifest=manifest,
+            previous_manifest=previous_manifest,
+            result=result,
+        )
+
+        publish_result = result
+        status_label = "reviewed"
+        if outcome is not None and outcome.waiting:
+            # The review has not failed; it has not finished. Publish a
+            # non-final waiting state rather than a verdict.
+            publish_result = render_waiting_result(
+                outcome, base_sha=event.base_sha, head_sha=event.head_sha)
+            status_label = "waiting_for_metadata"
+
+        published = self._publish(
             event,
             client,
             config.enforcement_mode,
-            result,
-            status="reviewed",
+            publish_result,
+            status=status_label,
             expected_app_id=expected_app_id,
+        )
+        self._record_publication_identity(event, outcome, published)
+        if outcome is not None:
+            published["review_id"] = outcome.review_id
+            published["review_attempt"] = outcome.attempt
+            published["lifecycle_state"] = outcome.lifecycle_state
+            published["collection_request_id"] = outcome.request_id
+        return published
+
+    def _begin_lifecycle(self, event, config, *, manifest, previous_manifest,
+                         result):
+        """Persist the review through the lifecycle service.
+
+        Returns None when the deterministic filesystem-compatibility mode is
+        active. A lifecycle failure is never swallowed into a silent
+        filesystem-only review: it propagates, so the delivery is retried
+        rather than published as if it had been recorded.
+        """
+        if not getattr(self.lifecycle, "enabled", False):
+            return None
+        incident = result.get("incident") or {}
+        health = incident.get("health")
+        return self.lifecycle.begin(
+            organization_id=str(event.repository.owner),
+            repository_id=str(event.repository.name),
+            pull_number=event.pull_number,
+            base_sha=event.base_sha,
+            head_sha=event.head_sha,
+            base_manifest=previous_manifest,
+            head_manifest=manifest,
+            changed_models=list(result.get("changed_models") or []),
+            enforcement_mode=config.enforcement_mode,
+            delivery_id=event.delivery_id,
+            code_health=int(health) if isinstance(health, int) else 100,
+        )
+
+    def _record_publication_identity(self, event, outcome, published):
+        """Persist the sticky comment and check-run identities.
+
+        Recomputation reconciles these rather than publishing again.
+        """
+        if outcome is None or not getattr(self.lifecycle, "enabled", False):
+            return
+        comment = published.get("comment") or {}
+        check = published.get("check") or {}
+        self.lifecycle.record_publication(
+            organization_id=str(event.repository.owner),
+            repository_id=str(event.repository.name),
+            review_id=outcome.review_id,
+            comment_id=comment.get("id"),
+            check_run_id=check.get("id"),
         )
 
     def _publish_neutral(
