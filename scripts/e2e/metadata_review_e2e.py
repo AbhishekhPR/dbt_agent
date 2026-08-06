@@ -48,6 +48,10 @@ from stages import REQUIRED_STAGES, StageIncomplete, StageTracker  # noqa: E402
 REPO = os.environ.get("RELIUM_E2E_REPOSITORY", "AbhishekhPR/relium-e2e-dbt")
 APP_SLUG = os.environ.get("RELIUM_E2E_APP_SLUG", "relium-e2e")
 API = "https://api.github.com"
+# Separate fine-grained credential. The App keeps contents:read; this token
+# is the ONLY thing permitted to write repository contents, and only for
+# fixture branch/commit/PR operations.
+FIXTURE_TOKEN = os.environ.get("RELIUM_E2E_FIXTURE_TOKEN", "")
 RUN = uuid.uuid4().hex[:10]
 
 EV = Path(sys.argv[1])
@@ -159,7 +163,7 @@ def cleanup(reason="normal"):
     for number in ([state["pr_number"]] if state["pr_number"] else []) + \
             state.get("extra_prs", []):
         try:
-            token = installation_token()
+            token = FIXTURE_TOKEN or installation_token()
             st, pr = gh("GET", f"/repos/{REPO}/pulls/{number}", token, bearer=False)
             if st == 200 and pr.get("merged"):
                 result["failures"].append(f"fixture PR #{number} was MERGED")
@@ -257,8 +261,7 @@ def issue_token(dsn, owner, repo_name):
 def run_variant(letter, *, dsn, owner, repo_name, token, mode, manifest_variant,
                 snapshot_kwargs, expect, since):
     """Create a real fixture PR, drive the real flow, assert the outcome."""
-    inst = installation_token()
-    pr = lf.create_fixture_pr(state, gh, inst, REPO, f"{RUN}-{letter.lower()}",
+    pr = lf.create_fixture_pr(state, gh, FIXTURE_TOKEN, REPO, f"{RUN}-{letter.lower()}",
                               variant=manifest_variant, enforcement_mode=mode)
     state.setdefault("extra_prs", []).append(pr["pr_number"])
     review = vf.verify_postgres_review(dsn, owner, repo_name, pr["head_sha"],
@@ -346,6 +349,12 @@ def main() -> int:
     status, repos = gh("GET", "/installation/repositories", inst_token, bearer=False)
     names = [r["full_name"] for r in (repos.get("repositories") or [])]
     check("App accesses exactly the synthetic E2E repository", names == [REPO], names)
+    check("fixture token is configured", bool(FIXTURE_TOKEN))
+    if FIXTURE_TOKEN:
+        scope = lf.assert_fixture_token_scope(gh, FIXTURE_TOKEN, REPO)
+        check("fixture token reaches exactly the E2E repository",
+              scope["unrelated_access_denied"], scope["accessible_repository"])
+        write("fixture-token-scope.json", scope)
     if not all(c["passed"] for c in checks):
         write("prelive-safety-final.json", {"checks": checks, "gate_passed": False})
         raise StageFailure("pre-live gate failed - no outward-facing change made")
@@ -395,7 +404,7 @@ def main() -> int:
 
     # ---- genuine synthetic pull request ------------------------------
     tracker.begin("fixture_pr_created")
-    pr = lf.create_fixture_pr(state, gh, installation_token(), REPO, RUN,
+    pr = lf.create_fixture_pr(state, gh, FIXTURE_TOKEN, REPO, RUN,
                               variant="external", enforcement_mode=mode)
     tracker.complete("fixture_pr_created", pr)
 

@@ -175,6 +175,10 @@ jobs:
           RELIUM_GITHUB_APP_ID: ${{ secrets.RELIUM_E2E_APP_ID }}
           RELIUM_GITHUB_WEBHOOK_SECRET: ${{ secrets.RELIUM_E2E_WEBHOOK_SECRET }}
           RELIUM_E2E_INSTALLATION_ID: ${{ secrets.RELIUM_E2E_INSTALLATION_ID }}
+          # Fine-grained, repository-scoped, contents+PR write only. Used
+          # solely for fixture branch/commit/PR operations; the dedicated App
+          # keeps contents:read and performs every review action.
+          RELIUM_E2E_FIXTURE_TOKEN: ${{ secrets.RELIUM_E2E_FIXTURE_TOKEN }}
           RELIUM_ENFORCEMENT_MODE: ${{ inputs.enforcement_mode }}
           RELIUM_RUN_VARIANTS: ${{ inputs.run_variants }}
         run: |
@@ -189,6 +193,7 @@ jobs:
         env:
           RELIUM_GITHUB_APP_ID: ${{ secrets.RELIUM_E2E_APP_ID }}
           RELIUM_E2E_INSTALLATION_ID: ${{ secrets.RELIUM_E2E_INSTALLATION_ID }}
+          RELIUM_E2E_FIXTURE_TOKEN: ${{ secrets.RELIUM_E2E_FIXTURE_TOKEN }}
         run: |
           # No `|| true`: a cleanup failure MUST fail the workflow. The first
           # run masked a cleanup that could not even find its own script.
@@ -208,7 +213,7 @@ jobs:
         if: always()
         run: |
           # Refuse to publish evidence containing credential material.
-          if grep -rIlE 'BEGIN [A-Z ]*PRIVATE KEY|gh[pousr]_[A-Za-z0-9]{20,}|postgresql://[^ ]*:[^ ]*@' \
+          if grep -rIlE 'BEGIN [A-Z ]*PRIVATE KEY|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|postgresql://[^ ]*:[^ ]*@' \
                "$EVIDENCE_DIR" 2>/dev/null; then
             echo "SECRET-SHAPED CONTENT FOUND IN EVIDENCE - not uploading"
             exit 1

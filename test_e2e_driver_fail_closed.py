@@ -266,6 +266,58 @@ class ProhibitedContentTests(unittest.TestCase):
         self.assertIn('"variant_g_verified"', source)
 
 
+class FixtureTokenBoundaryTests(unittest.TestCase):
+    """The fixture token is the only credential with contents:write.
+
+    The dedicated App deliberately keeps contents:read, so this token's blast
+    radius must stay confined to fixture branch/commit/PR operations.
+    """
+
+    def test_fixture_token_scope_is_asserted_before_use(self):
+        """Execution order inside main(), not source position.
+
+        run_variant is DEFINED above main() but only CALLED from it, so a
+        whole-file index comparison measures the wrong thing.
+        """
+        driver = _source(DRIVER)
+        body = driver[driver.index("def main() -> int:"):]
+        assertion = body.index("assert_fixture_token_scope")
+        first_use = body.index("lf.create_fixture_pr(")
+        self.assertLess(assertion, first_use,
+                        "token scope must be asserted before any fixture write")
+
+    def test_scope_assertion_precedes_the_variant_helper_call(self):
+        driver = _source(DRIVER)
+        body = driver[driver.index("def main() -> int:"):]
+        assertion = body.index("assert_fixture_token_scope")
+        variant_call = body.index("run_variant(")
+        self.assertLess(assertion, variant_call)
+
+    def test_scope_assertion_rejects_unrelated_private_repositories(self):
+        live = _source(LIVE)
+        body = live[live.index("def assert_fixture_token_scope"):]
+        self.assertIn("unrelated private repository", body)
+        self.assertIn("raise StageFailure", body)
+
+    def test_fixture_token_is_never_used_for_app_operations(self):
+        driver = _source(DRIVER)
+        forbidden = ("/app/hook/config", "/app/installations",
+                     "/issues/", "/check-runs", "/api/metadata-snapshots")
+        for line in driver.splitlines():
+            if "FIXTURE_TOKEN" not in line:
+                continue
+            for path in forbidden:
+                with self.subTest(line=line.strip()[:60], path=path):
+                    self.assertNotIn(path, line,
+                                     "fixture token used on an App-only path")
+
+    def test_webhook_operations_use_the_app_jwt_only(self):
+        driver = _source(DRIVER)
+        for line in driver.splitlines():
+            if "/app/hook/config" in line:
+                self.assertNotIn("FIXTURE_TOKEN", line)
+
+
 class WorkflowTests(unittest.TestCase):
     def test_workflow_is_dispatch_only_with_bounded_timeout(self):
         import yaml

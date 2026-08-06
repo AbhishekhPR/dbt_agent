@@ -241,9 +241,61 @@ def build_manifests(variant="external"):
     return base, head, ["fct_orders"]
 
 
+def assert_fixture_token_scope(gh, fixture_token, repo):
+    """Fail closed unless the fixture token reaches EXACTLY the E2E repository.
+
+    The dedicated App keeps contents:read. This separate fine-grained token is
+    the only credential able to write repository contents, so its blast radius
+    is asserted before it is ever used: it must see the E2E repository and must
+    NOT be able to read an unrelated private repository.
+    """
+    status, me = gh("GET", f"/repos/{repo}", fixture_token, bearer=False)
+    if status != 200:
+        raise StageFailure(f"fixture token cannot access {repo}: HTTP {status}")
+
+    # Enumerate everything the token can see. A repository-scoped fine-grained
+    # token must report exactly one.
+    status, listing = gh("GET", "/installation/repositories", fixture_token,
+                         bearer=False)
+    visible = None
+    if status == 200:
+        visible = [r["full_name"] for r in (listing.get("repositories") or [])]
+    else:
+        status, listing = gh("GET", "/user/repos?per_page=100&affiliation=owner",
+                             fixture_token, bearer=False)
+        if status == 200 and isinstance(listing, list):
+            visible = [r["full_name"] for r in listing]
+
+    if visible is not None:
+        others = [n for n in visible if n != repo]
+        if others:
+            raise StageFailure(
+                f"fixture token reaches {len(others)} unrelated repositories")
+
+    # Negative control: a known unrelated private repository must be denied.
+    control = "AbhishekhPR/dbt_agent"
+    status, _ = gh("GET", f"/repos/{control}", fixture_token, bearer=False)
+    if status == 200:
+        raise StageFailure(
+            f"fixture token can read the unrelated private repository {control}")
+    return {"accessible_repository": repo,
+            "visible_repositories": visible if visible is not None else "not enumerable",
+            "unrelated_private_repo_status": status,
+            "unrelated_access_denied": status in (403, 404),
+            "used_only_for": ["branch creation", "file commits",
+                              "pull request creation", "fixture closure"],
+            "never_used_for": ["review execution", "webhook management",
+                               "comments", "check runs", "App authentication",
+                               "snapshot submission", "dashboard access"]}
+
+
 def create_fixture_pr(state, gh, token, repo, run_id, variant="external",
                       enforcement_mode="enforce"):
-    """Create a REAL unmerged pull request in the synthetic E2E repository."""
+    """Create a REAL unmerged pull request in the synthetic E2E repository.
+
+    ``token`` here is the FIXTURE token, never the App installation token: the
+    App deliberately holds contents:read and must not gain write access.
+    """
     base, head, changed = build_manifests(variant)
 
     status, repo_info = gh("GET", f"/repos/{repo}", token, bearer=False)
