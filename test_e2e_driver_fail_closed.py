@@ -293,32 +293,51 @@ class FixtureTokenBoundaryTests(unittest.TestCase):
         variant_call = body.index("run_variant(")
         self.assertLess(assertion, variant_call)
 
-    def test_scope_assertion_tests_write_capability_not_visibility(self):
-        """Counting visible repositories cannot distinguish a grant from
-        ordinary public visibility; push capability can."""
+    def _scope_body(self):
         live = _source(LIVE)
-        body = live[live.index("def assert_fixture_token_scope"):
+        return live[live.index("def assert_fixture_token_scope"):
                     live.index("def create_fixture_pr")]
-        self.assertIn('control_perms.get("push")', body)
+
+    def test_public_repositories_do_not_fail_the_scope_assertion(self):
+        """A fine-grained PAT keeps read access to public repositories, so
+        public visibility must never be treated as grant scope."""
+        body = self._scope_body()
+        self.assertIn('if r.get("private")', body,
+                      "the scope set must be filtered to private repositories")
+        self.assertIn("public_repositories_ignored", body)
+
+    def test_unrelated_private_repositories_fail_the_assertion(self):
+        body = self._scope_body()
+        self.assertIn("unrelated PRIVATE", body)
         self.assertIn("raise StageFailure", body)
-        self.assertIn("write access to the unrelated repository", body)
 
-    def test_visible_repository_count_is_informational_only(self):
-        live = _source(LIVE)
-        body = live[live.index("def assert_fixture_token_scope"):
-                    live.index("def create_fixture_pr")]
-        self.assertIn("visible_repositories_informational", body)
-        listing = body.index("/user/repos")
-        # no StageFailure may be raised on the enumeration result
-        after = body[listing:]
-        self.assertNotIn("raise StageFailure", after,
-                         "enumeration must not be an assertion")
+    def test_target_private_repository_is_required(self):
+        body = self._scope_body()
+        self.assertIn("cannot see the target private repository", body)
+        self.assertIn("private_set != [repo]", body)
 
-    def test_target_write_access_is_required(self):
-        live = _source(LIVE)
-        body = live[live.index("def assert_fixture_token_scope"):
-                    live.index("def create_fixture_pr")]
-        self.assertIn('target_perms.get("push")', body)
+    def test_public_repo_permissions_are_never_used_as_proof(self):
+        """E2E-SEC-01 came from inferring grant scope from a public repo's
+        permissions object. That inference must not return."""
+        body = self._scope_body()
+        for forbidden in ('control_perms', 'permissions") or {}',
+                          '.get("push")', '.get("admin")', "dbt_agent"):
+            with self.subTest(pattern=forbidden):
+                self.assertNotIn(forbidden, body)
+
+    def test_write_capability_is_proven_by_the_real_fixture_creation(self):
+        body = self._scope_body()
+        self.assertIn("write_capability_proof", body)
+        driver = _source(DRIVER)
+        self.assertIn("lf.create_fixture_pr(state, gh, FIXTURE_TOKEN", driver)
+
+    def test_fixture_operations_are_restricted_to_the_allowed_set(self):
+        body = self._scope_body()
+        allowed = ["branch creation", "file commits", "pull request creation",
+                   "pull request closure", "fixture branch deletion"]
+        for op in allowed:
+            with self.subTest(operation=op):
+                self.assertIn(op, body)
 
     def test_fixture_token_is_never_used_for_app_operations(self):
         driver = _source(DRIVER)

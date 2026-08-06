@@ -241,65 +241,63 @@ def build_manifests(variant="external"):
     return base, head, ["fct_orders"]
 
 
-def assert_fixture_token_scope(gh, fixture_token, repo, control_repo=None):
-    """Fail closed unless the fixture token's WRITE reach is exactly `repo`.
+def assert_fixture_token_scope(gh, fixture_token, repo):
+    """Fail closed unless the token's PRIVATE repository reach is exactly `repo`.
 
-    Two earlier versions of this check were wrong, and both would have been
-    misleading rather than merely noisy:
+    Two earlier versions of this check were wrong, and the second was actively
+    misleading:
 
-      * counting repositories the token can SEE treats public repositories as
-        "reach". Any token can read a public repository, so that count says
-        nothing about grant scope;
-      * using a PUBLIC repository as the negative control proves nothing for
-        the same reason, and would have failed a correctly scoped token.
+      * counting every visible repository treats public repositories as
+        "reach". A fine-grained PAT retains read access to public
+        repositories, so that count says nothing about the selected-repository
+        grant;
+      * reading permissions.push/admin from GET /repos on a PUBLIC repository
+        cannot establish the token's private grant either. GET /repos is
+        publicly accessible, and the permissions object there reflects the
+        resource owner's underlying access. Using it produced E2E-SEC-01, an
+        ambiguous result that was NOT evidence of an over-privileged token.
 
-    Write capability is what actually matters. GitHub returns a `permissions`
-    object on an authenticated repository read, so push access can be asserted
-    without mutating anything.
+    The selected-repository grant is observable in exactly one place: the set
+    of PRIVATE repositories the token can see. Write capability is not probed
+    synthetically here - it is proven later by the real run-scoped fixture
+    branch creation, which either succeeds or fails the run.
     """
-    status, target = gh("GET", f"/repos/{repo}", fixture_token, bearer=False)
-    if status != 200:
-        raise StageFailure(f"fixture token cannot access {repo}: HTTP {status}")
-    target_perms = target.get("permissions") or {}
-    if not target_perms.get("push"):
+    private_seen = []
+    page = 1
+    while page <= 5:
+        status, listing = gh("GET", f"/user/repos?per_page=100&page={page}",
+                             fixture_token, bearer=False)
+        if status != 200 or not isinstance(listing, list) or not listing:
+            break
+        private_seen.extend(r["full_name"] for r in listing if r.get("private"))
+        if len(listing) < 100:
+            break
+        page += 1
+
+    private_set = sorted(set(private_seen))
+    if private_set != [repo]:
+        extra = [n for n in private_set if n != repo]
+        if extra:
+            raise StageFailure(
+                f"fixture token reaches {len(extra)} unrelated PRIVATE "
+                f"repositories: {', '.join(extra)}")
         raise StageFailure(
-            f"fixture token lacks write access to {repo}; it cannot create fixtures")
+            f"fixture token cannot see the target private repository {repo}; "
+            f"private set was {private_set}")
 
-    # Negative control: a repository the token must NOT be able to write.
-    # Read access is irrelevant when the control is public - only push matters.
-    control_repo = control_repo or "AbhishekhPR/dbt_agent"
-    control_status, control = gh("GET", f"/repos/{control_repo}", fixture_token,
-                                 bearer=False)
-    control_perms = (control.get("permissions") or {}) if control_status == 200 else {}
-    control_push = bool(control_perms.get("push"))
-    control_admin = bool(control_perms.get("admin"))
-    if control_push or control_admin:
-        raise StageFailure(
-            f"fixture token has write access to the unrelated repository "
-            f"{control_repo} (push={control_push} admin={control_admin})")
-
-    # Informational only. A visible-repository count cannot distinguish a grant
-    # from ordinary public visibility, so it is recorded, never asserted on.
-    visible = None
-    listing_status, listing = gh("GET", "/user/repos?per_page=100", fixture_token,
-                                 bearer=False)
-    if listing_status == 200 and isinstance(listing, list):
-        visible = {"total": len(listing),
-                   "private": [r["full_name"] for r in listing if r.get("private")]}
-
-    return {"accessible_repository": repo,
-            "write_access_to_target": True,
-            "control_repository": control_repo,
-            "control_is_public": not control.get("private", True),
-            "control_push": control_push,
-            "control_admin": control_admin,
-            "write_reach_confined_to_target": True,
-            "visible_repositories_informational": visible,
+    return {"target_private_repository": repo,
+            "private_repositories_visible": private_set,
+            "public_repositories_ignored": True,
+            "scope_basis": "private-repository visibility only",
+            "write_capability_proof": ("deferred to the real fixture branch "
+                                       "creation; not probed synthetically"),
+            "public_repo_permissions_used": False,
             "used_only_for": ["branch creation", "file commits",
-                              "pull request creation", "fixture closure"],
+                              "pull request creation", "pull request closure",
+                              "fixture branch deletion"],
             "never_used_for": ["review execution", "webhook management",
                                "comments", "check runs", "App authentication",
-                               "snapshot submission", "dashboard access"]}
+                               "Relium APIs", "dashboard APIs"]}
 
 
 def create_fixture_pr(state, gh, token, repo, run_id, variant="external",
