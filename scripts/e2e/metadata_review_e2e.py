@@ -61,7 +61,13 @@ RECOVERY = EV / "webhook-recovery-record.json"
 
 state = {"mutated": False, "procs": [], "tunnel": None, "pr_number": None,
          "branches": [], "expected_slug": APP_SLUG, "cleanup_ok": None}
-tracker = StageTracker(EV / "stage-tracker.json")
+# StageTracker starts every stage incomplete and write() overwrites the file,
+# so the workflow's outer --cleanup-only process destroyed the driver's stage
+# record in run 8: the uploaded tracker reported 2 of 27 complete and said
+# nothing about the run it was supposed to describe. The two processes must
+# not share a path.
+tracker = StageTracker(EV / ("stage-tracker-outer.json" if CLEANUP_ONLY
+                             else "stage-tracker.json"))
 checks: list[dict] = []
 
 

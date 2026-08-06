@@ -447,6 +447,15 @@ class CleanupCompletenessTests(unittest.TestCase):
         self.assertIn("cleanup-verification-outer.json", driver)
         self.assertIn("if CLEANUP_ONLY", driver)
 
+    def test_outer_cleanup_does_not_overwrite_the_stage_tracker(self):
+        """StageTracker starts every stage incomplete and write() overwrites,
+        so a shared path lets the outer always-step destroy the driver's stage
+        record. Run 8 uploaded a tracker reporting 2 of 27 complete that
+        described the cleanup process, not the run."""
+        driver = _source(DRIVER)
+        self.assertIn("stage-tracker-outer.json", driver)
+        self.assertNotIn('StageTracker(EV / "stage-tracker.json")', driver)
+
 
 class ObservabilityTests(unittest.TestCase):
     def test_webhook_stage_asserts_the_application_disposition(self):
