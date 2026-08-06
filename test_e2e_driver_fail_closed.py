@@ -331,6 +331,17 @@ class FixtureTokenBoundaryTests(unittest.TestCase):
         driver = _source(DRIVER)
         self.assertIn("lf.create_fixture_pr(state, gh, FIXTURE_TOKEN", driver)
 
+    def test_driver_only_reads_keys_the_scope_proof_actually_returns(self):
+        """Run 6 died on KeyError: 'unrelated_access_denied' - the driver still
+        subscripted a key the rewritten proof no longer returns. Nothing
+        compared producer to consumer, so nothing caught it."""
+        produced = set(re.findall(r'"([a-z_]+)":', self._scope_body()))
+        consumed = set(re.findall(r'scope\["([a-z_]+)"\]', _source(DRIVER)))
+        self.assertTrue(consumed, "driver must read the scope proof")
+        missing = consumed - produced
+        self.assertEqual(set(), missing,
+                         f"driver reads keys the proof never returns: {missing}")
+
     def test_fixture_operations_are_restricted_to_the_allowed_set(self):
         body = self._scope_body()
         allowed = ["branch creation", "file commits", "pull request creation",

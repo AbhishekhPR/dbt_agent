@@ -352,8 +352,9 @@ def main() -> int:
     check("fixture token is configured", bool(FIXTURE_TOKEN))
     if FIXTURE_TOKEN:
         scope = lf.assert_fixture_token_scope(gh, FIXTURE_TOKEN, REPO)
-        check("fixture token reaches exactly the E2E repository",
-              scope["unrelated_access_denied"], scope["accessible_repository"])
+        check("fixture token's PRIVATE reach is exactly the E2E repository",
+              scope["private_repositories_visible"] == [REPO],
+              scope["private_repositories_visible"])
         write("fixture-token-scope.json", scope)
     if not all(c["passed"] for c in checks):
         write("prelive-safety-final.json", {"checks": checks, "gate_passed": False})
