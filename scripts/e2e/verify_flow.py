@@ -56,10 +56,14 @@ def verify_genuine_webhook(gh, app_jwt, since_utc, pr_number):
     # "ignored" and "duplicate" alike, so run 7 recorded a green webhook stage
     # while telling us nothing about what the application actually did with
     # the event. Read the response body GitHub itself stored.
+    # The detail endpoint is keyed by the numeric delivery id, not the guid.
+    # Passing the guid returns HTTP 422.
     guid = delivery.get("guid")
-    status, detail = gh("GET", f"/app/hook/deliveries/{guid}", app_jwt())
+    numeric_id = delivery.get("id")
+    status, detail = gh("GET", f"/app/hook/deliveries/{numeric_id}", app_jwt())
     if status != 200:
-        raise StageFailure(f"could not read delivery {guid}: HTTP {status}")
+        raise StageFailure(
+            f"could not read delivery {numeric_id}: HTTP {status}")
     payload = ((detail.get("response") or {}).get("payload")) or ""
     try:
         body = json.loads(payload) if isinstance(payload, str) else payload

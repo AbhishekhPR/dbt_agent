@@ -457,6 +457,13 @@ class ObservabilityTests(unittest.TestCase):
         self.assertIn('disposition != "accepted"', verify)
         self.assertIn("application_disposition", verify)
 
+    def test_delivery_detail_is_fetched_by_numeric_id(self):
+        """The detail endpoint is keyed by the numeric delivery id. Passing
+        the guid returns HTTP 422, which is how run 8 failed."""
+        verify = _source(VERIFY)
+        self.assertIn("deliveries/{numeric_id}", verify)
+        self.assertNotIn("deliveries/{guid}", verify)
+
     def test_application_logs_are_captured(self):
         """Run 7's api.log was empty, so a silent skip inside the review path
         was invisible."""
