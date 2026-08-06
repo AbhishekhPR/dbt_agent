@@ -49,8 +49,25 @@ def verify_genuine_webhook(gh, app_jwt, since_utc, pr_number):
         accepted = [d for d in recent if d.get("status_code") == 202]
         return accepted[0] if accepted else None
 
-    delivery = poll(delivered, timeout=240, interval=5,
-                    description="a GitHub pull_request delivery accepted with 202")
+    try:
+        delivery = poll(delivered, timeout=240, interval=5,
+                        description="a GitHub pull_request delivery accepted with 202")
+    except StageFailure:
+        # Run 10 reported only "last=None", which discarded the one piece of
+        # evidence that distinguishes "GitHub never delivered" from "GitHub
+        # delivered and the endpoint answered something other than 202".
+        # Report what GitHub actually recorded. No secrets: event, action,
+        # status code and timestamp only.
+        status, deliveries = gh("GET", "/app/hook/deliveries?per_page=50", app_jwt())
+        window = [d for d in (deliveries if status == 200 and
+                              isinstance(deliveries, list) else [])
+                  if d.get("delivered_at", "") >= since_utc]
+        observed = [f"{d.get('event')}/{d.get('action')}={d.get('status_code')}"
+                    f"@{d.get('delivered_at')}" for d in window]
+        raise StageFailure(
+            "no pull_request delivery was accepted with 202. GitHub recorded "
+            f"{len(window)} deliveries in this window: "
+            f"{', '.join(observed) if observed else 'none at all'}")
 
     # 202 alone is not acceptance. The application returns 202 for "accepted",
     # "ignored" and "duplicate" alike, so run 7 recorded a green webhook stage

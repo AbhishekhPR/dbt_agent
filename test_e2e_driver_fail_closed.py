@@ -569,6 +569,62 @@ class VariantFixtureReachabilityTests(unittest.TestCase):
         self.assertIn("Code health is {review['health']}", verify)
 
 
+class TunnelReachabilityTests(unittest.TestCase):
+    """Run 10 lost the webhook to an unserved tunnel hostname.
+
+    cloudflared reported a healthy connection and printed a URL, the webhook
+    was repointed at it, the pull request was opened, and the application
+    received zero inbound requests. GitHub does not retry a failed webhook
+    delivery, so a hostname the Cloudflare edge is not yet serving loses the
+    event permanently and the run cannot recover.
+    """
+
+    def _tunnel_body(self):
+        live = _source(LIVE)
+        return live[live.index("def start_tunnel"):live.index("def point_webhook")]
+
+    def test_edge_reachability_is_proven_not_assumed(self):
+        body = self._tunnel_body()
+        self.assertIn("/healthz", body,
+                      "a URL scraped from a log is not a routable endpoint")
+        self.assertIn("edge_reachable_from_public_internet", body)
+
+    def test_edge_is_verified_before_the_webhook_is_repointed(self):
+        """Repointing first and discovering the edge is dead afterwards loses
+        the delivery, because GitHub will not send it again."""
+        live = _source(LIVE)
+        tunnel_probe = live.index("the Cloudflare edge to serve the tunnel hostname")
+        repoint = live.index('gh("PATCH", "/app/hook/config"')
+        self.assertLess(tunnel_probe, repoint)
+
+    def test_unreachable_edge_fails_the_stage(self):
+        """The probe must fail closed. poll() raises StageFailure on timeout,
+        so the stage cannot complete with an unserved hostname."""
+        body = self._tunnel_body()
+        self.assertRegex(body, r"poll\(edge_serving,")
+
+    def test_missing_webhook_reports_what_github_recorded(self):
+        """"last=None" discarded the only evidence that separates "GitHub
+        never delivered" from "GitHub delivered and got a non-202"."""
+        verify = _source(VERIFY)
+        self.assertIn("GitHub recorded", verify)
+        self.assertIn("none at all", verify)
+
+    def test_delivery_diagnostics_carry_no_secrets(self):
+        """The diagnostic must report event, action, status and timestamp -
+        never headers, payloads or the response body."""
+        verify = _source(VERIFY)
+        block = verify[verify.index("except StageFailure:"):
+                       verify.index("# 202 alone is not acceptance")]
+        # Comments describe the rule; only executable lines can break it.
+        block = "\n".join(line for line in block.splitlines()
+                          if not line.lstrip().startswith("#"))
+        for forbidden in ("request_headers", "payload", "response",
+                          "Authorization", "secret"):
+            with self.subTest(field=forbidden):
+                self.assertNotIn(forbidden, block)
+
+
 class WorkflowTests(unittest.TestCase):
     def test_workflow_is_dispatch_only_with_bounded_timeout(self):
         import yaml

@@ -169,8 +169,33 @@ def start_tunnel(state, log_path):
         return match.group(0) if match else None
 
     public = poll(url, timeout=120, interval=2, description="tunnel URL")
+
+    # A URL in cloudflared's log is not a routable endpoint. Run 10 failed
+    # exactly there: the tunnel process was healthy and connected, the webhook
+    # was repointed at the scraped hostname, the pull request was opened, and
+    # the application received nothing at all - zero inbound requests. GitHub
+    # does not retry a failed webhook delivery, so a hostname the Cloudflare
+    # edge is not yet serving loses the event permanently.
+    #
+    # Prove the edge actually serves this hostname BEFORE the webhook is
+    # repointed. The API is already up, so its own /healthz is the probe.
+    def edge_serving():
+        request = urllib.request.Request(public.rstrip("/") + "/healthz",
+                                         method="GET")
+        request.add_header("User-Agent", "relium-metadata-e2e")
+        try:
+            with urllib.request.urlopen(request, timeout=15) as resp:
+                return resp.status if resp.status == 200 else None
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+            return None
+
+    poll(edge_serving, timeout=120, interval=3,
+         description="the Cloudflare edge to serve the tunnel hostname")
+
     state["tunnel"] = {"proc": proc, "url": public}
-    return {"pid": proc.pid, "url_host": public.split("//")[1], "scheme": "https"}
+    return {"pid": proc.pid, "url_host": public.split("//")[1], "scheme": "https",
+            "edge_reachable_from_public_internet": True,
+            "verified_before_webhook_repoint": True}
 
 
 # ------------------------------------------------------------- webhook
