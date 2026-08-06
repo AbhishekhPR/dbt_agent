@@ -538,7 +538,13 @@ def main() -> int:
     variant_results = {}
     if run_variants:
         specs = [
-            ("a", "variant_a_verified", "enforce", "external",
+            # A and E assert ALLOW, so their fixtures must be code-health
+            # neutral. On the plain 'external'/'head_derived' shapes the code
+            # review scores health 80 for a revenue-named addition, which the
+            # policy puts in the WARN band before production metadata is even
+            # considered - ALLOW was unreachable and the variant proved
+            # nothing. See build_manifests.
+            ("a", "variant_a_verified", "enforce", "external_clean",
              {"null_rate": vf.HEALTHY_NULL_RATE}, {"decision": "ALLOW",
                                                    "coverage": "COMPLETE"}),
             ("b", "variant_b_verified", "enforce", "external",
@@ -548,7 +554,7 @@ def main() -> int:
              {"observed_at": datetime.now(timezone.utc) - timedelta(hours=6),
               "ttl_seconds": 900}, {"decision": "BLOCK",
                                     "coverage": "INCOMPLETE"}),
-            ("e", "variant_e_verified", "enforce", "head_derived",
+            ("e", "variant_e_verified", "enforce", "head_derived_clean",
              {"null_rate": vf.HEALTHY_NULL_RATE}, {"decision": "ALLOW"}),
         ]
         for letter, stage, vmode, manifest, snap, expect in specs:

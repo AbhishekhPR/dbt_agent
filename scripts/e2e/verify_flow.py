@@ -322,11 +322,17 @@ def verify_recomputation(dsn, owner, repo_name, review_id):
             "code_findings": 0, "observed_null_rate": HIGH_NULL_RATE,
             "threshold": NULL_RATE_THRESHOLD,
             "completed_jobs": len(completed),
+            # Read health off the record instead of asserting a number in
+            # prose. Run 9's evidence asserted a health of 100 while the same
+            # document recorded 80 - an evidence file must not contradict
+            # itself.
             "explanation": (
                 "Coverage COMPLETE means the required evidence was obtained. "
-                "Complete evidence can still reveal risk: the WARN is caused by "
-                "the 82% production null rate, and health remains 100 because "
-                "no direct code defect was found.")}
+                "Complete evidence can still reveal risk: the WARN is caused "
+                f"by the {int(HIGH_NULL_RATE * 100)}% production null rate. "
+                f"Code health is {review['health']}, computed independently of "
+                "the evidence and unaffected by it; zero code findings were "
+                "reported for this change.")}
 
 
 # ------------------------------------------------- GitHub reconciliation

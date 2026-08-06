@@ -220,14 +220,46 @@ def _model(name, deps, columns, schema="analytics"):
 def build_manifests(variant="external"):
     """Base and head dbt manifests for the scenario.
 
-    'external'     - head newly references raw.orders.discount_amount, which no
-                     model in the PR creates.
-    'head_derived' - an upstream head model creates the column a downstream
-                     head model consumes (variant E).
+    'external'       - head newly references raw.orders.discount_amount, which
+                       no model in the PR creates.
+    'head_derived'   - an upstream head model creates the column a downstream
+                       head model consumes.
+    'external_clean'      - 'external', but code-health neutral.
+    'head_derived_clean'  - 'head_derived', but code-health neutral.
+
+    The two *_clean shapes exist because run 9 failed variant A with
+    "expected ALLOW, got WARN". That was a fixture defect, not an application
+    defect. Adding a column named net_revenue to fct_orders makes the code
+    review report "Revenue / GMV gained related columns net_revenue" and score
+    code health 80, and _health_decision puts anything under 90 in the WARN
+    band. ALLOW was therefore unreachable for that fixture no matter how
+    healthy the production metadata was, so the variant could not isolate the
+    dimension it exists to test. The clean shapes keep the external dependency
+    and keep production metadata REQUIRED - only the code-health confound is
+    removed, so the decision is driven by the metadata alone.
     """
     sources = {"source.a.raw.orders": {
         "schema": "raw", "name": "orders", "database": "warehouse",
         "columns": {"order_id": {}, "discount_amount": {}}}}
+    if variant == "external_clean":
+        base = {"nodes": {"model.a.fct_orders": _model(
+            "fct_orders", ["source.a.raw.orders"], ["order_id"])},
+            "sources": sources}
+        head = {"nodes": {"model.a.fct_orders": _model(
+            "fct_orders", ["source.a.raw.orders"],
+            ["order_id", "discount_amount"])}, "sources": sources}
+        return base, head, ["fct_orders"]
+    if variant == "head_derived_clean":
+        base = {"nodes": {"model.a.dim_regions": _model(
+            "dim_regions", ["source.a.raw.orders"], ["order_id"])},
+            "sources": sources}
+        head = {"nodes": {
+            "model.a.stg_regions": _model("stg_regions", ["source.a.raw.orders"],
+                                          ["order_id", "discount_amount"]),
+            "model.a.dim_regions": _model("dim_regions", ["model.a.stg_regions"],
+                                          ["order_id", "discount_amount"])},
+            "sources": sources}
+        return base, head, ["stg_regions", "dim_regions"]
     if variant == "head_derived":
         base = {"nodes": {"model.a.fct_orders": _model(
             "fct_orders", ["source.a.raw.orders"], ["order_id"])},

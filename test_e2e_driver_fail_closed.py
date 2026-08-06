@@ -481,6 +481,94 @@ class ObservabilityTests(unittest.TestCase):
         self.assertNotIn("log_level='warning'", live)
 
 
+class VariantFixtureReachabilityTests(unittest.TestCase):
+    """Run 9 failed variant A with "expected ALLOW, got WARN".
+
+    That was a fixture defect. Adding a column named net_revenue to fct_orders
+    makes the code review report "Revenue / GMV gained related columns
+    net_revenue" and score code health 80, and the evidence policy puts
+    anything under 90 in the WARN band before production metadata is
+    considered. ALLOW was unreachable for that fixture whatever the metadata
+    said, so the variant could not isolate the dimension it exists to test.
+
+    These tests run the REAL application engine, so they fail if a fixture
+    stops being able to reach the outcome its variant asserts.
+    """
+
+    @staticmethod
+    def _review(variant):
+        sys.path.insert(0, str(E2E))
+        import live_flow
+        from agent.deployment_review_service import review_manifest_change
+        from agent.metadata_evidence.collection_plan import build_collection_plan
+
+        base, head, changed = live_flow.build_manifests(variant)
+        files = sorted(live_flow._model_files(head))
+        result = review_manifest_change(
+            manifest=head, previous_manifest=base, changed_files=files,
+            deployment_id="fixture-test",
+            manifest_source={"base": "github", "head": "github"},
+            base_sha="b" * 40, head_sha="h" * 40)
+        plan = build_collection_plan(
+            base_manifest=base, head_manifest=head, changed_models=changed,
+            evidence_level="profile", critical_models=()).as_dict()
+        return (result.get("incident") or {}).get("health"), plan
+
+    def _assert_allow_reachable(self, variant):
+        health, plan = self._review(variant)
+        self.assertGreaterEqual(
+            health, 90,
+            f"{variant} scores code health {health}; the evidence policy puts "
+            f"anything under 90 in the WARN band, so ALLOW is unreachable and "
+            f"the variant cannot isolate the metadata dimension")
+        self.assertTrue(
+            plan["metadata_required"],
+            f"{variant} must still REQUIRE production metadata, otherwise the "
+            f"variant no longer exercises the metadata path at all")
+
+    def test_variant_a_fixture_can_reach_allow(self):
+        self._assert_allow_reachable("external_clean")
+
+    def test_variant_e_fixture_can_reach_allow(self):
+        self._assert_allow_reachable("head_derived_clean")
+
+    def test_variant_a_fixture_keeps_the_external_dependency(self):
+        _, plan = self._review("external_clean")
+        kinds = {t["dependency_kind"] for t in plan["targets"]}
+        self.assertIn("external", kinds,
+                      "removing the code-health confound must not remove the "
+                      "external production dependency being tested")
+
+    def test_variant_e_fixture_keeps_the_head_derived_dependency(self):
+        _, plan = self._review("head_derived_clean")
+        kinds = {t["dependency_kind"] for t in plan["targets"]}
+        self.assertIn("head_derived", kinds,
+                      "variant E exists to test head-derived dependencies")
+
+    def test_allow_variants_use_the_clean_fixtures(self):
+        driver = _source(DRIVER)
+        self.assertIn('"variant_a_verified", "enforce", "external_clean"', driver)
+        self.assertIn('"variant_e_verified", "enforce", "head_derived_clean"',
+                      driver)
+
+    def test_primary_and_other_variants_keep_their_proven_fixtures(self):
+        """The primary scenario and variants B, C and D passed on 'external'.
+        The fix must not disturb them."""
+        driver = _source(DRIVER)
+        for stage in ("variant_b_verified", "variant_c_verified",
+                      "variant_d_verified"):
+            with self.subTest(stage=stage):
+                self.assertIn(f'"{stage}", "enforce", "external"', driver)
+
+    def test_evidence_explanation_does_not_hardcode_a_health_number(self):
+        """Run 9's recomputation evidence claimed "health remains 100" while
+        the same document recorded 80. An evidence file must not contradict
+        itself."""
+        verify = _source(VERIFY)
+        self.assertNotIn("health remains 100", verify)
+        self.assertIn("Code health is {review['health']}", verify)
+
+
 class WorkflowTests(unittest.TestCase):
     def test_workflow_is_dispatch_only_with_bounded_timeout(self):
         import yaml
