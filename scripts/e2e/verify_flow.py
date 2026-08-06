@@ -51,9 +51,29 @@ def verify_genuine_webhook(gh, app_jwt, since_utc, pr_number):
 
     delivery = poll(delivered, timeout=240, interval=5,
                     description="a GitHub pull_request delivery accepted with 202")
-    return {"delivery_id": delivery.get("guid"), "event": delivery.get("event"),
+
+    # 202 alone is not acceptance. The application returns 202 for "accepted",
+    # "ignored" and "duplicate" alike, so run 7 recorded a green webhook stage
+    # while telling us nothing about what the application actually did with
+    # the event. Read the response body GitHub itself stored.
+    guid = delivery.get("guid")
+    status, detail = gh("GET", f"/app/hook/deliveries/{guid}", app_jwt())
+    if status != 200:
+        raise StageFailure(f"could not read delivery {guid}: HTTP {status}")
+    payload = ((detail.get("response") or {}).get("payload")) or ""
+    try:
+        body = json.loads(payload) if isinstance(payload, str) else payload
+    except json.JSONDecodeError:
+        body = {}
+    disposition = (body or {}).get("status")
+    if disposition != "accepted":
+        raise StageFailure(
+            f"application answered the webhook with '{disposition}', not "
+            f"'accepted' - the event was not taken up for review")
+    return {"delivery_id": guid, "event": delivery.get("event"),
             "action": delivery.get("action"), "status_code": delivery.get("status_code"),
             "delivered_at": delivery.get("delivered_at"),
+            "application_disposition": disposition,
             "signature_verified_by_application": True,
             "pull_request": pr_number}
 

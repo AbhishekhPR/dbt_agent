@@ -369,6 +369,102 @@ class FixtureTokenBoundaryTests(unittest.TestCase):
                 self.assertNotIn("FIXTURE_TOKEN", line)
 
 
+class FixtureShapeTests(unittest.TestCase):
+    """Run 7 reached the application and produced no review row.
+
+    The application was right. The review path derives changed models by
+    matching changed file paths against each manifest node's
+    original_file_path, and the fixture pull request committed only
+    relium.yml and target/manifest.json - no dbt model file. The reviewer
+    correctly raised "At least one changed model is required." and the runner
+    published a neutral skip before the lifecycle could ever run.
+
+    These tests hold the fixture to being a genuine dbt model change.
+    """
+
+    def _fixture(self):
+        live = _source(LIVE)
+        return live[live.index("def _model_files"):]
+
+    def test_fixture_commits_real_dbt_model_files(self):
+        body = self._fixture()
+        self.assertIn("original_file_path", body,
+                      "model files must come from the manifest's own paths")
+        self.assertIn("base_files = _model_files(base)", body)
+        self.assertIn("head_files = _model_files(head)", body)
+
+    def test_head_must_change_at_least_one_model_file(self):
+        body = self._fixture()
+        self.assertIn("changed_paths", body)
+        self.assertIn("changes no dbt model file", body,
+                      "a fixture that changes no model must fail closed, "
+                      "not silently produce an unreviewable pull request")
+
+    def test_pull_request_opens_against_a_base_branch(self):
+        """The runner reads the base manifest at pull_request.base.sha.
+        Opening against the default branch binds the review to a tree with no
+        manifest at all."""
+        body = self._fixture()
+        self.assertIn('"base": base_branch', body)
+        self.assertIn('"head": head_branch', body)
+        self.assertNotIn('"base": default_branch', body)
+
+    def test_shas_are_read_back_from_github_not_inferred(self):
+        body = self._fixture()
+        self.assertIn('pr["base"]["sha"]', body)
+        self.assertIn('pr["head"]["sha"]', body)
+
+    def test_both_fixture_branches_are_tracked_for_removal(self):
+        body = self._fixture()
+        self.assertIn('state.setdefault("branches", []).append(name)', body)
+        self.assertIn("make_branch(base_branch", body)
+        self.assertIn("make_branch(head_branch", body)
+
+
+class CleanupCompletenessTests(unittest.TestCase):
+    def test_cleanup_deletes_fixture_branches(self):
+        """state["branches"] was populated at creation and consumed by
+        nothing, so every run so far left its branches behind."""
+        driver = _source(DRIVER)
+        self.assertIn("git/refs/heads/", driver)
+        self.assertIn("fixture_branches_deleted", driver)
+        self.assertIn("fixture_branches_remaining", driver)
+
+    def test_cleanup_sweeps_by_prefix_for_the_outer_step(self):
+        """The workflow's always-step runs cleanup in a fresh process with
+        empty state, so removal cannot depend on in-memory state alone."""
+        driver = _source(DRIVER)
+        self.assertIn("git/matching-refs/heads/e2e/", driver)
+        self.assertIn("fixture_prs_swept", driver)
+
+    def test_branch_removal_requires_the_fixture_token(self):
+        driver = _source(DRIVER)
+        self.assertIn("no fixture token available to remove fixture branches",
+                      driver)
+
+    def test_outer_cleanup_does_not_overwrite_the_driver_record(self):
+        driver = _source(DRIVER)
+        self.assertIn("cleanup-verification-outer.json", driver)
+        self.assertIn("if CLEANUP_ONLY", driver)
+
+
+class ObservabilityTests(unittest.TestCase):
+    def test_webhook_stage_asserts_the_application_disposition(self):
+        """The application answers 202 for accepted, ignored and duplicate
+        alike, so a 202 on its own proves only that the signature verified."""
+        verify = _source(VERIFY)
+        self.assertIn("/app/hook/deliveries/", verify)
+        self.assertIn('disposition != "accepted"', verify)
+        self.assertIn("application_disposition", verify)
+
+    def test_application_logs_are_captured(self):
+        """Run 7's api.log was empty, so a silent skip inside the review path
+        was invisible."""
+        live = _source(LIVE)
+        self.assertIn("logging.basicConfig", live)
+        self.assertNotIn("log_level='warning'", live)
+
+
 class WorkflowTests(unittest.TestCase):
     def test_workflow_is_dispatch_only_with_bounded_timeout(self):
         import yaml

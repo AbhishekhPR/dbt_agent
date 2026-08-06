@@ -177,6 +177,52 @@ def cleanup(reason="normal"):
     result["fixture_prs_closed"] = closed
     result["fixture_prs_merged"] = False
 
+    # 2b. remove the fixture branches. state["branches"] was populated at
+    # creation but nothing ever consumed it, so every run so far left its
+    # branches behind. The workflow's outer always-step also runs in a FRESH
+    # process with empty state, so removal must additionally sweep by the
+    # e2e/ prefix inside the dedicated synthetic repository. Branch deletion
+    # needs contents:write, which only the fixture token holds.
+    swept, deleted, remaining = [], [], []
+    if FIXTURE_TOKEN:
+        try:
+            st, open_prs = gh("GET", f"/repos/{REPO}/pulls?state=open&per_page=100",
+                              FIXTURE_TOKEN, bearer=False)
+            for pr in (open_prs if st == 200 and isinstance(open_prs, list) else []):
+                ref = (pr.get("head") or {}).get("ref") or ""
+                if not ref.startswith("e2e/") or pr["number"] in closed:
+                    continue
+                if pr.get("merged"):
+                    result["failures"].append(f"fixture PR #{pr['number']} was MERGED")
+                gh("PATCH", f"/repos/{REPO}/pulls/{pr['number']}", FIXTURE_TOKEN,
+                   {"state": "closed"}, bearer=False)
+                swept.append(pr["number"])
+        except Exception as exc:  # noqa: BLE001
+            result["failures"].append(f"sweeping fixture PRs: {type(exc).__name__}")
+        try:
+            st, refs = gh("GET", f"/repos/{REPO}/git/matching-refs/heads/e2e/",
+                          FIXTURE_TOKEN, bearer=False)
+            found = [r["ref"].split("refs/heads/", 1)[1]
+                     for r in (refs if st == 200 and isinstance(refs, list) else [])]
+            for name in sorted(set(found) | set(state.get("branches", []))):
+                dst, _ = gh("DELETE", f"/repos/{REPO}/git/refs/heads/{name}",
+                            FIXTURE_TOKEN, bearer=False)
+                if dst in (204, 404, 422):
+                    deleted.append(name)
+                else:
+                    remaining.append(name)
+                    result["failures"].append(
+                        f"fixture branch {name} not deleted: HTTP {dst}")
+        except Exception as exc:  # noqa: BLE001
+            result["failures"].append(
+                f"deleting fixture branches: {type(exc).__name__}")
+    else:
+        result["failures"].append(
+            "no fixture token available to remove fixture branches")
+    result["fixture_prs_swept"] = swept
+    result["fixture_branches_deleted"] = deleted
+    result["fixture_branches_remaining"] = remaining
+
     # 3. tunnel, then API/worker
     if state["tunnel"]:
         try:
@@ -212,7 +258,12 @@ def cleanup(reason="normal"):
     result["cleanup_passed"] = not result["failures"]
     state["cleanup_result"] = result
     state["cleanup_ok"] = result["cleanup_passed"]
-    write("cleanup-verification.json", result)
+    # The workflow's outer always-step invokes cleanup a second time in a
+    # fresh process. Run 7 let that empty-state pass overwrite the driver's
+    # own record, destroying the evidence of what the run actually cleaned up.
+    evidence_name = ("cleanup-verification-outer.json" if CLEANUP_ONLY
+                     else "cleanup-verification.json")
+    write(evidence_name, result)
     if result["cleanup_passed"]:
         try:
             tracker.complete("cleanup_verified", {
@@ -228,7 +279,7 @@ def cleanup(reason="normal"):
                 f"could not mark cleanup stages: {type(exc).__name__}")
             result["cleanup_passed"] = False
             state["cleanup_ok"] = False
-            write("cleanup-verification.json", result)
+            write(evidence_name, result)
     print(f"[cleanup:{reason}] passed={result['cleanup_passed']} "
           f"failures={result['failures']}", flush=True)
     return result

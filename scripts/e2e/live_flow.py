@@ -84,7 +84,13 @@ def start_api(state, workdir, dsn, storage_root, webhook_secret, app_id, key_pat
               log_path):
     """Start the REAL application through build_application under uvicorn."""
     launcher = (
-        "import os, time, uvicorn;"
+        # Run 7 produced an EMPTY api.log because uvicorn ran at warning level
+        # and the application's own loggers had no handler. A silent skip
+        # inside the review path was therefore invisible and cost a full run
+        # to diagnose. The application must be able to speak.
+        "import os, time, logging, uvicorn;"
+        "logging.basicConfig(level=logging.INFO,"
+        " format='%(levelname)s %(name)s %(message)s');"
         "from agent.github_app.server import build_application;"
         "from agent.github_app.settings import load_settings;"
         "s=load_settings({"
@@ -96,7 +102,7 @@ def start_api(state, workdir, dsn, storage_root, webhook_secret, app_id, key_pat
         f"'RELIUM_PORT': '{PORT}', 'RELIUM_HOST': '127.0.0.1',"
         "'RELIUM_WORKER_COUNT': '2'});"
         f"uvicorn.run(build_application(s), host='127.0.0.1', port={PORT},"
-        " log_level='warning')")
+        " log_level='info')")
     env = {**os.environ,
            "RELIUM_DATABASE_URL": dsn,
            "RELIUM_STORAGE_ROOT": str(storage_root),
@@ -300,12 +306,51 @@ def assert_fixture_token_scope(gh, fixture_token, repo):
                                "Relium APIs", "dashboard APIs"]}
 
 
+def _model_files(manifest):
+    """The dbt model .sql files a manifest describes.
+
+    Run 7 failed here. The review path derives changed models by matching
+    changed FILE PATHS against each node's original_file_path
+    (load_changed_models_from_manifest). The old fixture committed only
+    relium.yml and target/manifest.json, so no model file ever changed, the
+    reviewer raised "At least one changed model is required.", and the runner
+    published a NEUTRAL skip and returned BEFORE the lifecycle ever ran - no
+    review row was possible. The application was right; the fixture simply was
+    not a dbt model change.
+
+    The body is derived from the node's columns, so a column difference
+    between base and head is a genuine file modification.
+    """
+    files = {}
+    for node in (manifest.get("nodes") or {}).values():
+        columns = list(node.get("columns") or {})
+        deps = list((node.get("depends_on") or {}).get("nodes") or [])
+        if deps and not deps[0].startswith("source."):
+            frm = "{{ ref('" + deps[0].split(".")[-1] + "') }}"
+        else:
+            frm = "{{ source('raw', 'orders') }}"
+        body = ["-- Relium E2E fixture model. Generated; never merged.",
+                "select"]
+        body.append("    " + ",\n    ".join(columns))
+        body.append("from " + frm)
+        files[node["original_file_path"]] = "\n".join(body) + "\n"
+    return files
+
+
 def create_fixture_pr(state, gh, token, repo, run_id, variant="external",
                       enforcement_mode="enforce"):
     """Create a REAL unmerged pull request in the synthetic E2E repository.
 
+    The pull request is opened from a head branch against a BASE BRANCH, not
+    against the default branch. That matters: the runner reads the base
+    manifest at pull_request.base.sha. Opening against the default branch
+    binds the review to a tree with no manifest at all, so the scenario would
+    be evaluated against nothing.
+
     ``token`` here is the FIXTURE token, never the App installation token: the
-    App deliberately holds contents:read and must not gain write access.
+    App deliberately holds contents:read and must not gain write access. This
+    call is also the write-capability proof for the scope assertion - it
+    performs a real write or the run fails.
     """
     base, head, changed = build_manifests(variant)
 
@@ -318,11 +363,12 @@ def create_fixture_pr(state, gh, token, repo, run_id, variant="external",
                      token, bearer=False)
     if status != 200:
         raise StageFailure(f"cannot read default branch ref: HTTP {status}")
-    base_sha = ref["object"]["sha"]
+    default_sha = ref["object"]["sha"]
 
-    branch = f"e2e/metadata-{variant}-{run_id}"
+    base_branch = f"e2e/base-{variant}-{run_id}"
+    head_branch = f"e2e/head-{variant}-{run_id}"
 
-    def put_file(path, content, message, branch_name, parent_sha=None):
+    def put_file(path, content, message, branch_name):
         body = {"message": message,
                 "content": base64.b64encode(content.encode()).decode(),
                 "branch": branch_name}
@@ -337,35 +383,55 @@ def create_fixture_pr(state, gh, token, repo, run_id, variant="external",
             raise StageFailure(f"could not write {path}: HTTP {st}")
         return resp["commit"]["sha"]
 
-    # branch from the default branch, then commit the BASE manifest so the
-    # base SHA carries the pre-change artifact
-    st, _ = gh("POST", f"/repos/{repo}/git/refs", token,
-               {"ref": f"refs/heads/{branch}", "sha": base_sha}, bearer=False)
-    if st not in (200, 201):
-        raise StageFailure(f"could not create branch: HTTP {st}")
+    def make_branch(name, from_sha):
+        st, _ = gh("POST", f"/repos/{repo}/git/refs", token,
+                   {"ref": f"refs/heads/{name}", "sha": from_sha}, bearer=False)
+        if st not in (200, 201):
+            raise StageFailure(f"could not create branch {name}: HTTP {st}")
+        state.setdefault("branches", []).append(name)
 
+    # --- base branch: the pre-change project, complete and self-consistent
+    make_branch(base_branch, default_sha)
     put_file("relium.yml",
              f"enabled: true\nenforcement_mode: {enforcement_mode}\n",
-             f"e2e {run_id}: relium config", branch)
-    real_base_sha = put_file(
-        "target/manifest.json", json.dumps(base, indent=2),
-        f"e2e {run_id}: base manifest", branch)
-    real_head_sha = put_file(
-        "target/manifest.json", json.dumps(head, indent=2),
-        f"e2e {run_id}: head manifest introducing an external dependency", branch)
+             f"e2e {run_id}: relium config", base_branch)
+    base_files = _model_files(base)
+    for path in sorted(base_files):
+        put_file(path, base_files[path], f"e2e {run_id}: base model {path}",
+                 base_branch)
+    base_tip = put_file("target/manifest.json", json.dumps(base, indent=2),
+                        f"e2e {run_id}: base manifest", base_branch)
+
+    # --- head branch: the proposed change, branched from the base branch
+    make_branch(head_branch, base_tip)
+    head_files = _model_files(head)
+    changed_paths = [p for p in sorted(head_files)
+                     if base_files.get(p) != head_files[p]]
+    if not changed_paths:
+        raise StageFailure(
+            f"variant {variant} changes no dbt model file - the application "
+            f"would correctly skip it and no review could exist")
+    for path in changed_paths:
+        put_file(path, head_files[path], f"e2e {run_id}: head model {path}",
+                 head_branch)
+    put_file("target/manifest.json", json.dumps(head, indent=2),
+             f"e2e {run_id}: head manifest", head_branch)
 
     st, pr = gh("POST", f"/repos/{repo}/pulls", token, {
         "title": f"[E2E FIXTURE - DO NOT MERGE] metadata review {variant} {run_id}",
-        "head": branch, "base": default_branch,
+        "head": head_branch, "base": base_branch,
         "body": ("Synthetic fixture for the Relium metadata-review E2E. "
-                 "Never merge. Closed automatically during cleanup."),
+                 "Never merge. Closed and deleted automatically during cleanup."),
         "draft": False}, bearer=False)
     if st not in (200, 201):
         raise StageFailure(f"could not open pull request: HTTP {st}")
 
     state["pr_number"] = pr["number"]
-    state.setdefault("branches", []).append(branch)
-    return {"pr_number": pr["number"], "branch": branch,
-            "base_sha": real_base_sha, "head_sha": pr["head"]["sha"],
-            "changed_models": changed, "merged": False,
-            "enforcement_mode": enforcement_mode}
+    # Read the SHAs back from GitHub rather than inferring them: these are the
+    # exact values the webhook payload will carry.
+    return {"pr_number": pr["number"], "branch": head_branch,
+            "base_branch": base_branch,
+            "base_sha": pr["base"]["sha"], "head_sha": pr["head"]["sha"],
+            "changed_models": changed, "changed_model_files": changed_paths,
+            "merged": False, "enforcement_mode": enforcement_mode,
+            "write_capability_proved": True}
