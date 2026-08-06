@@ -293,11 +293,32 @@ class FixtureTokenBoundaryTests(unittest.TestCase):
         variant_call = body.index("run_variant(")
         self.assertLess(assertion, variant_call)
 
-    def test_scope_assertion_rejects_unrelated_private_repositories(self):
+    def test_scope_assertion_tests_write_capability_not_visibility(self):
+        """Counting visible repositories cannot distinguish a grant from
+        ordinary public visibility; push capability can."""
         live = _source(LIVE)
-        body = live[live.index("def assert_fixture_token_scope"):]
-        self.assertIn("unrelated private repository", body)
+        body = live[live.index("def assert_fixture_token_scope"):
+                    live.index("def create_fixture_pr")]
+        self.assertIn('control_perms.get("push")', body)
         self.assertIn("raise StageFailure", body)
+        self.assertIn("write access to the unrelated repository", body)
+
+    def test_visible_repository_count_is_informational_only(self):
+        live = _source(LIVE)
+        body = live[live.index("def assert_fixture_token_scope"):
+                    live.index("def create_fixture_pr")]
+        self.assertIn("visible_repositories_informational", body)
+        listing = body.index("/user/repos")
+        # no StageFailure may be raised on the enumeration result
+        after = body[listing:]
+        self.assertNotIn("raise StageFailure", after,
+                         "enumeration must not be an assertion")
+
+    def test_target_write_access_is_required(self):
+        live = _source(LIVE)
+        body = live[live.index("def assert_fixture_token_scope"):
+                    live.index("def create_fixture_pr")]
+        self.assertIn('target_perms.get("push")', body)
 
     def test_fixture_token_is_never_used_for_app_operations(self):
         driver = _source(DRIVER)

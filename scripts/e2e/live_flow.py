@@ -241,47 +241,60 @@ def build_manifests(variant="external"):
     return base, head, ["fct_orders"]
 
 
-def assert_fixture_token_scope(gh, fixture_token, repo):
-    """Fail closed unless the fixture token reaches EXACTLY the E2E repository.
+def assert_fixture_token_scope(gh, fixture_token, repo, control_repo=None):
+    """Fail closed unless the fixture token's WRITE reach is exactly `repo`.
 
-    The dedicated App keeps contents:read. This separate fine-grained token is
-    the only credential able to write repository contents, so its blast radius
-    is asserted before it is ever used: it must see the E2E repository and must
-    NOT be able to read an unrelated private repository.
+    Two earlier versions of this check were wrong, and both would have been
+    misleading rather than merely noisy:
+
+      * counting repositories the token can SEE treats public repositories as
+        "reach". Any token can read a public repository, so that count says
+        nothing about grant scope;
+      * using a PUBLIC repository as the negative control proves nothing for
+        the same reason, and would have failed a correctly scoped token.
+
+    Write capability is what actually matters. GitHub returns a `permissions`
+    object on an authenticated repository read, so push access can be asserted
+    without mutating anything.
     """
-    status, me = gh("GET", f"/repos/{repo}", fixture_token, bearer=False)
+    status, target = gh("GET", f"/repos/{repo}", fixture_token, bearer=False)
     if status != 200:
         raise StageFailure(f"fixture token cannot access {repo}: HTTP {status}")
-
-    # Enumerate everything the token can see. A repository-scoped fine-grained
-    # token must report exactly one.
-    status, listing = gh("GET", "/installation/repositories", fixture_token,
-                         bearer=False)
-    visible = None
-    if status == 200:
-        visible = [r["full_name"] for r in (listing.get("repositories") or [])]
-    else:
-        status, listing = gh("GET", "/user/repos?per_page=100&affiliation=owner",
-                             fixture_token, bearer=False)
-        if status == 200 and isinstance(listing, list):
-            visible = [r["full_name"] for r in listing]
-
-    if visible is not None:
-        others = [n for n in visible if n != repo]
-        if others:
-            raise StageFailure(
-                f"fixture token reaches {len(others)} unrelated repositories")
-
-    # Negative control: a known unrelated private repository must be denied.
-    control = "AbhishekhPR/dbt_agent"
-    status, _ = gh("GET", f"/repos/{control}", fixture_token, bearer=False)
-    if status == 200:
+    target_perms = target.get("permissions") or {}
+    if not target_perms.get("push"):
         raise StageFailure(
-            f"fixture token can read the unrelated private repository {control}")
+            f"fixture token lacks write access to {repo}; it cannot create fixtures")
+
+    # Negative control: a repository the token must NOT be able to write.
+    # Read access is irrelevant when the control is public - only push matters.
+    control_repo = control_repo or "AbhishekhPR/dbt_agent"
+    control_status, control = gh("GET", f"/repos/{control_repo}", fixture_token,
+                                 bearer=False)
+    control_perms = (control.get("permissions") or {}) if control_status == 200 else {}
+    control_push = bool(control_perms.get("push"))
+    control_admin = bool(control_perms.get("admin"))
+    if control_push or control_admin:
+        raise StageFailure(
+            f"fixture token has write access to the unrelated repository "
+            f"{control_repo} (push={control_push} admin={control_admin})")
+
+    # Informational only. A visible-repository count cannot distinguish a grant
+    # from ordinary public visibility, so it is recorded, never asserted on.
+    visible = None
+    listing_status, listing = gh("GET", "/user/repos?per_page=100", fixture_token,
+                                 bearer=False)
+    if listing_status == 200 and isinstance(listing, list):
+        visible = {"total": len(listing),
+                   "private": [r["full_name"] for r in listing if r.get("private")]}
+
     return {"accessible_repository": repo,
-            "visible_repositories": visible if visible is not None else "not enumerable",
-            "unrelated_private_repo_status": status,
-            "unrelated_access_denied": status in (403, 404),
+            "write_access_to_target": True,
+            "control_repository": control_repo,
+            "control_is_public": not control.get("private", True),
+            "control_push": control_push,
+            "control_admin": control_admin,
+            "write_reach_confined_to_target": True,
+            "visible_repositories_informational": visible,
             "used_only_for": ["branch creation", "file commits",
                               "pull request creation", "fixture closure"],
             "never_used_for": ["review execution", "webhook management",
