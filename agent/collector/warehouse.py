@@ -81,13 +81,17 @@ class PostgresMetadataReader:
         connection.read_only = True
         return connection
 
-    def collect_relation(self, *, relation_name, columns, signals):
+    def collect_relation(self, *, relation_name, columns, signals,
+                         relation_schema=None):
         """Return the metadata for exactly one requested relation.
 
         ``columns`` and ``signals`` are the ones named in the collection
         request. Nothing else is read, and no other relation is touched.
+        ``relation_schema`` is the schema dbt resolved, and is authoritative
+        over parsing the dotted name.
         """
-        schema, table = split_relation(relation_name)
+        schema, table = split_relation(relation_name,
+                                       relation_schema=relation_schema)
         wanted_columns = [validate_column(c) for c in (columns or [])]
         signal_set = set(signals or ())
 

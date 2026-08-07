@@ -133,8 +133,23 @@ def _source_nodes(manifest) -> dict[str, dict]:
 
 
 def _relation_of(node: dict) -> str:
+    """The PHYSICAL relation a dbt node resolves to.
+
+    dbt names the physical object differently by resource type, and getting
+    this wrong sends a collector to a table that does not exist:
+
+      * a source carries ``identifier`` (the real table); ``name`` is only the
+        logical name used in ``source()`` calls,
+      * a model carries ``alias`` (defaults to the model name),
+      * ``schema`` is already the final schema, after any custom-schema macro.
+
+    Reading ``alias or name`` missed ``identifier`` entirely, so every source
+    declared with a custom identifier resolved to a non-existent relation -
+    which a collector reports as absent from production, which decides BLOCK.
+    A false BLOCK on every pull request touching that source.
+    """
     schema = node.get("schema")
-    name = node.get("alias") or node.get("name")
+    name = node.get("identifier") or node.get("alias") or node.get("name")
     return f"{schema}.{name}" if schema else str(name)
 
 

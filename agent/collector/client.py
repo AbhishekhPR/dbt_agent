@@ -10,6 +10,7 @@ on this class returns or logs it.
 from __future__ import annotations
 
 import json
+import ssl
 import urllib.error
 import urllib.request
 
@@ -25,7 +26,19 @@ class ReliumApiError(RuntimeError):
         self.payload = payload or {}
 
 
-def _urllib_transport(timeout):
+def _urllib_transport(timeout, ca_bundle=None):
+    """Standard-library HTTP with TLS verification always on.
+
+    There is deliberately no setting that disables verification. A customer
+    behind a TLS-inspecting proxy or a private CA supplies the bundle instead.
+    Proxies come from the usual HTTP_PROXY / HTTPS_PROXY / NO_PROXY variables,
+    which urllib already honours, so no proxy option is invented here.
+    """
+    context = ssl.create_default_context(cafile=ca_bundle) if ca_bundle \
+        else ssl.create_default_context()
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+
     def send(method, url, body, headers):
         data = json.dumps(body).encode() if body is not None else None
         request = urllib.request.Request(url, data=data, method=method)
@@ -34,7 +47,8 @@ def _urllib_transport(timeout):
         if data is not None:
             request.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with urllib.request.urlopen(request, timeout=timeout,
+                                        context=context) as response:
                 raw = response.read()
                 return response.status, (json.loads(raw) if raw else {})
         except urllib.error.HTTPError as exc:
@@ -56,7 +70,8 @@ class ReliumClient:
 
     def __init__(self, config, *, transport=None):
         self._config = config
-        self._send = transport or _urllib_transport(config.timeout_seconds)
+        self._send = transport or _urllib_transport(config.timeout_seconds,
+                                                    config.ca_bundle)
 
     def _headers(self, idempotency_key=None):
         headers = {

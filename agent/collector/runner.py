@@ -183,7 +183,8 @@ def collect_snapshot(request, reader, *, config, now=None):
         columns = list(target.get("columns") or [])
         try:
             relation = reader.collect_relation(
-                relation_name=relation_name, columns=columns, signals=supported)
+                relation_name=relation_name, columns=columns, signals=supported,
+                relation_schema=target.get("relation_schema"))
         except RelationMissing:
             missing.append(relation_name)
             relations.append(reader.missing_relation(relation_name))

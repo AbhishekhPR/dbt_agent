@@ -83,9 +83,11 @@ class _RecordingReader:
         self._columns = columns
         self._row_count = row_count
 
-    def collect_relation(self, *, relation_name, columns, signals):
+    def collect_relation(self, *, relation_name, columns, signals,
+                         relation_schema=None):
         self.calls.append({"relation": relation_name, "columns": list(columns),
-                           "signals": sorted(signals)})
+                           "signals": sorted(signals),
+                           "schema": relation_schema})
         return {
             "relation_name": relation_name,
             "exists_in_production": True,

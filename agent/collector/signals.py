@@ -88,27 +88,38 @@ def classify_signals(required_signals):
     return supported, unimplemented
 
 
-def split_relation(relation_name):
-    """Split ``schema.table`` (or bare ``table``) into validated parts.
+def split_relation(relation_name, *, relation_schema=None):
+    """Resolve a target to validated (schema, table) parts.
 
-    Validation happens here rather than at query-build time so an unsafe name
-    can never reach a statement, whatever the caller does next.
+    ``relation_schema`` comes from the collection request and is authoritative
+    when present: the request already carries the schema dbt resolved, so the
+    remainder of ``relation_name`` is the physical identifier. Splitting on the
+    first dot instead would misread any schema that contains one.
+
+    Validation happens here rather than at query-build time, so an unsafe name
+    can never reach a statement whatever the caller does next.
     """
     text = str(relation_name or "").strip()
     if not text:
         raise UnsafeIdentifierError("relation name is empty")
-    parts = text.split(".")
-    if len(parts) == 1:
-        schema, table = "public", parts[0]
-    elif len(parts) == 2:
-        schema, table = parts
+
+    schema = str(relation_schema).strip() if relation_schema else None
+    if schema and text.lower().startswith(schema.lower() + "."):
+        table = text[len(schema) + 1:]
     else:
-        # Three-part names would mean cross-database access. Refuse rather
-        # than silently reinterpret what the request meant.
-        raise UnsafeIdentifierError(
-            f"relation {text!r} is not a schema-qualified name")
+        parts = text.split(".")
+        if len(parts) == 1:
+            schema, table = schema or "public", parts[0]
+        elif len(parts) == 2:
+            schema, table = parts
+        else:
+            # Three-part names would mean cross-database access. Refuse rather
+            # than silently reinterpret what the request meant.
+            raise UnsafeIdentifierError(
+                f"relation {text!r} is not a schema-qualified name")
+
     for part in (schema, table):
-        if not _IDENTIFIER.fullmatch(part):
+        if not _IDENTIFIER.fullmatch(part or ""):
             raise UnsafeIdentifierError(f"unsafe identifier: {part!r}")
     return schema, table
 

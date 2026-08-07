@@ -658,11 +658,41 @@ class PostgresLifecycleStore:
         ).fetchone()
         return dict(row) if row else None
 
+    def list_service_tokens(self, organization_id=None, repository_id=None):
+        """Tokens for an operator to identify later. The hash is never returned.
+
+        A token has to be findable after issuance - to audit it, or to revoke
+        the right one - and that has to be possible without the secret, which
+        is unrecoverable by design.
+        """
+        sql = ("SELECT token_id, organization_id, repository_id, environment, "
+               "description, created_at, expires_at, revoked_at "
+               "FROM api_service_tokens")
+        clauses, args = [], []
+        if organization_id is not None:
+            clauses.append("organization_id=%s")
+            args.append(organization_id)
+        if repository_id is not None:
+            clauses.append("repository_id=%s")
+            args.append(repository_id)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC"
+        return [dict(r) for r in self.connection.execute(sql, tuple(args)).fetchall()]
+
     def revoke_service_token(self, token_id):
-        self.connection.execute(
-            "UPDATE api_service_tokens SET revoked_at=now() WHERE token_id=%s AND revoked_at IS NULL",
+        """Returns True when this call performed the revocation.
+
+        False means the token does not exist or was already revoked - the
+        caller needs to know which, so it can report honestly rather than
+        claim to have revoked something it did not.
+        """
+        row = self.connection.execute(
+            "UPDATE api_service_tokens SET revoked_at=now() "
+            "WHERE token_id=%s AND revoked_at IS NULL RETURNING token_id",
             (token_id,),
-        )
+        ).fetchone()
+        return row is not None
 
     # -- idempotent event receipts -------------------------------------------
 
