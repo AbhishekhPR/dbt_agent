@@ -17,6 +17,8 @@ SUPPORTED_COMMANDS = frozenset(
         "ast",
         "backtest-deployment",
         "blast",
+        # The customer-side collector's single entry point.
+        "collect",
         "compare-last-run",
         "demo-pipeline",
         "diagnose",

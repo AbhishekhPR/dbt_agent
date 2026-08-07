@@ -1226,5 +1226,54 @@ def history(project, table, days):
                 )
 
 
+@cli.command()
+@click.option('--request-id', default=None,
+              help='Collect a specific request instead of the oldest pending one')
+@click.option('--json', 'as_json', is_flag=True,
+              help='Emit the outcome as JSON')
+def collect(request_id, as_json):
+    """Run the customer-side Relium Collector once.
+
+    Reads a targeted collection request from Relium, queries the configured
+    warehouse for ONLY the requested metadata, submits the resulting snapshot,
+    and exits. Configuration comes from RELIUM_API_URL, RELIUM_API_TOKEN and
+    RELIUM_WAREHOUSE_DSN; no secret is echoed.
+    """
+    import json as _json
+    import sys
+
+    from agent.collector import CollectorConfig, CollectorConfigError, run_collection
+
+    try:
+        config = CollectorConfig.from_env()
+    except CollectorConfigError as exc:
+        click.echo(f"relium collect: {exc}", err=True)
+        sys.exit(2)
+
+    outcome = run_collection(config)
+
+    if as_json:
+        click.echo(_json.dumps(outcome.as_dict(), indent=2, sort_keys=True))
+    else:
+        click.echo(f"relium collect: {outcome.reason}")
+        if outcome.request_id:
+            click.echo(f"  request       {outcome.request_id}")
+            click.echo(f"  review        {outcome.review_id} (attempt {outcome.attempt})")
+        if outcome.snapshot_id:
+            click.echo(f"  snapshot      {outcome.snapshot_id} (HTTP {outcome.status_code})")
+        if outcome.relations_collected:
+            click.echo(f"  relations     {outcome.relations_collected} "
+                       f"({outcome.columns_collected} columns)")
+            click.echo(f"  signals       {', '.join(outcome.signals_collected)}")
+        if outcome.signals_unsupported:
+            click.echo(f"  UNSUPPORTED   {', '.join(outcome.signals_unsupported)}")
+        if outcome.relations_missing:
+            click.echo(f"  absent        {', '.join(outcome.relations_missing)}")
+
+    # A failed collection must be a non-zero exit, so whatever schedules the
+    # collector cannot mistake it for success.
+    sys.exit(0 if outcome.ok else 1)
+
+
 if __name__ == '__main__':
     cli()
