@@ -12,7 +12,10 @@ enabled.
 from __future__ import annotations
 
 import ast
+import json
+import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -23,7 +26,10 @@ DRIVER = E2E / "metadata_review_e2e.py"
 LIVE = E2E / "live_flow.py"
 VERIFY = E2E / "verify_flow.py"
 STAGES = E2E / "stages.py"
+WEBHOOK_RECOVERY = E2E / "webhook_recovery_e2e.py"
 WORKFLOW = Path(__file__).with_name(".github") / "workflows" / "metadata-review-e2e.yml"
+GOVERNANCE_WORKFLOW = (Path(__file__).with_name(".github") / "workflows" /
+                       "governance-e2e.yml")
 
 # Every mandatory live operation, and the function that must implement it.
 MANDATORY_OPERATIONS = {
@@ -422,6 +428,32 @@ class FixtureShapeTests(unittest.TestCase):
 
 
 class CleanupCompletenessTests(unittest.TestCase):
+    def test_fresh_outer_cleanup_never_claims_webhook_restoration(self):
+        """A new cleanup process has no in-memory mutation to restore.
+
+        Run 31246080645's outer cleanup used to report ``restored: true`` in
+        exactly this state even though it neither knew nor queried the
+        original configuration. Exercise the real cleanup-only entrypoint in
+        a new process and require the result to remain explicitly unknown.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ.copy()
+            for name in tuple(env):
+                if name.startswith("RELIUM_"):
+                    env.pop(name)
+            proc = subprocess.run(
+                [sys.executable, str(DRIVER), tmp, "--cleanup-only"],
+                capture_output=True, text=True, env=env, timeout=30,
+                check=False)
+            self.assertNotEqual(0, proc.returncode,
+                                "missing fixture cleanup authority must fail closed")
+            record = json.loads(
+                (Path(tmp) / "cleanup-verification-outer.json").read_text(
+                    encoding="utf-8"))
+            webhook = record["webhook"]
+            self.assertIsNone(webhook["restored"])
+            self.assertFalse(webhook["verified_through_github"])
+
     def test_cleanup_deletes_fixture_branches(self):
         """state["branches"] was populated at creation and consumed by
         nothing, so every run so far left its branches behind."""
@@ -455,6 +487,63 @@ class CleanupCompletenessTests(unittest.TestCase):
         driver = _source(DRIVER)
         self.assertIn("stage-tracker-outer.json", driver)
         self.assertNotIn('StageTracker(EV / "stage-tracker.json")', driver)
+
+
+class WebhookRecoveryHarnessTests(unittest.TestCase):
+    def test_recovery_is_pinned_to_the_two_authoritative_runs(self):
+        source = _source(WEBHOOK_RECOVERY)
+        self.assertIn("31085032785", source)
+        self.assertIn("https://example.invalid/github/webhook", source)
+        self.assertIn("31246080645", source)
+        self.assertIn(
+            "https://connector-wind-terms-yet.trycloudflare.com/github/webhook",
+            source)
+
+    def test_temporary_mutation_is_preserved_and_restored_in_order(self):
+        source = _source(WEBHOOK_RECOVERY)
+        body = source[source.index("def main() -> int:"):]
+        preserve = body.index("preserve_webhook()")
+        temporary = body.index("lf.point_webhook(")
+        restore = body.index("restore_webhook()")
+        final_verify = body.index("final = read_webhook_state(")
+        self.assertLess(preserve, temporary)
+        self.assertLess(temporary, restore)
+        self.assertLess(restore, final_verify)
+
+    def test_recovery_verifies_identity_and_untouched_configuration(self):
+        source = _source(WEBHOOK_RECOVERY)
+        for required in ("relium-e2e", "AbhishekhPR/relium-e2e-dbt",
+                         "active", "events", "content_type", "insecure_ssl",
+                         "verified_through_github", "relium_pilot_touched"):
+            with self.subTest(required=required):
+                self.assertIn(required, source)
+
+    def test_recovery_creates_no_fixture_pull_request_or_branch(self):
+        source = _source(WEBHOOK_RECOVERY)
+        self.assertNotIn("create_fixture_pr", source)
+        self.assertNotIn('gh("POST", f"/repos/', source)
+        self.assertNotIn('gh("PATCH", f"/repos/', source)
+        self.assertNotIn('gh("DELETE", f"/repos/', source)
+
+    def test_recovery_fails_if_tunnel_or_listener_survives_cleanup(self):
+        source = _source(WEBHOOK_RECOVERY)
+        self.assertIn('_require(cleanup["tunnel_stopped"]', source)
+        self.assertIn('_require(not cleanup["local_listener_still_up"]', source)
+
+    def test_secure_workflow_has_a_small_recovery_only_job(self):
+        import yaml
+        doc = yaml.safe_load(_source(GOVERNANCE_WORKFLOW))
+        triggers = doc.get(True) or doc.get("on")
+        operation = triggers["workflow_dispatch"]["inputs"]["operation"]
+        self.assertEqual("governance", operation["default"])
+        recovery = doc["jobs"]["webhook-recovery"]
+        self.assertLessEqual(recovery["timeout-minutes"], 15)
+        self.assertNotIn("services", recovery)
+        commands = "\n".join(
+            str(step.get("run", "")) for step in recovery["steps"])
+        self.assertIn("webhook_recovery_e2e.py", commands)
+        self.assertNotIn("governance_e2e.py", commands)
+        self.assertIn("E2E LISTENER STILL UP", commands)
 
 
 class ObservabilityTests(unittest.TestCase):

@@ -36,7 +36,8 @@ import live_flow as lf                                        # noqa: E402
 import verify_flow as vf                                      # noqa: E402
 from live_flow import ENVIRONMENT, StageFailure, local, poll  # noqa: E402
 from metadata_review_e2e import (                             # noqa: E402
-    app_jwt, cleanup, gh, installation_token, issue_token, state,
+    app_jwt, cleanup, gh, installation_token, issue_token,
+    preserve_webhook, state,
 )
 
 REPO = os.environ.get("RELIUM_E2E_REPOSITORY", "AbhishekhPR/relium-e2e-dbt")
@@ -101,6 +102,7 @@ def main() -> int:
     lf.start_tunnel(state, EV / "tunnel.log")
     # start_tunnel returns a REPORT dict; the url is on state.
     tunnel_url = state["tunnel"]["url"]
+    preserve_webhook()          # required before any repoint
     lf.point_webhook(state, gh, app_jwt, tunnel_url)
     lf.verify_webhook(gh, app_jwt, tunnel_url)
     check("services_started", True, tunnel_url)

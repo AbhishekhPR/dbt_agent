@@ -14,6 +14,12 @@ name: governance-e2e
 on:
   workflow_dispatch:
     inputs:
+      operation:
+        description: "Focused operation to run"
+        required: true
+        default: "governance"
+        type: choice
+        options: [governance, recover-webhook]
       enforcement_mode:
         description: "Policy mode for the fixture review"
         required: true
@@ -32,6 +38,7 @@ concurrency:
 
 jobs:
   governance:
+    if: inputs.operation == 'governance'
     runs-on: ubuntu-latest
     timeout-minutes: 35
 
@@ -175,3 +182,84 @@ jobs:
           if [ $rc -ne 0 ]; then
             echo "CLEANUP FAILED (rc=$rc)"; exit $rc
           fi
+
+  webhook-recovery:
+    if: inputs.operation == 'recover-webhook'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RELIUM_E2E_REPOSITORY: AbhishekhPR/relium-e2e-dbt
+      RELIUM_E2E_APP_SLUG: relium-e2e
+      EVIDENCE_DIR: ${{ github.workspace }}/webhook-recovery-evidence
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Write the dedicated E2E App private key outside the workspace
+        env:
+          RELIUM_GITHUB_PRIVATE_KEY: ${{ secrets.RELIUM_E2E_PRIVATE_KEY }}
+        run: |
+          install -m 700 -d "$RUNNER_TEMP/relium-secrets"
+          printf '%s' "$RELIUM_GITHUB_PRIVATE_KEY" > "$RUNNER_TEMP/relium-secrets/app.pem"
+          chmod 600 "$RUNNER_TEMP/relium-secrets/app.pem"
+          test -s "$RUNNER_TEMP/relium-secrets/app.pem" || exit 1
+          echo "RELIUM_GITHUB_PRIVATE_KEY_PATH=$RUNNER_TEMP/relium-secrets/app.pem" >> "$GITHUB_ENV"
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL -o /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Recover and prove exact webhook cleanup
+        env:
+          RELIUM_GITHUB_APP_ID: ${{ secrets.RELIUM_E2E_APP_ID }}
+          RELIUM_E2E_INSTALLATION_ID: ${{ secrets.RELIUM_E2E_INSTALLATION_ID }}
+          RELIUM_E2E_FIXTURE_TOKEN: ${{ secrets.RELIUM_E2E_FIXTURE_TOKEN }}
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          python scripts/e2e/webhook_recovery_e2e.py "$EVIDENCE_DIR"
+
+      - name: Mandatory outer cleanup and exact restore
+        if: always()
+        env:
+          RELIUM_GITHUB_APP_ID: ${{ secrets.RELIUM_E2E_APP_ID }}
+          RELIUM_E2E_INSTALLATION_ID: ${{ secrets.RELIUM_E2E_INSTALLATION_ID }}
+          RELIUM_E2E_FIXTURE_TOKEN: ${{ secrets.RELIUM_E2E_FIXTURE_TOKEN }}
+        run: |
+          rc=0
+          python scripts/e2e/metadata_review_e2e.py "$EVIDENCE_DIR" --cleanup-only || rc=$?
+          pkill -f cloudflared || true
+          pkill -f webhook_recovery_e2e.py || true
+          if [ $rc -ne 0 ]; then
+            echo "CLEANUP FAILED (rc=$rc)"; exit $rc
+          fi
+          if ss -ltnp | grep -qE ':(8791)'; then
+            echo "E2E LISTENER STILL UP"; exit 1
+          fi
+          if pgrep -f cloudflared; then
+            echo "E2E TUNNEL STILL UP"; exit 1
+          fi
+
+      - name: Scan recovery evidence for secrets
+        if: always()
+        run: |
+          python scripts/live_e2e/secret_scan.py "$EVIDENCE_DIR" || {
+            echo "SECRET SCAN FAILED - refusing to upload evidence"; exit 1; }
+
+      - name: Upload recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webhook-recovery-cleanup-proof
+          path: |
+            ${{ env.EVIDENCE_DIR }}/*.json
+            ${{ env.EVIDENCE_DIR }}/*.log
+          if-no-files-found: error

@@ -129,9 +129,35 @@ def installation_token(jwt=None):
 
 
 # ---------------------------------------------------------------- cleanup
+def preserve_webhook(gh_fn=None, jwt_fn=None):
+    """Record the current webhook config so cleanup can put it back.
+
+    Any driver that repoints the App webhook must call this BEFORE the
+    mutation. `governance_e2e` did not, so its cleanup had nothing to restore
+    from and reported a failure it could not explain.
+    """
+    gh_fn, jwt_fn = gh_fn or gh, jwt_fn or app_jwt
+    status, hook = gh_fn("GET", "/app/hook/config", jwt_fn())
+    if status != 200:
+        raise StageFailure("cannot read the current webhook configuration")
+    RECOVERY.write_text(json.dumps({
+        "recorded_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "url": hook.get("url"),
+        "content_type": hook.get("content_type", "json"),
+        "secret_captured": False}, indent=2, sort_keys=True), encoding="utf-8")
+    return {"preserved_url_host": (hook.get("url") or "//?").split("//")[-1],
+            "secret_captured": False}
+
+
 def restore_webhook():
     if not RECOVERY.is_file():
-        return {"restored": False, "reason": "no recovery record"}
+        # No record of the original, so restoration is impossible - not
+        # merely unperformed. Say so in the same vocabulary as the success
+        # case, or the caller's `verified_through_github` check reports this
+        # as a generic failure and hides why.
+        return {"restored": False, "verified_through_github": False,
+                "reason": "no recovery record: the original webhook "
+                          "configuration was never preserved by this process"}
     record = json.loads(RECOVERY.read_text(encoding="utf-8"))
     jwt = app_jwt()
     patch_status, _ = gh("PATCH", "/app/hook/config", jwt,
@@ -162,7 +188,17 @@ def cleanup(reason="normal"):
             result["webhook"] = {"restored": False, "error": type(exc).__name__}
             result["failures"].append(f"webhook restore raised {type(exc).__name__}")
     else:
-        result["webhook"] = {"restored": True, "note": "never mutated"}
+        # This process changed nothing, so it has nothing to restore. Saying
+        # "restored: true" here read as "the webhook is confirmed correct",
+        # which it never was: the outer --cleanup-only process runs with fresh
+        # state and would report success while doing nothing at all.
+        result["webhook"] = {
+            "restored": None,
+            "verified_through_github": False,
+            "note": "this process made no webhook change and has no record "
+                    "of the original; restoration was neither needed nor "
+                    "attempted by it",
+        }
 
     # 2. close (never merge) the fixture PRs
     closed = []
