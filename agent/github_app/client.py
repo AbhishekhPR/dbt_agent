@@ -282,6 +282,21 @@ class GitHubClient:
             route_template="/repos/{owner}/{repo}/check-runs",
         )
 
+    def get_repository_installation(self, owner, repository, app_jwt):
+        """Which App installation covers this repository.
+
+        Lets a multi-tenant worker mint an installation token without a
+        per-tenant installation id in configuration. Requires an App JWT, not
+        an installation token.
+        """
+        return self._request(
+            "GET",
+            f"/repos/{owner}/{repository}/installation",
+            token=app_jwt,
+            operation="get_repository_installation",
+            route_template="/repos/{owner}/{repo}/installation",
+        )
+
     def create_pull_request_review(self, owner, repository, pull_number, *,
                                    body, event="REQUEST_CHANGES"):
         """Submit a pull-request review.

@@ -317,6 +317,17 @@ def main(argv=None):
         print("RELIUM_DATABASE_URL must be a PostgreSQL DSN", file=sys.stderr)
         return 2
 
+    # Install the outbound publisher. Without this the republication and
+    # request-changes handlers run, find no publisher, and record that
+    # nothing was published - durable and honest, but never delivered.
+    from agent.worker.publisher_config import build_publisher_factory
+
+    factory = build_publisher_factory()
+    if factory is not None:
+        configure_publisher(factory)
+        logger.info("worker_publisher_configured",
+                    extra={"operation": "startup"})
+
     worker = build_worker(dsn, poll_seconds=args.poll_seconds,
                           max_attempts=args.max_attempts,
                           backoff_seconds=args.backoff_seconds)

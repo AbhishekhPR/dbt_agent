@@ -141,6 +141,10 @@ def start_worker(state, workdir, dsn, log_path):
     from agent.worker.lifecycle_worker import registry
     if "metadata.review_recompute_requested" not in registry.supported():
         raise StageFailure("worker does not support metadata.review_recompute_requested")
+    # The worker builds its outbound publisher from the App configuration in
+    # its environment. Without these it runs, finds no publisher, and records
+    # that nothing was published - which is exactly how the first live run
+    # left a request-changes row PENDING forever.
     env = {**os.environ, "RELIUM_DATABASE_URL": dsn, "PYTHONPATH": str(workdir)}
     log = open(log_path, "w", encoding="utf-8")
     proc = subprocess.Popen(
@@ -150,7 +154,15 @@ def start_worker(state, workdir, dsn, log_path):
     time.sleep(5)
     if proc.poll() is not None:
         raise StageFailure(f"worker exited early rc={proc.returncode}")
-    return {"pid": proc.pid, "alive": True,
+    # Prove the worker can actually publish, rather than discovering hours
+    # later that every outbound job recorded "no publisher".
+    from agent.worker.publisher_config import build_publisher_factory
+    publisher_configured = build_publisher_factory() is not None
+    if not publisher_configured:
+        raise StageFailure(
+            "the worker has no GitHub publisher configured; outbound jobs "
+            "would record 'no publisher' and never reach GitHub")
+    return {"pid": proc.pid, "alive": True, "publisher_configured": True,
             "supported_events": sorted(registry.supported())}
 
 
