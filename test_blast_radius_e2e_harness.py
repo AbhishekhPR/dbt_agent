@@ -305,6 +305,34 @@ class BlastRadiusOwnershipTests(unittest.TestCase):
 
         self.assertEqual(saved["owned_branches"], [branch])
 
+    def test_branch_create_polls_recognized_delayed_404_visibility(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = _load_driver(Path(tmp), "blast_create_delayed_visibility")
+            record = driver._initial_recovery()
+            branch = record["branch_candidates"][0]
+            posted = {"value": False, "reads": 0}
+
+            def fake_gh(method, path, _token, body=None, bearer=True):
+                if method == "POST":
+                    posted["value"] = True
+                    return 201, {}
+                if method == "GET" and not posted["value"]:
+                    return 404, {}
+                if method == "GET":
+                    posted["reads"] += 1
+                    if posted["reads"] <= 2:
+                        return 404, {}
+                    return 200, {"ref": f"refs/heads/{branch}",
+                                 "object": {"type": "commit", "sha": "base-sha"}}
+                self.fail(f"unexpected operation {method} {path}")
+
+            driver.gh = fake_gh
+            with mock.patch.object(driver.time, "sleep") as sleep:
+                driver._make_branch("fixture-token", branch, "base-sha")
+
+        self.assertEqual(posted["reads"], 3)
+        self.assertEqual(sleep.call_count, 2)
+
     def test_failed_ownership_write_compensates_by_removing_exact_created_ref(self):
         with tempfile.TemporaryDirectory() as tmp:
             driver = _load_driver(Path(tmp), "blast_ref_record_failure")
@@ -542,6 +570,40 @@ class BlastRadiusHeadMutationTests(unittest.TestCase):
                             if call[0:2] == ("POST", f"/repos/{driver.REPO}/git/commits"))
         self.assertLess(commit_index, patch_index)
         self.assertNotIn("/contents/", _source(DRIVER))
+
+    def test_ref_update_polls_only_exact_old_sha_until_new_sha_visible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = _load_driver(Path(tmp), "blast_update_delayed_visibility")
+            _record, branch = self._owned_base(driver)
+            reads = {"count": 0}
+
+            def fake_gh(method, path, _token, body=None, bearer=True):
+                if method == "GET" and "/git/commits/" in path:
+                    return 200, {"sha": "old-sha", "tree": {"sha": "tree-old"}}
+                if method == "POST" and path.endswith("/git/blobs"):
+                    return 201, {"sha": "blob-new"}
+                if method == "POST" and path.endswith("/git/trees"):
+                    return 201, {"sha": "tree-new"}
+                if method == "POST" and path.endswith("/git/commits"):
+                    return 201, {"sha": "new-sha"}
+                if method == "PATCH":
+                    return 200, {}
+                if method == "GET" and "/git/ref/heads/" in path:
+                    reads["count"] += 1
+                    sha = "old-sha" if reads["count"] <= 2 else "new-sha"
+                    return 200, {"ref": f"refs/heads/{branch}",
+                                 "object": {"type": "commit", "sha": sha}}
+                self.fail(f"unexpected operation {method} {path}")
+
+            driver.gh = fake_gh
+            with mock.patch.object(driver.time, "sleep") as sleep:
+                result = driver._commit_file_git_data(
+                    "fixture-token", branch, "models/fct_orders.sql",
+                    "select 1\n", "fact mutation")
+
+        self.assertEqual(result, "new-sha")
+        self.assertEqual(reads["count"], 3)
+        self.assertEqual(sleep.call_count, 2)
 
     def test_promotion_failure_is_recovered_by_fresh_cleanup_process(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -815,6 +877,46 @@ class BlastRadiusStartupTests(unittest.TestCase):
         self.assertIn("invalid durable process identity", failures)
 
 
+class BlastRadiusRefPollingTests(unittest.TestCase):
+    def test_wrong_ref_type_or_unrelated_sha_fails_immediately_without_retry(self):
+        cases = [
+            {"ref": "refs/heads/wrong", "object": {"type": "commit",
+                                                      "sha": "new-sha"}},
+            {"ref": "refs/heads/proof", "object": {"type": "blob",
+                                                      "sha": "new-sha"}},
+            {"ref": "refs/heads/proof", "object": {"type": "commit",
+                                                      "sha": "unrelated-sha"}},
+        ]
+        for index, response in enumerate(cases):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as tmp:
+                driver = _load_driver(Path(tmp), f"blast_ref_mismatch_{index}")
+                calls = []
+                driver.gh = lambda *_args, **_kwargs: (
+                    calls.append(True) or (200, response))
+                with self.assertRaisesRegex(driver.StageFailure, "unexpected ref state"):
+                    driver._wait_for_exact_ref(
+                        "proof", "fixture-token", expected_sha="new-sha",
+                        transitional_sha="old-sha", description="test update",
+                        _sleep=lambda _seconds: self.fail("mismatch must not retry"))
+                self.assertEqual(len(calls), 1)
+
+    def test_recognized_transition_times_out_fail_closed_without_real_sleep(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = _load_driver(Path(tmp), "blast_ref_timeout")
+            driver.gh = lambda *_args, **_kwargs: (404, {})
+            clock_values = iter([0.0, 0.5, 1.1])
+            sleeps = []
+            with self.assertRaisesRegex(driver.StageFailure, "timed out"):
+                driver._wait_for_exact_ref(
+                    "proof", "fixture-token", expected_sha="new-sha",
+                    absent_is_transitional=True, description="test create",
+                    timeout=1.0, interval=0.1,
+                    _clock=lambda: next(clock_values),
+                    _sleep=sleeps.append)
+
+        self.assertEqual(sleeps, [0.1])
+
+
 class BlastRadiusCleanupTests(unittest.TestCase):
     def _record(self, driver):
         candidates = [
@@ -1049,6 +1151,44 @@ class BlastRadiusCleanupTests(unittest.TestCase):
             sorted(record["owned_branches"]),
         )
         self.assertFalse(any(method == "DELETE" for method, _path in calls))
+
+    def test_delete_polls_exact_present_ref_until_404_is_visible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = _load_driver(Path(tmp), "blast_delete_delayed_visibility")
+            record = self._record(driver)
+            record["webhook_mutated"] = False
+            driver.RUN_RECOVERY.write_text(json.dumps(record), encoding="utf-8")
+            driver.FIXTURE_TOKEN = "fixture-token"
+            remote = {branch: {"deleted": False, "lag_reads": 0}
+                      for branch in record["owned_branches"]}
+
+            def fake_gh(method, path, _token, body=None, bearer=True):
+                if path.endswith("/pulls/71") and method == "GET":
+                    return 200, self._pull(record, 71, state="closed")
+                if "/git/refs/heads/" in path and method == "DELETE":
+                    branch = path.split("/heads/", 1)[1]
+                    remote[branch]["deleted"] = True
+                    return 204, {}
+                if "/git/ref/heads/" in path and method == "GET":
+                    branch = path.split("/heads/", 1)[1]
+                    state = remote[branch]
+                    if state["deleted"]:
+                        state["lag_reads"] += 1
+                        if state["lag_reads"] > 2:
+                            return 404, {}
+                    return 200, {"ref": f"refs/heads/{branch}",
+                                 "object": {"type": "commit",
+                                            "sha": record["owned_branch_heads"][branch]}}
+                self.fail(f"unexpected operation {method} {path}")
+
+            driver.gh = fake_gh
+            with mock.patch.object(driver.time, "sleep") as sleep:
+                result = driver.cleanup("delete-visibility-lag")
+
+        self.assertTrue(result["cleanup_passed"], result)
+        self.assertEqual(sleep.call_count, 4)
+        self.assertEqual(sorted(result["fixture_branches_deleted"]),
+                         sorted(record["owned_branches"]))
 
     def test_owned_ref_sha_mismatch_fails_before_any_delete(self):
         with tempfile.TemporaryDirectory() as tmp:

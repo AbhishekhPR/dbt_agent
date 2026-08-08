@@ -489,6 +489,47 @@ def _persist_process(label: str, proc, marker: str) -> None:
     _write_recovery(record)
 
 
+def _wait_for_exact_ref(
+        branch: str, token: str, *, expected_sha: str | None,
+        description: str, transitional_sha: str | None = None,
+        absent_is_transitional: bool = False, timeout: float = 20.0,
+        interval: float = 0.5, _clock=None, _sleep=None,
+) -> dict:
+    """Poll only explicitly recognized GitHub ref-visibility transitions."""
+    clock = _clock or time.monotonic
+    sleep = _sleep or time.sleep
+    deadline = clock() + timeout
+    while True:
+        status, ref = gh(
+            "GET", f"/repos/{REPO}/git/ref/heads/{branch}",
+            token, bearer=False)
+        identity_exact = (status == 200 and isinstance(ref, dict)
+                          and ref.get("ref") == f"refs/heads/{branch}"
+                          and (ref.get("object") or {}).get("type") == "commit")
+        observed_sha = ((ref.get("object") or {}).get("sha")
+                        if identity_exact else None)
+        if expected_sha is None:
+            if status == 404:
+                return {"status": 404, "absent": True}
+            transitional = identity_exact and observed_sha == transitional_sha
+        else:
+            if identity_exact and observed_sha == expected_sha:
+                return {"status": 200, "ref": ref}
+            transitional = ((absent_is_transitional and status == 404)
+                            or (transitional_sha is not None
+                                and identity_exact
+                                and observed_sha == transitional_sha))
+        if not transitional:
+            raise StageFailure(
+                f"{description} observed unexpected ref state: HTTP {status}, "
+                f"ref={ref.get('ref') if isinstance(ref, dict) else None}, "
+                f"type={(ref.get('object') or {}).get('type') if isinstance(ref, dict) else None}, "
+                f"sha={observed_sha}")
+        if clock() >= deadline:
+            raise StageFailure(f"timed out waiting for {description}")
+        sleep(interval)
+
+
 def _commit_file_git_data(token: str, branch: str, path: str,
                           content: str, message: str) -> str:
     record = _load_recovery()
@@ -548,14 +589,9 @@ def _commit_file_git_data(token: str, branch: str, path: str,
         {"sha": new_sha, "force": False}, bearer=False)
     if patch_status != 200:
         raise StageFailure(f"owned branch ref update returned HTTP {patch_status}")
-    verify_status, verified = gh(
-        "GET", f"/repos/{REPO}/git/ref/heads/{branch}", token, bearer=False)
-    exact = (verify_status == 200
-             and verified.get("ref") == f"refs/heads/{branch}"
-             and (verified.get("object") or {}).get("type") == "commit"
-             and (verified.get("object") or {}).get("sha") == new_sha)
-    if not exact:
-        raise StageFailure("owned branch ref update was not exactly verified")
+    _wait_for_exact_ref(
+        branch, token, expected_sha=new_sha, transitional_sha=old_sha,
+        description=f"owned branch {branch} update visibility")
     record = _load_recovery()
     _validate_branch_record(record)
     if record.get("branch_head_mutation_intents") != [intent]:
@@ -595,15 +631,13 @@ def _make_branch(token: str, branch: str, from_sha: str) -> None:
             raise StageFailure(f"cannot create owned branch {branch}: HTTP {status}")
     except (OSError, TimeoutError) as exc:
         response_error = exc
-    verify_status, verified = gh("GET", ref_path, token, bearer=False)
-    exact = (verify_status == 200
-             and verified.get("ref") == f"refs/heads/{branch}"
-             and (verified.get("object") or {}).get("type") == "commit"
-             and (verified.get("object") or {}).get("sha") == from_sha)
-    if not exact:
+    try:
+        _wait_for_exact_ref(
+            branch, token, expected_sha=from_sha, absent_is_transitional=True,
+            description=f"owned branch {branch} creation visibility")
+    except StageFailure as exc:
         detail = f" after {type(response_error).__name__}" if response_error else ""
-        raise StageFailure(
-            f"owned branch {branch} creation was not exactly verified{detail}")
+        raise StageFailure(f"{exc}{detail}") from exc
     record = _load_recovery()
     candidates, owned = _validate_branch_record(record)
     if (branch != candidates[len(owned)]
@@ -621,10 +655,12 @@ def _make_branch(token: str, branch: str, from_sha: str) -> None:
         delete_status, _ = gh(
             "DELETE", f"/repos/{REPO}/git/refs/heads/{branch}",
             token, bearer=False)
-        absent_status, _ = gh("GET", ref_path, token, bearer=False)
-        if delete_status not in (204, 404) or absent_status != 404:
+        if delete_status not in (204, 404):
             raise StageFailure(
                 f"owned branch {branch} could neither be recorded nor removed") from exc
+        _wait_for_exact_ref(
+            branch, token, expected_sha=None, transitional_sha=from_sha,
+            description=f"compensating deletion of owned branch {branch}")
         raise
 
 
@@ -1166,12 +1202,14 @@ def cleanup(reason: str = "normal") -> dict:
                     result["failures"].append(
                         f"owned branch {branch} delete returned HTTP {delete_status}")
                     break
-                verify_status, _ = gh(
-                    "GET", f"/repos/{REPO}/git/ref/heads/{branch}",
-                    FIXTURE_TOKEN, bearer=False)
-                if verify_status != 404:
+                try:
+                    _wait_for_exact_ref(
+                        branch, FIXTURE_TOKEN, expected_sha=None,
+                        transitional_sha=record["owned_branch_heads"][branch],
+                        description=f"owned branch {branch} deletion visibility")
+                except Exception as exc:  # noqa: BLE001
                     result["failures"].append(
-                        f"owned branch {branch} absence was not verified")
+                        f"owned branch {branch} absence was not verified: {exc}")
                     break
                 try:
                     record = _clear_durable_branch_ownership(branch)
