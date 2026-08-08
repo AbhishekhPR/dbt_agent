@@ -1,0 +1,15 @@
+version: 2
+
+exposures:
+  - name: revenue_dashboard
+    label: Revenue dashboard
+    type: dashboard
+    maturity: high
+    url: https://example.invalid/revenue
+    description: Fixture exposure proving non-model consumers are not projected.
+    depends_on:
+      - ref('rpt_revenue')
+      - ref('rpt_customer_revenue')
+    owner:
+      name: Analytics
+      email: analytics@example.invalid
