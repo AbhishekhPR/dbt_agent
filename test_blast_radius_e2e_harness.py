@@ -249,7 +249,9 @@ class BlastRadiusOwnershipTests(unittest.TestCase):
             record = driver._initial_recovery()
 
         self.assertEqual(record["owned_branches"], [])
+        self.assertEqual(record["owned_branch_heads"], {})
         self.assertEqual(record["branch_mutation_intents"], [])
+        self.assertEqual(record["branch_head_mutation_intents"], [])
         self.assertEqual(record["branch_candidates"], [
             f"e2e/blast-radius-base-{driver.RUN}",
             f"e2e/blast-radius-head-{driver.RUN}",
@@ -404,7 +406,8 @@ class BlastRadiusOwnershipTests(unittest.TestCase):
 
         self.assertTrue(result["cleanup_passed"], result)
         self.assertEqual(saved["branch_mutation_intents"], [])
-        self.assertEqual(saved["owned_branches"], [branch])
+        self.assertEqual(saved["owned_branches"], [])
+        self.assertEqual(saved["owned_branch_heads"], {})
         self.assertEqual(result["fixture_branches_deleted"], [branch])
         get_index = calls.index(
             ("GET", f"/repos/{driver.REPO}/git/ref/heads/{branch}"))
@@ -479,6 +482,246 @@ class BlastRadiusRecoveryDurabilityTests(unittest.TestCase):
 
             self.assertEqual(driver._load_recovery(), valid)
             self.assertEqual(list(Path(tmp).glob("*.tmp")), [])
+
+
+class BlastRadiusHeadMutationTests(unittest.TestCase):
+    @staticmethod
+    def _owned_base(driver, old_sha="old-sha"):
+        record = driver._initial_recovery()
+        branch = record["branch_candidates"][0]
+        record["owned_branches"] = [branch]
+        record["owned_branch_heads"] = {branch: old_sha}
+        driver._write_recovery(record)
+        return record, branch
+
+    @staticmethod
+    def _git_data_gh(driver, branch, remote, calls):
+        def fake_gh(method, path, _token, body=None, bearer=True):
+            calls.append((method, path, body))
+            if method == "GET" and "/git/commits/" in path:
+                return 200, {"sha": remote["sha"], "tree": {"sha": "tree-old"}}
+            if method == "POST" and path.endswith("/git/blobs"):
+                return 201, {"sha": "blob-new"}
+            if method == "POST" and path.endswith("/git/trees"):
+                return 201, {"sha": "tree-new"}
+            if method == "POST" and path.endswith("/git/commits"):
+                return 201, {"sha": "new-sha"}
+            if method == "PATCH" and path.endswith(f"/git/refs/heads/{branch}"):
+                persisted = driver._load_recovery()
+                intent = persisted["branch_head_mutation_intents"]
+                if len(intent) != 1:
+                    raise AssertionError("head intent was not durable before PATCH")
+                remote["sha"] = body["sha"]
+                return 200, {"ref": f"refs/heads/{branch}",
+                             "object": {"type": "commit", "sha": body["sha"]}}
+            if method == "GET" and path.endswith(f"/git/ref/heads/{branch}"):
+                return 200, {"ref": f"refs/heads/{branch}",
+                             "object": {"type": "commit", "sha": remote["sha"]}}
+            raise AssertionError(f"unexpected operation {method} {path}")
+        return fake_gh
+
+    def test_git_data_commit_persists_exact_intent_before_ref_patch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = _load_driver(Path(tmp), "blast_git_data_commit")
+            _record, branch = self._owned_base(driver)
+            calls = []
+            remote = {"sha": "old-sha"}
+            driver.gh = self._git_data_gh(driver, branch, remote, calls)
+
+            result = driver._commit_file_git_data(
+                "fixture-token", branch, "models/fct_orders.sql",
+                "select 1\n", "fact mutation")
+            saved = driver._load_recovery()
+
+        self.assertEqual(result, "new-sha")
+        self.assertEqual(saved["owned_branch_heads"][branch], "new-sha")
+        self.assertEqual(saved["branch_head_mutation_intents"], [])
+        self.assertFalse(any("/contents/" in path for _method, path, _body in calls))
+        patch_index = next(i for i, call in enumerate(calls) if call[0] == "PATCH")
+        commit_index = next(i for i, call in enumerate(calls)
+                            if call[0:2] == ("POST", f"/repos/{driver.REPO}/git/commits"))
+        self.assertLess(commit_index, patch_index)
+        self.assertNotIn("/contents/", _source(DRIVER))
+
+    def test_promotion_failure_is_recovered_by_fresh_cleanup_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = Path(tmp)
+            driver = _load_driver(evidence, "blast_head_promotion_failure")
+            _record, branch = self._owned_base(driver)
+            calls = []
+            remote = {"sha": "old-sha"}
+            driver.gh = self._git_data_gh(driver, branch, remote, calls)
+            real_write = driver._write_recovery
+            writes = {"count": 0}
+
+            def fail_promotion(document):
+                writes["count"] += 1
+                if writes["count"] == 1:
+                    return real_write(document)
+                raise OSError("promotion write failed")
+
+            with mock.patch.object(driver, "_write_recovery",
+                                   side_effect=fail_promotion):
+                with self.assertRaises(OSError):
+                    driver._commit_file_git_data(
+                        "fixture-token", branch, "models/fct_orders.sql",
+                        "select 1\n", "fact mutation")
+            durable = driver._load_recovery()
+            self.assertEqual(durable["owned_branch_heads"][branch], "old-sha")
+            self.assertEqual(durable["branch_head_mutation_intents"][0]["new_sha"],
+                             "new-sha")
+
+            outer = _load_driver(evidence, "blast_head_promotion_outer")
+            outer.FIXTURE_TOKEN = "fixture-token"
+            outer_calls = []
+
+            def cleanup_gh(method, path, _token, body=None, bearer=True):
+                outer_calls.append((method, path))
+                if "/pulls?" in path:
+                    return 200, []
+                if method == "DELETE":
+                    remote["sha"] = None
+                    return 204, {}
+                if method == "GET" and remote["sha"] is not None:
+                    return 200, {"ref": f"refs/heads/{branch}",
+                                 "object": {"type": "commit", "sha": remote["sha"]}}
+                return 404, {}
+
+            outer.gh = cleanup_gh
+            result = outer.cleanup("fresh-outer")
+            saved = outer._load_recovery()
+
+        self.assertTrue(result["cleanup_passed"], result)
+        self.assertEqual(saved["branch_head_mutation_intents"], [])
+        self.assertEqual(saved["owned_branches"], [])
+        self.assertEqual(len([call for call in outer_calls if call[0] == "DELETE"]), 1)
+
+    def test_cleanup_remote_old_sha_clears_unapplied_intent_then_deletes_old_ref(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = _load_driver(Path(tmp), "blast_head_intent_old")
+            record, branch = self._owned_base(driver)
+            record["branch_head_mutation_intents"] = [{
+                "branch": branch, "ref": f"refs/heads/{branch}",
+                "old_sha": "old-sha", "new_sha": "new-sha",
+                "operation_identity": {"kind": "git-data-file-commit",
+                                       "path": "models/fct_orders.sql",
+                                       "blob_sha": "blob-new"},
+            }]
+            driver._write_recovery(record)
+            driver.FIXTURE_TOKEN = "fixture-token"
+            remote = {"sha": "old-sha"}
+            calls = []
+
+            def fake_gh(method, path, _token, body=None, bearer=True):
+                calls.append((method, path))
+                if "/pulls?" in path:
+                    return 200, []
+                if method == "DELETE":
+                    remote["sha"] = None
+                    return 204, {}
+                if method == "GET" and remote["sha"] is not None:
+                    return 200, {"ref": f"refs/heads/{branch}",
+                                 "object": {"type": "commit", "sha": remote["sha"]}}
+                return 404, {}
+
+            driver.gh = fake_gh
+            result = driver.cleanup("mutation-not-applied")
+            saved = driver._load_recovery()
+
+        self.assertTrue(result["cleanup_passed"], result)
+        self.assertEqual(saved["branch_head_mutation_intents"], [])
+        self.assertEqual(result["fixture_branches_deleted"], [branch])
+
+    def test_cleanup_head_intent_sha_mismatch_fails_without_delete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = _load_driver(Path(tmp), "blast_head_intent_mismatch")
+            record, branch = self._owned_base(driver)
+            record["branch_head_mutation_intents"] = [{
+                "branch": branch, "ref": f"refs/heads/{branch}",
+                "old_sha": "old-sha", "new_sha": "new-sha",
+                "operation_identity": {"kind": "git-data-file-commit",
+                                       "path": "models/fct_orders.sql",
+                                       "blob_sha": "blob-new"},
+            }]
+            driver._write_recovery(record)
+            driver.FIXTURE_TOKEN = "fixture-token"
+            calls = []
+
+            def fake_gh(method, path, _token, body=None, bearer=True):
+                calls.append((method, path))
+                return 200, {"ref": f"refs/heads/{branch}",
+                             "object": {"type": "commit", "sha": "other-sha"}}
+
+            driver.gh = fake_gh
+            result = driver.cleanup("head-intent-mismatch")
+
+        self.assertFalse(result["cleanup_passed"])
+        self.assertIn("head mutation intent", " ".join(result["failures"]))
+        self.assertFalse(any(method == "DELETE" for method, _path in calls))
+
+    def test_head_intent_404_clears_only_after_pr_absence_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = _load_driver(Path(tmp), "blast_head_intent_absent_safe")
+            record, branch = self._owned_base(driver)
+            record["branch_head_mutation_intents"] = [{
+                "branch": branch, "ref": f"refs/heads/{branch}",
+                "old_sha": "old-sha", "new_sha": "new-sha",
+                "operation_identity": {"kind": "git-data-file-commit",
+                                       "path": "models/fct_orders.sql",
+                                       "blob_sha": "blob-new"},
+            }]
+            driver._write_recovery(record)
+            driver.FIXTURE_TOKEN = "fixture-token"
+            calls = []
+
+            def fake_gh(method, path, _token, body=None, bearer=True):
+                calls.append((method, path))
+                if "/pulls?" in path:
+                    return 200, []
+                return 404, {}
+
+            driver.gh = fake_gh
+            result = driver.cleanup("head-intent-absent-safe")
+            saved = driver._load_recovery()
+
+        self.assertTrue(result["cleanup_passed"], result)
+        self.assertEqual(saved["branch_head_mutation_intents"], [])
+        self.assertEqual(saved["owned_branches"], [])
+        self.assertEqual(result["fixture_branches_already_absent"], [branch])
+        self.assertFalse(any(method == "DELETE" for method, _path in calls))
+
+    def test_head_intent_404_is_retained_when_pr_gate_is_unverifiable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = _load_driver(Path(tmp), "blast_head_intent_absent_unsafe")
+            record, branch = self._owned_base(driver)
+            record["pr_number"] = 71
+            record["branch_head_mutation_intents"] = [{
+                "branch": branch, "ref": f"refs/heads/{branch}",
+                "old_sha": "old-sha", "new_sha": "new-sha",
+                "operation_identity": {"kind": "git-data-file-commit",
+                                       "path": "models/fct_orders.sql",
+                                       "blob_sha": "blob-new"},
+            }]
+            driver._write_recovery(record)
+            driver.FIXTURE_TOKEN = "fixture-token"
+            calls = []
+
+            def fake_gh(method, path, _token, body=None, bearer=True):
+                calls.append((method, path))
+                if "/git/ref/heads/" in path:
+                    return 404, {}
+                if path.endswith("/pulls/71"):
+                    return 500, {}
+                self.fail(f"unexpected operation {method} {path}")
+
+            driver.gh = fake_gh
+            result = driver.cleanup("head-intent-absent-unsafe")
+            saved = driver._load_recovery()
+
+        self.assertFalse(result["cleanup_passed"])
+        self.assertEqual(len(saved["branch_head_mutation_intents"]), 1)
+        self.assertEqual(saved["owned_branches"], [branch])
+        self.assertFalse(any(method == "DELETE" for method, _path in calls))
 
 
 class BlastRadiusStartupTests(unittest.TestCase):
@@ -590,7 +833,12 @@ class BlastRadiusCleanupTests(unittest.TestCase):
             "pr_number": 71,
             "branch_candidates": candidates,
             "owned_branches": list(candidates),
+            "owned_branch_heads": {
+                candidates[0]: "base-tip-sha",
+                candidates[1]: "head-tip-sha",
+            },
             "branch_mutation_intents": [],
+            "branch_head_mutation_intents": [],
             "processes": [],
         }
         driver.RUN_RECOVERY.write_text(json.dumps(record), encoding="utf-8")
@@ -611,6 +859,7 @@ class BlastRadiusCleanupTests(unittest.TestCase):
             driver.app_jwt = lambda: "app-jwt"
             calls = []
             pr_state = {"state": "open"}
+            remote_refs = dict(record["owned_branch_heads"])
 
             def fake_gh(method, path, token, body=None, bearer=True):
                 calls.append((method, path, token, body, bearer))
@@ -624,10 +873,17 @@ class BlastRadiusCleanupTests(unittest.TestCase):
                 if path.endswith("/pulls/71") and method == "PATCH":
                     pr_state["state"] = "closed"
                     return 200, self._pull(record, 71, state="closed")
-                if "/git/refs/heads/" in path and method == "DELETE":
-                    return 204, {}
                 if "/git/ref/heads/" in path and method == "GET":
+                    branch = path.split("/heads/", 1)[1]
+                    if branch in remote_refs:
+                        return 200, {"ref": f"refs/heads/{branch}",
+                                     "object": {"type": "commit",
+                                                "sha": remote_refs[branch]}}
                     return 404, {}
+                if "/git/refs/heads/" in path and method == "DELETE":
+                    branch = path.split("/heads/", 1)[1]
+                    remote_refs.pop(branch)
+                    return 204, {}
                 self.fail(f"unexpected GitHub operation: {method} {path}")
 
             driver.gh = fake_gh
@@ -641,7 +897,7 @@ class BlastRadiusCleanupTests(unittest.TestCase):
         self.assertEqual(
             deleted,
             [f"/repos/{driver.REPO}/git/refs/heads/{branch}"
-             for branch in record["owned_branches"]],
+             for branch in reversed(record["owned_branches"])],
         )
         self.assertNotIn("matching-refs", "\n".join(path for _, path, *_ in calls))
         restore_index = next(i for i, call in enumerate(calls)
@@ -720,6 +976,106 @@ class BlastRadiusCleanupTests(unittest.TestCase):
         self.assertFalse(result["cleanup_passed"])
         self.assertIn("MERGED", " ".join(result["failures"]))
         self.assertEqual(result["fixture_branches_deleted"], [])
+        self.assertFalse(any(method == "DELETE" for method, _path in calls))
+
+    def test_finalizer_deletes_then_fresh_outer_cleanup_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = Path(tmp)
+            driver = _load_driver(evidence, "blast_cleanup_first_process")
+            record = self._record(driver)
+            record["webhook_mutated"] = False
+            driver.RUN_RECOVERY.write_text(json.dumps(record), encoding="utf-8")
+            driver.FIXTURE_TOKEN = "fixture-token"
+            remote_refs = dict(record["owned_branch_heads"])
+            calls = []
+
+            def fake_gh(method, path, _token, body=None, bearer=True):
+                calls.append((method, path))
+                if path.endswith("/pulls/71") and method == "GET":
+                    return 200, self._pull(record, 71, state="closed")
+                for branch, sha in list(remote_refs.items()):
+                    if path.endswith(f"/git/ref/heads/{branch}") and method == "GET":
+                        return 200, {"ref": f"refs/heads/{branch}",
+                                     "object": {"type": "commit", "sha": sha}}
+                    if path.endswith(f"/git/refs/heads/{branch}") and method == "DELETE":
+                        del remote_refs[branch]
+                        return 204, {}
+                if "/git/ref/heads/" in path and method == "GET":
+                    return 404, {}
+                self.fail(f"unexpected operation {method} {path}")
+
+            driver.gh = fake_gh
+            first = driver.cleanup("driver-finalizer")
+            after_first = driver._load_recovery()
+
+            outer = _load_driver(evidence, "blast_cleanup_fresh_outer")
+            outer.FIXTURE_TOKEN = "fixture-token"
+            outer.gh = fake_gh
+            second = outer.cleanup("workflow-always-step")
+
+        self.assertTrue(first["cleanup_passed"], first)
+        self.assertTrue(second["cleanup_passed"], second)
+        self.assertEqual(after_first["owned_branches"], [])
+        self.assertEqual(after_first["owned_branch_heads"], {})
+        self.assertEqual(len([call for call in calls if call[0] == "DELETE"]), 2)
+        self.assertEqual(remote_refs, {})
+
+    def test_already_absent_owned_refs_clear_durably_without_delete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = _load_driver(Path(tmp), "blast_cleanup_already_absent")
+            record = self._record(driver)
+            record["webhook_mutated"] = False
+            driver.RUN_RECOVERY.write_text(json.dumps(record), encoding="utf-8")
+            driver.FIXTURE_TOKEN = "fixture-token"
+            calls = []
+
+            def fake_gh(method, path, _token, body=None, bearer=True):
+                calls.append((method, path))
+                if path.endswith("/pulls/71") and method == "GET":
+                    return 200, self._pull(record, 71, state="closed")
+                if "/git/ref/heads/" in path and method == "GET":
+                    return 404, {}
+                self.fail(f"already absent ref must not be deleted: {method} {path}")
+
+            driver.gh = fake_gh
+            result = driver.cleanup("fresh-outer")
+            saved = driver._load_recovery()
+
+        self.assertTrue(result["cleanup_passed"], result)
+        self.assertEqual(saved["owned_branches"], [])
+        self.assertEqual(saved["owned_branch_heads"], {})
+        self.assertEqual(
+            sorted(result["fixture_branches_already_absent"]),
+            sorted(record["owned_branches"]),
+        )
+        self.assertFalse(any(method == "DELETE" for method, _path in calls))
+
+    def test_owned_ref_sha_mismatch_fails_before_any_delete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = _load_driver(Path(tmp), "blast_cleanup_ref_sha_mismatch")
+            record = self._record(driver)
+            record["webhook_mutated"] = False
+            driver.RUN_RECOVERY.write_text(json.dumps(record), encoding="utf-8")
+            driver.FIXTURE_TOKEN = "fixture-token"
+            calls = []
+
+            def fake_gh(method, path, _token, body=None, bearer=True):
+                calls.append((method, path))
+                if path.endswith("/pulls/71") and method == "GET":
+                    return 200, self._pull(record, 71, state="closed")
+                if "/git/ref/heads/" in path and method == "GET":
+                    branch = path.split("/heads/", 1)[1]
+                    sha = (record["owned_branch_heads"][branch]
+                           if branch.endswith("head-abc123") else "wrong-sha")
+                    return 200, {"ref": f"refs/heads/{branch}",
+                                 "object": {"type": "commit", "sha": sha}}
+                self.fail(f"mismatch must stop before delete: {method} {path}")
+
+            driver.gh = fake_gh
+            result = driver.cleanup("sha-mismatch")
+
+        self.assertFalse(result["cleanup_passed"])
+        self.assertIn("does not match durable ownership", " ".join(result["failures"]))
         self.assertFalse(any(method == "DELETE" for method, _path in calls))
 
     def test_exact_webhook_restore_also_verifies_tls_configuration(self):
@@ -830,7 +1186,8 @@ class BlastRadiusCleanupTests(unittest.TestCase):
             record = {"run_id": "../../main",
                       "branch_candidates": ["e2e/blast-radius-base-../../main",
                                             "e2e/blast-radius-head-../../main"],
-                      "owned_branches": [], "branch_mutation_intents": []}
+                      "owned_branches": [], "branch_mutation_intents": [],
+                      "branch_head_mutation_intents": []}
             with self.assertRaisesRegex(driver.StageFailure, "run id"):
                 driver._validate_owned_branches(record)
 
@@ -849,6 +1206,7 @@ class BlastRadiusCleanupTests(unittest.TestCase):
             driver.app_jwt = lambda: "app-jwt"
             calls = []
             pr_state = {"state": "open"}
+            remote_refs = dict(record["owned_branch_heads"])
 
             def fake_gh(method, path, _token, body=None, bearer=True):
                 calls.append((method, path))
@@ -866,10 +1224,17 @@ class BlastRadiusCleanupTests(unittest.TestCase):
                 if path.endswith("/pulls/72") and method == "PATCH":
                     pr_state["state"] = "closed"
                     return 200, self._pull(record, 72, state="closed")
-                if "/git/refs/heads/" in path and method == "DELETE":
-                    return 204, {}
                 if "/git/ref/heads/" in path and method == "GET":
+                    branch = path.split("/heads/", 1)[1]
+                    if branch in remote_refs:
+                        return 200, {"ref": f"refs/heads/{branch}",
+                                     "object": {"type": "commit",
+                                                "sha": remote_refs[branch]}}
                     return 404, {}
+                if "/git/refs/heads/" in path and method == "DELETE":
+                    branch = path.split("/heads/", 1)[1]
+                    remote_refs.pop(branch)
+                    return 204, {}
                 self.fail(f"unexpected GitHub operation: {method} {path}")
 
             driver.gh = fake_gh

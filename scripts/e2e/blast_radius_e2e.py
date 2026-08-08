@@ -342,7 +342,9 @@ def _initial_recovery() -> dict:
         "pr_number": None,
         "branch_candidates": [base_branch, head_branch],
         "owned_branches": [],
+        "owned_branch_heads": {},
         "branch_mutation_intents": [],
+        "branch_head_mutation_intents": [],
         "processes": [],
     }
     _write_recovery(record)
@@ -376,6 +378,12 @@ def _validate_branch_record(record: dict) -> tuple[list[str], list[str]]:
     if not isinstance(owned, list) or owned not in ([], expected[:1], expected):
         raise StageFailure(
             "owned branch record must be an ordered proven subset of the exact refs")
+    heads = record.get("owned_branch_heads")
+    if (not isinstance(heads, dict) or set(heads) != set(owned)
+            or any(not isinstance(heads[branch], str) or not heads[branch]
+                   for branch in owned)):
+        raise StageFailure(
+            "owned branch head record must exactly map every proven-owned ref")
     intents = record.get("branch_mutation_intents")
     if not isinstance(intents, list) or len(intents) > 1:
         raise StageFailure("branch mutation intent record must contain at most one intent")
@@ -388,6 +396,27 @@ def _validate_branch_record(record: dict) -> tuple[list[str], list[str]]:
                 or not isinstance(intent.get("expected_sha"), str)
                 or not intent["expected_sha"]):
             raise StageFailure("branch mutation intent is not the exact next candidate")
+    head_intents = record.get("branch_head_mutation_intents")
+    if not isinstance(head_intents, list) or len(head_intents) > 1:
+        raise StageFailure(
+            "branch head mutation intent record must contain at most one intent")
+    if head_intents:
+        intent = head_intents[0]
+        branch = intent.get("branch") if isinstance(intent, dict) else None
+        operation = (intent.get("operation_identity")
+                     if isinstance(intent, dict) else None)
+        if (intents or branch not in owned
+                or intent.get("ref") != f"refs/heads/{branch}"
+                or intent.get("old_sha") != heads.get(branch)
+                or not isinstance(intent.get("new_sha"), str)
+                or not intent["new_sha"] or intent["new_sha"] == intent["old_sha"]
+                or not isinstance(operation, dict)
+                or operation.get("kind") != "git-data-file-commit"
+                or not isinstance(operation.get("path"), str)
+                or not operation["path"]
+                or not isinstance(operation.get("blob_sha"), str)
+                or not operation["blob_sha"]):
+            raise StageFailure("branch head mutation intent is not exactly typed")
     return expected, owned
 
 
@@ -460,21 +489,81 @@ def _persist_process(label: str, proc, marker: str) -> None:
     _write_recovery(record)
 
 
-def _put_file(token: str, branch: str, path: str, content: str, message: str) -> str:
-    body = {"message": message,
-            "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
-            "branch": branch}
-    status, existing = gh(
-        "GET", f"/repos/{REPO}/contents/{path}?ref={branch}", token, bearer=False)
-    if status == 200 and isinstance(existing, dict) and existing.get("sha"):
-        body["sha"] = existing["sha"]
-    elif status != 404:
-        raise StageFailure(f"cannot inspect {path} on {branch}: HTTP {status}")
-    put_status, response = gh(
-        "PUT", f"/repos/{REPO}/contents/{path}", token, body, bearer=False)
-    if put_status not in (200, 201):
-        raise StageFailure(f"cannot commit {path} on {branch}: HTTP {put_status}")
-    return response["commit"]["sha"]
+def _commit_file_git_data(token: str, branch: str, path: str,
+                          content: str, message: str) -> str:
+    record = _load_recovery()
+    if record is None:
+        raise StageFailure("cannot commit to owned branch without recovery")
+    _candidates, owned = _validate_branch_record(record)
+    if branch not in owned:
+        raise StageFailure("cannot commit to a branch not proven owned")
+    old_sha = record["owned_branch_heads"][branch]
+    status, parent = gh(
+        "GET", f"/repos/{REPO}/git/commits/{old_sha}", token, bearer=False)
+    parent_tree = ((parent.get("tree") or {}).get("sha")
+                   if isinstance(parent, dict) else None)
+    if status != 200 or parent.get("sha") != old_sha or not parent_tree:
+        raise StageFailure("owned branch parent commit was not exactly readable")
+    status, blob = gh(
+        "POST", f"/repos/{REPO}/git/blobs", token,
+        {"content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+         "encoding": "base64"}, bearer=False)
+    blob_sha = blob.get("sha") if isinstance(blob, dict) else None
+    if status != 201 or not isinstance(blob_sha, str) or not blob_sha:
+        raise StageFailure("Git Data blob creation did not return a typed SHA")
+    status, tree = gh(
+        "POST", f"/repos/{REPO}/git/trees", token,
+        {"base_tree": parent_tree,
+         "tree": [{"path": path, "mode": "100644", "type": "blob",
+                   "sha": blob_sha}]}, bearer=False)
+    tree_sha = tree.get("sha") if isinstance(tree, dict) else None
+    if status != 201 or not isinstance(tree_sha, str) or not tree_sha:
+        raise StageFailure("Git Data tree creation did not return a typed SHA")
+    status, commit = gh(
+        "POST", f"/repos/{REPO}/git/commits", token,
+        {"message": message, "tree": tree_sha, "parents": [old_sha]},
+        bearer=False)
+    new_sha = commit.get("sha") if isinstance(commit, dict) else None
+    if (status != 201 or not isinstance(new_sha, str) or not new_sha
+            or new_sha == old_sha):
+        raise StageFailure("Git Data commit creation did not return a new typed SHA")
+    intent = {
+        "branch": branch,
+        "ref": f"refs/heads/{branch}",
+        "old_sha": old_sha,
+        "new_sha": new_sha,
+        "operation_identity": {
+            "kind": "git-data-file-commit", "path": path,
+            "blob_sha": blob_sha,
+        },
+    }
+    record = _load_recovery()
+    _validate_branch_record(record)
+    if record["owned_branch_heads"].get(branch) != old_sha:
+        raise StageFailure("owned branch head changed before mutation intent")
+    record["branch_head_mutation_intents"] = [intent]
+    _write_recovery(record)  # durable BEFORE the ref-moving PATCH
+    patch_status, _ = gh(
+        "PATCH", f"/repos/{REPO}/git/refs/heads/{branch}", token,
+        {"sha": new_sha, "force": False}, bearer=False)
+    if patch_status != 200:
+        raise StageFailure(f"owned branch ref update returned HTTP {patch_status}")
+    verify_status, verified = gh(
+        "GET", f"/repos/{REPO}/git/ref/heads/{branch}", token, bearer=False)
+    exact = (verify_status == 200
+             and verified.get("ref") == f"refs/heads/{branch}"
+             and (verified.get("object") or {}).get("type") == "commit"
+             and (verified.get("object") or {}).get("sha") == new_sha)
+    if not exact:
+        raise StageFailure("owned branch ref update was not exactly verified")
+    record = _load_recovery()
+    _validate_branch_record(record)
+    if record.get("branch_head_mutation_intents") != [intent]:
+        raise StageFailure("branch head mutation intent changed during update")
+    record["owned_branch_heads"][branch] = new_sha
+    record["branch_head_mutation_intents"] = []
+    _write_recovery(record)
+    return new_sha
 
 
 def _make_branch(token: str, branch: str, from_sha: str) -> None:
@@ -521,6 +610,7 @@ def _make_branch(token: str, branch: str, from_sha: str) -> None:
             or record.get("branch_mutation_intents") != [intent]):
         raise StageFailure("owned branch intent changed during creation")
     record["owned_branches"] = owned + [branch]
+    record["owned_branch_heads"][branch] = from_sha
     record["branch_mutation_intents"] = []
     try:
         _write_recovery(record)
@@ -566,9 +656,10 @@ def _create_fixture_pr(default_branch: str, default_sha: str,
             f"ephemeral base changes more than config/exposure: {base_changes}")
     base_tip = None
     for path in base_changes:
-        base_tip = _put_file(FIXTURE_TOKEN, base_branch, path, base_files[path],
-                             f"blast radius {RUN}: base {path}")
-    base_tip = _put_file(
+        base_tip = _commit_file_git_data(
+            FIXTURE_TOKEN, base_branch, path, base_files[path],
+            f"blast radius {RUN}: base {path}")
+    base_tip = _commit_file_git_data(
         FIXTURE_TOKEN, base_branch, "target/manifest.json",
         json.dumps(base_manifest, indent=2, sort_keys=True),
         f"blast radius {RUN}: parsed base manifest")
@@ -579,9 +670,10 @@ def _create_fixture_pr(default_branch: str, default_sha: str,
     fact_path = _model_path(base_files, "fct_orders")
     if changed_paths != [fact_path]:
         raise StageFailure(f"head source change is not fact-only: {changed_paths}")
-    _put_file(FIXTURE_TOKEN, head_branch, changed_paths[0],
-              head_files[changed_paths[0]], f"blast radius {RUN}: change fct_orders")
-    _put_file(
+    _commit_file_git_data(
+        FIXTURE_TOKEN, head_branch, changed_paths[0],
+        head_files[changed_paths[0]], f"blast radius {RUN}: change fct_orders")
+    _commit_file_git_data(
         FIXTURE_TOKEN, head_branch, "target/manifest.json",
         json.dumps(head_manifest, indent=2, sort_keys=True),
         f"blast radius {RUN}: parsed head manifest")
@@ -599,6 +691,9 @@ def _create_fixture_pr(default_branch: str, default_sha: str,
     number = pull["number"]
     record = _load_recovery()
     _validate_branch_record(record)
+    if (record["owned_branch_heads"].get(base_branch) != pull["base"]["sha"]
+            or record["owned_branch_heads"].get(head_branch) != pull["head"]["sha"]):
+        raise StageFailure("created fixture PR SHAs do not match durable owned refs")
     record["pr_number"] = number
     _write_recovery(record)
     return {"pr_number": number, "base_branch": base_branch,
@@ -815,6 +910,7 @@ def _resolve_branch_mutation_intent(record: dict,
             failures.append("branch mutation intent cannot preserve ownership order")
             return record, False
         record["owned_branches"] = owned + [branch]
+        record["owned_branch_heads"][branch] = intent["expected_sha"]
         record["branch_mutation_intents"] = []
     else:
         failures.append(
@@ -829,12 +925,92 @@ def _resolve_branch_mutation_intent(record: dict,
     return _load_recovery(), True
 
 
+def _resolve_branch_head_mutation_intent(
+        record: dict, failures: list[str], *, allow_absent_clear: bool = False,
+) -> tuple[dict, bool, bool]:
+    _candidates, _owned = _validate_branch_record(record)
+    intents = record["branch_head_mutation_intents"]
+    if not intents:
+        return record, True, False
+    if not FIXTURE_TOKEN:
+        failures.append("fixture token unavailable for branch head mutation intent")
+        return record, False, False
+    intent = intents[0]
+    branch = intent["branch"]
+    status, ref = gh(
+        "GET", f"/repos/{REPO}/git/ref/heads/{branch}",
+        FIXTURE_TOKEN, bearer=False)
+    if status == 404:
+        if not allow_absent_clear:
+            # Absence is only actionable after the existing PR safety gate.
+            return record, True, True
+        record["branch_head_mutation_intents"] = []
+    elif status == 200:
+        exact_identity = (ref.get("ref") == intent["ref"]
+                          and (ref.get("object") or {}).get("type") == "commit")
+        remote_sha = (ref.get("object") or {}).get("sha")
+        if not exact_identity or remote_sha not in {
+                intent["old_sha"], intent["new_sha"]}:
+            failures.append(
+                f"branch head mutation intent {branch} does not exactly match old/new SHA")
+            return record, False, False
+        if remote_sha == intent["new_sha"]:
+            record["owned_branch_heads"][branch] = intent["new_sha"]
+        record["branch_head_mutation_intents"] = []
+    else:
+        failures.append(
+            f"branch head mutation intent {branch} exact GET returned HTTP {status}")
+        return record, False, False
+    try:
+        _write_recovery(record)
+    except Exception as exc:  # noqa: BLE001
+        failures.append(
+            f"branch head mutation resolution was not durable: {type(exc).__name__}")
+        return record, False, False
+    return _load_recovery(), True, False
+
+
+def _preflight_owned_refs(record: dict, branches: list[str]) -> list[dict]:
+    heads = record["owned_branch_heads"]
+    observations = []
+    for branch in reversed(branches):
+        status, ref = gh(
+            "GET", f"/repos/{REPO}/git/ref/heads/{branch}",
+            FIXTURE_TOKEN, bearer=False)
+        if status == 404:
+            observations.append({"branch": branch, "already_absent": True})
+            continue
+        exact = (status == 200
+                 and ref.get("ref") == f"refs/heads/{branch}"
+                 and (ref.get("object") or {}).get("type") == "commit"
+                 and (ref.get("object") or {}).get("sha") == heads[branch])
+        if not exact:
+            raise StageFailure(
+                f"owned branch {branch} does not match durable ownership")
+        observations.append({"branch": branch, "already_absent": False})
+    return observations
+
+
+def _clear_durable_branch_ownership(branch: str) -> dict:
+    record = _load_recovery()
+    if record is None:
+        raise StageFailure("cannot clear branch ownership without recovery")
+    _candidates, owned = _validate_branch_record(record)
+    if not owned or branch != owned[-1]:
+        raise StageFailure("branch ownership must be cleared in reverse order")
+    record["owned_branches"] = owned[:-1]
+    record["owned_branch_heads"].pop(branch)
+    _write_recovery(record)
+    return _load_recovery()
+
+
 def cleanup(reason: str = "normal") -> dict:
     if state.get("cleanup_done"):
         return state.get("cleanup_result") or {}
     state["cleanup_done"] = True
     result = {"reason": reason, "failures": [], "nothing_owned": False,
-              "fixture_pr": None, "fixture_branches_deleted": []}
+              "fixture_pr": None, "fixture_branches_deleted": [],
+              "fixture_branches_already_absent": []}
     record = _load_recovery()
     if record is None:
         result.update({
@@ -879,6 +1055,8 @@ def cleanup(reason: str = "normal") -> dict:
                              "reason": "record attributes no webhook mutation"}
 
     intents_resolved = True
+    head_intent_resolved = True
+    head_intent_absent = False
     if candidates is not None:
         try:
             record, intents_resolved = _resolve_branch_mutation_intent(
@@ -888,8 +1066,17 @@ def cleanup(reason: str = "normal") -> dict:
             intents_resolved = False
             result["failures"].append(
                 f"branch mutation intent resolution raised {type(exc).__name__}")
+    if candidates is not None and intents_resolved:
+        try:
+            record, head_intent_resolved, head_intent_absent = (
+                _resolve_branch_head_mutation_intent(record, result["failures"]))
+            candidates, branches = _validate_branch_record(record)
+        except Exception as exc:  # noqa: BLE001
+            head_intent_resolved = False
+            result["failures"].append(
+                f"branch head mutation resolution raised {type(exc).__name__}")
 
-    if branches and intents_resolved:
+    if branches and intents_resolved and head_intent_resolved:
         if not FIXTURE_TOKEN:
             result["failures"].append("fixture token unavailable for owned cleanup")
         else:
@@ -944,22 +1131,55 @@ def cleanup(reason: str = "normal") -> dict:
                 except Exception as exc:  # noqa: BLE001
                     result["failures"].append(str(exc))
 
-            for branch in branches if refs_safe_to_delete else []:
+            observations = []
+            if refs_safe_to_delete and head_intent_absent:
+                try:
+                    record, head_ok, still_absent = (
+                        _resolve_branch_head_mutation_intent(
+                            record, result["failures"], allow_absent_clear=True))
+                    refs_safe_to_delete = head_ok and not still_absent
+                    candidates, branches = _validate_branch_record(record)
+                except Exception as exc:  # noqa: BLE001
+                    refs_safe_to_delete = False
+                    result["failures"].append(
+                        f"post-gate head mutation resolution raised {type(exc).__name__}")
+            if refs_safe_to_delete:
+                try:
+                    observations = _preflight_owned_refs(record, branches)
+                except Exception as exc:  # noqa: BLE001
+                    result["failures"].append(str(exc))
+            for observation in observations:
+                branch = observation["branch"]
+                if observation["already_absent"]:
+                    try:
+                        record = _clear_durable_branch_ownership(branch)
+                        result["fixture_branches_already_absent"].append(branch)
+                    except Exception as exc:  # noqa: BLE001
+                        result["failures"].append(
+                            f"clearing absent branch {branch}: {type(exc).__name__}")
+                        break
+                    continue
                 delete_status, _ = gh(
                     "DELETE", f"/repos/{REPO}/git/refs/heads/{branch}",
                     FIXTURE_TOKEN, bearer=False)
-                if delete_status not in (204, 404):
+                if delete_status != 204:
                     result["failures"].append(
                         f"owned branch {branch} delete returned HTTP {delete_status}")
-                    continue
+                    break
                 verify_status, _ = gh(
                     "GET", f"/repos/{REPO}/git/ref/heads/{branch}",
                     FIXTURE_TOKEN, bearer=False)
                 if verify_status != 404:
                     result["failures"].append(
                         f"owned branch {branch} absence was not verified")
-                else:
+                    break
+                try:
+                    record = _clear_durable_branch_ownership(branch)
                     result["fixture_branches_deleted"].append(branch)
+                except Exception as exc:  # noqa: BLE001
+                    result["failures"].append(
+                        f"clearing deleted branch {branch}: {type(exc).__name__}")
+                    break
 
     result["processes"] = _stop_recorded_processes(record, result["failures"])
     result["listeners_remaining"] = [port for port in (lf.PORT, 5181)
