@@ -961,6 +961,49 @@ def create_api_routes(*, store_pool, authenticator_factory=None):
 
 # -- response projections. Only disclosed fields cross the API boundary. -------
 
+def _change_plan_view(record):
+    payload = record.get("payload")
+    plan = payload.get("plan") if isinstance(payload, dict) else None
+    if not isinstance(plan, dict):
+        plan = {}
+
+    def string_list(field):
+        values = plan.get(field)
+        if not isinstance(values, list):
+            return []
+        return [value for value in values if isinstance(value, str)]
+
+    target_values = plan.get("targets")
+    if not isinstance(target_values, list):
+        target_values = []
+
+    targets = []
+    for target in target_values:
+        if not isinstance(target, dict):
+            continue
+        columns = target.get("columns")
+        targets.append({
+            "relation_name": target.get("relation_name")
+            if isinstance(target.get("relation_name"), str) else None,
+            "model_unique_id": target.get("model_unique_id")
+            if isinstance(target.get("model_unique_id"), str) else None,
+            "dependency_kind": target.get("dependency_kind")
+            if isinstance(target.get("dependency_kind"), str) else None,
+            "columns": [value for value in columns if isinstance(value, str)]
+            if isinstance(columns, list) else [],
+            "reason": target.get("reason")
+            if isinstance(target.get("reason"), str) else None,
+        })
+
+    return {
+        "changed_models": string_list("changed_models"),
+        "added_dependencies": string_list("added_dependencies"),
+        "removed_dependencies": string_list("removed_dependencies"),
+        "downstream_models": string_list("downstream_models"),
+        "targets": targets,
+    }
+
+
 def _review_view(record):
     """Review identity, decision and evidence state.
 
@@ -968,7 +1011,8 @@ def _review_view(record):
     persisted but none of them crossed the API, so a dashboard could show a
     decision without being able to say which code state it described or
     whether it was still provisional. Every field here is already non-secret
-    review metadata; no payload, plan or finding detail is included.
+    review metadata. The change plan is a deliberately small projection; raw
+    manifests and arbitrary persisted payload fields never cross this boundary.
     """
     return {
         "review_id": record["review_id"],
@@ -989,6 +1033,7 @@ def _review_view(record):
         "head_manifest_hash": record.get("head_manifest_hash"),
         "policy_version": record.get("policy_version"),
         "policy_hash": record.get("policy_hash"),
+        "change_plan": _change_plan_view(record),
         "created_at": isoformat(record.get("created_at")),
         "updated_at": isoformat(record.get("updated_at")),
     }

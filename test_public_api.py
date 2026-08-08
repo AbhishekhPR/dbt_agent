@@ -876,6 +876,72 @@ class ReviewDetailSurfaceTests(PublicApiTestCase):
         # Waiting is not a verdict, and the API must not invent one.
         self.assertIsNone(body["decision"])
 
+    def test_review_detail_exposes_only_the_allowlisted_change_plan(self):
+        outcome = self._review(pull_number=4243)
+        with self.pool.acquire() as store:
+            record = store.get_review(self.org, self.repo, outcome.review_id)
+            payload = dict(record["payload"])
+            payload["internal_note"] = "must not cross the API boundary"
+            payload["raw_manifest"] = {"nodes": {"model.secret": {"raw_sql": "select *"}}}
+            plan = dict(payload["plan"])
+            plan["notes"] = ["internal planner note"]
+            plan["required_evidence_level"] = "full"
+            payload["plan"] = plan
+            store.connection.execute(
+                "UPDATE reviews SET payload=%s WHERE organization_id=%s "
+                "AND repository_id=%s AND review_id=%s",
+                (store._Jsonb(payload), self.org, self.repo, outcome.review_id),
+            )
+
+        body = self._get(f"/api/reviews/{outcome.review_id}")
+
+        self.assertEqual(set(body["change_plan"]), {
+            "changed_models", "added_dependencies", "removed_dependencies",
+            "downstream_models", "targets",
+        })
+        self.assertEqual(body["change_plan"]["changed_models"], ["fct_orders"])
+        self.assertIsInstance(body["change_plan"]["added_dependencies"], list)
+        self.assertIsInstance(body["change_plan"]["removed_dependencies"], list)
+        self.assertIsInstance(body["change_plan"]["downstream_models"], list)
+        self.assertTrue(body["change_plan"]["targets"])
+        for target in body["change_plan"]["targets"]:
+            self.assertEqual(set(target), {
+                "relation_name", "model_unique_id", "dependency_kind",
+                "columns", "reason",
+            })
+        serialized = json.dumps(body).lower()
+        self.assertNotIn("internal_note", serialized)
+        self.assertNotIn("raw_manifest", serialized)
+        self.assertNotIn("required_evidence_level", serialized)
+        self.assertNotIn("internal planner note", serialized)
+
+    def test_review_detail_tolerates_malformed_persisted_change_plan_shapes(self):
+        empty_plan = {
+            "changed_models": [],
+            "added_dependencies": [],
+            "removed_dependencies": [],
+            "downstream_models": [],
+            "targets": [],
+        }
+        malformed_payloads = (
+            42,
+            {"plan": 42},
+            {"plan": {"targets": 42}},
+        )
+
+        for index, malformed in enumerate(malformed_payloads, start=1):
+            with self.subTest(malformed=malformed):
+                outcome = self._review(pull_number=4250 + index)
+                with self.pool.acquire() as store:
+                    store.connection.execute(
+                        "UPDATE reviews SET payload=%s WHERE organization_id=%s "
+                        "AND repository_id=%s AND review_id=%s",
+                        (store._Jsonb(malformed), self.org, self.repo, outcome.review_id),
+                    )
+
+                body = self._get(f"/api/reviews/{outcome.review_id}")
+                self.assertEqual(body["change_plan"], empty_plan)
+
     def test_findings_expose_measured_value_and_threshold(self):
         outcome = self._review()
         body = self._get(f"/api/reviews/{outcome.review_id}/findings")
