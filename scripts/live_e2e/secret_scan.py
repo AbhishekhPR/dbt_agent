@@ -32,7 +32,11 @@ ALLOWED = (
     "postgresql://relium_app:PASSWORD@",
 )
 
-TEXT_SUFFIXES = {".json", ".md", ".txt", ".log", ".csv", ".html", ".yml", ".yaml"}
+# ``.sql`` is here because a database export is the one artifact that carries
+# whole rows out of the run. It is the most likely place for a credential to
+# escape, so it must be scanned like any other text evidence, not skipped.
+TEXT_SUFFIXES = {".json", ".md", ".txt", ".log", ".csv", ".html", ".yml", ".yaml",
+                 ".sql"}
 
 
 def scan(root: Path):

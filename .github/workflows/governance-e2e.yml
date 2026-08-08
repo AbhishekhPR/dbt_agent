@@ -303,6 +303,24 @@ jobs:
           mkdir -p "$EVIDENCE_DIR"
           python scripts/e2e/blast_radius_e2e.py "$EVIDENCE_DIR"
 
+      # The durable state this run produced, exported before cleanup stops the
+      # service. It exists so the promoted dashboard — which cannot run here —
+      # can later be pointed at THIS run's rows instead of a handcrafted
+      # replay. Ownership and grants are stripped so the restore target needs
+      # no role from this runner; nothing about the review data is altered.
+      - name: Export the isolated review database
+        env:
+          PGPASSWORD: bootstrap_only_not_used_by_the_app
+        run: |
+          set -o pipefail
+          pg_dump -h 127.0.0.1 -U postgres -d relium_e2e \
+            --no-owner --no-privileges \
+            -f "$EVIDENCE_DIR/blast-radius-review-state.sql"
+          test -s "$EVIDENCE_DIR/blast-radius-review-state.sql"
+          sha256sum "$EVIDENCE_DIR/blast-radius-review-state.sql" \
+            | tee "$EVIDENCE_DIR/blast-radius-review-state.sha256.txt"
+          wc -c "$EVIDENCE_DIR/blast-radius-review-state.sql"
+
       # Always restore/verify the webhook first, close the unmerged owned PR,
       # remove the exact two recorded refs, and stop recorded local processes.
       - name: Mandatory exact blast-radius cleanup
@@ -344,6 +362,8 @@ jobs:
           path: |
             ${{ env.EVIDENCE_DIR }}/*.json
             ${{ env.EVIDENCE_DIR }}/*.log
+            ${{ env.EVIDENCE_DIR }}/*.sql
+            ${{ env.EVIDENCE_DIR }}/*.sha256.txt
           if-no-files-found: error
 
   webhook-recovery:
