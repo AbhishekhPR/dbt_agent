@@ -232,10 +232,16 @@ def main() -> int:
     distinct = len({str(v) for v in ids.values() if v}) == len([v for v in ids.values() if v])
     check("comment_check_and_review_ids_are_distinct", distinct, ids)
 
+    # The store keeps these ids as TEXT; GitHub returns them as integers.
+    # verify_reconciliation compares with !=, so passing the strings made a
+    # correctly reconciled comment look replaced.
+    def _as_int(value):
+        return int(value) if value not in (None, "") else None
+
     reconciliation = vf.verify_reconciliation(
         gh, installation_token(), REPO, pr["pr_number"], pr["head_sha"],
-        expected_app_id, final.get("github_comment_id"),
-        final.get("github_check_run_id"))
+        expected_app_id, _as_int(final.get("github_comment_id")),
+        _as_int(final.get("github_check_run_id")))
     check("sticky_comment_reconciled_not_duplicated",
           reconciliation["duplicate_comments"] == 0, reconciliation)
 

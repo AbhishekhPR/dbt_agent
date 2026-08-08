@@ -364,6 +364,16 @@ def verify_recomputation(dsn, owner, repo_name, review_id):
 # ------------------------------------------------- GitHub reconciliation
 def verify_reconciliation(gh, token, repo, pr_number, head_sha, expected_app_id,
                           comment_before, check_before):
+    """Prove the sticky comment and check run were updated, not duplicated.
+
+    The ids are compared numerically. Callers reading them from the store hand
+    over TEXT while GitHub returns integers, and a bare != on those two made a
+    correctly reconciled comment look like it had been replaced.
+    """
+    def _id(value):
+        return int(value) if value not in (None, "") else None
+
+    comment_before, check_before = _id(comment_before), _id(check_before)
     status, comments = gh("GET", f"/repos/{repo}/issues/{pr_number}/comments",
                           token, bearer=False)
     owned = [c for c in comments
