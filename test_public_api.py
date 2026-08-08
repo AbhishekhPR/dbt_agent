@@ -7,6 +7,7 @@ or a mocked connection for the API's production persistence path.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import threading
@@ -801,6 +802,545 @@ class FailureBehaviourTests(PublicApiTestCase):
                 (deployment_id,),
             ).fetchone()["total"]
         self.assertEqual(total, 1)
+
+
+class ReviewDetailSurfaceTests(PublicApiTestCase):
+    """The read surface a dashboard needs to render a review's evidence.
+
+    Every field asserted here was already persisted by the lifecycle store and
+    unreachable over HTTP, so a dashboard could show a verdict but never the
+    evidence behind it.
+    """
+
+    reset_schema = False
+
+    FORBIDDEN = ("-----begin", "postgresql://", "password", "private key",
+                 "select ", "insert into", "drop table", "ghp_", "ghs_")
+
+    _pull_counter = itertools.count(1)
+
+    def _next_pull(self):
+        return next(self._pull_counter)
+
+    def _review(self, pull_number=None):
+        """A review carried through the real lifecycle, not an inserted row.
+
+        The review id is a digest of (repository, pull number, head SHA), so
+        every test takes its own pull number. Sharing one would make these
+        tests order-dependent through the database.
+        """
+        from agent.metadata_evidence.review_lifecycle import begin_review
+
+        pull_number = pull_number or (4000 + self._next_pull())
+
+        base = {"nodes": {"model.a.fct_orders": {
+            "resource_type": "model", "name": "fct_orders", "schema": "analytics",
+            "alias": "fct_orders", "database": "warehouse",
+            "depends_on": {"nodes": ["source.a.raw.orders"]},
+            "columns": {"order_id": {"name": "order_id"}}}},
+            "sources": {"source.a.raw.orders": {
+                "schema": "raw", "name": "orders", "database": "warehouse",
+                "columns": {"order_id": {}}}}}
+        head = {"nodes": base["nodes"], "sources": {"source.a.raw.orders": {
+            "schema": "raw", "name": "orders", "database": "warehouse",
+            "columns": {"order_id": {}, "customer_id": {}}}}}
+
+        with self.pool.acquire() as store:
+            outcome = begin_review(
+                store, organization_id=self.org, repository_id=self.repo,
+                environment=self.env, pull_number=pull_number,
+                base_sha="a" * 40, head_sha=f"{pull_number:040d}",
+                base_manifest=base, head_manifest=head,
+                changed_models=["fct_orders"], enforcement_mode="enforce")
+        return outcome
+
+    def _get(self, path):
+        response = self.client.get(path, headers=self.auth)
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def test_review_detail_carries_identity_attempt_and_health(self):
+        outcome = self._review(pull_number=4242)
+        body = self._get(f"/api/reviews/{outcome.review_id}")
+
+        self.assertEqual(body["review_id"], outcome.review_id)
+        self.assertEqual(body["pull_number"], 4242)
+        self.assertEqual(body["base_sha"], "a" * 40)
+        self.assertEqual(body["head_sha"], f"{4242:040d}")
+        self.assertEqual(body["attempt"], outcome.attempt)
+        self.assertEqual(body["lifecycle_state"], outcome.lifecycle_state)
+        self.assertEqual(body["health"], outcome.health)
+        self.assertTrue(body["base_manifest_hash"])
+        self.assertTrue(body["head_manifest_hash"])
+        self.assertTrue(body["metadata_required"])
+        # Waiting is not a verdict, and the API must not invent one.
+        self.assertIsNone(body["decision"])
+
+    def test_findings_expose_measured_value_and_threshold(self):
+        outcome = self._review()
+        body = self._get(f"/api/reviews/{outcome.review_id}/findings")
+
+        self.assertEqual(body["review_id"], outcome.review_id)
+        findings = body["attempts"][0]["findings"]
+        self.assertTrue(findings, "a waiting review still has evidence findings")
+        for finding in findings:
+            for field in ("code", "severity", "category", "message", "detail"):
+                self.assertIn(field, finding)
+
+    def test_attempts_expose_the_lifecycle_transitions(self):
+        outcome = self._review()
+        body = self._get(f"/api/reviews/{outcome.review_id}/attempts")
+
+        self.assertEqual(body["current_attempt"], outcome.attempt)
+        self.assertTrue(body["attempts"])
+        states = [t["to_state"] for t in body["transitions"]]
+        self.assertIn("CODE_ANALYSIS_COMPLETE", states)
+        self.assertIn("WAITING_FOR_METADATA", states)
+
+    def test_collection_requests_show_what_was_asked_for(self):
+        outcome = self._review(pull_number=4244)
+        body = self._get(f"/api/reviews/{outcome.review_id}/collection-requests")
+
+        self.assertEqual(body["total"], 1)
+        item = body["items"][0]
+        self.assertEqual(item["request_id"], outcome.request_id)
+        self.assertEqual(item["state"], "PENDING")
+        # The request must be bound to the exact code state under review, or
+        # the evidence it returns cannot be attributed to this review.
+        self.assertEqual(item["head_sha"], f"{4244:040d}")
+        self.assertEqual(item["base_sha"], "a" * 40)
+        self.assertIn("plan", item)
+
+    def test_snapshots_and_publications_are_empty_before_collection(self):
+        outcome = self._review(pull_number=4243)
+
+        snapshots = self._get(f"/api/reviews/{outcome.review_id}/snapshots")
+        self.assertEqual(snapshots["total"], 0)
+
+        publications = self._get(f"/api/reviews/{outcome.review_id}/publications")
+        self.assertIsNone(publications["github"]["comment_id"])
+        self.assertEqual(publications["github"]["pull_number"], 4243)
+
+    def test_publication_identity_is_reported_once_recorded(self):
+        outcome = self._review()
+        with self.pool.acquire() as store:
+            store.record_review_publication(
+                self.org, self.repo, outcome.review_id,
+                comment_id="991", check_run_id="7723")
+
+        body = self._get(f"/api/reviews/{outcome.review_id}/publications")
+        self.assertEqual(body["github"]["comment_id"], "991")
+        self.assertEqual(body["github"]["check_run_id"], "7723")
+
+    def test_detail_routes_are_tenant_scoped(self):
+        outcome = self._review()
+        other = self._issue_token("org-other", "repo-other", self.env)
+        for suffix in ("", "/findings", "/attempts", "/collection-requests",
+                       "/snapshots", "/publications"):
+            response = self.client.get(
+                f"/api/reviews/{outcome.review_id}{suffix}",
+                headers={"Authorization": f"Bearer {other}"})
+            self.assertEqual(response.status_code, 404,
+                             f"{suffix} leaked across tenants")
+
+    def test_detail_routes_require_authentication(self):
+        outcome = self._review()
+        for suffix in ("/findings", "/attempts", "/collection-requests",
+                       "/snapshots", "/publications"):
+            response = self.client.get(f"/api/reviews/{outcome.review_id}{suffix}")
+            self.assertEqual(response.status_code, 401, suffix)
+
+    def test_detail_routes_disclose_nothing_sensitive(self):
+        outcome = self._review()
+        for suffix in ("", "/findings", "/attempts", "/collection-requests",
+                       "/snapshots", "/publications", "/evidence-coverage"):
+            text = json.dumps(
+                self._get(f"/api/reviews/{outcome.review_id}{suffix}")).lower()
+            for needle in self.FORBIDDEN:
+                self.assertNotIn(needle, text, f"{suffix} leaked {needle!r}")
+
+    # -- re-run analysis --------------------------------------------------
+
+    def _settle_requests(self, review_id):
+        """Close every actionable request for this review.
+
+        The review id is a digest of (repo, PR, head SHA), so re-running this
+        suite against the same database reaches the same review — and a rerun
+        left open by the previous run would make the next one answer
+        `already_running`. Settling first makes each test independent of run
+        history rather than of test order alone.
+        """
+        with self.pool.acquire() as store:
+            for r in store.collection_requests_for_review(
+                    self.org, self.repo, review_id):
+                if r["state"] in ("PENDING", "ACKNOWLEDGED"):
+                    store.close_collection_request(
+                        self.org, self.repo, r["request_id"], state="COMPLETED")
+
+    def _post_rerun(self, review_id, body=None, token=None):
+        headers = {"Authorization": f"Bearer {token or self.token}",
+                   "Idempotency-Key": uuid.uuid4().hex}
+        return self.client.post(f"/api/reviews/{review_id}/rerun",
+                                json=body or {}, headers=headers)
+
+    def test_rerun_creates_a_new_collection_request(self):
+        """A re-run must ask for fresh evidence, not replay the old answer."""
+        outcome = self._review(pull_number=4300)
+        self._settle_requests(outcome.review_id)
+
+        response = self._post_rerun(outcome.review_id)
+        self.assertEqual(response.status_code, 202, response.text)
+        body = response.json()
+        self.assertEqual(body["status"], "accepted")
+        self.assertTrue(body["rerun_id"])
+        self.assertNotEqual(body["rerun_id"], outcome.request_id)
+
+        requests = self._get(
+            f"/api/reviews/{outcome.review_id}/collection-requests")
+        states = {r["request_id"]: r["state"] for r in requests["items"]}
+        self.assertEqual(states[body["rerun_id"]], "PENDING")
+        # Exactly one request is actionable: the one this re-run created.
+        actionable = [r for r in requests["items"]
+                      if r["state"] in ("PENDING", "ACKNOWLEDGED")]
+        self.assertEqual([r["request_id"] for r in actionable], [body["rerun_id"]])
+
+    def test_rerun_does_not_alter_previous_attempts(self):
+        outcome = self._review(pull_number=4301)
+        before = self._get(f"/api/reviews/{outcome.review_id}/attempts")
+        self._settle_requests(outcome.review_id)
+        self._post_rerun(outcome.review_id)
+        after = self._get(f"/api/reviews/{outcome.review_id}/attempts")
+        self.assertEqual(before["attempts"], after["attempts"],
+                         "a re-run rewrote history")
+
+    def test_a_second_click_returns_the_run_already_in_flight(self):
+        """Double-click must not queue a second collection."""
+        outcome = self._review(pull_number=4302)
+        first = self._post_rerun(outcome.review_id)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json()["status"], "already_running")
+        # The request begin_review raised is still open, so it IS the run.
+        self.assertEqual(first.json()["rerun_id"], outcome.request_id)
+
+        second = self._post_rerun(outcome.review_id)
+        self.assertEqual(second.json()["rerun_id"], first.json()["rerun_id"])
+        actionable = [r for r in self._get(
+            f"/api/reviews/{outcome.review_id}/collection-requests")["items"]
+            if r["state"] in ("PENDING", "ACKNOWLEDGED")]
+        self.assertEqual(len(actionable), 1, "a second run was queued")
+
+    def test_rerun_against_a_changed_head_is_refused(self):
+        """A moved HEAD is a different review, and must be said so."""
+        outcome = self._review(pull_number=4303)
+        response = self._post_rerun(outcome.review_id, {"head_sha": "f" * 40})
+        self.assertEqual(response.status_code, 409, response.text)
+        detail = response.json()["detail"]
+        self.assertIn("HEAD has changed", detail)
+        self.assertIn("gh-", detail, "the new review id should be named")
+
+    def test_rerun_of_a_review_needing_no_metadata_is_refused(self):
+        outcome = self._review(pull_number=4304)
+        with self.pool.acquire() as store:
+            store.connection.execute(
+                "UPDATE reviews SET metadata_required=false WHERE "
+                "organization_id=%s AND repository_id=%s AND review_id=%s",
+                (self.org, self.repo, outcome.review_id))
+        response = self._post_rerun(outcome.review_id)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("no external production dependency",
+                      response.json()["detail"])
+
+    def test_rerun_is_tenant_scoped(self):
+        outcome = self._review(pull_number=4305)
+        other = self._issue_token("org-intruder", "repo-intruder", self.env)
+        response = self._post_rerun(outcome.review_id, token=other)
+        self.assertEqual(response.status_code, 404,
+                         "another tenant could re-run this review")
+
+    def test_rerun_requires_authentication(self):
+        outcome = self._review(pull_number=4306)
+        response = self.client.post(
+            f"/api/reviews/{outcome.review_id}/rerun", json={},
+            headers={"Idempotency-Key": uuid.uuid4().hex})
+        self.assertEqual(response.status_code, 401)
+
+    def test_rerun_of_an_unknown_review_is_not_found(self):
+        self.assertEqual(self._post_rerun("gh-does-not-exist").status_code, 404)
+
+    def test_rerun_names_the_collection_request_without_shadowing(self):
+        """The envelope reserves top-level `request_id` for the correlation id.
+
+        A handler returning its own `request_id` has it silently overwritten,
+        so the caller receives a plausible-looking value that identifies the
+        wrong thing. The collection request is named explicitly instead.
+        """
+        outcome = self._review(pull_number=4308)
+        self._settle_requests(outcome.review_id)
+        body = self._post_rerun(outcome.review_id).json()
+
+        self.assertIn("collection_request_id", body)
+        self.assertEqual(body["collection_request_id"], body["rerun_id"])
+        self.assertTrue(body["collection_request_id"].startswith("req-"))
+        # The envelope's own key is a correlation id, and is NOT the request.
+        self.assertNotEqual(body["request_id"], body["collection_request_id"])
+
+    def test_rerun_is_recorded_in_the_audit_trail(self):
+        outcome = self._review(pull_number=4307)
+        self._settle_requests(outcome.review_id)
+        self._post_rerun(outcome.review_id)
+        with self.pool.acquire() as store:
+            events = [e for e in store.audit_events(self.org, self.repo)
+                      if e["event_type"] == "review.rerun_requested"
+                      and e["reference_id"] == outcome.review_id]
+        self.assertGreaterEqual(len(events), 1)
+        self.assertEqual(events[0]["actor"], "dashboard")
+
+    def _clear_governance(self, review_id):
+        """Remove change requests and exceptions left by an earlier run.
+
+        The review id is deterministic, so without this the second execution
+        of this suite against the same database would assert `created` against
+        rows the first execution made.
+        """
+        with self.pool.acquire() as store:
+            store.connection.execute(
+                "DELETE FROM review_change_requests WHERE organization_id=%s "
+                "AND repository_id=%s AND review_id=%s",
+                (self.org, self.repo, review_id))
+            store.connection.execute(
+                "DELETE FROM review_exceptions WHERE organization_id=%s "
+                "AND repository_id=%s AND review_id=%s",
+                (self.org, self.repo, review_id))
+            store.connection.execute(
+                "DELETE FROM outbox_events WHERE organization_id=%s "
+                "AND repository_id=%s AND subject_id=%s "
+                "AND event_type='review.change_request_submitted'",
+                (self.org, self.repo, review_id))
+
+    # -- request changes --------------------------------------------------
+
+    def _request_changes(self, review_id, message="Please restore the refund join.",
+                         token=None, actor=None):
+        body = {"message": message}
+        if actor:
+            body["actor"] = actor
+        return self.client.post(
+            f"/api/reviews/{review_id}/request-changes", json=body,
+            headers={"Authorization": f"Bearer {token or self.token}",
+                     "Idempotency-Key": uuid.uuid4().hex})
+
+    def test_request_changes_records_a_durable_intent(self):
+        outcome = self._review(pull_number=4400)
+        self._clear_governance(outcome.review_id)
+        response = self._request_changes(outcome.review_id, actor="sarah")
+        self.assertEqual(response.status_code, 202, response.text)
+        body = response.json()
+        self.assertEqual(body["state"], "PENDING")
+        self.assertTrue(body["change_request_id"])
+
+        listed = self._get(f"/api/reviews/{outcome.review_id}/change-requests")
+        self.assertEqual(listed["total"], 1)
+        item = listed["items"][0]
+        self.assertEqual(item["actor"], "sarah")
+        self.assertEqual(item["attempt"], outcome.attempt)
+        self.assertEqual(item["pull_number"], 4400)
+        # PENDING, not published: GitHub has not been called yet, and the
+        # record must not claim otherwise.
+        self.assertEqual(item["state"], "PENDING")
+        self.assertIsNone(item["remote_review_id"])
+
+    def test_request_changes_is_not_duplicated_by_a_second_click(self):
+        outcome = self._review(pull_number=4401)
+        self._clear_governance(outcome.review_id)
+        first = self._request_changes(outcome.review_id)
+        second = self._request_changes(outcome.review_id)
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json()["status"], "already_requested")
+        self.assertEqual(first.json()["change_request_id"],
+                         second.json()["change_request_id"])
+        listed = self._get(f"/api/reviews/{outcome.review_id}/change-requests")
+        self.assertEqual(listed["total"], 1, "a second GitHub review was queued")
+
+    def test_request_changes_requires_a_message(self):
+        outcome = self._review(pull_number=4402)
+        response = self._request_changes(outcome.review_id, message="  ")
+        self.assertEqual(response.status_code, 422)
+
+    def test_request_changes_is_tenant_scoped(self):
+        outcome = self._review(pull_number=4403)
+        other = self._issue_token("org-other-cr", "repo-other-cr", self.env)
+        response = self._request_changes(outcome.review_id, token=other)
+        self.assertEqual(response.status_code, 404)
+
+    def test_request_changes_enqueues_a_worker_job(self):
+        from agent.metadata_evidence.change_request import EVENT_TYPE
+
+        outcome = self._review(pull_number=4404)
+        self._clear_governance(outcome.review_id)
+        body = self._request_changes(outcome.review_id).json()
+        with self.pool.acquire() as store:
+            rows = store.connection.execute(
+                "SELECT event_type, payload FROM outbox_events "
+                "WHERE subject_id=%s AND event_type=%s",
+                (outcome.review_id, EVENT_TYPE)).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["payload"]["change_request_id"],
+                         body["change_request_id"])
+
+    # -- approve exception ------------------------------------------------
+
+    def _approve_exception(self, review_id, reason="Finance signed off for FY27.",
+                           token=None, actor=None, scope=None, attempt=None):
+        body = {"reason": reason}
+        if actor:
+            body["actor"] = actor
+        if scope:
+            body["scope"] = scope
+        if attempt is not None:
+            body["attempt"] = attempt
+        return self.client.post(
+            f"/api/reviews/{review_id}/exceptions", json=body,
+            headers={"Authorization": f"Bearer {token or self.token}",
+                     "Idempotency-Key": uuid.uuid4().hex})
+
+    def test_exception_never_rewrites_the_relium_decision(self):
+        """The whole point: BLOCK stays BLOCK."""
+        outcome = self._review(pull_number=4500)
+        self._clear_governance(outcome.review_id)
+        with self.pool.acquire() as store:
+            store.record_review_decision(
+                self.org, self.repo, outcome.review_id, decision="BLOCK",
+                evidence_coverage="COMPLETE", health=100, attempt=2,
+                trigger="manual", payload={"findings": []})
+        self.assertEqual(self._get(f"/api/reviews/{outcome.review_id}")["decision"],
+                         "BLOCK")
+
+        response = self._approve_exception(outcome.review_id, actor="marcus")
+        self.assertEqual(response.status_code, 201, response.text)
+
+        after = self._get(f"/api/reviews/{outcome.review_id}")
+        self.assertEqual(after["decision"], "BLOCK",
+                         "an exception rewrote the Relium decision")
+        listed = self._get(f"/api/reviews/{outcome.review_id}/exceptions")
+        self.assertEqual(listed["decision"], "BLOCK")
+        self.assertEqual(listed["active_exception"]["overridden_decision"], "BLOCK")
+        self.assertEqual(listed["active_exception"]["actor"], "marcus")
+
+    def test_exception_requires_a_reason(self):
+        outcome = self._review(pull_number=4501)
+        self.assertEqual(
+            self._approve_exception(outcome.review_id, reason="  ").status_code, 422)
+        blank = self.client.post(
+            f"/api/reviews/{outcome.review_id}/exceptions", json={},
+            headers={**self.auth, "Idempotency-Key": uuid.uuid4().hex})
+        self.assertEqual(blank.status_code, 422)
+
+    def test_exception_binds_to_the_exact_attempt(self):
+        outcome = self._review(pull_number=4502)
+        self._clear_governance(outcome.review_id)
+        self._approve_exception(outcome.review_id)
+        listed = self._get(f"/api/reviews/{outcome.review_id}/exceptions")
+        self.assertEqual(listed["active_exception"]["attempt"], outcome.attempt)
+        self.assertEqual(listed["active_exception"]["scope"], "attempt")
+
+    def test_a_later_attempt_does_not_inherit_an_attempt_scoped_exception(self):
+        """A new attempt analysed new evidence. An old override must not carry."""
+        outcome = self._review(pull_number=4503)
+        self._clear_governance(outcome.review_id)
+        self._approve_exception(outcome.review_id)
+        with self.pool.acquire() as store:
+            store.record_review_decision(
+                self.org, self.repo, outcome.review_id, decision="BLOCK",
+                evidence_coverage="COMPLETE", health=100,
+                attempt=outcome.attempt + 1, trigger="manual",
+                payload={"findings": []})
+        listed = self._get(f"/api/reviews/{outcome.review_id}/exceptions")
+        self.assertEqual(listed["attempt"], outcome.attempt + 1)
+        self.assertIsNone(listed["active_exception"],
+                          "a newer attempt inherited an older exception")
+        # The historical record survives, bound to its own attempt.
+        self.assertEqual(listed["total"], 1)
+        self.assertEqual(listed["items"][0]["attempt"], outcome.attempt)
+
+    def test_a_review_scoped_exception_is_honoured_across_attempts(self):
+        outcome = self._review(pull_number=4504)
+        self._clear_governance(outcome.review_id)
+        self._approve_exception(outcome.review_id, scope="review")
+        with self.pool.acquire() as store:
+            store.record_review_decision(
+                self.org, self.repo, outcome.review_id, decision="BLOCK",
+                evidence_coverage="COMPLETE", health=100,
+                attempt=outcome.attempt + 1, trigger="manual",
+                payload={"findings": []})
+        listed = self._get(f"/api/reviews/{outcome.review_id}/exceptions")
+        self.assertIsNotNone(listed["active_exception"])
+        self.assertEqual(listed["active_exception"]["scope"], "review")
+
+    def test_duplicate_exception_returns_the_existing_one(self):
+        outcome = self._review(pull_number=4505)
+        self._clear_governance(outcome.review_id)
+        first = self._approve_exception(outcome.review_id)
+        second = self._approve_exception(outcome.review_id)
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json()["status"], "already_approved")
+        self.assertEqual(first.json()["exception_id"], second.json()["exception_id"])
+        self.assertEqual(
+            self._get(f"/api/reviews/{outcome.review_id}/exceptions")["total"], 1)
+
+    def test_exception_revocation_is_audited(self):
+        outcome = self._review(pull_number=4506)
+        self._clear_governance(outcome.review_id)
+        approved = self._approve_exception(outcome.review_id).json()
+        response = self.client.post(
+            f"/api/reviews/{outcome.review_id}/exceptions/"
+            f"{approved['exception_id']}/revoke",
+            json={"reason": "Finance withdrew approval.", "actor": "priya"},
+            headers={**self.auth, "Idempotency-Key": uuid.uuid4().hex})
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["state"], "revoked")
+        self.assertEqual(body["revoked_by"], "priya")
+        self.assertEqual(body["revocation_reason"], "Finance withdrew approval.")
+
+        listed = self._get(f"/api/reviews/{outcome.review_id}/exceptions")
+        self.assertIsNone(listed["active_exception"])
+        # The audit trail is append-only, so counting across runs would be
+        # asserting run history. Assert THIS revocation is recorded instead.
+        with self.pool.acquire() as store:
+            events = [e for e in store.audit_events(self.org, self.repo)
+                      if e["event_type"] == "review.exception_revoked"
+                      and (e["payload"] or {}).get("exception_id")
+                      == approved["exception_id"]]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["actor"], "priya")
+
+    def test_exceptions_are_tenant_scoped(self):
+        outcome = self._review(pull_number=4507)
+        self._clear_governance(outcome.review_id)
+        self._approve_exception(outcome.review_id)
+        other = self._issue_token("org-other-exc", "repo-other-exc", self.env)
+        self.assertEqual(
+            self._approve_exception(outcome.review_id, token=other).status_code, 404)
+        listed = self.client.get(
+            f"/api/reviews/{outcome.review_id}/exceptions",
+            headers={"Authorization": f"Bearer {other}"})
+        self.assertEqual(listed.status_code, 404,
+                         "an exception leaked across tenants")
+
+    def test_exception_for_an_unrecorded_attempt_is_refused(self):
+        outcome = self._review(pull_number=4508)
+        response = self._approve_exception(outcome.review_id, attempt=99)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("not recorded", response.json()["detail"])
+
+    def test_unknown_review_is_not_found_on_every_detail_route(self):
+        for suffix in ("/findings", "/attempts", "/collection-requests",
+                       "/snapshots", "/publications"):
+            response = self.client.get(f"/api/reviews/does-not-exist{suffix}",
+                                       headers=self.auth)
+            self.assertEqual(response.status_code, 404, suffix)
 
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ def create_http_app(
     job_store=None,
     store_pool=None,
     review_lifecycle_mode=None,
+    cors_allowed_origins=(),
 ):
     """Build the served application.
 
@@ -191,14 +192,45 @@ def create_http_app(
     if store_pool is not None:
         routes.extend(create_api_routes(store_pool=store_pool))
 
+    # Browser access to the dashboard API.
+    #
+    # The /api routes are declared dashboard resources, but a browser served
+    # from any other origin could not call them: the Authorization header makes
+    # every request preflighted, and OPTIONS had no handler, so the preflight
+    # answered 405 and the fetch never happened.
+    #
+    # Opt-in and explicit. With no configured origins there is no middleware at
+    # all and behaviour is byte-identical to before. Origins are listed exactly;
+    # there is no wildcard, because these routes carry a bearer token and a
+    # wildcard would invite any page to spend it.
+    middleware = []
+    if cors_allowed_origins:
+        from starlette.middleware import Middleware
+        from starlette.middleware.cors import CORSMiddleware
+
+        middleware.append(Middleware(
+            CORSMiddleware,
+            allow_origins=list(cors_allowed_origins),
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type", "Idempotency-Key",
+                           "X-Request-Id"],
+            expose_headers=["X-Request-Id"],
+            # The token is supplied by the application, not by a cookie, so
+            # credentialed requests are neither needed nor allowed.
+            allow_credentials=False,
+            max_age=600,
+        ))
+
     app = Starlette(
         debug=False,
         routes=routes,
+        middleware=middleware,
         lifespan=lifespan,
         exception_handlers={Exception: unexpected_error},
     )
     app.state.started = False
     app.state.store_pool = store_pool
+    app.state.cors_allowed_origins = list(cors_allowed_origins or ())
     return app
 
 

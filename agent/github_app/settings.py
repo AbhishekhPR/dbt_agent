@@ -38,6 +38,9 @@ class GitHubAppSettings:
     metadata_review_enabled: bool = True
     metadata_review_environment: str = "production"
     api_pool_size: int = 5
+    # Browser origins permitted to call the dashboard API. Empty means no
+    # CORS middleware at all, which is the default and the safe one.
+    cors_allowed_origins: tuple[str, ...] = ()
 
 
 def load_settings(environ: Mapping[str, str] | None = None) -> GitHubAppSettings:
@@ -118,7 +121,38 @@ def load_settings(environ: Mapping[str, str] | None = None) -> GitHubAppSettings
         api_pool_size=_integer(
             values, "RELIUM_API_POOL_SIZE", default="5", minimum=1, maximum=50
         ),
+        cors_allowed_origins=_cors_origins(values),
     )
+
+
+def _cors_origins(values: Mapping[str, str]) -> tuple[str, ...]:
+    """Exact browser origins allowed to call /api.
+
+    A comma-separated list of origins. Absent or empty disables CORS entirely.
+    '*' is rejected: these routes carry a bearer token, and a wildcard would
+    let any page in a user's browser spend it.
+    """
+    raw = values.get("RELIUM_CORS_ALLOWED_ORIGINS")
+    if raw is None or not str(raw).strip():
+        return ()
+    origins = tuple(part.strip() for part in str(raw).split(",") if part.strip())
+    for origin in origins:
+        if origin == "*":
+            raise SettingsError(
+                "RELIUM_CORS_ALLOWED_ORIGINS must not be '*': the dashboard API "
+                "authenticates with a bearer token and cannot be world-readable."
+            )
+        if not (origin.startswith("http://") or origin.startswith("https://")):
+            raise SettingsError(
+                "RELIUM_CORS_ALLOWED_ORIGINS entries must be full origins, "
+                "for example https://app.example.com."
+            )
+        if origin.rstrip("/") != origin or origin.count("/") > 2:
+            raise SettingsError(
+                "RELIUM_CORS_ALLOWED_ORIGINS entries must be an origin only, "
+                "with no path or trailing slash."
+            )
+    return origins
 
 
 def _metadata_review_enabled(values: Mapping[str, str]) -> bool:

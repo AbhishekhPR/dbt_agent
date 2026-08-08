@@ -140,6 +140,7 @@ def build_application(settings, *, client_factory=None, logger=None, sleep=time.
         job_store=storage,
         store_pool=store_pool,
         review_lifecycle_mode=lifecycle.mode,
+        cors_allowed_origins=settings.cors_allowed_origins,
     )
     app.state.job_queue = jobs
     return app

@@ -470,7 +470,12 @@ def _relation_findings(targets, index):
             column = columns.get(column_name.lower())
 
             # -- case 1/2: external column exists? -------------------------
-            if column is None:
+            # Two shapes mean the same thing. `None` is a column the snapshot
+            # never mentioned. `exists_in_production=False` is one the collector
+            # explicitly looked for and did not find - which is what the real
+            # collector reports, since it answers for every requested column.
+            # Testing only for None made this finding unreachable in production.
+            if column is None or column.get("exists_in_production") is False:
                 findings.append(Finding(
                     code="column.missing_in_production", severity="block",
                     category="production", relation=name, column=column_name,

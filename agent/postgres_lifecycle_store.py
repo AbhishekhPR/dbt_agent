@@ -251,11 +251,14 @@ class PostgresLifecycleStore:
                 (deployment_id, organization_id, repository_id, environment, row["status"], to_status, next_seq),
             )
             self.connection.execute(
+                # dedup_key defaults to '' for deployment events, so the
+                # conflict target must name it to match the unique index.
+                # Behaviour is unchanged: one event per (deployment, status).
                 "INSERT INTO outbox_events (event_id, organization_id, repository_id, environment, "
                 "subject_type, subject_id, deployment_id, event_type, payload) "
                 "VALUES (%s, %s, %s, %s, 'deployment', %s, %s, %s, %s) "
                 "ON CONFLICT (organization_id, repository_id, environment, subject_type, "
-                "subject_id, event_type) DO NOTHING",
+                "subject_id, event_type, dedup_key) DO NOTHING",
                 (str(uuid.uuid4()), organization_id, repository_id, environment, deployment_id,
                  deployment_id, f"deployment.{to_status}",
                  self._Jsonb({"deployment_id": deployment_id, "status": to_status})),
@@ -1141,6 +1144,174 @@ class PostgresLifecycleStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def collection_requests_for_review(self, organization_id, repository_id, review_id):
+        """Every collection request raised for one review, in creation order.
+
+        ``pending_collection_requests`` answers the collector's question - what
+        should I work on. This answers the dashboard's - what was asked for and
+        what happened to it - so completed, failed and expired requests are
+        included rather than filtered out.
+        """
+        rows = self.connection.execute(
+            "SELECT * FROM collection_requests "
+            "WHERE organization_id=%s AND repository_id=%s AND review_id=%s "
+            "ORDER BY created_at, request_id",
+            (organization_id, repository_id, review_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def snapshots_for_review(self, organization_id, repository_id, review_id):
+        """Every snapshot submitted against one review, newest first."""
+        rows = self.connection.execute(
+            "SELECT snapshot_id, environment, completeness, freshness_state, "
+            "observed_at, received_at, collected_at, request_id, collector_id, "
+            "collector_version, adapter_type, base_sha, head_sha, "
+            "base_manifest_hash, head_manifest_hash, ttl_seconds "
+            "FROM metadata_snapshots "
+            "WHERE organization_id=%s AND repository_id=%s AND review_id=%s "
+            "ORDER BY received_at DESC, snapshot_id",
+            (organization_id, repository_id, review_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- human governance actions -----------------------------------------
+    #
+    # Neither of these writes to `reviews`. What Relium decided and what a
+    # person decided about it are separate facts, and they stay separate.
+
+    def create_change_request(self, organization_id, repository_id, environment, *,
+                              change_request_id, review_id, attempt, pull_number,
+                              head_sha, actor, message):
+        """Record the intent to submit a GitHub request-changes review.
+
+        Returns (row, created). A second call for the same (review, attempt)
+        returns the existing row with created=False, so a double click cannot
+        submit two GitHub reviews on one pull request.
+        """
+        with self.connection.transaction():
+            row = self.connection.execute(
+                "INSERT INTO review_change_requests (organization_id, repository_id, "
+                "change_request_id, review_id, attempt, environment, pull_number, "
+                "head_sha, actor, message) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT DO NOTHING RETURNING *",
+                (organization_id, repository_id, change_request_id, review_id,
+                 attempt, environment, pull_number, head_sha, actor, message),
+            ).fetchone()
+            if row is not None:
+                return dict(row), True
+            existing = self.connection.execute(
+                "SELECT * FROM review_change_requests WHERE organization_id=%s "
+                "AND repository_id=%s AND review_id=%s AND attempt=%s "
+                "AND state IN ('PENDING','PUBLISHED')",
+                (organization_id, repository_id, review_id, attempt),
+            ).fetchone()
+        return (dict(existing) if existing else None), False
+
+    def complete_change_request(self, organization_id, repository_id,
+                                change_request_id, *, remote_review_id=None,
+                                failure_reason=None):
+        """Mark a change request published or failed. Never both."""
+        state = "FAILED" if failure_reason else "PUBLISHED"
+        self.connection.execute(
+            "UPDATE review_change_requests SET state=%s, remote_review_id=%s, "
+            "failure_reason=%s, published_at=CASE WHEN %s='PUBLISHED' THEN now() END "
+            "WHERE organization_id=%s AND repository_id=%s AND change_request_id=%s",
+            (state, str(remote_review_id) if remote_review_id else None,
+             failure_reason, state, organization_id, repository_id, change_request_id),
+        )
+        return self.get_change_request(organization_id, repository_id, change_request_id)
+
+    def get_change_request(self, organization_id, repository_id, change_request_id):
+        row = self.connection.execute(
+            "SELECT * FROM review_change_requests WHERE organization_id=%s "
+            "AND repository_id=%s AND change_request_id=%s",
+            (organization_id, repository_id, change_request_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def change_requests_for_review(self, organization_id, repository_id, review_id):
+        rows = self.connection.execute(
+            "SELECT * FROM review_change_requests WHERE organization_id=%s "
+            "AND repository_id=%s AND review_id=%s ORDER BY created_at",
+            (organization_id, repository_id, review_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def create_review_exception(self, organization_id, repository_id, environment, *,
+                                exception_id, review_id, attempt, actor, reason,
+                                scope="attempt", overridden_decision=None,
+                                base_sha=None, head_sha=None):
+        """Approve an exception against one attempt's decision.
+
+        Returns (row, created). The review's own decision is never written.
+        """
+        with self.connection.transaction():
+            row = self.connection.execute(
+                "INSERT INTO review_exceptions (organization_id, repository_id, "
+                "exception_id, review_id, attempt, environment, overridden_decision, "
+                "base_sha, head_sha, actor, reason, scope) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT DO NOTHING RETURNING *",
+                (organization_id, repository_id, exception_id, review_id, attempt,
+                 environment, overridden_decision, base_sha, head_sha, actor,
+                 reason, scope),
+            ).fetchone()
+            if row is not None:
+                return dict(row), True
+            existing = self.connection.execute(
+                "SELECT * FROM review_exceptions WHERE organization_id=%s "
+                "AND repository_id=%s AND review_id=%s AND attempt=%s AND state='active'",
+                (organization_id, repository_id, review_id, attempt),
+            ).fetchone()
+        return (dict(existing) if existing else None), False
+
+    def revoke_review_exception(self, organization_id, repository_id, exception_id, *,
+                                actor, reason):
+        self.connection.execute(
+            "UPDATE review_exceptions SET state='revoked', revoked_at=now(), "
+            "revoked_by=%s, revocation_reason=%s "
+            "WHERE organization_id=%s AND repository_id=%s AND exception_id=%s "
+            "AND state='active'",
+            (actor, reason, organization_id, repository_id, exception_id),
+        )
+        return self.get_review_exception(organization_id, repository_id, exception_id)
+
+    def get_review_exception(self, organization_id, repository_id, exception_id):
+        row = self.connection.execute(
+            "SELECT * FROM review_exceptions WHERE organization_id=%s "
+            "AND repository_id=%s AND exception_id=%s",
+            (organization_id, repository_id, exception_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def exceptions_for_review(self, organization_id, repository_id, review_id):
+        """Every exception ever approved for this review, newest first."""
+        rows = self.connection.execute(
+            "SELECT * FROM review_exceptions WHERE organization_id=%s "
+            "AND repository_id=%s AND review_id=%s ORDER BY created_at DESC",
+            (organization_id, repository_id, review_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def active_exception_for_attempt(self, organization_id, repository_id, review_id,
+                                     attempt):
+        """The exception in force for exactly this attempt, if any.
+
+        Attempt-scoped by default: a later attempt analysed newer evidence, and
+        must not inherit an override approved against findings nobody has
+        re-examined. A 'review'-scoped exception is honoured across attempts
+        because that scope was chosen explicitly.
+        """
+        row = self.connection.execute(
+            "SELECT * FROM review_exceptions WHERE organization_id=%s "
+            "AND repository_id=%s AND review_id=%s AND state='active' "
+            "AND (attempt=%s OR scope='review') "
+            "ORDER BY (attempt=%s) DESC, created_at DESC LIMIT 1",
+            (organization_id, repository_id, review_id, attempt, attempt),
+        ).fetchone()
+        return dict(row) if row else None
+
     def record_review_publication(self, organization_id, repository_id, review_id, *,
                                   comment_id=None, check_run_id=None):
         """Remember the sticky comment and check run so a recomputation updates
@@ -1419,14 +1590,17 @@ class PostgresLifecycleStore:
                 for c_index, column in enumerate(relation.get("columns") or ()):
                     self.connection.execute(
                         "INSERT INTO snapshot_columns (organization_id, repository_id, "
-                        "snapshot_id, relation_index, column_index, column_name, data_type, "
+                        "snapshot_id, relation_index, column_index, column_name, "
+                        "exists_in_production, data_type, "
                         "is_nullable, ordinal_position, null_count, null_rate, "
                         "duplicate_count, duplicate_rate, distinct_count, cardinality, "
                         "min_value, max_value, collection_status) "
                         "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                        "%s, %s, %s)",
+                        "%s, %s, %s, %s)",
                         (organization_id, repository_id, snapshot_id, r_index, c_index,
-                         column["column_name"], column.get("data_type"),
+                         column["column_name"],
+                         bool(column.get("exists_in_production", True)),
+                         column.get("data_type"),
                          column.get("is_nullable"), column.get("ordinal_position"),
                          column.get("null_count"), column.get("null_rate"),
                          column.get("duplicate_count"), column.get("duplicate_rate"),
@@ -1534,26 +1708,35 @@ class PostgresLifecycleStore:
 
     def enqueue_review_recomputation(self, organization_id, repository_id, environment, *,
                                      review_id, event_type="review.recompute_requested",
-                                     payload=None):
+                                     payload=None, dedup_key=None):
         """Enqueue on the same durable outbox the deployment path uses.
 
-        The subject-scoped unique index makes this exactly-once per
-        (review, event_type): a duplicate snapshot cannot produce a second
-        recomputation.
+        ``dedup_key`` names the unit of work. Exactly-once is per
+        (review, event_type, dedup_key), so a redelivered duplicate collapses
+        while genuinely new evidence still enqueues. Keying on the review
+        alone froze a review's decision at its first snapshot: every later
+        snapshot was discarded by ON CONFLICT and never recomputed.
+
+        Callers pass the thing that makes the job distinct - the snapshot id
+        for recomputation, the attempt for republication. Omitting it keeps
+        the old subject-scoped behaviour, which is what the deployment
+        lifecycle events want.
         """
+        dedup_key = "" if dedup_key is None else str(dedup_key)
         self.connection.execute(
             "INSERT INTO outbox_events (event_id, organization_id, repository_id, environment, "
-            "subject_type, subject_id, deployment_id, event_type, payload) "
-            "VALUES (%s, %s, %s, %s, 'review', %s, NULL, %s, %s) "
+            "subject_type, subject_id, deployment_id, event_type, payload, dedup_key) "
+            "VALUES (%s, %s, %s, %s, 'review', %s, NULL, %s, %s, %s) "
             "ON CONFLICT (organization_id, repository_id, environment, subject_type, "
-            "subject_id, event_type) DO NOTHING",
+            "subject_id, event_type, dedup_key) DO NOTHING",
             (str(uuid.uuid4()), organization_id, repository_id, environment, review_id,
-             event_type, self._Jsonb(payload or {"review_id": review_id})),
+             event_type, self._Jsonb(payload or {"review_id": review_id}), dedup_key),
         )
         row = self.connection.execute(
             "SELECT * FROM outbox_events WHERE organization_id=%s AND repository_id=%s "
-            "AND environment=%s AND subject_type='review' AND subject_id=%s AND event_type=%s",
-            (organization_id, repository_id, environment, review_id, event_type),
+            "AND environment=%s AND subject_type='review' AND subject_id=%s "
+            "AND event_type=%s AND dedup_key=%s",
+            (organization_id, repository_id, environment, review_id, event_type, dedup_key),
         ).fetchone()
         return dict(row) if row else None
 

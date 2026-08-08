@@ -15,6 +15,20 @@ DASHBOARD_RESOURCES = {
     "incident_rca": "/api/incidents/{incident_id}/rca",
     "evidence_coverage": "/api/evidence-coverage",
     "delivery_status": "/api/delivery-status",
+    # Added so the customer-facing dashboard can render a review's evidence
+    # rather than only its verdict. Every one reads state the lifecycle store
+    # already persisted.
+    "review_rerun": "/api/reviews/{review_id}/rerun",
+    "review_change_requests": "/api/reviews/{review_id}/change-requests",
+    "review_exceptions": "/api/reviews/{review_id}/exceptions",
+    "review_findings": "/api/reviews/{review_id}/findings",
+    "review_attempts": "/api/reviews/{review_id}/attempts",
+    "review_collection_requests": "/api/reviews/{review_id}/collection-requests",
+    "review_snapshots": "/api/reviews/{review_id}/snapshots",
+    "review_publications": "/api/reviews/{review_id}/publications",
+    "review_evidence_coverage": "/api/reviews/{review_id}/evidence-coverage",
+    "metadata_snapshot": "/api/metadata-snapshots/{snapshot_id}",
+    "collection_request_detail": "/api/collection-requests/{request_id}",
 }
 
 

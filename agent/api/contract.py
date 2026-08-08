@@ -51,6 +51,20 @@ MANDATORY_ROUTES = {
     ("GET", "/api/metadata-snapshots/{snapshot_id}"),
     ("GET", "/api/reviews/{review_id}/evidence-coverage"),
     ("POST", "/api/collectors"),
+    # Review detail surface. These expose evidence the store already held but
+    # nothing could read: findings, attempt history, what was requested from
+    # the collector, which snapshots answered it, and where it was published.
+    ("POST", "/api/reviews/{review_id}/rerun"),
+    ("POST", "/api/reviews/{review_id}/request-changes"),
+    ("GET", "/api/reviews/{review_id}/change-requests"),
+    ("POST", "/api/reviews/{review_id}/exceptions"),
+    ("GET", "/api/reviews/{review_id}/exceptions"),
+    ("POST", "/api/reviews/{review_id}/exceptions/{exception_id}/revoke"),
+    ("GET", "/api/reviews/{review_id}/findings"),
+    ("GET", "/api/reviews/{review_id}/attempts"),
+    ("GET", "/api/reviews/{review_id}/collection-requests"),
+    ("GET", "/api/reviews/{review_id}/snapshots"),
+    ("GET", "/api/reviews/{review_id}/publications"),
 }
 
 AUTHENTICATION = {

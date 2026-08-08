@@ -513,5 +513,136 @@ class WorkerSubprocessTests(WorkerTestCase):
         self.assertIn("queue_depth", state)
 
 
+class RepublicationOnRecomputationTests(WorkerTestCase):
+    """A recomputed decision must reach GitHub and Slack, on the same worker.
+
+    These drive the real outbox, the real worker claim path and the real
+    recomputation handler. Only the outbound HTTP surface is recorded.
+    """
+
+    def _review(self, *, enforcement_mode="enforce"):
+        from agent.metadata_evidence.review_lifecycle import begin_review
+
+        base = {"nodes": {"model.a.fct_orders": {
+            "resource_type": "model", "name": "fct_orders", "schema": "analytics",
+            "alias": "fct_orders", "database": "warehouse",
+            "depends_on": {"nodes": ["source.a.raw.orders"]},
+            "columns": {"order_id": {"name": "order_id"}}}},
+            "sources": {"source.a.raw.orders": {
+                "schema": "raw", "name": "orders", "database": "warehouse",
+                "columns": {"order_id": {}}}}}
+        head = {"nodes": base["nodes"], "sources": {"source.a.raw.orders": {
+            "schema": "raw", "name": "orders", "database": "warehouse",
+            "columns": {"order_id": {}, "customer_id": {}}}}}
+
+        outcome = begin_review(
+            self.store, organization_id=self.org, repository_id=self.repo,
+            environment=self.env, pull_number=77,
+            base_sha="a" * 40, head_sha="b" * 40,
+            base_manifest=base, head_manifest=head,
+            changed_models=["fct_orders"], enforcement_mode=enforcement_mode)
+        self.store.record_review_publication(
+            self.org, self.repo, outcome.review_id,
+            comment_id="4242", check_run_id="8484")
+        return outcome
+
+    def _submit(self, outcome, snapshot_id, relations):
+        from datetime import datetime, timezone
+
+        from agent.metadata_evidence.review_lifecycle import validate_and_bind_snapshot
+
+        now = datetime.now(timezone.utc)
+        self.store.submit_metadata_snapshot(
+            self.org, self.repo, self.env, snapshot_id=snapshot_id,
+            idempotency_key=f"idem-{snapshot_id}", payload_hash=f"ph-{snapshot_id}",
+            evidence_hash=f"ev-{snapshot_id}", observed_at=now, collected_at=now,
+            relations=relations, review_id=outcome.review_id,
+            base_sha="a" * 40, head_sha="b" * 40,
+            completeness="COMPLETE", freshness_state="CURRENT", ttl_seconds=3600)
+        stored = self.store.get_snapshot(self.org, self.repo, snapshot_id)
+        validate_and_bind_snapshot(
+            self.store, organization_id=self.org, repository_id=self.repo,
+            environment=self.env, review_id=outcome.review_id, snapshot=stored)
+
+    @staticmethod
+    def _relations(*, null_rate=0.0, customer_id_present=True):
+        columns = [{"column_name": "order_id", "data_type": "bigint",
+                    "exists_in_production": True, "null_rate": 0.0}]
+        columns.append({
+            "column_name": "customer_id", "data_type": "bigint",
+            "exists_in_production": customer_id_present,
+            "null_rate": null_rate if customer_id_present else None})
+        return [{"relation_name": "raw.orders", "relation_schema": "raw",
+                 "exists_in_production": True, "collection_status": "COLLECTED",
+                 "schema_fingerprint": "fp-1", "row_count": 650,
+                 "columns": columns}]
+
+    def _run_worker(self, publisher):
+        from agent.worker import lifecycle_worker
+
+        lifecycle_worker.configure_publisher(lambda **_scope: publisher)
+        self.addCleanup(lifecycle_worker.configure_publisher, None)
+        self._worker().run(max_iterations=12)
+
+    def test_degrading_evidence_republishes_the_same_comment_and_check(self):
+        from test_publication_reconcile import _RecordingPublisher
+
+        outcome = self._review()
+        publisher = _RecordingPublisher()
+
+        # Healthy production, then a null rate over policy.
+        self._submit(outcome, "snap-healthy", self._relations(null_rate=0.0))
+        self._run_worker(publisher)
+        self._submit(outcome, "snap-degraded", self._relations(null_rate=0.34))
+        self._run_worker(publisher)
+
+        attempts = self.store.review_attempts(self.org, self.repo, outcome.review_id)
+        decisions = [a["decision"] for a in attempts]
+        self.assertIn("ALLOW", decisions, decisions)
+        self.assertIn("WARN", decisions, decisions)
+
+        # Both republications targeted the identities recorded on the review.
+        self.assertGreaterEqual(len(publisher.comments), 2)
+        self.assertTrue(all(c["comment_id"] == "4242" for c in publisher.comments))
+        self.assertTrue(all(c["check_run_id"] == "8484" for c in publisher.checks))
+
+        conclusions = [c["payload"]["conclusion"] for c in publisher.checks]
+        self.assertEqual(conclusions[0], "success")
+        self.assertEqual(conclusions[-1], "neutral")
+
+    def test_a_blocking_finding_reaches_the_check_as_a_failure(self):
+        from test_publication_reconcile import _RecordingPublisher
+
+        outcome = self._review()
+        publisher = _RecordingPublisher()
+
+        self._submit(outcome, "snap-dropped",
+                     self._relations(customer_id_present=False))
+        self._run_worker(publisher)
+
+        attempts = self.store.review_attempts(self.org, self.repo, outcome.review_id)
+        self.assertIn("BLOCK", [a["decision"] for a in attempts])
+        self.assertEqual(publisher.checks[-1]["payload"]["conclusion"], "failure")
+
+    def test_republication_is_registered_as_a_supported_event(self):
+        from agent.metadata_evidence.publication_reconcile import EVENT_TYPE
+        from agent.worker.lifecycle_worker import registry
+
+        self.assertIn(EVENT_TYPE, registry.supported())
+
+    def test_each_attempt_republishes_exactly_once(self):
+        from test_publication_reconcile import _RecordingPublisher
+
+        outcome = self._review()
+        publisher = _RecordingPublisher()
+        self._submit(outcome, "snap-once", self._relations(null_rate=0.0))
+        self._run_worker(publisher)
+        before = len(publisher.comments)
+        # Running the worker again must not republish an already-published
+        # attempt: the outbox row for it is COMPLETED.
+        self._run_worker(publisher)
+        self.assertEqual(len(publisher.comments), before)
+
+
 if __name__ == "__main__":
     unittest.main()

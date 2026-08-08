@@ -282,6 +282,42 @@ class GitHubClient:
             route_template="/repos/{owner}/{repo}/check-runs",
         )
 
+    def create_pull_request_review(self, owner, repository, pull_number, *,
+                                   body, event="REQUEST_CHANGES"):
+        """Submit a pull-request review.
+
+        Uses the App's existing ``pull_requests: write`` permission - the same
+        one ``REQUIRED_INSTALLATION_TOKEN_PERMISSIONS`` already enforces on
+        every installation token. No permission expansion is involved.
+
+        This is a real review on the pull request, not a comment: GitHub shows
+        it as a requested change and it participates in branch protection.
+        """
+        if event not in {"REQUEST_CHANGES", "COMMENT", "APPROVE"}:
+            raise ValueError(f"unsupported pull request review event: {event!r}")
+        return self._request(
+            "POST",
+            f"/repos/{owner}/{repository}/pulls/{pull_number}/reviews",
+            {"body": body, "event": event},
+            operation="create_pull_request_review",
+            route_template="/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
+        )
+
+    def update_check_run(self, owner, repository, check_run_id, payload):
+        """Update an existing check run in place.
+
+        Recomputation must move the SAME check run to its new conclusion. A
+        second create would leave two Relium checks on one commit, and the
+        stale one would keep asserting a decision that no longer holds.
+        """
+        return self._request(
+            "PATCH",
+            f"/repos/{owner}/{repository}/check-runs/{check_run_id}",
+            payload,
+            operation="update_check_run",
+            route_template="/repos/{owner}/{repo}/check-runs/{check_run_id}",
+        )
+
     def list_check_runs(self, owner, repository, *, head_sha, check_name):
         """List existing runs so an ambiguous publication can be reconciled."""
         route_template = "/repos/{owner}/{repo}/commits/{ref}/check-runs"

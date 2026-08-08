@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from datetime import datetime, timezone
 
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
@@ -40,6 +41,10 @@ from agent.api.validation import (
     require_timestamp,
 )
 from agent.lifecycle_models import ALLOWED_TRANSITIONS
+
+
+def _utcnow():
+    return datetime.now(timezone.utc)
 
 logger = logging.getLogger(__name__)
 
@@ -284,6 +289,464 @@ def create_api_routes(*, store_pool, authenticator_factory=None):
             raise NotFoundError("unknown review")
         return 200, _review_view(record)
 
+    def rerun_review(request, body, scope, service):
+        """Re-run the analysis for one review.
+
+        What a re-run can honestly mean here is fixed by the lifecycle, not
+        chosen:
+
+        * ``review_id`` is a digest of (repository, pull number, head SHA), so
+          a re-run is bound to immutable analysis inputs by construction. A
+          different HEAD is a DIFFERENT review, and this endpoint says so
+          rather than pretending the same analysis was repeated.
+        * ``recompute_review`` is idempotent on the snapshot that triggered it,
+          so recomputing against the SAME evidence produces no new attempt.
+          Re-running therefore means *collect fresh production evidence*: a
+          new collection request, which a collector answers with a new
+          snapshot, which produces a genuinely new attempt and a
+          republication.
+
+        Nothing here computes a decision. It asks for the evidence a decision
+        needs, and the existing worker path does the rest.
+        """
+        from datetime import timedelta
+
+        from agent.metadata_evidence.collection_plan import ttl_minutes_for
+        from agent.metadata_evidence.review_lifecycle import (
+            REQUEST_TTL_MINUTES, review_id_for,
+        )
+
+        review_id = request.path_params["review_id"]
+        record = service.store.get_review(
+            scope.organization_id, scope.repository_id, review_id)
+        if record is None:
+            raise NotFoundError("unknown review")
+
+        # The caller may assert which HEAD it believes it is re-running. If the
+        # pull request has moved on, the honest answer is that a different
+        # review covers the new HEAD - not a silent re-run of stale inputs.
+        claimed_head = optional_str(body, "head_sha")
+        if claimed_head and claimed_head != record.get("head_sha"):
+            raise ConflictError(
+                "the pull request HEAD has changed since this review; "
+                "a new review covers the new HEAD. Expected "
+                f"{record.get('head_sha')}, and this review cannot be re-run "
+                f"against {claimed_head}. The review for that HEAD is "
+                f"{review_id_for(scope.repository_id, record.get('pull_number'), claimed_head)}.")
+
+        if not record.get("metadata_required"):
+            raise ConflictError(
+                "this review introduces no external production dependency, so "
+                "there is no production evidence to re-collect. Its decision "
+                "is derived from code evidence that has not changed.")
+
+        # Double-click safety, and the correct answer regardless: a request
+        # that is still actionable IS the re-run already in flight.
+        existing = service.store.collection_requests_for_review(
+            scope.organization_id, scope.repository_id, review_id)
+        actionable = [r for r in existing
+                      if r["state"] in ("PENDING", "ACKNOWLEDGED")]
+        if actionable:
+            return 200, {
+                "status": "already_running",
+                "review_id": review_id,
+                "rerun_id": actionable[0]["request_id"],
+                # NOT "request_id": the envelope reserves that key for the
+                # correlation id and would overwrite it.
+                "collection_request_id": actionable[0]["request_id"],
+                "request_state": actionable[0]["state"],
+                "attempt": record.get("attempt"),
+                "expires_at": isoformat(actionable[0]["expires_at"]),
+            }
+
+        plan = (record.get("payload") or {}).get("plan") or {}
+        targets = [t for t in plan.get("targets", [])
+                   if t.get("dependency_kind") == "external"]
+        if not targets:
+            raise ConflictError(
+                "the collection plan for this review names no external "
+                "relation, so there is nothing to collect.")
+
+        criticality = "critical" if any(
+            t.get("criticality") == "critical" for t in targets) else "standard"
+        request_id = f"req-{review_id}-rerun-{len(existing) + 1}"
+        service.store.create_collection_request(
+            scope.organization_id, scope.repository_id, record["environment"],
+            request_id=request_id, review_id=review_id, reason="rerun",
+            expires_at=_utcnow() + timedelta(minutes=REQUEST_TTL_MINUTES),
+            targets=targets,
+            base_sha=record["base_sha"], head_sha=record["head_sha"],
+            base_manifest_hash=record["base_manifest_hash"],
+            head_manifest_hash=record["head_manifest_hash"],
+            priority=criticality,
+            required_evidence_level=plan.get("required_evidence_level", "profile"),
+            plan={"attempt": record.get("attempt"),
+                  "policy_version": record.get("policy_version"),
+                  "policy_hash": record.get("policy_hash"),
+                  "ttl_minutes": ttl_minutes_for(criticality),
+                  "rerun": True},
+        )
+        service.store.transition_review(
+            scope.organization_id, scope.repository_id, review_id,
+            "METADATA_REQUESTED", reason=f"re-run requested: {request_id}")
+        service.store.append_audit(
+            scope.organization_id, scope.repository_id, actor="dashboard",
+            event_type="review.rerun_requested", reference_type="review",
+            reference_id=review_id,
+            payload={"request_id": request_id,
+                     "attempt_before": record.get("attempt"),
+                     "head_sha": record.get("head_sha")})
+
+        return 202, {
+            "status": "accepted",
+            "review_id": review_id,
+            "rerun_id": request_id,
+            "collection_request_id": request_id,
+            "request_state": "PENDING",
+            # The attempt the re-run starts FROM. The new attempt appears once
+            # a collector answers this request and the worker recomputes.
+            "attempt": record.get("attempt"),
+            "head_sha": record.get("head_sha"),
+        }
+
+    def request_changes(request, body, scope, service):
+        """Submit a GitHub request-changes review on the reviewer's behalf.
+
+        Durable and asynchronous: the intent is committed, then the worker
+        performs the GitHub call. A GitHub outage therefore retries instead of
+        becoming a lost decision or a fabricated success - the record stays
+        PENDING until GitHub returns a review id.
+
+        Uses ``pull_requests: write``, already in the App's enforced permission
+        set. No permission is broadened.
+        """
+        from agent.metadata_evidence.change_request import EVENT_TYPE
+
+        review_id = request.path_params["review_id"]
+        record = service.store.get_review(
+            scope.organization_id, scope.repository_id, review_id)
+        if record is None:
+            raise NotFoundError("unknown review")
+        if not record.get("pull_number"):
+            raise ConflictError(
+                "this review has no pull request number recorded, so there is "
+                "no pull request to request changes on.")
+
+        message = require_str(body, "message")
+        if len(message.strip()) < 3:
+            raise ValidationError(
+                "'message' must say what needs to change", field="message")
+        actor = optional_str(body, "actor") or "dashboard"
+        attempt = int(record.get("attempt") or 1)
+
+        change_request_id = f"cr-{review_id}-{attempt}"
+        row, created = service.store.create_change_request(
+            scope.organization_id, scope.repository_id, record["environment"],
+            change_request_id=change_request_id, review_id=review_id,
+            attempt=attempt, pull_number=record["pull_number"],
+            head_sha=record.get("head_sha") or "", actor=actor,
+            message=message.strip()[:4000])
+
+        if not created:
+            # A request for this attempt already exists. Returning it is the
+            # correct answer to a double click: one GitHub review, not two.
+            return 200, {
+                "status": "already_requested",
+                "review_id": review_id,
+                "change_request_id": row["change_request_id"],
+                "state": row["state"],
+                "attempt": row["attempt"],
+                "remote_review_id": row.get("remote_review_id"),
+            }
+
+        service.store.enqueue_review_recomputation(
+            scope.organization_id, scope.repository_id, record["environment"],
+            review_id=review_id, event_type=EVENT_TYPE,
+            payload={"review_id": review_id,
+                     "change_request_id": change_request_id},
+            dedup_key=change_request_id)
+        service.store.append_audit(
+            scope.organization_id, scope.repository_id, actor=actor,
+            event_type="review.change_request_requested", reference_type="review",
+            reference_id=review_id,
+            payload={"change_request_id": change_request_id, "attempt": attempt,
+                     "pull_number": record["pull_number"]})
+
+        return 202, {
+            "status": "accepted",
+            "review_id": review_id,
+            "change_request_id": change_request_id,
+            "state": "PENDING",
+            "attempt": attempt,
+        }
+
+    def list_change_requests(request, body, scope, service):
+        review_id = request.path_params["review_id"]
+        if service.store.get_review(scope.organization_id, scope.repository_id,
+                                    review_id) is None:
+            raise NotFoundError("unknown review")
+        rows = service.store.change_requests_for_review(
+            scope.organization_id, scope.repository_id, review_id)
+        return 200, {"review_id": review_id, "total": len(rows),
+                     "items": [_change_request_view(r) for r in rows]}
+
+    def approve_exception(request, body, scope, service):
+        """Approve a human exception against one attempt's decision.
+
+        The review's decision is NOT rewritten. A BLOCK stays BLOCK, and the
+        exception is recorded beside it - an override is governance metadata,
+        not evidence that the analysis was wrong. The dashboard renders the
+        pair, e.g. "BLOCK - exception approved".
+
+        Scope defaults to the exact attempt: a later attempt analysed newer
+        evidence, and must not inherit an override approved against findings
+        nobody has re-examined.
+        """
+        import uuid as _uuid
+
+        review_id = request.path_params["review_id"]
+        record = service.store.get_review(
+            scope.organization_id, scope.repository_id, review_id)
+        if record is None:
+            raise NotFoundError("unknown review")
+
+        reason = require_str(body, "reason")
+        if len(reason.strip()) < 3:
+            raise ValidationError(
+                "'reason' is required: an override without a stated reason "
+                "cannot be audited", field="reason")
+        actor = optional_str(body, "actor") or "dashboard"
+        scope_value = optional_choice(body, "scope", {"attempt", "review"}) or "attempt"
+        attempt = body.get("attempt")
+        attempt = int(attempt) if isinstance(attempt, int) else int(record.get("attempt") or 1)
+
+        attempts = service.store.review_attempts(
+            scope.organization_id, scope.repository_id, review_id)
+        matching = next((a for a in attempts if a["attempt"] == attempt), None)
+        if matching is None:
+            raise ConflictError(
+                f"attempt {attempt} is not recorded for this review, so there "
+                f"is no decision to override.")
+
+        row, created = service.store.create_review_exception(
+            scope.organization_id, scope.repository_id, record["environment"],
+            exception_id=f"exc-{_uuid.uuid4().hex[:20]}", review_id=review_id,
+            attempt=attempt, actor=actor, reason=reason.strip()[:2000],
+            scope=scope_value, overridden_decision=matching.get("decision"),
+            base_sha=record.get("base_sha"), head_sha=record.get("head_sha"))
+
+        if not created:
+            return 200, {"status": "already_approved",
+                         "review_id": review_id,
+                         **_exception_view(row)}
+
+        service.store.append_audit(
+            scope.organization_id, scope.repository_id, actor=actor,
+            event_type="review.exception_approved", reference_type="review",
+            reference_id=review_id,
+            payload={"exception_id": row["exception_id"], "attempt": attempt,
+                     "scope": scope_value,
+                     "overridden_decision": matching.get("decision"),
+                     "reason": reason.strip()[:200]})
+        return 201, {"status": "approved", "review_id": review_id,
+                     **_exception_view(row)}
+
+    def revoke_exception(request, body, scope, service):
+        review_id = request.path_params["review_id"]
+        exception_id = request.path_params["exception_id"]
+        if service.store.get_review(scope.organization_id, scope.repository_id,
+                                    review_id) is None:
+            raise NotFoundError("unknown review")
+        existing = service.store.get_review_exception(
+            scope.organization_id, scope.repository_id, exception_id)
+        if existing is None or existing["review_id"] != review_id:
+            raise NotFoundError("unknown exception")
+
+        reason = require_str(body, "reason")
+        actor = optional_str(body, "actor") or "dashboard"
+        if existing["state"] == "revoked":
+            return 200, {"status": "already_revoked", "review_id": review_id,
+                         **_exception_view(existing)}
+
+        row = service.store.revoke_review_exception(
+            scope.organization_id, scope.repository_id, exception_id,
+            actor=actor, reason=reason.strip()[:2000])
+        service.store.append_audit(
+            scope.organization_id, scope.repository_id, actor=actor,
+            event_type="review.exception_revoked", reference_type="review",
+            reference_id=review_id,
+            payload={"exception_id": exception_id,
+                     "reason": reason.strip()[:200]})
+        return 200, {"status": "revoked", "review_id": review_id,
+                     **_exception_view(row)}
+
+    def list_exceptions(request, body, scope, service):
+        review_id = request.path_params["review_id"]
+        record = service.store.get_review(
+            scope.organization_id, scope.repository_id, review_id)
+        if record is None:
+            raise NotFoundError("unknown review")
+        rows = service.store.exceptions_for_review(
+            scope.organization_id, scope.repository_id, review_id)
+        active = service.store.active_exception_for_attempt(
+            scope.organization_id, scope.repository_id, review_id,
+            int(record.get("attempt") or 1))
+        return 200, {
+            "review_id": review_id,
+            # The decision as Relium computed it. Unchanged by any exception.
+            "decision": record.get("decision"),
+            "attempt": record.get("attempt"),
+            # The exception in force for the CURRENT attempt, if any.
+            "active_exception": _exception_view(active) if active else None,
+            "total": len(rows),
+            "items": [_exception_view(r) for r in rows],
+        }
+
+    def review_findings(request, body, scope, service):
+        """Findings for one review, by attempt.
+
+        Findings are computed by the decision engine and preserved on each
+        immutable attempt. They were reachable only by reading the database
+        directly, so no dashboard could show why a decision was what it was.
+        """
+        review_id = request.path_params["review_id"]
+        record = service.store.get_review(
+            scope.organization_id, scope.repository_id, review_id)
+        if record is None:
+            raise NotFoundError("unknown review")
+
+        attempts = service.store.review_attempts(
+            scope.organization_id, scope.repository_id, review_id)
+        requested = request.query_params.get("attempt")
+        if requested is not None:
+            try:
+                wanted = int(requested)
+            except ValueError:
+                raise ValidationError("'attempt' must be an integer",
+                                      field="attempt") from None
+            attempts = [a for a in attempts if a["attempt"] == wanted]
+
+        return 200, {
+            "review_id": review_id,
+            "current_attempt": record.get("attempt"),
+            "attempts": [
+                {
+                    "attempt": a["attempt"],
+                    "decision": a.get("decision"),
+                    "evidence_coverage": a.get("evidence_coverage"),
+                    "health": a.get("health"),
+                    "lifecycle_state": a.get("lifecycle_state"),
+                    "trigger": a.get("trigger"),
+                    "snapshot_id": a.get("snapshot_id"),
+                    "created_at": isoformat(a.get("created_at")),
+                    "findings": [_finding_view(f)
+                                 for f in (a.get("payload") or {}).get("findings", [])],
+                }
+                for a in attempts
+            ],
+        }
+
+    def review_attempts(request, body, scope, service):
+        """Attempt history and lifecycle transitions for one review."""
+        review_id = request.path_params["review_id"]
+        record = service.store.get_review(
+            scope.organization_id, scope.repository_id, review_id)
+        if record is None:
+            raise NotFoundError("unknown review")
+
+        attempts = service.store.review_attempts(
+            scope.organization_id, scope.repository_id, review_id)
+        transitions = service.store.review_transitions(
+            scope.organization_id, scope.repository_id, review_id)
+        return 200, {
+            "review_id": review_id,
+            "current_attempt": record.get("attempt"),
+            "attempts": [
+                {"attempt": a["attempt"], "decision": a.get("decision"),
+                 "evidence_coverage": a.get("evidence_coverage"),
+                 "health": a.get("health"),
+                 "lifecycle_state": a.get("lifecycle_state"),
+                 "trigger": a.get("trigger"), "snapshot_id": a.get("snapshot_id"),
+                 "enforcement_mode": a.get("enforcement_mode"),
+                 "policy_version": a.get("policy_version"),
+                 "finding_count": len((a.get("payload") or {}).get("findings", [])),
+                 "created_at": isoformat(a.get("created_at"))}
+                for a in attempts
+            ],
+            "transitions": [
+                {"from_state": t.get("from_state"), "to_state": t.get("to_state"),
+                 "reason": t.get("reason"),
+                 "created_at": isoformat(t.get("created_at"))}
+                for t in transitions
+            ],
+        }
+
+    def review_collection_requests(request, body, scope, service):
+        """Every collection request raised for one review, with its outcome."""
+        review_id = request.path_params["review_id"]
+        if service.store.get_review(scope.organization_id, scope.repository_id,
+                                    review_id) is None:
+            raise NotFoundError("unknown review")
+        rows = service.store.collection_requests_for_review(
+            scope.organization_id, scope.repository_id, review_id)
+        return 200, {"review_id": review_id, "total": len(rows),
+                     "items": [_collection_request_view(r) for r in rows]}
+
+    def review_snapshots(request, body, scope, service):
+        """Metadata snapshots submitted against one review, newest first."""
+        review_id = request.path_params["review_id"]
+        if service.store.get_review(scope.organization_id, scope.repository_id,
+                                    review_id) is None:
+            raise NotFoundError("unknown review")
+        rows = service.store.snapshots_for_review(
+            scope.organization_id, scope.repository_id, review_id)
+        bindings = {}
+        for binding in service.store.review_bindings(
+                scope.organization_id, scope.repository_id, review_id):
+            bindings.setdefault(binding["snapshot_id"], []).append({
+                "binding_state": binding["binding_state"],
+                "rejection_reason": binding.get("rejection_reason"),
+            })
+        return 200, {
+            "review_id": review_id, "total": len(rows),
+            "items": [{**_snapshot_summary_view(r),
+                       "bindings": bindings.get(r["snapshot_id"], [])}
+                      for r in rows],
+        }
+
+    def review_publications(request, body, scope, service):
+        """Where this review has been published, and under which identity.
+
+        The GitHub comment and check-run ids are the reconciliation evidence:
+        an unchanged id across attempts proves the sticky object was updated
+        rather than duplicated.
+        """
+        review_id = request.path_params["review_id"]
+        record = service.store.get_review(
+            scope.organization_id, scope.repository_id, review_id)
+        if record is None:
+            raise NotFoundError("unknown review")
+        channels = {}
+        for delivery in service.store.deliveries(
+                scope.organization_id, scope.repository_id, record["environment"]):
+            if review_id not in str(delivery.get("event_key", "")):
+                continue
+            channels.setdefault(delivery["channel"], []).append({
+                "event_key": delivery["event_key"], "status": delivery["status"],
+                "attempts": delivery["attempts"],
+                "remote_id": delivery.get("remote_id"),
+                "reconciled_at": isoformat(delivery.get("reconciled_at")),
+            })
+        return 200, {
+            "review_id": review_id,
+            "github": {
+                "comment_id": record.get("github_comment_id"),
+                "check_run_id": record.get("github_check_run_id"),
+                "pull_number": record.get("pull_number"),
+            },
+            "channels": channels,
+        }
+
     def list_deployments(request, body, scope, service):
         limit, offset = _page(request)
         page = service.store.list_deployments(
@@ -452,6 +915,28 @@ def create_api_routes(*, store_pool, authenticator_factory=None):
         Route("/api/reviews", handler(list_reviews, write=False), methods=["GET"]),
         Route("/api/reviews", handler(post_review, write=True), methods=["POST"]),
         Route("/api/reviews/{review_id}", handler(get_review, write=False), methods=["GET"]),
+        Route("/api/reviews/{review_id}/rerun",
+              handler(rerun_review, write=True), methods=["POST"]),
+        Route("/api/reviews/{review_id}/request-changes",
+              handler(request_changes, write=True), methods=["POST"]),
+        Route("/api/reviews/{review_id}/change-requests",
+              handler(list_change_requests, write=False), methods=["GET"]),
+        Route("/api/reviews/{review_id}/exceptions",
+              handler(approve_exception, write=True), methods=["POST"]),
+        Route("/api/reviews/{review_id}/exceptions",
+              handler(list_exceptions, write=False), methods=["GET"]),
+        Route("/api/reviews/{review_id}/exceptions/{exception_id}/revoke",
+              handler(revoke_exception, write=True), methods=["POST"]),
+        Route("/api/reviews/{review_id}/findings",
+              handler(review_findings, write=False), methods=["GET"]),
+        Route("/api/reviews/{review_id}/attempts",
+              handler(review_attempts, write=False), methods=["GET"]),
+        Route("/api/reviews/{review_id}/collection-requests",
+              handler(review_collection_requests, write=False), methods=["GET"]),
+        Route("/api/reviews/{review_id}/snapshots",
+              handler(review_snapshots, write=False), methods=["GET"]),
+        Route("/api/reviews/{review_id}/publications",
+              handler(review_publications, write=False), methods=["GET"]),
         Route("/api/deployments", handler(list_deployments, write=False), methods=["GET"]),
         Route("/api/deployments/{deployment_id}", handler(get_deployment, write=False), methods=["GET"]),
         Route("/api/monitoring", handler(monitoring_status, write=False), methods=["GET"]),
@@ -477,16 +962,142 @@ def create_api_routes(*, store_pool, authenticator_factory=None):
 # -- response projections. Only disclosed fields cross the API boundary. -------
 
 def _review_view(record):
+    """Review identity, decision and evidence state.
+
+    Attempt, lifecycle state, health and the git/manifest binding were all
+    persisted but none of them crossed the API, so a dashboard could show a
+    decision without being able to say which code state it described or
+    whether it was still provisional. Every field here is already non-secret
+    review metadata; no payload, plan or finding detail is included.
+    """
     return {
         "review_id": record["review_id"],
         "environment": record["environment"],
         "pull_number": record.get("pull_number"),
         "commit_sha": record.get("commit_sha"),
         "decision": record["decision"],
+        "lifecycle_state": record.get("lifecycle_state"),
+        "attempt": record.get("attempt"),
         "enforcement_mode": record.get("enforcement_mode"),
         "risk_score": record.get("risk_score"),
         "evidence_coverage": record.get("evidence_coverage"),
+        "health": record.get("health"),
+        "metadata_required": record.get("metadata_required"),
+        "base_sha": record.get("base_sha"),
+        "head_sha": record.get("head_sha"),
+        "base_manifest_hash": record.get("base_manifest_hash"),
+        "head_manifest_hash": record.get("head_manifest_hash"),
+        "policy_version": record.get("policy_version"),
+        "policy_hash": record.get("policy_hash"),
         "created_at": isoformat(record.get("created_at")),
+        "updated_at": isoformat(record.get("updated_at")),
+    }
+
+
+def _change_request_view(record):
+    return {
+        "change_request_id": record["change_request_id"],
+        "review_id": record["review_id"],
+        "attempt": record["attempt"],
+        "pull_number": record["pull_number"],
+        "actor": record["actor"],
+        "message": record["message"],
+        "state": record["state"],
+        "remote_review_id": record.get("remote_review_id"),
+        "failure_reason": record.get("failure_reason"),
+        "created_at": isoformat(record.get("created_at")),
+        "published_at": isoformat(record.get("published_at")),
+    }
+
+
+def _exception_view(record):
+    """An exception, beside the decision it overrides - never replacing it."""
+    if record is None:
+        return None
+    return {
+        "exception_id": record["exception_id"],
+        "review_id": record["review_id"],
+        "attempt": record["attempt"],
+        # What RELIUM decided. Preserved so the pair stays legible.
+        "overridden_decision": record.get("overridden_decision"),
+        "actor": record["actor"],
+        "reason": record["reason"],
+        "scope": record["scope"],
+        "state": record["state"],
+        "base_sha": record.get("base_sha"),
+        "head_sha": record.get("head_sha"),
+        "created_at": isoformat(record.get("created_at")),
+        "revoked_at": isoformat(record.get("revoked_at")),
+        "revoked_by": record.get("revoked_by"),
+        "revocation_reason": record.get("revocation_reason"),
+    }
+
+
+def _finding_view(finding):
+    """One finding, exactly as the decision engine produced it.
+
+    ``detail`` carries the measured value and the configured threshold, which
+    is what makes a finding checkable rather than assertable. It is engine
+    output - never a warehouse row - so it is disclosed unchanged.
+    """
+    if not isinstance(finding, dict):
+        return {"code": "unreadable", "severity": "info", "category": "evidence",
+                "message": "finding could not be read", "detail": {}}
+    return {
+        "code": finding.get("code"),
+        "severity": finding.get("severity"),
+        "category": finding.get("category"),
+        "message": finding.get("message"),
+        "relation": finding.get("relation"),
+        "column": finding.get("column"),
+        "detail": finding.get("detail") or {},
+    }
+
+
+def _collection_request_view(record):
+    plan = record.get("plan") or {}
+    return {
+        "request_id": record["request_id"],
+        "review_id": record.get("review_id"),
+        "environment": record["environment"],
+        "state": record["state"],
+        "reason": record.get("reason"),
+        "priority": record.get("priority"),
+        "required_evidence_level": record.get("required_evidence_level"),
+        "acknowledged_by": record.get("acknowledged_by"),
+        "acknowledged_at": isoformat(record.get("acknowledged_at")),
+        "completed_at": isoformat(record.get("completed_at")),
+        "failure_reason": record.get("failure_reason"),
+        "expires_at": isoformat(record.get("expires_at")),
+        "created_at": isoformat(record.get("created_at")),
+        "base_sha": record.get("base_sha"),
+        "head_sha": record.get("head_sha"),
+        "base_manifest_hash": record.get("base_manifest_hash"),
+        "head_manifest_hash": record.get("head_manifest_hash"),
+        # The plan states what was asked for. It contains relation and column
+        # names and requested signal names - never data.
+        "plan": plan,
+    }
+
+
+def _snapshot_summary_view(record):
+    return {
+        "snapshot_id": record["snapshot_id"],
+        "environment": record.get("environment"),
+        "completeness": record.get("completeness"),
+        "freshness_state": record.get("freshness_state"),
+        "observed_at": isoformat(record.get("observed_at")),
+        "collected_at": isoformat(record.get("collected_at")),
+        "received_at": isoformat(record.get("received_at")),
+        "request_id": record.get("request_id"),
+        "collector_id": record.get("collector_id"),
+        "collector_version": record.get("collector_version"),
+        "adapter_type": record.get("adapter_type"),
+        "ttl_seconds": record.get("ttl_seconds"),
+        "base_sha": record.get("base_sha"),
+        "head_sha": record.get("head_sha"),
+        "base_manifest_hash": record.get("base_manifest_hash"),
+        "head_manifest_hash": record.get("head_manifest_hash"),
     }
 
 

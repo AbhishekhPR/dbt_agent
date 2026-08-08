@@ -114,8 +114,34 @@ for _event in ("deployment.reviewed", "deployment.approved", "deployment.deploym
 # Review recomputation runs on this same worker and this same outbox. It is
 # registered here so the supported event set stays inspectable in one place.
 from agent.metadata_evidence.recompute import register as _register_recompute  # noqa: E402
+from agent.metadata_evidence.publication_reconcile import (  # noqa: E402
+    register as _register_publication,
+)
+from agent.metadata_evidence.change_request import (  # noqa: E402
+    register as _register_change_request,
+)
 
 _register_recompute(registry)
+
+# Republication of a recomputed decision. The factory is installed by
+# configure_publisher(); until then the handler runs and records that the
+# decision was not published, rather than reporting a delivery that never
+# happened.
+_publisher_factory = {"build": None}
+
+
+def configure_publisher(factory):
+    """Install the per-tenant publisher factory used by republication."""
+    _publisher_factory["build"] = factory
+
+
+def _build_publisher(**scope):
+    build = _publisher_factory["build"]
+    return build(**scope) if build is not None else None
+
+
+_register_publication(registry, publisher_factory=_build_publisher)
+_register_change_request(registry, publisher_factory=_build_publisher)
 
 
 class WorkerState:

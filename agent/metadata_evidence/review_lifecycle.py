@@ -304,10 +304,14 @@ def validate_and_bind_snapshot(store, *, organization_id, repository_id, environ
         state = "PARTIAL" if snapshot.get("completeness") == "PARTIAL" else "COMPLETED"
         store.close_collection_request(organization_id, repository_id, request_id,
                                        state=state)
+    # Dedup on the snapshot: this snapshot's evidence is recomputed exactly
+    # once, and the NEXT snapshot for the same review still enqueues its own
+    # job. Keying on the review alone froze the decision at the first one.
     store.enqueue_review_recomputation(
         organization_id, repository_id, environment, review_id=review_id,
         event_type="metadata.review_recompute_requested",
         payload={"review_id": review_id, "snapshot_id": snapshot["snapshot_id"]},
+        dedup_key=snapshot["snapshot_id"],
     )
     store.append_audit(
         organization_id, repository_id, actor="collector",

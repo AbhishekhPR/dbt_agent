@@ -1,0 +1,177 @@
+name: governance-e2e
+
+# Manually triggered live proof that "Request changes" is a real GitHub
+# pull-request review, submitted by the dedicated Relium E2E App.
+#
+# It exists because the App credentials live only as Actions secrets, which
+# are write-only by design and unavailable on a developer machine. This is the
+# only place the live GitHub leg can be proven.
+#
+# Same shape and same safety rules as metadata-review-e2e: workflow_dispatch
+# only, one at a time, webhook restored by a mandatory always-run cleanup, and
+# no credential ever written into the workspace or an artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      enforcement_mode:
+        description: "Policy mode for the fixture review"
+        required: true
+        default: "enforce"
+        type: choice
+        options: [enforce, shadow]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Shares the group with metadata-review-e2e: both repoint the SAME webhook,
+  # so they must never run together.
+  group: metadata-review-e2e
+  cancel-in-progress: false
+
+jobs:
+  governance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: bootstrap_only_not_used_by_the_app
+          POSTGRES_DB: postgres
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      RELIUM_E2E_REPOSITORY: AbhishekhPR/relium-e2e-dbt
+      RELIUM_E2E_APP_SLUG: relium-e2e
+      EVIDENCE_DIR: ${{ github.workspace }}/governance-evidence
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install the hash-locked dependency set
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip check
+
+      - name: Install PostgreSQL 18 client tools
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-18
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+
+      - name: Provision the least-privileged application role
+        env:
+          PGPASSWORD: bootstrap_only_not_used_by_the_app
+        run: |
+          APP_PW="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 32)"
+          psql -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 -q <<SQL
+          CREATE ROLE relium_app LOGIN PASSWORD '${APP_PW}'
+            NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+            CONNECTION LIMIT 20;
+          CREATE DATABASE relium_e2e OWNER relium_app;
+          SQL
+          psql -h 127.0.0.1 -U postgres -d relium_e2e -v ON_ERROR_STOP=1 -q <<SQL
+          ALTER SCHEMA public OWNER TO relium_app;
+          SQL
+          echo "::add-mask::${APP_PW}"
+          echo "RELIUM_DATABASE_URL=postgresql://relium_app:${APP_PW}@127.0.0.1:5432/relium_e2e" >> "$GITHUB_ENV"
+
+      - name: Assert the application role is least-privileged
+        env:
+          PGPASSWORD: bootstrap_only_not_used_by_the_app
+        run: |
+          VERDICT="$(psql -h 127.0.0.1 -U postgres -tAc "
+            SELECT CASE WHEN NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole
+                         AND NOT rolreplication AND NOT rolbypassrls
+                        THEN 'LEAST_PRIVILEGED' ELSE 'OVER_PRIVILEGED' END
+              FROM pg_roles WHERE rolname='relium_app'")"
+          echo "app role: $VERDICT"
+          [ "$VERDICT" = "LEAST_PRIVILEGED" ] || exit 1
+
+      - name: Write the App private key outside the workspace
+        env:
+          RELIUM_GITHUB_PRIVATE_KEY: ${{ secrets.RELIUM_E2E_PRIVATE_KEY }}
+        run: |
+          # Outside ${{ github.workspace }} so it can never be collected as an
+          # artifact, and 600 so nothing else on the runner can read it.
+          install -m 700 -d "$RUNNER_TEMP/relium-secrets"
+          printf '%s' "$RELIUM_GITHUB_PRIVATE_KEY" > "$RUNNER_TEMP/relium-secrets/app.pem"
+          chmod 600 "$RUNNER_TEMP/relium-secrets/app.pem"
+          test -s "$RUNNER_TEMP/relium-secrets/app.pem" || { echo "private key secret is empty"; exit 1; }
+          echo "RELIUM_GITHUB_PRIVATE_KEY_PATH=$RUNNER_TEMP/relium-secrets/app.pem" >> "$GITHUB_ENV"
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL -o /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Run the governance E2E
+        id: governance
+        env:
+          RELIUM_GITHUB_APP_ID: ${{ secrets.RELIUM_E2E_APP_ID }}
+          RELIUM_GITHUB_WEBHOOK_SECRET: ${{ secrets.RELIUM_E2E_WEBHOOK_SECRET }}
+          RELIUM_E2E_INSTALLATION_ID: ${{ secrets.RELIUM_E2E_INSTALLATION_ID }}
+          # Fixture branch/commit/PR operations ONLY. Every application-owned
+          # GitHub action in this run is performed by the App installation
+          # token, never by this token.
+          RELIUM_E2E_FIXTURE_TOKEN: ${{ secrets.RELIUM_E2E_FIXTURE_TOKEN }}
+          RELIUM_ENFORCEMENT_MODE: ${{ inputs.enforcement_mode }}
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          python scripts/e2e/governance_e2e.py "$EVIDENCE_DIR"
+
+      - name: Scan the evidence for secrets
+        if: always()
+        run: |
+          python scripts/live_e2e/secret_scan.py "$EVIDENCE_DIR" || {
+            echo "SECRET SCAN FAILED - refusing to upload evidence"; exit 1; }
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: governance-evidence
+          path: |
+            ${{ env.EVIDENCE_DIR }}/*.json
+            ${{ env.EVIDENCE_DIR }}/*.log
+          if-no-files-found: warn
+
+      # Mandatory, always. Restores the webhook and closes the fixture PR even
+      # on failure, cancellation or timeout. A cleanup failure fails the run.
+      - name: Mandatory cleanup
+        if: always()
+        env:
+          RELIUM_GITHUB_APP_ID: ${{ secrets.RELIUM_E2E_APP_ID }}
+          RELIUM_E2E_INSTALLATION_ID: ${{ secrets.RELIUM_E2E_INSTALLATION_ID }}
+          RELIUM_E2E_FIXTURE_TOKEN: ${{ secrets.RELIUM_E2E_FIXTURE_TOKEN }}
+        run: |
+          set -o pipefail
+          rc=0
+          python scripts/e2e/metadata_review_e2e.py "$EVIDENCE_DIR" --cleanup-only || rc=$?
+          pkill -f cloudflared || true
+          pkill -f uvicorn || true
+          pkill -f lifecycle_worker || true
+          echo "listeners still up:"; (ss -ltnp | grep -E ':(8000|8080|8791)' || echo none)
+          if [ $rc -ne 0 ]; then
+            echo "CLEANUP FAILED (rc=$rc)"; exit $rc
+          fi

@@ -2,6 +2,7 @@
   "contract_version": "1.0.0",
   "dashboard_resources": {
     "anomaly_list": "/api/anomalies",
+    "collection_request_detail": "/api/collection-requests/{request_id}",
     "delivery_status": "/api/delivery-status",
     "deployment_detail": "/api/deployments/{deployment_id}",
     "deployment_list": "/api/deployments",
@@ -9,11 +10,21 @@
     "incident_detail": "/api/incidents/{incident_id}",
     "incident_rca": "/api/incidents/{incident_id}/rca",
     "kpi_impact": "/api/kpis/{kpi}/impact",
+    "metadata_snapshot": "/api/metadata-snapshots/{snapshot_id}",
     "model_lineage": "/api/models/{model}/lineage",
     "monitoring_status": "/api/monitoring",
     "repository_settings": "/api/repositories/{repository}/settings",
+    "review_attempts": "/api/reviews/{review_id}/attempts",
+    "review_change_requests": "/api/reviews/{review_id}/change-requests",
+    "review_collection_requests": "/api/reviews/{review_id}/collection-requests",
     "review_detail": "/api/reviews/{review_id}",
-    "review_list": "/api/reviews"
+    "review_evidence_coverage": "/api/reviews/{review_id}/evidence-coverage",
+    "review_exceptions": "/api/reviews/{review_id}/exceptions",
+    "review_findings": "/api/reviews/{review_id}/findings",
+    "review_list": "/api/reviews",
+    "review_publications": "/api/reviews/{review_id}/publications",
+    "review_rerun": "/api/reviews/{review_id}/rerun",
+    "review_snapshots": "/api/reviews/{review_id}/snapshots"
   },
   "mandatory_routes": [
     "GET /api/anomalies",
@@ -34,7 +45,14 @@
     "GET /api/repositories/{repository}/settings",
     "GET /api/reviews",
     "GET /api/reviews/{review_id}",
+    "GET /api/reviews/{review_id}/attempts",
+    "GET /api/reviews/{review_id}/change-requests",
+    "GET /api/reviews/{review_id}/collection-requests",
     "GET /api/reviews/{review_id}/evidence-coverage",
+    "GET /api/reviews/{review_id}/exceptions",
+    "GET /api/reviews/{review_id}/findings",
+    "GET /api/reviews/{review_id}/publications",
+    "GET /api/reviews/{review_id}/snapshots",
     "GET /healthz",
     "GET /readyz",
     "POST /api/anomalies",
@@ -47,6 +65,10 @@
     "POST /api/monitoring/baselines",
     "POST /api/monitoring/observations",
     "POST /api/reviews",
+    "POST /api/reviews/{review_id}/exceptions",
+    "POST /api/reviews/{review_id}/exceptions/{exception_id}/revoke",
+    "POST /api/reviews/{review_id}/request-changes",
+    "POST /api/reviews/{review_id}/rerun",
     "POST /github/webhook"
   ],
   "routes": [
@@ -193,7 +215,62 @@
     {
       "authentication": "service-token",
       "method": "GET",
+      "path": "/api/reviews/{review_id}/attempts"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/reviews/{review_id}/change-requests"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/reviews/{review_id}/collection-requests"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
       "path": "/api/reviews/{review_id}/evidence-coverage"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/reviews/{review_id}/exceptions"
+    },
+    {
+      "authentication": "service-token",
+      "method": "POST",
+      "path": "/api/reviews/{review_id}/exceptions"
+    },
+    {
+      "authentication": "service-token",
+      "method": "POST",
+      "path": "/api/reviews/{review_id}/exceptions/{exception_id}/revoke"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/reviews/{review_id}/findings"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/reviews/{review_id}/publications"
+    },
+    {
+      "authentication": "service-token",
+      "method": "POST",
+      "path": "/api/reviews/{review_id}/request-changes"
+    },
+    {
+      "authentication": "service-token",
+      "method": "POST",
+      "path": "/api/reviews/{review_id}/rerun"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/reviews/{review_id}/snapshots"
     },
     {
       "authentication": "github-webhook-signature",
