@@ -91,18 +91,19 @@ Expected: suite passes with zero failures.
 - Verify: `.github/workflows/governance-e2e.yml`
 - Produce through Actions: `webhook-recovery-cleanup-proof.json`
 
-- [ ] **Step 1: Commit and push the scoped harness hardening**
+- [x] **Step 1: Commit and push the scoped harness hardening**
 
 Commit only the five existing recovery/cleanup files, their test, and this plan; push `governance-live-e2e`.
 
-- [ ] **Step 2: Dispatch webhook-recovery mode only**
+- [x] **Step 2: Dispatch webhook-recovery mode only**
 
 Use the workflow's `webhook-recovery` input. Do not dispatch governance or the full metadata-review product E2E.
 
-- [ ] **Step 3: Verify the uploaded evidence**
+- [x] **Step 3: Verify the uploaded evidence**
 
 Require original URL before mutation, a distinct temporary URL, final URL equal to original, matching content type/events/TLS state, intended active state supported by genuine delivery evidence, `verified_through_github: true`, no fixture PRs/branches, stopped tunnel/listener, no secret capture, and `relium_pilot_touched: false`.
 
-- [ ] **Step 4: Commit any evidence-only test correction separately if required**
+- [x] **Step 4: Commit any evidence-only test correction separately if required**
 
-Make no unrelated product, frontend, decision, or fixture changes.
+No evidence-only correction was required. Make no unrelated product, frontend,
+decision, or fixture changes.
