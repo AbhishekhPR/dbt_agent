@@ -902,6 +902,34 @@ class BlastRadiusCleanupTests(unittest.TestCase):
 
 
 class BlastRadiusWorkflowTests(unittest.TestCase):
+    def test_initial_durable_state_satisfies_live_flow_webhook_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = _load_driver(Path(tmp), "blast_live_flow_state_contract")
+            record = driver._initial_recovery()
+            calls = []
+
+            def fake_gh(method, path, token, body=None, bearer=True):
+                calls.append((method, path, token, body))
+                if method == "GET" and path == "/app":
+                    return 200, {"slug": driver.APP_SLUG}
+                if method == "PATCH" and path == "/app/hook/config":
+                    return 200, {}
+                self.fail(f"unexpected operation {method} {path}")
+
+            proof = driver.lf.point_webhook(
+                driver.state, fake_gh, lambda: "app-jwt",
+                "https://tunnel.example.invalid")
+
+        self.assertTrue({"procs", "tunnel", "expected_slug", "mutated",
+                         "cleanup_done", "cleanup_result"}
+                        .issubset(driver.state))
+        self.assertEqual(record["expected_app_slug"], driver.APP_SLUG)
+        self.assertEqual(driver.state["expected_slug"], driver.APP_SLUG)
+        self.assertTrue(driver.state["mutated"])
+        self.assertEqual(proof["app_slug"], driver.APP_SLUG)
+        self.assertEqual([call[:2] for call in calls], [
+            ("GET", "/app"), ("PATCH", "/app/hook/config")])
+
     def test_manual_workflow_has_a_focused_blast_radius_job(self):
         doc = yaml.safe_load(_source(WORKFLOW))
         triggers = doc.get(True) or doc.get("on")

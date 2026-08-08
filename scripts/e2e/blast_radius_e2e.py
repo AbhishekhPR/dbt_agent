@@ -61,7 +61,8 @@ if _STRAY_TRACKER.exists():
     _STRAY_TRACKER.unlink()
 
 state = {"procs": [], "tunnel": None, "cleanup_done": False,
-         "cleanup_result": None}
+         "cleanup_result": None, "expected_slug": APP_SLUG,
+         "mutated": False}
 
 
 def _write(name: str, document) -> None:
@@ -334,6 +335,7 @@ def _initial_recovery() -> dict:
     record = {
         "run_id": RUN,
         "repository": REPO,
+        "expected_app_slug": APP_SLUG,
         "webhook_preserved": False,
         "webhook_mutated": False,
         "original_webhook": None,
@@ -344,6 +346,10 @@ def _initial_recovery() -> dict:
         "processes": [],
     }
     _write_recovery(record)
+    # Keep the shared live_flow mutation guard sourced from the same exact
+    # dedicated App identity that was durably recorded for this run.
+    state["expected_slug"] = record["expected_app_slug"]
+    state["mutated"] = False
     return record
 
 
