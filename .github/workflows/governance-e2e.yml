@@ -222,7 +222,6 @@ jobs:
         env:
           RELIUM_GITHUB_APP_ID: ${{ secrets.RELIUM_E2E_APP_ID }}
           RELIUM_E2E_INSTALLATION_ID: ${{ secrets.RELIUM_E2E_INSTALLATION_ID }}
-          RELIUM_E2E_FIXTURE_TOKEN: ${{ secrets.RELIUM_E2E_FIXTURE_TOKEN }}
         run: |
           mkdir -p "$EVIDENCE_DIR"
           python scripts/e2e/webhook_recovery_e2e.py "$EVIDENCE_DIR"
@@ -231,11 +230,9 @@ jobs:
         if: always()
         env:
           RELIUM_GITHUB_APP_ID: ${{ secrets.RELIUM_E2E_APP_ID }}
-          RELIUM_E2E_INSTALLATION_ID: ${{ secrets.RELIUM_E2E_INSTALLATION_ID }}
-          RELIUM_E2E_FIXTURE_TOKEN: ${{ secrets.RELIUM_E2E_FIXTURE_TOKEN }}
         run: |
           rc=0
-          python scripts/e2e/metadata_review_e2e.py "$EVIDENCE_DIR" --cleanup-only || rc=$?
+          python scripts/e2e/metadata_review_e2e.py "$EVIDENCE_DIR" --webhook-restore-only || rc=$?
           pkill -f cloudflared || true
           pkill -f webhook_recovery_e2e.py || true
           if [ $rc -ne 0 ]; then

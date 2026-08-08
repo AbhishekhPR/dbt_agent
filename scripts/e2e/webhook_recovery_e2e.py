@@ -19,7 +19,6 @@ Neither path reads, writes, prints, or persists the webhook secret.
 from __future__ import annotations
 
 import json
-import os
 import sys
 import threading
 import urllib.error
@@ -62,21 +61,27 @@ def _require(condition: bool, message: str) -> None:
         raise StageFailure(message)
 
 
-def read_webhook_state(jwt: str | None = None) -> dict:
-    """Read only non-secret App and webhook fields through GitHub."""
+def read_app_identity(jwt: str | None = None) -> dict:
+    """Read only identity/subscription fields, before any webhook metadata."""
     jwt = jwt or app_jwt()
     app_status, app = gh("GET", "/app", jwt)
+    _require(app_status == 200, f"could not read App identity: HTTP {app_status}")
+    return {"app_slug": app.get("slug"),
+            "events": sorted(app.get("events") or [])}
+
+
+def read_webhook_state(jwt: str | None = None, identity: dict | None = None) -> dict:
+    """Read non-secret config only after the App identity has passed its gate."""
+    jwt = jwt or app_jwt()
+    identity = identity or read_app_identity(jwt)
+    _assert_dedicated_app(identity)
     hook_status, hook = gh("GET", "/app/hook/config", jwt)
     hook.pop("secret", None)
-    _require(app_status == 200, f"could not read App identity: HTTP {app_status}")
     _require(hook_status == 200,
              f"could not read App webhook config: HTTP {hook_status}")
-    attributes = app.get("hook_attributes") or {}
     return {
-        "app_slug": app.get("slug"),
-        "app_hook_url": attributes.get("url"),
-        "active": attributes.get("active"),
-        "events": sorted(app.get("events") or []),
+        **identity,
+        "active": None,
         "url": hook.get("url"),
         "content_type": hook.get("content_type"),
         "insecure_ssl": hook.get("insecure_ssl"),
@@ -163,24 +168,16 @@ def _stop_tunnel_and_listener(server, thread) -> dict:
 
 
 def _fixture_state() -> dict:
-    token = os.environ.get("RELIUM_E2E_FIXTURE_TOKEN", "")
-    _require(bool(token), "fixture token is required for read-only cleanup proof")
-    status, pulls = gh(
-        "GET", f"/repos/{FIXTURE_REPOSITORY}/pulls?state=open&per_page=100",
-        token, bearer=False)
-    _require(status == 200 and isinstance(pulls, list),
-             f"could not list fixture pull requests: HTTP {status}")
-    open_fixtures = [
-        pull["number"] for pull in pulls
-        if ((pull.get("head") or {}).get("ref") or "").startswith("e2e/")]
-    status, refs = gh(
-        "GET", f"/repos/{FIXTURE_REPOSITORY}/git/matching-refs/heads/e2e/",
-        token, bearer=False)
-    _require(status == 200 and isinstance(refs, list),
-             f"could not list fixture branches: HTTP {status}")
-    branches = [ref["ref"] for ref in refs]
-    return {"open_fixture_pull_requests": open_fixtures,
-            "fixture_branches_remaining": branches}
+    token = installation_token()
+    pulls = md.gh_list_all(
+        f"/repos/{FIXTURE_REPOSITORY}/pulls?state=open", token,
+        bearer=False)
+    branches = md.gh_list_all(
+        f"/repos/{FIXTURE_REPOSITORY}/branches", token, bearer=False)
+    return {"open_fixture_pull_requests": [pull["number"] for pull in pulls],
+            "fixture_branches_remaining": [
+                branch["name"] for branch in branches
+                if branch["name"] != "main"]}
 
 
 def _same_untouched_fields(left: dict, right: dict) -> bool:
@@ -190,14 +187,15 @@ def _same_untouched_fields(left: dict, right: dict) -> bool:
 
 def main() -> int:
     jwt = app_jwt()
-    observed = read_webhook_state(jwt)
+    identity = read_app_identity(jwt)
+    _assert_dedicated_app(identity)
+    repositories = _assert_installation_scope(jwt)
+    observed = read_webhook_state(jwt, identity)
     _write("webhook-state-observed-before-mutation.json", {
         "observed": observed,
         "secret_captured": False,
         "github_mutation_performed": False,
     })
-    _assert_dedicated_app(observed)
-    repositories = _assert_installation_scope(jwt)
     _require(observed["url"] in (CORRUPT_URL, ORIGINAL_URL),
              "current webhook URL matches neither the proven corrupt URL nor "
              "the proven Run 11 original")

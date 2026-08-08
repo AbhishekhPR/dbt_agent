@@ -56,6 +56,7 @@ RUN = uuid.uuid4().hex[:10]
 
 EV = Path(sys.argv[1])
 CLEANUP_ONLY = "--cleanup-only" in sys.argv
+WEBHOOK_RESTORE_ONLY = "--webhook-restore-only" in sys.argv
 EV.mkdir(parents=True, exist_ok=True)
 RECOVERY = EV / "webhook-recovery-record.json"
 
@@ -66,7 +67,8 @@ state = {"mutated": False, "procs": [], "tunnel": None, "pr_number": None,
 # record in run 8: the uploaded tracker reported 2 of 27 complete and said
 # nothing about the run it was supposed to describe. The two processes must
 # not share a path.
-tracker = StageTracker(EV / ("stage-tracker-outer.json" if CLEANUP_ONLY
+tracker = StageTracker(EV / ("stage-tracker-outer.json" if
+                             (CLEANUP_ONLY or WEBHOOK_RESTORE_ONLY)
                              else "stage-tracker.json"))
 checks: list[dict] = []
 
@@ -128,6 +130,22 @@ def installation_token(jwt=None):
     return tok["token"]
 
 
+def gh_list_all(path, token, bearer=False):
+    """Read every page of a GitHub list endpoint or fail closed."""
+    values, page = [], 1
+    while True:
+        separator = "&" if "?" in path else "?"
+        status, batch = gh(
+            "GET", f"{path}{separator}per_page=100&page={page}", token,
+            bearer=bearer)
+        if status != 200 or not isinstance(batch, list):
+            raise StageFailure(f"could not list {path}: HTTP {status}")
+        values.extend(batch)
+        if len(batch) < 100:
+            return values
+        page += 1
+
+
 # ---------------------------------------------------------------- cleanup
 def preserve_webhook(gh_fn=None, jwt_fn=None):
     """Record the current webhook config so cleanup can put it back.
@@ -165,9 +183,54 @@ def restore_webhook():
                           "content_type": record["content_type"]})
     status, confirmed = gh("GET", "/app/hook/config", jwt)
     confirmed.pop("secret", None)
-    verified = status == 200 and confirmed.get("url") == record["url"]
-    return {"patch_status": patch_status, "verified_through_github": verified,
+    patch_succeeded = patch_status == 200
+    url_matches = status == 200 and confirmed.get("url") == record["url"]
+    content_type_matches = (
+        status == 200
+        and confirmed.get("content_type") == record["content_type"])
+    verified = patch_succeeded and url_matches and content_type_matches
+    return {"patch_status": patch_status,
+            "patch_succeeded": patch_succeeded,
+            "url_matches_original": url_matches,
+            "content_type_matches_original": content_type_matches,
+            "verified_through_github": verified,
             "matches_original": verified, "secret_touched": False}
+
+
+def cleanup_webhook_only(reason="workflow-always-step"):
+    """Restore only the App webhook; never inspect or mutate fixture refs."""
+    result = {
+        "reason": reason,
+        "at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "failures": [],
+        "fixture_cleanup_attempted": False,
+    }
+    if RECOVERY.is_file():
+        try:
+            result["webhook"] = restore_webhook()
+            if not result["webhook"].get("verified_through_github"):
+                result["failures"].append("webhook restoration not verified")
+        except Exception as exc:  # noqa: BLE001
+            result["webhook"] = {"restored": False,
+                                 "error": type(exc).__name__}
+            result["failures"].append(
+                f"webhook restore raised {type(exc).__name__}")
+    else:
+        result["webhook"] = {
+            "restored": None,
+            "verified_through_github": False,
+            "note": "no recovery record; no webhook mutation was attributed "
+                    "to this fresh process",
+        }
+    result["cleanup_passed"] = not result["failures"]
+    # The module-level ``finally`` always invokes cleanup().  Mark this
+    # process cleanup complete so that finalizer returns this exact result
+    # instead of falling through to fixture cleanup without its credential.
+    state["cleanup_done"] = True
+    state["cleanup_result"] = result
+    state["cleanup_ok"] = result["cleanup_passed"]
+    write("webhook-cleanup-verification-outer.json", result)
+    return result
 
 
 def cleanup(reason="normal"):
@@ -207,12 +270,21 @@ def cleanup(reason="normal"):
         try:
             token = FIXTURE_TOKEN or installation_token()
             st, pr = gh("GET", f"/repos/{REPO}/pulls/{number}", token, bearer=False)
-            if st == 200 and pr.get("merged"):
+            if st != 200:
+                result["failures"].append(
+                    f"reading PR #{number} before close: HTTP {st}")
+                continue
+            if pr.get("merged"):
                 result["failures"].append(f"fixture PR #{number} was MERGED")
-            gh("PATCH", f"/repos/{REPO}/pulls/{number}", token,
-               {"state": "closed",
-                "title": f"[E2E FIXTURE - DO NOT MERGE] metadata review {RUN}"},
-               bearer=False)
+            close_status, _ = gh(
+                "PATCH", f"/repos/{REPO}/pulls/{number}", token,
+                {"state": "closed",
+                 "title": f"[E2E FIXTURE - DO NOT MERGE] metadata review {RUN}"},
+                bearer=False)
+            if close_status != 200:
+                result["failures"].append(
+                    f"closing PR #{number}: HTTP {close_status}")
+                continue
             closed.append(number)
         except Exception as exc:  # noqa: BLE001
             result["failures"].append(f"closing PR #{number}: {type(exc).__name__}")
@@ -228,33 +300,47 @@ def cleanup(reason="normal"):
     swept, deleted, remaining = [], [], []
     if FIXTURE_TOKEN:
         try:
-            st, open_prs = gh("GET", f"/repos/{REPO}/pulls?state=open&per_page=100",
-                              FIXTURE_TOKEN, bearer=False)
-            for pr in (open_prs if st == 200 and isinstance(open_prs, list) else []):
+            open_prs = gh_list_all(
+                f"/repos/{REPO}/pulls?state=open", FIXTURE_TOKEN,
+                bearer=False)
+            for pr in open_prs:
                 ref = (pr.get("head") or {}).get("ref") or ""
                 if not ref.startswith("e2e/") or pr["number"] in closed:
                     continue
                 if pr.get("merged"):
                     result["failures"].append(f"fixture PR #{pr['number']} was MERGED")
-                gh("PATCH", f"/repos/{REPO}/pulls/{pr['number']}", FIXTURE_TOKEN,
-                   {"state": "closed"}, bearer=False)
+                close_status, _ = gh(
+                    "PATCH", f"/repos/{REPO}/pulls/{pr['number']}",
+                    FIXTURE_TOKEN, {"state": "closed"}, bearer=False)
+                if close_status != 200:
+                    result["failures"].append(
+                        f"closing swept PR #{pr['number']}: HTTP {close_status}")
+                    continue
                 swept.append(pr["number"])
         except Exception as exc:  # noqa: BLE001
             result["failures"].append(f"sweeping fixture PRs: {type(exc).__name__}")
         try:
-            st, refs = gh("GET", f"/repos/{REPO}/git/matching-refs/heads/e2e/",
-                          FIXTURE_TOKEN, bearer=False)
+            refs = gh_list_all(
+                f"/repos/{REPO}/git/matching-refs/heads/e2e/",
+                FIXTURE_TOKEN, bearer=False)
             found = [r["ref"].split("refs/heads/", 1)[1]
-                     for r in (refs if st == 200 and isinstance(refs, list) else [])]
+                     for r in refs]
             for name in sorted(set(found) | set(state.get("branches", []))):
                 dst, _ = gh("DELETE", f"/repos/{REPO}/git/refs/heads/{name}",
                             FIXTURE_TOKEN, bearer=False)
-                if dst in (204, 404, 422):
+                if dst == 204:
                     deleted.append(name)
-                else:
-                    remaining.append(name)
+                elif dst != 404:
                     result["failures"].append(
                         f"fixture branch {name} not deleted: HTTP {dst}")
+            post_cleanup_refs = gh_list_all(
+                f"/repos/{REPO}/git/matching-refs/heads/e2e/",
+                FIXTURE_TOKEN, bearer=False)
+            remaining = [r["ref"].split("refs/heads/", 1)[1]
+                         for r in post_cleanup_refs]
+            if remaining:
+                result["failures"].append(
+                    f"fixture branches remain after cleanup: {remaining}")
         except Exception as exc:  # noqa: BLE001
             result["failures"].append(
                 f"deleting fixture branches: {type(exc).__name__}")
@@ -262,6 +348,21 @@ def cleanup(reason="normal"):
         result["failures"].append(
             "no fixture token available to remove fixture branches")
     result["fixture_prs_swept"] = swept
+    try:
+        post_cleanup_prs = gh_list_all(
+            f"/repos/{REPO}/pulls?state=open", FIXTURE_TOKEN,
+            bearer=False) if FIXTURE_TOKEN else []
+        fixture_prs_remaining = [
+            pr["number"] for pr in post_cleanup_prs
+            if ((pr.get("head") or {}).get("ref") or "").startswith("e2e/")]
+        if fixture_prs_remaining:
+            result["failures"].append(
+                f"fixture PRs remain after cleanup: {fixture_prs_remaining}")
+    except Exception as exc:  # noqa: BLE001
+        fixture_prs_remaining = []
+        result["failures"].append(
+            f"verifying fixture PR cleanup: {type(exc).__name__}")
+    result["fixture_prs_remaining"] = fixture_prs_remaining
     result["fixture_branches_deleted"] = deleted
     result["fixture_branches_remaining"] = remaining
 
@@ -406,6 +507,10 @@ def run_variant(letter, *, dsn, owner, repo_name, token, mode, manifest_variant,
 
 # ----------------------------------------------------------------- main
 def main() -> int:
+    if WEBHOOK_RESTORE_ONLY:
+        result = cleanup_webhook_only()
+        print(json.dumps(result, indent=2, default=str))
+        return 0 if result.get("cleanup_passed") else 1
     if CLEANUP_ONLY:
         state["mutated"] = RECOVERY.is_file()
         result = cleanup("workflow-always-step")

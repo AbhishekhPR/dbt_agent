@@ -17,6 +17,26 @@ from pathlib import Path
 API = "https://api.github.com"
 REPOSITORY = "AbhishekhPR/relium-e2e-dbt"
 EPHEMERAL_PREFIXES = ("e2e/", "phase7-")
+REVIEWED_STALE_PULL_REQUESTS = {
+    2: "phase7-20260802-safe-shadow",
+    5: "phase7-20260802-safe-shadow-corrected",
+    6: "phase7-20260802-l02",
+    7: "phase7-20260802-l03",
+    8: "phase7-20260802-l04",
+    9: "phase7-20260802-l05",
+    10: "phase7-20260802-l06",
+    11: "phase7-20260802-l07",
+    12: "phase7-20260802-l09",
+    13: "phase7-20260802-l10",
+    14: "phase7-20260802-l11",
+    15: "phase7-20260802-l12",
+    16: "phase7-20260802-l13",
+    17: "phase7-20260802-l12-corrected",
+}
+REVIEWED_STALE_BRANCHES = frozenset({
+    *REVIEWED_STALE_PULL_REQUESTS.values(),
+    "phase7-20260802-l04-base",
+})
 EVIDENCE_DIR = Path(sys.argv[1])
 EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
 TOKEN = os.environ.get("RELIUM_E2E_FIXTURE_TOKEN", "")
@@ -52,17 +72,27 @@ def _is_ephemeral(branch: str) -> bool:
     return branch.startswith(EPHEMERAL_PREFIXES)
 
 
+def list_all(path: str, gh_fn=gh):
+    values = []
+    page = 1
+    while True:
+        separator = "&" if "?" in path else "?"
+        status, batch = gh_fn(
+            "GET", f"{path}{separator}per_page=100&page={page}")
+        require(status == 200 and isinstance(batch, list),
+                f"could not paginate {path}: HTTP {status}")
+        values.extend(batch)
+        if len(batch) < 100:
+            return values
+        page += 1
+
+
 def _open_pulls():
-    status, pulls = gh("GET", f"/repos/{REPOSITORY}/pulls?state=open&per_page=100")
-    require(status == 200 and isinstance(pulls, list),
-            f"could not list open fixture pull requests: HTTP {status}")
-    return pulls
+    return list_all(f"/repos/{REPOSITORY}/pulls?state=open")
 
 
 def _branches():
-    status, branches = gh("GET", f"/repos/{REPOSITORY}/branches?per_page=100")
-    require(status == 200 and isinstance(branches, list),
-            f"could not list fixture branches: HTTP {status}")
+    branches = list_all(f"/repos/{REPOSITORY}/branches")
     return [branch["name"] for branch in branches]
 
 
@@ -77,8 +107,21 @@ def main() -> int:
     require(default_branch == "main", "unexpected fixture default branch")
 
     pulls = _open_pulls()
-    targets = [pull for pull in pulls
-               if _is_ephemeral((pull.get("head") or {}).get("ref") or "")]
+    ephemeral_pulls = [pull for pull in pulls
+                       if _is_ephemeral((pull.get("head") or {}).get("ref") or "")]
+    unknown_pulls = []
+    targets = []
+    for pull in ephemeral_pulls:
+        head = pull.get("head") or {}
+        branch = head.get("ref") or ""
+        head_repository = (head.get("repo") or {}).get("full_name")
+        if (REVIEWED_STALE_PULL_REQUESTS.get(pull["number"]) != branch
+                or head_repository != REPOSITORY):
+            unknown_pulls.append({"number": pull["number"], "branch": branch})
+        else:
+            targets.append(pull)
+    require(not unknown_pulls,
+            f"unknown ephemeral pull requests require review: {unknown_pulls}")
     closed = []
     for pull in targets:
         number = pull["number"]
@@ -88,13 +131,18 @@ def main() -> int:
         closed.append(number)
 
     branches = _branches()
+    unknown_branches = [branch for branch in branches
+                        if (_is_ephemeral(branch)
+                            and branch not in REVIEWED_STALE_BRANCHES)]
+    require(not unknown_branches,
+            f"unknown ephemeral branches require review: {unknown_branches}")
     deleted = []
     for branch in branches:
-        if not _is_ephemeral(branch) or branch == default_branch:
+        if branch not in REVIEWED_STALE_BRANCHES or branch == default_branch:
             continue
         encoded = urllib.parse.quote(branch, safe="")
         status, _ = gh("DELETE", f"/repos/{REPOSITORY}/git/refs/heads/{encoded}")
-        require(status in (204, 404),
+        require(status == 204,
                 f"could not delete fixture branch {branch}: HTTP {status}")
         deleted.append(branch)
 
