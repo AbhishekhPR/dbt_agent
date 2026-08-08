@@ -35,7 +35,14 @@ REVIEWED_STALE_PULL_REQUESTS = {
 }
 REVIEWED_STALE_BRANCHES = frozenset({
     *REVIEWED_STALE_PULL_REQUESTS.values(),
+    # Closed DO-NOT-MERGE fixture PRs 18-21, plus merged fixture PRs 1 and 4.
+    "cl01-safe-change",
+    "final-cl01-safe",
+    "final-cl02-enforce",
+    "final-cl02-risky",
     "phase7-20260802-l04-base",
+    "relium-e2e-matrix",
+    "relium-manifest-sha-binding",
 })
 EVIDENCE_DIR = Path(sys.argv[1])
 EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
@@ -146,18 +153,16 @@ def main() -> int:
                 f"could not delete fixture branch {branch}: HTTP {status}")
         deleted.append(branch)
 
-    remaining_pull_requests = [
-        pull["number"] for pull in _open_pulls()
-        if _is_ephemeral((pull.get("head") or {}).get("ref") or "")]
+    remaining_pull_requests = [pull["number"] for pull in _open_pulls()]
     remaining_branches = [branch for branch in _branches()
-                          if _is_ephemeral(branch) and branch != default_branch]
+                          if branch != default_branch]
     require(not remaining_pull_requests,
-            f"ephemeral fixture PRs remain open: {remaining_pull_requests}")
+            f"fixture PRs remain open: {remaining_pull_requests}")
     require(not remaining_branches,
-            f"ephemeral fixture branches remain: {remaining_branches}")
+            f"fixture branches remain: {remaining_branches}")
 
     evidence = {
-        "evidence_type": "stale-ephemeral-fixture-cleanup",
+        "evidence_type": "stale-fixture-cleanup",
         "recorded_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "repository": REPOSITORY,
         "default_branch": default_branch,

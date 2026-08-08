@@ -705,6 +705,26 @@ class StaleFixtureCleanupHarnessTests(unittest.TestCase):
         self.assertIn("page += 1", source)
         self.assertIn("len(batch) < 100", source)
 
+    def test_reviewed_closed_fixture_branches_are_allowlisted(self):
+        source = _source(FIXTURE_CLEANUP)
+        for branch in (
+                "cl01-safe-change", "final-cl01-safe", "final-cl02-enforce",
+                "final-cl02-risky", "relium-e2e-matrix",
+                "relium-manifest-sha-binding"):
+            with self.subTest(branch=branch):
+                self.assertIn(f'"{branch}"', source)
+
+    def test_fixture_cleanup_requires_only_default_branch_to_remain(self):
+        source = _source(FIXTURE_CLEANUP)
+        self.assertIn("if branch != default_branch", source)
+        self.assertNotIn(
+            "if _is_ephemeral(branch) and branch != default_branch", source)
+
+    def test_fixture_cleanup_requires_no_open_pull_request_to_remain(self):
+        source = _source(FIXTURE_CLEANUP)
+        verification = source[source.index("remaining_pull_requests ="):]
+        self.assertNotIn("_is_ephemeral", verification)
+
     def test_fixture_inventory_pagination_reads_later_pages(self):
         with tempfile.TemporaryDirectory() as tmp:
             cleanup = _load_script(FIXTURE_CLEANUP, Path(tmp),
