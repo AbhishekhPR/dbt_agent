@@ -27,6 +27,7 @@ LIVE = E2E / "live_flow.py"
 VERIFY = E2E / "verify_flow.py"
 STAGES = E2E / "stages.py"
 WEBHOOK_RECOVERY = E2E / "webhook_recovery_e2e.py"
+FIXTURE_CLEANUP = E2E / "cleanup_stale_fixtures.py"
 WORKFLOW = Path(__file__).with_name(".github") / "workflows" / "metadata-review-e2e.yml"
 GOVERNANCE_WORKFLOW = (Path(__file__).with_name(".github") / "workflows" /
                        "governance-e2e.yml")
@@ -561,6 +562,41 @@ class WebhookRecoveryHarnessTests(unittest.TestCase):
         self.assertIn("webhook_recovery_e2e.py", commands)
         self.assertNotIn("governance_e2e.py", commands)
         self.assertIn("E2E LISTENER STILL UP", commands)
+
+
+class StaleFixtureCleanupHarnessTests(unittest.TestCase):
+    def test_cleanup_is_limited_to_ephemeral_fixture_prefixes(self):
+        source = _source(FIXTURE_CLEANUP)
+        self.assertIn('EPHEMERAL_PREFIXES = ("e2e/", "phase7-")', source)
+        self.assertIn('default_branch == "main"', source)
+        self.assertIn('branch != default_branch', source)
+
+    def test_cleanup_closes_without_merging_then_deletes_fixture_refs(self):
+        source = _source(FIXTURE_CLEANUP)
+        close = source.index('{"state": "closed"}')
+        delete = source.index('gh("DELETE"')
+        verify = source.index("remaining_pull_requests")
+        self.assertLess(close, delete)
+        self.assertLess(delete, verify)
+        self.assertNotIn('"merged": true', source.lower())
+
+    def test_fixture_cleanup_cannot_administer_the_app_webhook(self):
+        source = _source(FIXTURE_CLEANUP)
+        self.assertNotIn("/app/hook", source)
+        self.assertNotIn("app_jwt", source)
+        self.assertNotIn("RELIUM_GITHUB_PRIVATE_KEY", source)
+
+    def test_fixture_cleanup_workflow_receives_only_the_fixture_credential(self):
+        import yaml
+        doc = yaml.safe_load(_source(GOVERNANCE_WORKFLOW))
+        cleanup = doc["jobs"]["fixture-cleanup"]
+        commands = "\n".join(
+            str(step.get("run", "")) for step in cleanup["steps"])
+        serialized = json.dumps(cleanup)
+        self.assertIn("cleanup_stale_fixtures.py", commands)
+        self.assertIn("RELIUM_E2E_FIXTURE_TOKEN", serialized)
+        self.assertNotIn("RELIUM_E2E_PRIVATE_KEY", serialized)
+        self.assertNotIn("RELIUM_E2E_APP_ID", serialized)
 
 
 class ObservabilityTests(unittest.TestCase):

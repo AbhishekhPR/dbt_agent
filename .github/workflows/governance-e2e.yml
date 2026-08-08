@@ -19,7 +19,7 @@ on:
         required: true
         default: "governance"
         type: choice
-        options: [governance, recover-webhook]
+        options: [governance, recover-webhook, cleanup-fixtures]
       enforcement_mode:
         description: "Policy mode for the fixture review"
         required: true
@@ -262,4 +262,35 @@ jobs:
           path: |
             ${{ env.EVIDENCE_DIR }}/*.json
             ${{ env.EVIDENCE_DIR }}/*.log
+          if-no-files-found: error
+
+  fixture-cleanup:
+    if: inputs.operation == 'cleanup-fixtures'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      EVIDENCE_DIR: ${{ github.workspace }}/fixture-cleanup-evidence
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Close stale fixture PRs and delete ephemeral branches
+        env:
+          RELIUM_E2E_FIXTURE_TOKEN: ${{ secrets.RELIUM_E2E_FIXTURE_TOKEN }}
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          python scripts/e2e/cleanup_stale_fixtures.py "$EVIDENCE_DIR"
+
+      - name: Scan fixture-cleanup evidence for secrets
+        if: always()
+        run: |
+          python scripts/live_e2e/secret_scan.py "$EVIDENCE_DIR" || {
+            echo "SECRET SCAN FAILED - refusing to upload evidence"; exit 1; }
+
+      - name: Upload fixture-cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stale-fixture-cleanup
+          path: ${{ env.EVIDENCE_DIR }}/*.json
           if-no-files-found: error
