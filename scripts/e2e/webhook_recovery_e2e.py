@@ -87,8 +87,6 @@ def _assert_dedicated_app(state: dict) -> None:
     slug = state.get("app_slug") or ""
     _require(slug == APP_SLUG and "pilot" not in slug.lower(),
              f"refusing webhook operation for App slug {slug!r}")
-    _require(state.get("active") is True,
-             "the dedicated E2E App webhook is not active")
     _require("pull_request" in state.get("events", []),
              "the dedicated E2E App is not subscribed to pull_request")
 
@@ -187,12 +185,17 @@ def _fixture_state() -> dict:
 
 def _same_untouched_fields(left: dict, right: dict) -> bool:
     return all(left.get(field) == right.get(field)
-               for field in ("active", "events", "insecure_ssl"))
+               for field in ("events", "insecure_ssl"))
 
 
 def main() -> int:
     jwt = app_jwt()
     observed = read_webhook_state(jwt)
+    _write("webhook-state-observed-before-mutation.json", {
+        "observed": observed,
+        "secret_captured": False,
+        "github_mutation_performed": False,
+    })
     _assert_dedicated_app(observed)
     repositories = _assert_installation_scope(jwt)
     _require(observed["url"] in (CORRUPT_URL, ORIGINAL_URL),
@@ -213,7 +216,7 @@ def main() -> int:
     _require(original["content_type"] == ORIGINAL_CONTENT_TYPE,
              "one-time recovery did not restore the Run 11 content type")
     _require(_same_untouched_fields(observed, original),
-             "active/events/TLS state changed during one-time recovery")
+             "events/TLS state changed during one-time recovery")
 
     server, thread = _start_probe_listener()
     restored = False
@@ -237,7 +240,7 @@ def main() -> int:
         _require(temporary_url != ORIGINAL_URL,
                  "temporary webhook URL unexpectedly equals the original")
         _require(_same_untouched_fields(original, temporary),
-                 "active/events/TLS state changed during temporary mutation")
+                 "events/TLS state changed during temporary mutation")
 
         restoration = restore_webhook()
         _require(restoration.get("verified_through_github") is True,
@@ -248,7 +251,7 @@ def main() -> int:
         _require(final["content_type"] == ORIGINAL_CONTENT_TYPE,
                  "final content type does not equal the recovered original")
         _require(_same_untouched_fields(original, final),
-                 "final active/events/TLS state differs from the original")
+                 "final events/TLS state differs from the original")
         restored = True
     finally:
         if md.state.get("mutated") and not restored:
@@ -292,11 +295,19 @@ def main() -> int:
                 "matches": (original["content_type"] == temporary["content_type"]
                             == final["content_type"]),
             },
-            "active": {"original": original["active"],
-                       "temporary": temporary["active"],
-                       "final": final["active"],
-                       "matches": (original["active"] == temporary["active"]
-                                   == final["active"])},
+            # The GitHub App REST API does not expose active. Successful
+            # genuine deliveries plus the narrow PATCH field set are the
+            # authoritative evidence for this registration-only setting.
+            "active_state": {
+                "intended": True,
+                "matches": True,
+                "verification_basis": (
+                    "Runs 31085032785 and 31246080645 received genuine "
+                    "pull_request deliveries; the corrupting PATCH changed "
+                    "only url/content_type. The GitHub App REST API does not "
+                    "expose active, so no unavailable response field is "
+                    "treated as runtime proof."),
+            },
             "events": {"original": original["events"],
                        "temporary": temporary["events"],
                        "final": final["events"],

@@ -518,6 +518,23 @@ class WebhookRecoveryHarnessTests(unittest.TestCase):
             with self.subTest(required=required):
                 self.assertIn(required, source)
 
+    def test_active_state_uses_delivery_evidence_not_a_nonexistent_api_field(self):
+        source = _source(WEBHOOK_RECOVERY)
+        self.assertNotIn('state.get("active") is True', source)
+        self.assertIn('"active_state": {', source)
+        self.assertIn('"intended": True', source)
+        self.assertIn("REST API does not expose active", source)
+
+    def test_observed_state_is_written_before_any_mutation_gate(self):
+        source = _source(WEBHOOK_RECOVERY)
+        body = source[source.index("def main() -> int:"):]
+        observed = body.index(
+            '_write("webhook-state-observed-before-mutation.json"')
+        identity_gate = body.index("_assert_dedicated_app(observed)")
+        recovery_patch = body.index("_patch_webhook(")
+        self.assertLess(observed, identity_gate)
+        self.assertLess(identity_gate, recovery_patch)
+
     def test_recovery_creates_no_fixture_pull_request_or_branch(self):
         source = _source(WEBHOOK_RECOVERY)
         self.assertNotIn("create_fixture_pr", source)
