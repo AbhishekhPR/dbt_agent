@@ -60,6 +60,7 @@ class RecordingGitHubTransport:
 
     COMMENT_ID = 900001
     CHECK_RUN_ID = 800001
+    REVIEW_ID = 700001
 
     def __init__(self, path, *, app_id=424242):
         self.path = path
@@ -129,6 +130,10 @@ class RecordingGitHubTransport:
                 "app": {"id": self.app_id},
             }
             return dict(self._check), 200
+
+        if (method == "POST" and "/pulls/" in path
+                and path.endswith("/reviews")):
+            return {"id": self.REVIEW_ID, "state": "CHANGES_REQUESTED"}, 201
 
         return {}, 200
 

@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from agent.lifecycle_models import ALLOWED_TRANSITIONS
+from agent.metadata_evidence.change_request import normalize_remote_review_id
 from agent.postgres_migrate import apply_migrations
 
 OUTBOX_LEASE_SECONDS = 300
@@ -1213,11 +1214,14 @@ class PostgresLifecycleStore:
                                 failure_reason=None):
         """Mark a change request published or failed. Never both."""
         state = "FAILED" if failure_reason else "PUBLISHED"
+        normalized_remote_id = (
+            None if failure_reason else normalize_remote_review_id(remote_review_id)
+        )
         self.connection.execute(
             "UPDATE review_change_requests SET state=%s, remote_review_id=%s, "
             "failure_reason=%s, published_at=CASE WHEN %s='PUBLISHED' THEN now() END "
             "WHERE organization_id=%s AND repository_id=%s AND change_request_id=%s",
-            (state, str(remote_review_id) if remote_review_id else None,
+            (state, normalized_remote_id,
              failure_reason, state, organization_id, repository_id, change_request_id),
         )
         return self.get_change_request(organization_id, repository_id, change_request_id)

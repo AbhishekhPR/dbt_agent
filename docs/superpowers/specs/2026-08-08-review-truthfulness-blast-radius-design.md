@@ -10,7 +10,7 @@ This work has two ordered phases. Phase 1 makes the promoted `relium-app` review
 
 The visible review decision, findings, and evidence checks must all use `review.attempt`. The adapter selects the findings entry whose attempt equals that value and filters coverage rows to exactly the same attempt. It must not independently infer “latest” values from array position or maximum attempt.
 
-Finding counts and validation-check counts remain separate. Findings are counted by mapped finding severity. Checks are counted from the selected evidence-coverage rows. Every report location that says “checks passed” consumes the check count.
+Finding counts and evidence-evaluation counts remain separate. Findings are counted by mapped finding severity. Evidence rows are counted from the selected coverage attempt. Because `EVALUATED` means the evidence was available and evaluated—not that an individual validation passed—every report location uses “checks evaluated” and consumes the evaluation count.
 
 ### Primary reason
 

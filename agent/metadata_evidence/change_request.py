@@ -12,10 +12,32 @@ already includes. Nothing here broadens what Relium may do.
 from __future__ import annotations
 
 EVENT_TYPE = "review.change_request_submitted"
+PUBLICATION_IDENTITY_FAILURE = (
+    "publication identity missing; publication success cannot be verified"
+)
 
 
 class ChangeRequestError(RuntimeError):
     """Submission failed and should be retried."""
+
+
+def normalize_remote_review_id(value):
+    """Return a GitHub review identity as text, or reject it.
+
+    GitHub's JSON response currently supplies an integer. Digit strings are
+    accepted as well so persistence callers can round-trip the TEXT column
+    without changing the identity.
+    """
+    if isinstance(value, bool):
+        raise ValueError("remote_review_id must be a positive integer identity")
+    if isinstance(value, int):
+        if value > 0:
+            return str(value)
+        raise ValueError("remote_review_id must be a positive integer identity")
+    if (isinstance(value, str) and value.isascii() and value.isdigit()
+            and any(digit != "0" for digit in value)):
+        return value
+    raise ValueError("remote_review_id must be a positive integer identity")
 
 
 def _body_for(review, attempt, message):
@@ -91,7 +113,21 @@ def submit_change_request(store, *, organization_id, repository_id, environment,
                      "error": type(exc).__name__})
         raise ChangeRequestError(str(exc)) from None
 
-    remote_id = (result or {}).get("id")
+    candidate_id = result.get("id") if isinstance(result, dict) else None
+    try:
+        remote_id = normalize_remote_review_id(candidate_id)
+    except ValueError:
+        store.complete_change_request(
+            organization_id, repository_id, change_request_id,
+            failure_reason=PUBLICATION_IDENTITY_FAILURE)
+        store.append_audit(
+            organization_id, repository_id, actor="worker:change-request",
+            event_type="review.change_request_failed", reference_type="review",
+            reference_id=record["review_id"],
+            payload={"change_request_id": change_request_id,
+                     "error": "publication_identity_missing"})
+        raise ChangeRequestError(PUBLICATION_IDENTITY_FAILURE) from None
+
     store.complete_change_request(
         organization_id, repository_id, change_request_id, remote_review_id=remote_id)
     store.append_audit(

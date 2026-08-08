@@ -107,11 +107,42 @@ class SubmissionTests(unittest.TestCase):
         result = _run(store, publisher)
 
         self.assertTrue(result["published"])
-        self.assertEqual(result["remote_review_id"], 55501)
+        self.assertEqual(result["remote_review_id"], "55501")
         self.assertEqual(publisher.calls[0]["pull_number"], 101)
         self.assertEqual(store._record["state"], "PUBLISHED")
+        self.assertEqual(store._record["remote_review_id"], "55501")
         self.assertEqual(store.audit[0]["event_type"],
                          "review.change_request_published")
+
+    def test_a_digit_string_review_id_is_normalized_and_published(self):
+        store = _Store(RECORD, attempts=[ATTEMPT])
+
+        result = _run(store, _Publisher(review_id="0055501"))
+
+        self.assertTrue(result["published"])
+        self.assertEqual(result["remote_review_id"], "0055501")
+        self.assertEqual(store._record["remote_review_id"], "0055501")
+
+    def test_malformed_success_is_failed_and_raises_for_retry_semantics(self):
+        invalid_ids = (
+            None, "", "   ", True, False, 0, -1, {}, [], "review-7", "１２３"
+        )
+        expected = (
+            "publication identity missing; publication success cannot be verified"
+        )
+
+        for invalid_id in invalid_ids:
+            with self.subTest(remote_review_id=invalid_id):
+                store = _Store(RECORD, attempts=[ATTEMPT])
+
+                with self.assertRaisesRegex(ChangeRequestError, f"^{expected}$"):
+                    _run(store, _Publisher(review_id=invalid_id))
+
+                self.assertEqual(store._record["state"], "FAILED")
+                self.assertIsNone(store._record["remote_review_id"])
+                self.assertEqual(store._record["failure_reason"], expected)
+                self.assertEqual(store.audit[0]["event_type"],
+                                 "review.change_request_failed")
 
     def test_a_github_failure_is_recorded_and_not_reported_as_success(self):
         store = _Store(RECORD, attempts=[ATTEMPT])

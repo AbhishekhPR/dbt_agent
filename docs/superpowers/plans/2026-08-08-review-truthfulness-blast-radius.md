@@ -23,8 +23,8 @@
 - [ ] Run `npm test -- src/lib/adapter.test.js` and confirm each new assertion fails for the current first-item/latest-attempt behavior.
 - [ ] Add a shared backend-severity comparator and decision-aware primary-reason selector. Select findings and coverage by `review.attempt`, and expose `checkCounts` separately from finding `counts`.
 - [ ] Run `npm test -- src/lib/adapter.test.js` and confirm the adapter cases pass.
-- [ ] Add a failing component test that renders two findings and five passed checks and expects `2 findings · 5 checks passed`.
-- [ ] Run the focused component test and confirm it fails with `0 checks passed`.
+- [ ] Add a failing component test that renders two findings and five evaluated evidence checks and expects `2 findings · 5 checks evaluated`.
+- [ ] Run the focused component test and confirm it fails with `0 checks evaluated` or the old semantically incorrect passed wording.
 - [ ] Update `Findings.jsx` and `ChangeReport.jsx` to consume `change.checkCounts.passed`.
 - [ ] Run both focused frontend tests and confirm they pass.
 
