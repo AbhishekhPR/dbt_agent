@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import live_flow as lf                                        # noqa: E402
 import verify_flow as vf                                      # noqa: E402
-from live_flow import BASE_URL, ENVIRONMENT, StageFailure, local, poll  # noqa: E402
+from live_flow import ENVIRONMENT, StageFailure, local, poll  # noqa: E402
 from metadata_review_e2e import (                             # noqa: E402
     app_jwt, cleanup, gh, installation_token, issue_token, state,
 )
@@ -89,13 +89,18 @@ def main() -> int:
     expected_app_id = int(os.environ["RELIUM_GITHUB_APP_ID"])
 
     # ---- services, tunnel, webhook -----------------------------------
-    lf.start_api(state, str(REPO_ROOT), dsn, EV / "storage",
-                 os.environ["RELIUM_GITHUB_WEBHOOK_SECRET"],
-                 os.environ["RELIUM_GITHUB_APP_ID"],
-                 os.environ["RELIUM_GITHUB_PRIVATE_KEY_PATH"], EV / "api.log")
-    poll(lambda: _healthz(), timeout=120, description="API health")
+    storage = EV / f"relium-storage-{RUN}"
+    storage.mkdir(parents=True, exist_ok=True)
+    api_report = lf.start_api(
+        state, str(REPO_ROOT), dsn, storage,
+        os.environ["RELIUM_GITHUB_WEBHOOK_SECRET"],
+        os.environ["RELIUM_GITHUB_APP_ID"],
+        os.environ["RELIUM_GITHUB_PRIVATE_KEY_PATH"], EV / "api.log")
+    check("api_started", api_report.get("healthz") == 200, api_report)
     lf.start_worker(state, str(REPO_ROOT), dsn, EV / "worker.log")
-    tunnel_url = lf.start_tunnel(state, EV / "tunnel.log")
+    lf.start_tunnel(state, EV / "tunnel.log")
+    # start_tunnel returns a REPORT dict; the url is on state.
+    tunnel_url = state["tunnel"]["url"]
     lf.point_webhook(state, gh, app_jwt, tunnel_url)
     lf.verify_webhook(gh, app_jwt, tunnel_url)
     check("services_started", True, tunnel_url)
@@ -302,22 +307,18 @@ def _failure_semantics(dsn, review_id):
         store.close()
 
 
-def _healthz():
-    import urllib.request
-    try:
-        with urllib.request.urlopen(f"{BASE_URL}/healthz", timeout=3) as r:
-            return r.status == 200
-    except Exception:
-        return False
-
-
 if __name__ == "__main__":
     try:
         code = main()
     except Exception as exc:
+        # Print the traceback. The first run failed on a one-line
+        # AttributeError with no location, which cost a whole run to place.
+        import traceback
+        detail = traceback.format_exc()
         print(f"GOVERNANCE E2E FAILED: {type(exc).__name__}: {exc}", flush=True)
+        print(detail, flush=True)
         write("governance-e2e-failure.json",
               {"error": type(exc).__name__, "detail": str(exc)[:2000],
-               "checks": checks})
+               "traceback": detail[-4000:], "checks": checks})
         code = 1
     raise SystemExit(code)
