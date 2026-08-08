@@ -177,8 +177,8 @@ def main() -> int:
           str(author_app).startswith(os.environ.get("RELIUM_E2E_APP_SLUG", "relium-e2e")),
           f"author={author_app}")
     check("targets_the_correct_pull_request",
-          str(remote.get("pull_request_url", "")).endswith(f"/pulls/{pr['pr_number']}")
-          or True, remote.get("html_url"))
+          str(remote.get("pull_request_url", "")).endswith(f"/pulls/{pr['pr_number']}"),
+          f"{remote.get('pull_request_url')} (expected .../pulls/{pr['pr_number']})")
     check("ids_match", str(remote["id"]) == remote_review_id,
           f"github={remote['id']} local={remote_review_id}")
 
