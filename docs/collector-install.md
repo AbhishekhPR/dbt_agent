@@ -76,6 +76,21 @@ SHA-256 hash. Transfer it over a secure channel and clear it from shell history.
 
 ## 5. Install the collector
 
+Check the artifact before installing it. You are about to run this code
+against your warehouse, and the checksum is how you confirm the file you
+received is the file we built.
+
+| Artifact | SHA-256 |
+|---|---|
+| `relium-0.1.0-py3-none-any.whl` | `779efed43584ebd2eaffd60c4893468046259dc35047ca588d59205e96708343` |
+
+```bash
+sha256sum relium-0.1.0-py3-none-any.whl
+```
+
+If the digest does not match the table above, stop and contact your Relium
+contact. Do not install it.
+
 ```bash
 python -m venv /opt/relium/venv
 /opt/relium/venv/bin/pip install relium-0.1.0-py3-none-any.whl
@@ -86,6 +101,9 @@ Verify:
 ```bash
 /opt/relium/venv/bin/relium collect --help
 ```
+
+The wheel depends only on `click` and `psycopg`. If `pip` pulls anything
+beyond those and their own dependencies, you have the wrong artifact.
 
 ---
 
