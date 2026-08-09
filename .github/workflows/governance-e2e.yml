@@ -19,7 +19,7 @@ on:
         required: true
         default: "governance"
         type: choice
-        options: [governance, blast-radius, recover-webhook, cleanup-fixtures]
+        options: [governance, blast-radius, semantic-diff, recover-webhook, cleanup-fixtures]
       enforcement_mode:
         description: "Policy mode for the fixture review"
         required: true
@@ -365,6 +365,22 @@ jobs:
             ${{ env.EVIDENCE_DIR }}/*.sql
             ${{ env.EVIDENCE_DIR }}/*.sha256.txt
           if-no-files-found: error
+
+  # Dispatch-mechanics probe ONLY. It touches no webhook, no fixture branch and
+  # no PR, and uses no secret. It exists to answer one question before any
+  # harness is written: can workflow_dispatch run a NEW operation value at a
+  # feature ref while main still carries the old input definition? The real
+  # semantic-diff job replaces this once that is known.
+  semantic-diff:
+    if: inputs.operation == 'semantic-diff'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Report the ref this workflow definition came from
+        run: |
+          echo "operation input accepted at ref: ${{ github.ref }}"
+          echo "sha: ${{ github.sha }}"
+          echo "NO remote mutation performed by this probe."
 
   webhook-recovery:
     if: inputs.operation == 'recover-webhook'
