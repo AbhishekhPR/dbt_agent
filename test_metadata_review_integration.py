@@ -107,8 +107,17 @@ class MetadataReviewIntegrationTests(unittest.TestCase):
             store.ensure_tenant(self.org, self.repo, self.env)
             store.create_service_token(token_id, hash_secret(secret), self.org,
                                        self.repo, environment=self.env,
-                                       description="integration")
+                                       description="integration", scope="collector")
+        # The collector credential. It submits snapshots and claims work; it
+        # is deliberately not allowed to browse the dashboard.
         self.auth = {"Authorization": f"Bearer {presented}"}
+        read_id, read_secret, read_token = generate_token()
+        with self.pool.acquire() as store:
+            store.create_service_token(read_id, hash_secret(read_secret), self.org,
+                                       self.repo, environment=self.env,
+                                       description="integration-read",
+                                       scope="operator_read")
+        self.read_auth = {"Authorization": f"Bearer {read_token}"}
         self.base_manifest, self.head_manifest = _manifests()
 
     # -- helpers ---------------------------------------------------------
@@ -131,8 +140,10 @@ class MetadataReviewIntegrationTests(unittest.TestCase):
             headers["Idempotency-Key"] = key
         return self.client.post(path, json=body, headers=headers)
 
-    def _get(self, path):
-        return self.client.get(path, headers=self.auth)
+    def _get(self, path, *, collector=False):
+        """Dashboard reads by default; `collector=True` for the collector's own work."""
+        return self.client.get(path,
+                               headers=self.auth if collector else self.read_auth)
 
     def _snapshot_body(self, outcome, *, columns=None, observed_at=None,
                        completeness="COMPLETE", ttl_seconds=3600, **overrides):
@@ -545,7 +556,7 @@ class MetadataReviewIntegrationTests(unittest.TestCase):
 
     def test_collector_can_poll_and_acknowledge_its_request(self):
         outcome = self._begin()
-        listing = self._get("/api/collection-requests")
+        listing = self._get("/api/collection-requests", collector=True)
         self.assertEqual(listing.status_code, 200)
         ids = [r["request_id"] for r in listing.json()["requests"]]
         self.assertIn(outcome.request_id, ids)

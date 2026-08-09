@@ -84,15 +84,28 @@ class TenantIsolationSecurityTests(unittest.TestCase):
     def _tenant(self, org, repo):
         from agent.api.auth import generate_token, hash_secret
 
-        token_id, secret, presented = generate_token()
+        # Two machine credentials per tenant. A machine no longer has one
+        # undifferentiated capability: `operator_read` reads the dashboard
+        # resources, `collector` submits pipeline events. Both are scoped to
+        # this tenant, so what these tests prove — that one tenant cannot
+        # reach another's data — is unchanged.
+        read_id, read_secret, read_token = generate_token()
+        ingest_id, ingest_secret, ingest_token = generate_token()
         with self.pool.acquire() as store:
             store.ensure_tenant(org, repo, "prod")
-            store.create_service_token(token_id, hash_secret(secret), org, repo,
-                                       environment="prod", description="security-suite")
-        return {"org": org, "repo": repo, "auth": {"Authorization": f"Bearer {presented}"}}
+            store.create_service_token(read_id, hash_secret(read_secret), org, repo,
+                                       environment="prod", description="security-suite",
+                                       scope="operator_read")
+            store.create_service_token(ingest_id, hash_secret(ingest_secret), org, repo,
+                                       environment="prod", description="security-suite",
+                                       scope="collector")
+        return {"org": org, "repo": repo,
+                "auth": {"Authorization": f"Bearer {read_token}"},
+                "ingest_auth": {"Authorization": f"Bearer {ingest_token}"}}
 
     def _post(self, path, body, tenant, key=None):
-        headers = dict(tenant["auth"])
+        # Ingestion is machine work and carries the collector credential.
+        headers = dict(tenant["ingest_auth"])
         headers["Idempotency-Key"] = key or uuid.uuid4().hex
         return self.client.post(path, json=body, headers=headers)
 
