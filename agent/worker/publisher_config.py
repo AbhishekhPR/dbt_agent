@@ -22,28 +22,33 @@ import os
 logger = logging.getLogger("relium.worker.publisher")
 
 
-def _read_private_key(path):
-    with open(path, "r", encoding="utf-8") as handle:
-        return handle.read()
-
-
 def build_publisher_factory(environ=None):
     """Return a factory(organization_id, repository_id, environment) -> publisher.
 
     Returns None when the GitHub App is not configured, which leaves the
     handlers on their existing 'nothing was attempted' path.
     """
+    from agent.github_app.private_key import (
+        INLINE_VAR, PATH_VAR, PrivateKeyError, resolve_private_key,
+    )
+
     values = os.environ if environ is None else environ
     app_id = (values.get("RELIUM_GITHUB_APP_ID") or "").strip()
-    key_path = (values.get("RELIUM_GITHUB_PRIVATE_KEY_PATH") or "").strip()
-    if not app_id or not key_path:
+    has_key = bool((values.get(INLINE_VAR) or "").strip()
+                   or (values.get(PATH_VAR) or "").strip())
+    if not app_id or not has_key:
         logger.info("worker_publisher_not_configured",
                     extra={"operation": "publisher_config"})
         return None
-    if not os.path.isfile(key_path):
-        # Fail loudly rather than silently degrading to "nothing published".
-        raise RuntimeError(
-            "RELIUM_GITHUB_PRIVATE_KEY_PATH does not name a readable file")
+
+    # The worker signs its own App JWTs, so it resolves the key by the same
+    # rule as the API. Validated once here at startup: a key that cannot sign
+    # must stop the worker, not silently degrade every publication to
+    # "nothing was attempted".
+    try:
+        private_key_pem, _source = resolve_private_key(values)
+    except PrivateKeyError as exc:
+        raise RuntimeError(str(exc)) from None
 
     configured_installation = (values.get("RELIUM_GITHUB_INSTALLATION_ID")
                                or values.get("RELIUM_E2E_INSTALLATION_ID") or "").strip()
@@ -56,7 +61,7 @@ def build_publisher_factory(environ=None):
         from agent.github_app.slack import SlackPublicationSink
         from agent.metadata_evidence.publishers import GitHubSlackPublisher
 
-        jwt = create_app_jwt(app_id, _read_private_key(key_path))
+        jwt = create_app_jwt(app_id, private_key_pem)
         anonymous = GitHubClient()
 
         installation_id = configured_installation

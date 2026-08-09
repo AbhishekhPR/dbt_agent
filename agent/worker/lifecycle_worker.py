@@ -327,6 +327,18 @@ def main(argv=None):
         configure_publisher(factory)
         logger.info("worker_publisher_configured",
                     extra={"operation": "startup"})
+    elif str(os.environ.get("RELIUM_WORKER_REQUIRE_PUBLISHER", "")).strip().lower() \
+            in {"1", "true", "yes", "on"}:
+        # A worker with no publisher still runs, and still records honestly
+        # that nothing was published — which is the right behaviour for a
+        # local run and the wrong one for a deployment, where it means every
+        # request-changes review is queued and silently never delivered.
+        # Production sets this so the mistake is a failed boot, not a quiet
+        # backlog nobody looks at.
+        print("RELIUM_WORKER_REQUIRE_PUBLISHER is set but the GitHub App is not "
+              "configured: set RELIUM_GITHUB_APP_ID and a private key",
+              file=sys.stderr)
+        return 2
 
     worker = build_worker(dsn, poll_seconds=args.poll_seconds,
                           max_attempts=args.max_attempts,

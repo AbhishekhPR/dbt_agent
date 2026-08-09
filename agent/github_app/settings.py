@@ -5,6 +5,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agent.github_app.private_key import PATH_VAR
+
 
 class SettingsError(ValueError):
     """Raised when server configuration is missing or unsafe."""
@@ -14,7 +16,7 @@ class SettingsError(ValueError):
 class GitHubAppSettings:
     app_id: int
     webhook_secret: str = field(repr=False)
-    private_key_path: Path = field(repr=False)
+    private_key_path: Path | None = field(repr=False)
     private_key: bytes = field(repr=False)
     storage_root: Path
     worker_count: int = 2
@@ -74,18 +76,21 @@ def load_settings(environ: Mapping[str, str] | None = None) -> GitHubAppSettings
     values = os.environ if environ is None else environ
     app_id = _integer(values, "RELIUM_GITHUB_APP_ID", minimum=1)
     webhook_secret = _required(values, "RELIUM_GITHUB_WEBHOOK_SECRET")
-    private_key_path = _resolved_path(
-        _required(values, "RELIUM_GITHUB_PRIVATE_KEY_PATH"),
-        "RELIUM_GITHUB_PRIVATE_KEY_PATH",
-    )
+
+    # The key may arrive inline from a secret manager or as a file on disk.
+    # One rule, in agent/github_app/private_key.py, and it is enforced here so
+    # a malformed key stops the process at boot rather than at the first
+    # webhook. The message names the variable, never the value.
+    from agent.github_app.private_key import PrivateKeyError, resolve_private_key
+
     try:
-        private_key = private_key_path.read_bytes()
-    except OSError:
-        raise SettingsError(
-            "RELIUM_GITHUB_PRIVATE_KEY_PATH must name a readable file."
-        ) from None
-    if not private_key:
-        raise SettingsError("RELIUM_GITHUB_PRIVATE_KEY_PATH must not be empty.")
+        private_key, private_key_source = resolve_private_key(values)
+    except PrivateKeyError as exc:
+        raise SettingsError(str(exc)) from None
+    private_key_path = (
+        Path(values[PATH_VAR]).expanduser()
+        if private_key_source == PATH_VAR else None
+    )
 
     storage_root = _resolved_path(
         _required(values, "RELIUM_STORAGE_ROOT"), "RELIUM_STORAGE_ROOT"
