@@ -31,6 +31,7 @@ import re
 import signal
 import sys
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1018,6 +1019,188 @@ def prepare_case(case: str, main_files: dict[str, str]) -> dict:
             "model_identities": identities}
 
 
+# -- per-case review verification -----------------------------------------
+#
+# Run 31330824658 created both PRs and exported an empty database: the driver
+# never waited for a review and never called its own assertion functions. A
+# fixture-creation driver that reaches cleanup is indistinguishable from a
+# passing E2E, which is exactly the failure this section exists to prevent.
+
+#: Bounded so a stalled runner fails with diagnostics instead of hanging.
+DELIVERY_TIMEOUT = 240
+REVIEW_TIMEOUT = 240
+ATTEMPT_TIMEOUT = 240
+
+
+def verify_case_delivery(since_utc: str, pr_number: int, head_sha: str) -> dict:
+    """Prove GitHub delivered *this case's* pull_request event, accepted 202.
+
+    `vf.verify_genuine_webhook` proves a delivery was accepted but does not
+    bind it to a pull request. With two PRs in one run that is not enough --
+    the BLOCK case could be satisfied by the ALLOW delivery. So the accepted
+    delivery is then re-read and its payload matched to the exact PR number
+    and head SHA.
+    """
+    delivery = vf.verify_genuine_webhook(GH, APP_JWT, since_utc, pr_number)
+    delivery_id = delivery.get("id") if isinstance(delivery, dict) else None
+    if delivery_id is None:
+        raise StageFailure(
+            f"accepted delivery for PR #{pr_number} carried no id to correlate")
+    status, detail = GH("GET", f"/app/hook/deliveries/{delivery_id}", APP_JWT())
+    if status != 200 or not isinstance(detail, dict):
+        raise StageFailure(
+            f"cannot read delivery {delivery_id} for PR #{pr_number}: HTTP {status}")
+    payload = ((detail.get("request") or {}).get("payload")
+               if isinstance(detail.get("request"), dict) else None) or {}
+    pull = payload.get("pull_request") or {}
+    delivered_number = pull.get("number")
+    delivered_head = ((pull.get("head") or {}).get("sha")
+                      if isinstance(pull.get("head"), dict) else None)
+    if delivered_number != pr_number or delivered_head != head_sha:
+        raise StageFailure(
+            f"delivery {delivery_id} is for PR #{delivered_number} at "
+            f"{str(delivered_head)[:12]}, not PR #{pr_number} at {head_sha[:12]}")
+    return {"delivery_id": delivery_id, "pull_number": delivered_number,
+            "head_sha": delivered_head, "status_code": delivery.get("status_code"),
+            "event": delivery.get("event"), "correlated": True}
+
+
+def _review_diagnostics(dsn: str, pr_number: int, base_sha: str,
+                        head_sha: str, delivery: dict) -> dict:
+    """Everything needed to tell "never delivered" from "never reviewed"."""
+    rows = []
+    try:
+        store = vf._store(dsn)
+        try:
+            found = store.connection.execute(
+                "SELECT review_id, attempt, pull_number, base_sha, head_sha, "
+                "lifecycle_state, decision FROM reviews "
+                "WHERE organization_id=%s AND repository_id=%s",
+                (OWNER, REPO_NAME)).fetchall()
+            rows = [dict(row) for row in found]
+        finally:
+            store.close()
+    except Exception as exc:  # noqa: BLE001
+        rows = [{"error": type(exc).__name__}]
+    return {"pull_number": pr_number, "base_sha": base_sha, "head_sha": head_sha,
+            "delivery_observed": delivery,
+            "reviews_for_repository": rows,
+            "lifecycle_states_observed": sorted(
+                {str(row.get("lifecycle_state")) for row in rows
+                 if isinstance(row, dict)})}
+
+
+def wait_for_decided_attempt(dsn: str, review_id: str, attempt: int) -> dict:
+    """Wait until the attempt row carries a durable decision.
+
+    A row can exist before the manifest review path has written its verdict.
+    Reading it early would show decision NULL, and treating NULL as a result
+    would let the E2E report a decision the product never made.
+    """
+    def decided():
+        store = vf._store(dsn)
+        try:
+            rows = store.connection.execute(
+                "SELECT * FROM review_attempts WHERE organization_id=%s AND "
+                "repository_id=%s AND review_id=%s AND attempt=%s",
+                (OWNER, REPO_NAME, review_id, attempt)).fetchall()
+            if not rows:
+                return None
+            row = dict(rows[0])
+            # decision and health are written together by the review path;
+            # semantic_evidence NULL means the comparison did not run, which
+            # is a real outcome the assertions must be allowed to see.
+            if row.get("decision") is None or row.get("health") is None:
+                return None
+            return row
+        finally:
+            store.close()
+
+    return lf.poll(decided, timeout=ATTEMPT_TIMEOUT, interval=4,
+                   description=(f"a decided review_attempts row for {review_id} "
+                                f"attempt {attempt}"))
+
+
+def persisted_case_view(row: dict) -> tuple[dict, dict]:
+    """Build the incident/evidence pair the assertions expect, from PostgreSQL.
+
+    Nothing is synthesised: every value comes from the persisted attempt.
+    """
+    payload = row.get("payload")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    comparison = ((payload.get("metadata") or {}).get("manifest_comparison")
+                  if isinstance(payload.get("metadata"), dict) else None)
+    comparison = comparison if isinstance(comparison, dict) else {}
+    incident = {
+        "decision": row.get("decision"),
+        "health": row.get("health"),
+        "metadata": {"manifest_comparison": {
+            "material_sql_changes": comparison.get("material_sql_changes") or []}},
+    }
+    evidence = row.get("semantic_evidence")
+    if isinstance(evidence, str):
+        try:
+            evidence = json.loads(evidence)
+        except json.JSONDecodeError:
+            evidence = None
+    return incident, (evidence if isinstance(evidence, dict) else {})
+
+
+def verify_case(dsn: str, case: str, pr_number: int, base_sha: str,
+                head_sha: str, since_utc: str) -> dict:
+    """Prove one case end to end, from GitHub delivery to persisted verdict."""
+    delivery = verify_case_delivery(since_utc, pr_number, head_sha)
+    try:
+        review = vf.verify_postgres_review(dsn, OWNER, REPO_NAME, head_sha, base_sha)
+    except StageFailure as exc:
+        diagnostics = _review_diagnostics(dsn, pr_number, base_sha, head_sha, delivery)
+        _write(f"semantic-diff-{case}-review-timeout.json", diagnostics)
+        raise StageFailure(
+            f"{case}: no persisted review for PR #{pr_number} "
+            f"head {head_sha[:12]}: {exc}. Diagnostics: "
+            f"{json.dumps(diagnostics, default=str)[:1200]}") from exc
+    try:
+        row = wait_for_decided_attempt(dsn, review["review_id"], review["attempt"])
+    except StageFailure as exc:
+        diagnostics = _review_diagnostics(dsn, pr_number, base_sha, head_sha, delivery)
+        diagnostics["review"] = review
+        _write(f"semantic-diff-{case}-attempt-timeout.json", diagnostics)
+        raise StageFailure(
+            f"{case}: review {review['review_id']} attempt {review['attempt']} "
+            f"never reached a decision: {exc}. Diagnostics: "
+            f"{json.dumps(diagnostics, default=str)[:1200]}") from exc
+
+    incident, evidence = persisted_case_view(row)
+    assertion = (assert_block_expectations if case == "block"
+                 else assert_allow_expectations)
+    verdict = assertion(incident, evidence)
+    record = {
+        "case": case, "pull_number": pr_number,
+        "base_sha": base_sha, "head_sha": head_sha,
+        "review_id": review["review_id"], "attempt": review["attempt"],
+        "lifecycle_state": row.get("lifecycle_state"),
+        "decision": incident["decision"], "health": incident["health"],
+        "semantic_evidence_status": evidence.get("status"),
+        "semantic_changes": semantic_changes(evidence),
+        "material_sql_changes":
+            len(incident["metadata"]["manifest_comparison"]["material_sql_changes"]),
+        "genuine_delivery": delivery,
+        "assertion": verdict,
+    }
+    if not verdict["passed"]:
+        _write(f"semantic-diff-{case}-failed.json", record)
+        raise StageFailure(
+            f"{case} case assertions failed against persisted state: "
+            f"{verdict['failures']}")
+    _write(f"semantic-diff-{case}-verified.json", record)
+    return record
+
+
 def main() -> int:
     if CLEANUP_ONLY:
         result = cleanup("workflow-always-step")
@@ -1051,7 +1234,9 @@ def main() -> int:
         GH, REPO, FIXTURE_TOKEN, default_sha,
         required_models=("fct_orders", "int_customer_orders"))
 
-    outcomes = []
+    # Each case is proven before the next begins. Creating both PRs and then
+    # cleaning up is what let run 31330824658 export an empty database.
+    verified = []
     for case in CASES:
         prepared = prepare_case(case, main_files)
         base_branch, head_branch = case_branches(RUN, case)
@@ -1063,18 +1248,35 @@ def main() -> int:
         commit_file(head_branch, prepared["changed_path"],
                     prepared["head_files"][prepared["changed_path"]],
                     f"relium semantic e2e {case} head")
+        # Captured before the PR so the delivery search cannot match an
+        # earlier case's event; correlation to this exact PR follows.
+        since = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+        head_sha = _load_recovery()["owned_branch_heads"][head_branch]
         number = open_pull(
             case, head_branch, base_branch,
             f"Relium semantic {case} fixture {RUN}",
             "Automated Relium semantic Before/After E2E fixture. Do not merge.")
-        outcomes.append({"case": case, "pr_number": number,
-                         "model_identities": prepared["model_identities"]})
-    _write("semantic-diff-fixtures.json", outcomes)
+        record = verify_case(dsn, case, number, base_head, head_sha, since)
+        record["model_identities"] = prepared["model_identities"]
+        verified.append(record)
 
-    result = {"preserved": preserved, "webhook": webhook, "cases": outcomes,
+    # Written only now: a case counts as completed once its assertions have
+    # passed against persisted PostgreSQL state, never because a PR exists.
+    result = {"preserved": preserved, "webhook": webhook, "cases": verified,
               "browser": "NOT_RUN"}
     _write("semantic-diff-run.json", result)
-    return 0 if cleanup("normal").get("cleanup_passed") else 1
+    print(json.dumps({case["case"]: {
+        "review_id": case["review_id"], "attempt": case["attempt"],
+        "decision": case["decision"], "health": case["health"],
+        "semantic_changes": len(case["semantic_changes"])} for case in verified},
+        indent=2, sort_keys=True))
+
+    outcome = cleanup("normal")
+    if not outcome.get("cleanup_passed"):
+        # Never a silent exit code: run 31330824658 failed this way and the
+        # log showed nothing but "exit code 1".
+        raise StageFailure(f"cleanup failed: {outcome.get('failures')}")
+    return 0
 
 
 def _changed_files(main_files: dict[str, str],
