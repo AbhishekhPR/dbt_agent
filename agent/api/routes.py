@@ -18,6 +18,11 @@ from starlette.routing import Route
 
 from agent.api.collector_routes import COLLECTOR_ROUTES, build_handlers
 from agent.api.auth import AuthenticationError, AuthorizationError, ServiceTokenAuthenticator, bearer_token
+from agent.api.authorization import (
+    COLLECTION_REQUEST_READ, COLLECTOR_INGEST, DASHBOARD_READ, GOVERNANCE_WRITE,
+    PIPELINE_INGEST, CapabilityError, authorize,
+)
+from agent.api.sessions import CSRF_HEADER, SESSION_COOKIE, SessionError
 from agent.api.service import (
     ConflictError,
     LifecycleService,
@@ -104,14 +109,110 @@ class _HttpError(Exception):
         self.payload = payload
 
 
-def create_api_routes(*, store_pool, authenticator_factory=None):
-    """Build the /api route table. Registration stays explicit and inspectable."""
+# What each collector-surface route is for, decided per route rather than by
+# HTTP verb. Only `get_collection_request` is reachable by both a person and a
+# machine, because the collector reads the request it is about to satisfy and
+# the dashboard shows the operator what was asked for.
+_COLLECTOR_CAPABILITY = {
+    "list_collection_requests": COLLECTOR_INGEST,
+    "get_collection_request": COLLECTION_REQUEST_READ,
+    "acknowledge_collection_request": COLLECTOR_INGEST,
+    "report_collection_failure": COLLECTOR_INGEST,
+    "submit_snapshot": COLLECTOR_INGEST,
+    "register_collector": COLLECTOR_INGEST,
+    # Read by the dashboard only; the collector never asks for these.
+    "get_snapshot_status": DASHBOARD_READ,
+    "get_review_evidence_coverage": DASHBOARD_READ,
+}
 
-    def _authenticate(request, store):
-        authenticator = (authenticator_factory or ServiceTokenAuthenticator)(store)
-        return authenticator.authenticate(bearer_token(request.headers.get("Authorization")))
 
-    def handler(fn, *, write: bool):
+def _governance_actor(body, principal) -> str:
+    """The identity recorded against a governance action.
+
+    It comes from the authenticated session and nowhere else. This used to be
+    ``optional_str(body, "actor") or "dashboard"``, so the audit trail recorded
+    whatever the caller typed — which made every exception approval
+    unattributable, and let one person's action be filed under another's name.
+
+    A body that still supplies ``actor`` is rejected rather than ignored. A
+    caller trying to set it is either running against the old contract or
+    trying to forge attribution, and both deserve an error instead of a
+    silently different outcome.
+    """
+    if isinstance(body, dict) and "actor" in body:
+        raise ValidationError(
+            "'actor' is not accepted: the actor is taken from the "
+            "authenticated session", field="actor")
+    actor = getattr(principal, "actor", None)
+    if not actor:
+        raise AuthorizationError("this credential has no human actor")
+    return actor
+
+
+def create_api_routes(*, store_pool, authenticator_factory=None,
+                      session_manager=None, allowed_origins=()):
+    """Build the /api route table. Registration stays explicit and inspectable.
+
+    Every route declares the capability it needs. Authentication answers *who*
+    is calling — a GitHub-authenticated person or a machine token — and
+    ``authorize`` answers whether that principal may do this. The two were
+    previously the same question, which is how a token compiled into the
+    dashboard's JavaScript ended up able to approve governance exceptions.
+    """
+    allowed_origins = tuple(allowed_origins or ())
+
+    def _authenticate(request, store, capability, *, mutating):
+        """Resolve the caller into a principal, or refuse.
+
+        A session cookie and a bearer token are different kinds of caller and
+        are never merged: whichever is presented is the one evaluated, and the
+        capability decides whether that kind is acceptable here.
+        """
+        session_id = request.cookies.get(SESSION_COOKIE) if session_manager else None
+        if session_id:
+            if mutating:
+                _require_csrf(request, store, session_id)
+            try:
+                principal = session_manager.authenticate(
+                    store, session_id,
+                    # A governance write re-verifies with GitHub rather than
+                    # trusting the permission recorded at sign-in.
+                    require_fresh_permission=(capability is GOVERNANCE_WRITE))
+            except SessionError as exc:
+                raise AuthenticationError(str(exc)) from None
+        else:
+            authenticator = (authenticator_factory or ServiceTokenAuthenticator)(store)
+            principal = authenticator.authenticate(
+                bearer_token(request.headers.get("Authorization")))
+
+        try:
+            authorize(principal, capability)
+        except CapabilityError as exc:
+            raise _HttpError(403, {"status": "forbidden", "detail": str(exc)}) from None
+        return principal
+
+    def _require_csrf(request, store, session_id):
+        """Cookie-authenticated mutations need an origin and a bound token.
+
+        SameSite is not relied on alone: the dashboard and the API share a
+        registrable domain, so a sibling subdomain would be same-site.
+        """
+        origin = request.headers.get("Origin")
+        if allowed_origins:
+            if not origin:
+                raise _HttpError(403, {"status": "forbidden",
+                                       "detail": "Origin header is required"})
+            if origin not in allowed_origins:
+                raise _HttpError(403, {"status": "forbidden",
+                                       "detail": "origin is not allowed"})
+        if not session_manager.verify_csrf(
+                store, session_id, request.headers.get(CSRF_HEADER)):
+            raise _HttpError(403, {"status": "forbidden",
+                                   "detail": "missing or invalid CSRF token"})
+
+    def handler(fn, *, write: bool, capability=None):
+        capability = capability or (GOVERNANCE_WRITE if write else DASHBOARD_READ)
+
         async def wrapped(request):
             request_id = _request_id(request)
             body = None
@@ -121,7 +222,8 @@ def create_api_routes(*, store_pool, authenticator_factory=None):
 
                 def work():
                     with store_pool.acquire() as store:
-                        scope = _authenticate(request, store)
+                        scope = _authenticate(request, store, capability,
+                                              mutating=write)
                         service = LifecycleService(store)
                         return fn(request, body, scope, service)
 
@@ -436,7 +538,7 @@ def create_api_routes(*, store_pool, authenticator_factory=None):
         if len(message.strip()) < 3:
             raise ValidationError(
                 "'message' must say what needs to change", field="message")
-        actor = optional_str(body, "actor") or "dashboard"
+        actor = _governance_actor(body, scope)
         attempt = int(record.get("attempt") or 1)
 
         change_request_id = f"cr-{review_id}-{attempt}"
@@ -515,7 +617,7 @@ def create_api_routes(*, store_pool, authenticator_factory=None):
             raise ValidationError(
                 "'reason' is required: an override without a stated reason "
                 "cannot be audited", field="reason")
-        actor = optional_str(body, "actor") or "dashboard"
+        actor = _governance_actor(body, scope)
         scope_value = optional_choice(body, "scope", {"attempt", "review"}) or "attempt"
         attempt = body.get("attempt")
         attempt = int(attempt) if isinstance(attempt, int) else int(record.get("attempt") or 1)
@@ -563,7 +665,7 @@ def create_api_routes(*, store_pool, authenticator_factory=None):
             raise NotFoundError("unknown exception")
 
         reason = require_str(body, "reason")
-        actor = optional_str(body, "actor") or "dashboard"
+        actor = _governance_actor(body, scope)
         if existing["state"] == "revoked":
             return 200, {"status": "already_revoked", "review_id": review_id,
                          **_exception_view(existing)}
@@ -905,15 +1007,15 @@ def create_api_routes(*, store_pool, authenticator_factory=None):
     _collector = build_handlers()
 
     routes = [
-        Route("/api/deployments/events", handler(post_deployment_event, write=True), methods=["POST"]),
-        Route("/api/monitoring/baselines", handler(post_baseline, write=True), methods=["POST"]),
-        Route("/api/monitoring/observations", handler(post_observation, write=True), methods=["POST"]),
+        Route("/api/deployments/events", handler(post_deployment_event, write=True, capability=PIPELINE_INGEST), methods=["POST"]),
+        Route("/api/monitoring/baselines", handler(post_baseline, write=True, capability=PIPELINE_INGEST), methods=["POST"]),
+        Route("/api/monitoring/observations", handler(post_observation, write=True, capability=PIPELINE_INGEST), methods=["POST"]),
         Route("/api/anomalies", handler(list_anomalies, write=False), methods=["GET"]),
-        Route("/api/anomalies", handler(post_anomaly, write=True), methods=["POST"]),
+        Route("/api/anomalies", handler(post_anomaly, write=True, capability=PIPELINE_INGEST), methods=["POST"]),
         Route("/api/incidents", handler(list_incidents, write=False), methods=["GET"]),
-        Route("/api/incidents", handler(post_incident_rca, write=True), methods=["POST"]),
+        Route("/api/incidents", handler(post_incident_rca, write=True, capability=PIPELINE_INGEST), methods=["POST"]),
         Route("/api/reviews", handler(list_reviews, write=False), methods=["GET"]),
-        Route("/api/reviews", handler(post_review, write=True), methods=["POST"]),
+        Route("/api/reviews", handler(post_review, write=True, capability=PIPELINE_INGEST), methods=["POST"]),
         Route("/api/reviews/{review_id}", handler(get_review, write=False), methods=["GET"]),
         Route("/api/reviews/{review_id}/rerun",
               handler(rerun_review, write=True), methods=["POST"]),
@@ -952,7 +1054,10 @@ def create_api_routes(*, store_pool, authenticator_factory=None):
         # Collector control and metadata snapshot surface. Registered on the
         # same application, behind the same authentication and tenant scoping.
         *[
-            Route(path, handler(_collector[name], write=write), methods=[method])
+            Route(path,
+                  handler(_collector[name], write=write,
+                          capability=_COLLECTOR_CAPABILITY[name]),
+                  methods=[method])
             for method, path, name, write in COLLECTOR_ROUTES
         ],
     ]

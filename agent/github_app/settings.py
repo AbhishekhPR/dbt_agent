@@ -42,6 +42,33 @@ class GitHubAppSettings:
     # CORS middleware at all, which is the default and the safe one.
     cors_allowed_origins: tuple[str, ...] = ()
 
+    # Dashboard sign-in through the GitHub App's user-to-server flow. All of
+    # these must be present together or the dashboard has no login and the
+    # /auth routes are not registered at all — a half-configured login is
+    # worse than none, because it looks like a boundary and is not one.
+    github_client_id: str | None = field(default=None, repr=False)
+    github_client_secret: str | None = field(default=None, repr=False)
+    session_encryption_key: bytes | None = field(default=None, repr=False)
+    dashboard_url: str | None = None
+    public_url: str | None = None
+    dashboard_organization: str | None = None
+    dashboard_repository: str | None = None
+    secure_cookies: bool = True
+
+    @property
+    def dashboard_login_enabled(self) -> bool:
+        return all((
+            self.github_client_id, self.github_client_secret,
+            self.session_encryption_key, self.dashboard_url, self.public_url,
+            self.dashboard_organization, self.dashboard_repository,
+        ))
+
+    @property
+    def oauth_callback_url(self) -> str | None:
+        if not self.public_url:
+            return None
+        return f"{self.public_url}/auth/github/callback"
+
 
 def load_settings(environ: Mapping[str, str] | None = None) -> GitHubAppSettings:
     values = os.environ if environ is None else environ
@@ -122,7 +149,45 @@ def load_settings(environ: Mapping[str, str] | None = None) -> GitHubAppSettings
             values, "RELIUM_API_POOL_SIZE", default="5", minimum=1, maximum=50
         ),
         cors_allowed_origins=_cors_origins(values),
+        github_client_id=_optional(values, "RELIUM_GITHUB_CLIENT_ID"),
+        github_client_secret=_optional(values, "RELIUM_GITHUB_CLIENT_SECRET"),
+        session_encryption_key=_session_encryption_key(values),
+        dashboard_url=_origin(values, "RELIUM_DASHBOARD_URL"),
+        public_url=_origin(values, "RELIUM_PUBLIC_URL"),
+        dashboard_organization=_optional(values, "RELIUM_DASHBOARD_ORGANIZATION"),
+        dashboard_repository=_optional(values, "RELIUM_DASHBOARD_REPOSITORY"),
+        secure_cookies=_boolean(values, "RELIUM_SECURE_COOKIES", default="true"),
     )
+
+
+def _session_encryption_key(values: Mapping[str, str]) -> bytes | None:
+    """Validate the session key at startup, not at first sign-in.
+
+    A bad key must stop the process now rather than surface as a login that
+    fails for one user at an unhelpful moment.
+    """
+    raw = values.get("RELIUM_SESSION_ENCRYPTION_KEY")
+    if raw is None or not str(raw).strip():
+        return None
+    from agent.api.session_crypto import CredentialEncryptionError, load_key
+
+    try:
+        return load_key(raw)
+    except CredentialEncryptionError as exc:
+        raise SettingsError(str(exc)) from None
+
+
+def _origin(values: Mapping[str, str], name: str) -> str | None:
+    """An absolute origin with no trailing slash and no path."""
+    value = _optional(values, name)
+    if value is None:
+        return None
+    if not value.startswith(("http://", "https://")):
+        raise SettingsError(f"{name} must be a full origin, for example https://app.example.com.")
+    value = value.rstrip("/")
+    if value.count("/") > 2:
+        raise SettingsError(f"{name} must be an origin only, with no path.")
+    return value
 
 
 def _cors_origins(values: Mapping[str, str]) -> tuple[str, ...]:

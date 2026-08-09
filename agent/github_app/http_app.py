@@ -25,6 +25,8 @@ def create_http_app(
     store_pool=None,
     review_lifecycle_mode=None,
     cors_allowed_origins=(),
+    session_manager=None,
+    auth_routes=(),
 ):
     """Build the served application.
 
@@ -190,7 +192,15 @@ def create_http_app(
         Route("/github/webhook", webhook, methods=["POST"]),
     ]
     if store_pool is not None:
-        routes.extend(create_api_routes(store_pool=store_pool))
+        routes.extend(create_api_routes(
+            store_pool=store_pool,
+            session_manager=session_manager,
+            allowed_origins=cors_allowed_origins,
+        ))
+    # Dashboard sign-in. Registered only when the App's user-authorization
+    # credentials are fully configured, so there is never a login route that
+    # cannot complete a login.
+    routes.extend(auth_routes)
 
     # Browser access to the dashboard API.
     #
@@ -213,11 +223,14 @@ def create_http_app(
             allow_origins=list(cors_allowed_origins),
             allow_methods=["GET", "POST", "OPTIONS"],
             allow_headers=["Authorization", "Content-Type", "Idempotency-Key",
-                           "X-Request-Id"],
+                           "X-Request-Id", "X-Relium-CSRF"],
             expose_headers=["X-Request-Id"],
-            # The token is supplied by the application, not by a cookie, so
-            # credentialed requests are neither needed nor allowed.
-            allow_credentials=False,
+            # The dashboard now authenticates with an HttpOnly session cookie,
+            # so credentialed requests are required. This is safe only because
+            # the origins are listed exactly and '*' is rejected at load time:
+            # a wildcard with credentials would let any page in a user's
+            # browser spend their session.
+            allow_credentials=True,
             max_age=600,
         ))
 

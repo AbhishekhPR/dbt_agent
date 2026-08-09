@@ -644,23 +644,148 @@ class PostgresLifecycleStore:
     # -- service tokens (public API authentication) -------------------------
 
     def create_service_token(self, token_id, secret_hash, organization_id, repository_id,
-                             *, environment=None, description=None, expires_at=None):
-        """Persist a token's hash. The secret itself is never stored."""
+                             *, environment=None, description=None, expires_at=None,
+                             scope="collector"):
+        """Persist a token's hash. The secret itself is never stored.
+
+        ``scope`` decides what the token may be used for. It defaults to
+        ``collector`` because that is what every service token is for: a
+        machine submitting the evidence it was asked for. Governance is not a
+        scope any token can hold — that requires a human session.
+        """
         self.connection.execute(
             "INSERT INTO api_service_tokens "
-            "(token_id, secret_hash, organization_id, repository_id, environment, description, expires_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-            (token_id, secret_hash, organization_id, repository_id, environment, description, expires_at),
+            "(token_id, secret_hash, organization_id, repository_id, environment, "
+            "description, expires_at, scope) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            (token_id, secret_hash, organization_id, repository_id, environment,
+             description, expires_at, scope),
         )
         return token_id
 
     def get_service_token(self, token_id):
         row = self.connection.execute(
             "SELECT token_id, secret_hash, organization_id, repository_id, environment, "
-            "expires_at, revoked_at FROM api_service_tokens WHERE token_id=%s",
+            "scope, expires_at, revoked_at FROM api_service_tokens WHERE token_id=%s",
             (token_id,),
         ).fetchone()
         return dict(row) if row else None
+
+    # -- dashboard sessions ------------------------------------------------
+    #
+    # A session is one authenticated GitHub user holding one verified
+    # repository permission. The session id is never stored: the browser holds
+    # it and the server keeps only its hash, so a database disclosure cannot be
+    # replayed as a live session.
+
+    def create_dashboard_session(self, session_id_hash, *, organization_id,
+                                 repository_id, environment, github_login,
+                                 github_user_id, github_permission, may_govern,
+                                 permission_checked_at, csrf_token, expires_at,
+                                 github_access_token=None,
+                                 github_access_expires_at=None,
+                                 github_refresh_token=None,
+                                 github_refresh_expires_at=None):
+        self.connection.execute(
+            "INSERT INTO dashboard_sessions ("
+            "session_id_hash, organization_id, repository_id, environment, "
+            "github_login, github_user_id, github_permission, may_govern, "
+            "permission_checked_at, github_access_token, github_access_expires_at, "
+            "github_refresh_token, github_refresh_expires_at, csrf_token, expires_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (session_id_hash, organization_id, repository_id, environment,
+             github_login, github_user_id, github_permission, may_govern,
+             permission_checked_at, github_access_token, github_access_expires_at,
+             github_refresh_token, github_refresh_expires_at, csrf_token, expires_at),
+        )
+        return session_id_hash
+
+    def get_dashboard_session(self, session_id_hash):
+        row = self.connection.execute(
+            "SELECT * FROM dashboard_sessions WHERE session_id_hash=%s",
+            (session_id_hash,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def touch_dashboard_session(self, session_id_hash):
+        self.connection.execute(
+            "UPDATE dashboard_sessions SET last_seen_at=now() WHERE session_id_hash=%s",
+            (session_id_hash,),
+        )
+
+    def update_dashboard_session_permission(self, session_id_hash, *,
+                                            github_permission, may_govern,
+                                            permission_checked_at):
+        self.connection.execute(
+            "UPDATE dashboard_sessions SET github_permission=%s, may_govern=%s, "
+            "permission_checked_at=%s WHERE session_id_hash=%s",
+            (github_permission, may_govern, permission_checked_at, session_id_hash),
+        )
+
+    def update_dashboard_session_credential(self, session_id_hash, *,
+                                            github_access_token,
+                                            github_access_expires_at,
+                                            github_refresh_token,
+                                            github_refresh_expires_at):
+        """Store a rotated credential.
+
+        GitHub issues a new refresh token every time one is used, so the old
+        values must be replaced rather than kept alongside.
+        """
+        self.connection.execute(
+            "UPDATE dashboard_sessions SET github_access_token=%s, "
+            "github_access_expires_at=%s, github_refresh_token=%s, "
+            "github_refresh_expires_at=%s WHERE session_id_hash=%s",
+            (github_access_token, github_access_expires_at, github_refresh_token,
+             github_refresh_expires_at, session_id_hash),
+        )
+
+    def revoke_dashboard_session(self, session_id_hash, reason="logout"):
+        """Revoke and destroy the stored GitHub credentials in one statement.
+
+        The credentials are cleared here rather than left to expire: a logged
+        out session must not leave a usable GitHub token in the database.
+        """
+        row = self.connection.execute(
+            "UPDATE dashboard_sessions SET revoked_at=now(), revocation_reason=%s, "
+            "github_access_token=NULL, github_refresh_token=NULL "
+            "WHERE session_id_hash=%s AND revoked_at IS NULL "
+            "RETURNING session_id_hash",
+            (reason, session_id_hash),
+        ).fetchone()
+        return row is not None
+
+    def delete_expired_dashboard_sessions(self, before):
+        self.connection.execute(
+            "DELETE FROM dashboard_sessions WHERE expires_at < %s", (before,))
+
+    # -- OAuth authorization states ----------------------------------------
+
+    def create_oauth_state(self, state_hash, *, nonce_hash, redirect_to, expires_at):
+        self.connection.execute(
+            "INSERT INTO oauth_authorization_states "
+            "(state_hash, nonce_hash, redirect_to, expires_at) VALUES (%s, %s, %s, %s)",
+            (state_hash, nonce_hash, redirect_to, expires_at),
+        )
+
+    def consume_oauth_state(self, state_hash, *, now):
+        """Claim a state exactly once.
+
+        The UPDATE is the claim: two concurrent callbacks with the same state
+        cannot both match ``consumed_at IS NULL``, so a replayed authorization
+        loses rather than being detected afterwards.
+        """
+        row = self.connection.execute(
+            "UPDATE oauth_authorization_states SET consumed_at=now() "
+            "WHERE state_hash=%s AND consumed_at IS NULL AND expires_at > %s "
+            "RETURNING state_hash, nonce_hash, redirect_to",
+            (state_hash, now),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def delete_expired_oauth_states(self, before):
+        self.connection.execute(
+            "DELETE FROM oauth_authorization_states WHERE expires_at < %s", (before,))
 
     def list_service_tokens(self, organization_id=None, repository_id=None):
         """Tokens for an operator to identify later. The hash is never returned.

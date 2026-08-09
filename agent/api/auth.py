@@ -30,12 +30,27 @@ class AuthorizationError(Exception):
 
 @dataclass(frozen=True)
 class TenantScope:
-    """The authorization boundary a request is confined to."""
+    """The authorization boundary a request is confined to.
+
+    A machine principal. ``scope`` says what kind of machine work the token was
+    issued for; it is checked per endpoint, so a collector credential is
+    refused on governance routes even though it authenticates correctly.
+    """
 
     organization_id: str
     repository_id: str
     environment: str | None = None
     token_id: str = ""
+    scope: str = "collector"
+
+    #: Distinguishes a token from a signed-in person. Governance actions
+    #: require a human, and a human is never accepted as a collector.
+    is_human = False
+
+    @property
+    def actor(self) -> None:
+        """A token is not a person, so it has no governance actor."""
+        return None
 
     def permits_environment(self, environment: str | None) -> bool:
         if self.environment is None:
@@ -125,4 +140,5 @@ class ServiceTokenAuthenticator:
             repository_id=record["repository_id"],
             environment=record.get("environment"),
             token_id=token_id,
+            scope=record.get("scope") or "collector",
         )
