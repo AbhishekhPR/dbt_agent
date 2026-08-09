@@ -909,8 +909,8 @@ def _has_refund_adjustment(sql: str) -> bool:
     # matched is unchanged; only the qualifier is now tolerated.
     return bool(
         re.search(
-            r"\b(?:gross|net|total|revenue|sales|income|amount)[a-z0-9_]*\s*-\s*"
-            r"(?:\(\s*)?(?:coalesce\s*\(\s*)?(?:[a-z0-9_]+\s*\.\s*)?refund[a-z0-9_.]*",
+            r"\b(?:gross|net|total|revenue|sales|income|amount)[a-z0-9_]*\b[^-]{0,80}?\s*-\s*"
+            r"(?:[a-z0-9_]+\s*\(\s*|\(\s*){0,3}(?:[a-z0-9_]+\s*\.\s*)?refund",
             sql,
             flags=re.I,
         )

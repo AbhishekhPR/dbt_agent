@@ -36,6 +36,7 @@ changed" are different facts.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -119,7 +120,9 @@ def _parse(sql):
     """Parse to an AST, or explain why not. Jinja refs keep their identity."""
     if not isinstance(sql, str) or not sql.strip():
         return None, "SQL was not available for this model"
-    text = strip_jinja(sql)
+    # Macros are rewritten BEFORE strip_jinja, which would otherwise delete
+    # them; ref and source are left for strip_jinja to resolve to names.
+    text = strip_jinja(_macro_calls_to_functions(sql))
     try:
         tree = sqlglot.parse_one(text, dialect=DIALECT)
     except Exception:
@@ -384,3 +387,41 @@ def _text(value) -> str | None:
         return None
     text = str(value).strip().strip('"').strip("`")
     return text or None
+
+
+#: `{{ some_macro(a, b) }}` left behind by strip_jinja, which resolves ref and
+#: source but deletes everything else.
+_MACRO_CALL = re.compile(
+    r"\{\{\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\((.*?)\)\s*\}\}", re.S)
+
+#: Resolved by strip_jinja into the relation name. Rewriting one of these as
+#: a function call would leave `ref('x')` in the FROM/JOIN clause, where it
+#: parses as an anonymous function rather than a relation -- and the join
+#: silently vanishes from the comparison.
+_JINJA_RESOLVED = frozenset({"ref", "source"})
+
+
+def _macro_calls_to_functions(sql: str) -> str:
+    """Rewrite a dbt macro call as an ordinary SQL function call.
+
+    strip_jinja deletes non-ref jinja outright, which turns
+    `{{ currency_conversion(...) }} as net_order_amount_usd` into
+    `, as net_order_amount_usd` — unparseable, so the whole model reports
+    unavailable and a real change goes unseen.
+
+    Rendering it as `currency_conversion(...)` keeps the statement parseable
+    AND keeps the arguments in the tree, so editing what is passed to a macro
+    is still visible as a projection change rather than being flattened into
+    one opaque token.
+    """
+    if "{{" not in sql:
+        return sql
+    return _MACRO_CALL.sub(_rewrite_macro, sql)
+
+
+def _rewrite_macro(match) -> str:
+    """Render one macro call, leaving ref/source for strip_jinja."""
+    name = match.group(1)
+    if name.lower() in _JINJA_RESOLVED:
+        return match.group(0)
+    return f"{name}({match.group(2).strip()})"
