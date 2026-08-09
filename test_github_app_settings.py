@@ -3,11 +3,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from pem_test_support import test_private_key_pem
+
 
 class GitHubAppSettingsTests(unittest.TestCase):
     def _environment(self, root, **overrides):
         key_path = Path(root) / "github-app.pem"
-        key_path.write_text("test-private-key", encoding="utf-8")
+        key_path.write_bytes(test_private_key_pem())
         values = {
             "RELIUM_GITHUB_APP_ID": "123",
             "RELIUM_GITHUB_WEBHOOK_SECRET": "webhook-secret-value",

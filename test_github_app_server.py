@@ -5,12 +5,14 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+
+from pem_test_support import test_private_key_pem
 from unittest.mock import ANY, Mock, patch
 
 
 def _environment(root):
     key_path = Path(root) / "app.pem"
-    key_path.write_text("test-private-key", encoding="utf-8")
+    key_path.write_bytes(test_private_key_pem())
     return {
         "RELIUM_GITHUB_APP_ID": "123",
         "RELIUM_GITHUB_WEBHOOK_SECRET": "server-webhook-secret",

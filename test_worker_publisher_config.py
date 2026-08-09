@@ -10,10 +10,19 @@ So these tests assert the wiring itself, not just the handlers.
 """
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from agent.worker.publisher_config import build_publisher_factory
+from pem_test_support import test_private_key_pem, write_test_private_key
+
+
+def _key_file():
+    """A real PEM on disk. The key is now loaded, not just read."""
+    directory = tempfile.mkdtemp(prefix="relium-worker-key-")
+    return write_test_private_key(Path(directory) / "app.pem")
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -32,30 +41,46 @@ class ConfigurationTests(unittest.TestCase):
                 "RELIUM_GITHUB_PRIVATE_KEY_PATH": "/definitely/not/here.pem",
             })
 
-    def test_a_configured_app_yields_a_factory(self):
-        with mock.patch("os.path.isfile", return_value=True):
-            factory = build_publisher_factory({
+    def test_a_malformed_key_fails_loudly(self):
+        directory = tempfile.mkdtemp(prefix="relium-worker-badkey-")
+        bad = Path(directory) / "app.pem"
+        bad.write_text("not a key", encoding="utf-8")
+        with self.assertRaises(RuntimeError):
+            build_publisher_factory({
                 "RELIUM_GITHUB_APP_ID": "424242",
-                "RELIUM_GITHUB_PRIVATE_KEY_PATH": "/tmp/app.pem",
+                "RELIUM_GITHUB_PRIVATE_KEY_PATH": str(bad),
             })
+
+    def test_a_configured_app_yields_a_factory(self):
+        factory = build_publisher_factory({
+            "RELIUM_GITHUB_APP_ID": "424242",
+            "RELIUM_GITHUB_PRIVATE_KEY_PATH": _key_file(),
+        })
+        self.assertTrue(callable(factory))
+
+    def test_an_inline_key_also_yields_a_factory(self):
+        """The worker obeys the same precedence rule as the API."""
+        factory = build_publisher_factory({
+            "RELIUM_GITHUB_APP_ID": "424242",
+            "RELIUM_GITHUB_PRIVATE_KEY": test_private_key_pem().decode(),
+        })
         self.assertTrue(callable(factory))
 
 
 class FactoryTests(unittest.TestCase):
-    ENV = {
-        "RELIUM_GITHUB_APP_ID": "424242",
-        "RELIUM_GITHUB_PRIVATE_KEY_PATH": "/tmp/app.pem",
-        "RELIUM_GITHUB_INSTALLATION_ID": "777",
-    }
+    @property
+    def ENV(self):
+        return {
+            "RELIUM_GITHUB_APP_ID": "424242",
+            "RELIUM_GITHUB_PRIVATE_KEY_PATH": _key_file(),
+            "RELIUM_GITHUB_INSTALLATION_ID": "777",
+        }
 
     def _factory(self, env=None):
-        with mock.patch("os.path.isfile", return_value=True):
-            return build_publisher_factory({**self.ENV, **(env or {})})
+        return build_publisher_factory({**self.ENV, **(env or {})})
 
     def _patches(self, installation=None):
         return (
-            mock.patch("agent.worker.publisher_config._read_private_key",
-                       return_value="KEY"),
             mock.patch("agent.github_app.auth.create_app_jwt", return_value="JWT"),
             mock.patch("agent.github_app.auth.get_installation_token",
                        return_value="INSTALLATION_TOKEN"),
@@ -81,8 +106,8 @@ class FactoryTests(unittest.TestCase):
     def test_the_installation_is_resolved_from_the_repository_when_unset(self):
         """A multi-tenant worker needs no per-tenant installation id."""
         factory = self._factory({"RELIUM_GITHUB_INSTALLATION_ID": ""})
-        p0, p1, p2, p3 = self._patches(installation={"id": 31337})
-        with p0, p1, p2, p3 as lookup:
+        p0, p1, p2 = self._patches(installation={"id": 31337})
+        with p0, p1, p2 as lookup:
             factory(organization_id="acme", repository_id="analytics",
                     environment="production")
         lookup.assert_called_once()

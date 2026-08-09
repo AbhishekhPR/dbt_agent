@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from pem_test_support import test_private_key_pem
+
 import yaml
 
 from bash_test_support import run_bash
@@ -83,7 +85,7 @@ class GitHubAppPilotAssetTests(unittest.TestCase):
             root = Path(temporary)
             bash_root = root.relative_to(ROOT)
             key_path = root / "pilot-test.private-key.pem"
-            key_value = "temporary-test-key-material"
+            key_value = test_private_key_pem().decode()
             key_path.write_text(key_value, encoding="utf-8")
             with socket.socket() as probe:
                 probe.bind(("127.0.0.1", 0))
