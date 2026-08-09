@@ -714,20 +714,51 @@ def _close_owned_pulls(record: dict, owned: list[str], result: dict) -> bool:
 
 
 def _delete_owned_branches(owned: list[str], result: dict) -> None:
+    """Remove each owned ref, deciding from a follow-up read rather than the
+    DELETE status alone.
+
+    GitHub answers a DELETE of an already-absent ref under `git/refs/heads/`
+    with 422, not 404. Treating that as a failure made run 31330824658 report
+    four stranded refs that were in fact gone. Blanket-accepting 422 would be
+    the opposite mistake -- it would let a genuinely surviving ref pass. So an
+    unexpected status decides nothing on its own: the exact ref is re-read,
+    and only proven absence counts as cleaned.
+    """
     for branch in owned:
+        ref_path = f"/repos/{REPO}/git/ref/heads/{branch}"
         try:
             status, _ = GH("DELETE", f"/repos/{REPO}/git/refs/heads/{branch}",
                            FIXTURE_TOKEN, bearer=False)
-            if status == 404:
-                result["fixture_branches_already_absent"].append(branch)
-            elif status != 204:
-                result["failures"].append(
-                    f"cannot delete owned branch {branch}: HTTP {status}")
-                continue
-            else:
+            if status == 204:
                 result["fixture_branches_deleted"].append(branch)
-            verify_status, _ = GH("GET", f"/repos/{REPO}/git/ref/heads/{branch}",
-                                  FIXTURE_TOKEN, bearer=False)
+            elif status == 404:
+                result["fixture_branches_already_absent"].append(branch)
+            else:
+                # Decide nothing from the status; prove it by reading the ref.
+                try:
+                    verify_status, _ = GH("GET", ref_path, FIXTURE_TOKEN,
+                                          bearer=False)
+                except Exception as exc:  # noqa: BLE001
+                    result["failures"].append(
+                        f"owned branch {branch} deletion returned HTTP {status} and "
+                        f"the verifying read raised {type(exc).__name__}")
+                    continue
+                if verify_status == 404:
+                    result["fixture_branches_already_absent"].append(branch)
+                    result.setdefault("reconciled_deletions", []).append(
+                        {"branch": branch, "delete_status": status,
+                         "verified_absent_by": "GET 404"})
+                    continue
+                if verify_status == 200:
+                    result["failures"].append(
+                        f"owned branch {branch} still present after deletion "
+                        f"returned HTTP {status}")
+                else:
+                    result["failures"].append(
+                        f"owned branch {branch} deletion returned HTTP {status} and "
+                        f"the verifying read was ambiguous: HTTP {verify_status}")
+                continue
+            verify_status, _ = GH("GET", ref_path, FIXTURE_TOKEN, bearer=False)
             if verify_status != 404:
                 result["failures"].append(
                     f"owned branch {branch} still present after deletion")

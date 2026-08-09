@@ -524,3 +524,104 @@ class UiAssertionPlan(HarnessTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeletionReconciliation(HarnessTestCase):
+    """An unexpected DELETE status must be decided by re-reading the ref.
+
+    GitHub answers a DELETE of an already-absent ref under `git/refs/heads/`
+    with 422. Run 31330824658 reported four stranded refs that were gone.
+    """
+
+    def _own_one_branch(self):
+        d = self.driver
+        d._initial_recovery()
+        branch = "e2e/semantic-block-base-testrun01"
+        d.make_branch(branch, MAIN_SHA)
+        return d, branch
+
+    def _delete_status(self, code, *, keep_ref):
+        """Force DELETE to answer `code`, optionally leaving the ref in place."""
+        original = self.gh._route
+
+        def route(method, path, body):
+            if method == "DELETE" and "/git/refs/heads/" in path:
+                if not keep_ref:
+                    branch = path.split("/git/refs/heads/", 1)[1]
+                    self.gh.refs.pop(branch, None)
+                return code, {}
+            return original(method, path, body)
+
+        self.gh._route = route
+
+    def test_422_with_the_ref_absent_is_reconciled_success(self):
+        d, branch = self._own_one_branch()
+        self._delete_status(422, keep_ref=False)
+        result = d.cleanup("422-absent")
+        self.assertTrue(result["cleanup_passed"], result["failures"])
+        self.assertIn(branch, result["fixture_branches_already_absent"])
+        self.assertEqual(result["reconciled_deletions"][0]["delete_status"], 422)
+
+    def test_422_with_the_owned_ref_still_present_is_a_failure(self):
+        d, branch = self._own_one_branch()
+        self._delete_status(422, keep_ref=True)
+        result = d.cleanup("422-present")
+        self.assertFalse(result["cleanup_passed"])
+        self.assertTrue(any("still present" in f for f in result["failures"]))
+        self.assertIn(branch, self.gh.refs)
+
+    def test_500_with_the_ref_absent_is_reconciled_success(self):
+        d, _branch = self._own_one_branch()
+        self._delete_status(500, keep_ref=False)
+        result = d.cleanup("500-absent")
+        self.assertTrue(result["cleanup_passed"], result["failures"])
+
+    def test_an_unexpected_delete_with_an_ambiguous_read_is_a_failure(self):
+        d, _branch = self._own_one_branch()
+        original = self.gh._route
+
+        def route(method, path, body):
+            if method == "DELETE" and "/git/refs/heads/" in path:
+                return 422, {}
+            if method == "GET" and "/git/ref/heads/" in path:
+                return 503, {}
+            return original(method, path, body)
+
+        self.gh._route = route
+        result = d.cleanup("ambiguous-read")
+        self.assertFalse(result["cleanup_passed"])
+        self.assertTrue(any("ambiguous" in f for f in result["failures"]))
+
+    def test_an_unexpected_delete_with_a_raising_read_is_a_failure(self):
+        d, _branch = self._own_one_branch()
+        original = self.gh._route
+
+        def route(method, path, body):
+            if method == "DELETE" and "/git/refs/heads/" in path:
+                return 422, {}
+            if method == "GET" and "/git/ref/heads/" in path:
+                raise OSError("injected read failure")
+            return original(method, path, body)
+
+        self.gh._route = route
+        result = d.cleanup("raising-read")
+        self.assertFalse(result["cleanup_passed"])
+        self.assertTrue(any("verifying read raised" in f for f in result["failures"]))
+
+    def test_reconciled_cleanup_stays_idempotent(self):
+        d, _branch = self._own_one_branch()
+        self._delete_status(422, keep_ref=False)
+        first = d.cleanup("first")
+        d.state["cleanup_done"] = False
+        d.state["cleanup_result"] = None
+        second = d.cleanup("second")
+        self.assertTrue(first["cleanup_passed"], first["failures"])
+        self.assertTrue(second["cleanup_passed"], second["failures"])
+
+    def test_a_foreign_ref_is_never_deleted_during_reconciliation(self):
+        d, _branch = self._own_one_branch()
+        self.gh.refs["someone-elses-branch"] = "c" * 40
+        self._delete_status(422, keep_ref=False)
+        d.cleanup("foreign-untouched")
+        self.assertIn("someone-elses-branch", self.gh.refs)
+        self.assertIn("main", self.gh.refs)
