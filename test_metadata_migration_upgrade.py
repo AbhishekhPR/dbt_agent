@@ -22,6 +22,17 @@ DSN = os.environ.get("RELIUM_TEST_POSTGRES_DSN")
 ORG, REPO, ENV = "org-upgrade", "repo-upgrade", "production"
 
 
+def _all_migration_versions():
+    """Every migration version on disk, ascending.
+
+    Derived rather than hardcoded so adding a migration does not fail tests
+    that are about upgrade BEHAVIOUR rather than about the migration count.
+    """
+    from agent.postgres_migrate import _migration_files, _version_of
+
+    return sorted(_version_of(path) for path in _migration_files())
+
+
 def _reset_schema(dsn):
     import psycopg
 
@@ -135,10 +146,13 @@ class Migration0004UpgradeTests(unittest.TestCase):
 
     def test_0004_applies_over_populated_169708c_schema(self):
         applied = self._upgrade()
-        self.assertEqual(applied, [4])
+        # The claim is that 0004 was pending on this schema and applied, not
+        # that 0004 is the last migration that will ever exist. Pinning the
+        # exact list made every later migration fail this test for no reason.
+        self.assertIn(4, applied)
         versions = sorted(r["version"] for r in self.conn.execute(
             "SELECT version FROM schema_migrations").fetchall())
-        self.assertEqual(versions, [1, 2, 3, 4])
+        self.assertEqual(versions, _all_migration_versions())
 
     def test_no_outbox_record_is_lost(self):
         self._upgrade()
@@ -277,7 +291,8 @@ class Migration0004UpgradeTests(unittest.TestCase):
         self.addCleanup(conn.close)
         from agent.postgres_migrate import apply_migrations
 
-        self.assertEqual(apply_migrations(conn), [1, 2, 3, 4])
+        # Every migration on disk applies, in ascending order, from empty.
+        self.assertEqual(apply_migrations(conn), _all_migration_versions())
         n = conn.execute(
             "SELECT count(*) AS n FROM information_schema.tables "
             "WHERE table_schema='public' AND table_name='metadata_snapshots'"

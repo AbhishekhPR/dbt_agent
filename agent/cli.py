@@ -1226,5 +1226,154 @@ def history(project, table, days):
                 )
 
 
+@cli.command()
+@click.option('--request-id', default=None,
+              help='Collect a specific request instead of the oldest pending one')
+@click.option('--json', 'as_json', is_flag=True,
+              help='Emit the outcome as JSON')
+def collect(request_id, as_json):
+    """Run the customer-side Relium Collector once.
+
+    Reads a targeted collection request from Relium, queries the configured
+    warehouse for ONLY the requested metadata, submits the resulting snapshot,
+    and exits. Configuration comes from RELIUM_API_URL, RELIUM_API_TOKEN and
+    RELIUM_WAREHOUSE_DSN; no secret is echoed.
+    """
+    import json as _json
+    import sys
+
+    from agent.collector import CollectorConfig, CollectorConfigError, run_collection
+
+    try:
+        config = CollectorConfig.from_env()
+    except CollectorConfigError as exc:
+        click.echo(f"relium collect: {exc}", err=True)
+        sys.exit(2)
+
+    outcome = run_collection(config)
+
+    if as_json:
+        click.echo(_json.dumps(outcome.as_dict(), indent=2, sort_keys=True))
+    else:
+        click.echo(f"relium collect: {outcome.reason}")
+        if outcome.request_id:
+            click.echo(f"  request       {outcome.request_id}")
+            click.echo(f"  review        {outcome.review_id} (attempt {outcome.attempt})")
+        if outcome.snapshot_id:
+            click.echo(f"  snapshot      {outcome.snapshot_id} (HTTP {outcome.status_code})")
+        if outcome.relations_collected:
+            click.echo(f"  relations     {outcome.relations_collected} "
+                       f"({outcome.columns_collected} columns)")
+            click.echo(f"  signals       {', '.join(outcome.signals_collected)}")
+        if outcome.signals_unsupported:
+            click.echo(f"  UNSUPPORTED   {', '.join(outcome.signals_unsupported)}")
+        if outcome.relations_missing:
+            click.echo(f"  absent        {', '.join(outcome.relations_missing)}")
+
+    # A failed collection must be a non-zero exit, so whatever schedules the
+    # collector cannot mistake it for success.
+    sys.exit(0 if outcome.ok else 1)
+
+
+def _admin_store():
+    """Open the evidence store for an operator command.
+
+    Possession of RELIUM_DATABASE_URL is the authorization: a customer never
+    has it, and anyone who does is already an operator of the evidence plane.
+    """
+    import os
+    import sys
+
+    dsn = os.environ.get("RELIUM_DATABASE_URL")
+    if not dsn:
+        click.echo("RELIUM_DATABASE_URL is required for operator commands",
+                   err=True)
+        sys.exit(2)
+    from agent.postgres_lifecycle_store import PostgresLifecycleStore
+
+    return PostgresLifecycleStore(dsn)
+
+
+@cli.command(name="issue-collector-token")
+@click.option('--organization', required=True, help='Tenant organization id')
+@click.option('--repository', required=True, help='Tenant repository id')
+@click.option('--environment', required=True,
+              help='Environment this collector reads (e.g. production)')
+@click.option('--description', default=None, help='How to recognise this token later')
+def issue_collector_token(organization, repository, environment, description):
+    """Operator: issue a collector service token. Shows the secret ONCE."""
+    import sys
+
+    from agent.collector.provisioning import ProvisioningError, issue_collector_token
+
+    store = _admin_store()
+    try:
+        token_id, presented = issue_collector_token(
+            store, organization_id=organization, repository_id=repository,
+            environment=environment, description=description)
+    except ProvisioningError as exc:
+        click.echo(f"cannot issue token: {exc}", err=True)
+        sys.exit(2)
+    finally:
+        store.close()
+
+    click.echo(f"token_id     {token_id}")
+    click.echo(f"scope        {organization}/{repository} [{environment}]")
+    click.echo("")
+    click.echo("RELIUM_API_TOKEN below is shown ONCE and is not recoverable.")
+    click.echo("Give it to the collector host over a secure channel, then")
+    click.echo("delete it from your terminal history.")
+    click.echo("")
+    click.echo(presented)
+
+
+@cli.command(name="list-collector-tokens")
+@click.option('--organization', default=None, help='Filter by organization')
+@click.option('--repository', default=None, help='Filter by repository')
+def list_collector_tokens(organization, repository):
+    """Operator: list issued tokens. Secrets are never shown."""
+    from agent.collector.provisioning import list_collector_tokens
+
+    store = _admin_store()
+    try:
+        rows = list_collector_tokens(store, organization_id=organization,
+                                     repository_id=repository)
+    finally:
+        store.close()
+
+    if not rows:
+        click.echo("no tokens issued")
+        return
+    click.echo(f"{'token_id':34s} {'scope':38s} {'state':9s} description")
+    for row in rows:
+        scope = (f"{row['organization_id']}/{row['repository_id']}"
+                 f" [{row['environment'] or 'any'}]")
+        state = "revoked" if row["revoked_at"] else "active"
+        click.echo(f"{row['token_id']:34s} {scope:38s} {state:9s} "
+                   f"{row['description'] or ''}")
+
+
+@cli.command(name="revoke-collector-token")
+@click.option('--token-id', required=True,
+              help='The token_id shown at issuance (never the secret)')
+def revoke_collector_token(token_id):
+    """Operator: revoke a collector token immediately."""
+    import sys
+
+    from agent.collector.provisioning import revoke_collector_token
+
+    store = _admin_store()
+    try:
+        revoked = revoke_collector_token(store, token_id)
+    finally:
+        store.close()
+
+    if revoked:
+        click.echo(f"revoked {token_id}")
+    else:
+        click.echo(f"{token_id} does not exist or was already revoked", err=True)
+        sys.exit(1)
+
+
 if __name__ == '__main__':
     cli()

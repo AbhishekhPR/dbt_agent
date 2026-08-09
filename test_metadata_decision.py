@@ -251,6 +251,57 @@ class DecisionCaseTests(unittest.TestCase):
         self.assertEqual(result.decision, "BLOCK")
         self.assertIn("column.missing_in_production", self._codes(result))
 
+    def test_column_reported_absent_by_the_collector_blocks(self):
+        """The shape the REAL collector produces, not an omitted column.
+
+        A collector answers for every column the request named, so an absent
+        one arrives as a present entry carrying exists_in_production=False -
+        never as a gap in the array. Testing only the omitted shape let a
+        dropped production column decide ALLOW with no findings at all.
+        """
+        result = self._decide(
+            [{"relation_name": "raw.orders", "dependency_kind": "external",
+              "columns": ["discount_amount"]}],
+            [_relation("raw.orders", [
+                _column("order_id", "bigint"),
+                _column("discount_amount", None, exists_in_production=False),
+            ])])
+        self.assertEqual(result.decision, "BLOCK")
+        self.assertIn("column.missing_in_production", self._codes(result))
+
+    def test_absent_column_warns_rather_than_blocks_in_shadow_mode(self):
+        result = self._decide(
+            [{"relation_name": "raw.orders", "dependency_kind": "external",
+              "columns": ["discount_amount"]}],
+            [_relation("raw.orders", [
+                _column("discount_amount", None, exists_in_production=False)])],
+            mode="shadow")
+        self.assertEqual(result.decision, "WARN")
+        self.assertIn("column.missing_in_production", self._codes(result))
+
+    def test_present_column_is_not_reported_as_absent(self):
+        """The flag must not manufacture a finding for a column that is there."""
+        result = self._decide(
+            [{"relation_name": "raw.orders", "dependency_kind": "external",
+              "columns": ["discount_amount"],
+              "column_types": {"discount_amount": "numeric"}}],
+            [_relation("raw.orders", [
+                _column("discount_amount", "numeric", exists_in_production=True,
+                        null_rate=0.01)])])
+        self.assertEqual(result.decision, "ALLOW")
+        self.assertNotIn("column.missing_in_production", self._codes(result))
+
+    def test_absent_flag_defaults_to_present_for_older_snapshots(self):
+        """A stored snapshot without the flag must not become a BLOCK."""
+        result = self._decide(
+            [{"relation_name": "raw.orders", "dependency_kind": "external",
+              "columns": ["discount_amount"],
+              "column_types": {"discount_amount": "numeric"}}],
+            [_relation("raw.orders", [_column("discount_amount", "numeric",
+                                              null_rate=0.01)])])
+        self.assertEqual(result.decision, "ALLOW")
+        self.assertNotIn("column.missing_in_production", self._codes(result))
+
     def test_missing_external_relation_blocks(self):
         result = self._decide(
             [{"relation_name": "raw.missing", "dependency_kind": "external",
@@ -455,6 +506,90 @@ class PlannerIntegrationTests(unittest.TestCase):
         names = {t["relation_name"] for t in plan["targets"]}
         self.assertIn("raw.orders", names)
         self.assertLessEqual(len(names), 4)
+
+
+class CollectorToDecisionChainTests(unittest.TestCase):
+    """The real collector output, through the real API parser, to a decision.
+
+    Every layer here was individually 'correct' while the chain was not: the
+    collector reported the absent column, the parser dropped the flag, and the
+    engine's `column is None` test therefore never fired. Only an end-to-end
+    assertion catches that class of loss, so this reconstructs the exact shapes
+    rather than hand-writing a snapshot.
+    """
+
+    SIGNALS = frozenset({"relation_exists", "column_exists", "data_type",
+                         "is_nullable", "row_count", "null_rate",
+                         "schema_fingerprint"})
+
+    def _collect(self, catalog, wanted, aggregates):
+        from agent.collector.warehouse import PostgresMetadataReader
+
+        reader = PostgresMetadataReader.__new__(PostgresMetadataReader)
+        return PostgresMetadataReader._assemble(
+            reader, schema="raw", table="orders", relation_name="raw.orders",
+            catalog=catalog, present={c["column_name"]: c for c in catalog},
+            wanted_columns=wanted, aggregates=aggregates, signals=self.SIGNALS)
+
+    def _decide(self, relation, mode="enforce"):
+        from agent.api.collector_routes import _parse_relations
+
+        return evaluate_metadata_decision(
+            plan={"metadata_required": True,
+                  "targets": [{"relation_name": "raw.orders",
+                               "dependency_kind": "external",
+                               "columns": ["order_id", "discount_amount"],
+                               "criticality": "standard"}]},
+            snapshot=_snapshot(_parse_relations({"relations": [relation]})),
+            enforcement_mode=mode, code_health=100)
+
+    def test_dropped_production_column_reaches_the_decision_as_a_block(self):
+        catalog = [{"column_name": "order_id", "data_type": "bigint",
+                    "is_nullable": False, "ordinal_position": 1}]
+        relation = self._collect(catalog, ["order_id", "discount_amount"],
+                                 {"row_count": 650, "nulls__order_id": 0})
+
+        result = self._decide(relation)
+        self.assertEqual(result.decision, "BLOCK")
+        codes = {f.code for f in result.findings}
+        self.assertIn("column.missing_in_production", codes)
+
+        finding = next(f for f in result.findings
+                       if f.code == "column.missing_in_production")
+        self.assertEqual(finding.relation, "raw.orders")
+        self.assertEqual(finding.column, "discount_amount")
+
+    def test_intact_production_column_still_allows(self):
+        catalog = [
+            {"column_name": "order_id", "data_type": "bigint",
+             "is_nullable": False, "ordinal_position": 1},
+            {"column_name": "discount_amount", "data_type": "numeric",
+             "is_nullable": True, "ordinal_position": 2},
+        ]
+        relation = self._collect(
+            catalog, ["order_id", "discount_amount"],
+            {"row_count": 650, "nulls__order_id": 0, "nulls__discount_amount": 0})
+
+        result = self._decide(relation)
+        self.assertEqual(result.decision, "ALLOW")
+        self.assertNotIn("column.missing_in_production",
+                         {f.code for f in result.findings})
+
+    def test_parser_accepts_both_spellings_of_the_flag(self):
+        from agent.api.collector_routes import _parse_relations
+
+        parsed = _parse_relations({"relations": [{
+            "relation_name": "raw.orders",
+            "columns": [
+                {"column_name": "a", "exists": False},
+                {"column_name": "b", "exists_in_production": False},
+                {"column_name": "c"},
+            ],
+        }]})
+        by_name = {c["column_name"]: c for c in parsed[0]["columns"]}
+        self.assertFalse(by_name["a"]["exists_in_production"])
+        self.assertFalse(by_name["b"]["exists_in_production"])
+        self.assertTrue(by_name["c"]["exists_in_production"])
 
 
 if __name__ == "__main__":

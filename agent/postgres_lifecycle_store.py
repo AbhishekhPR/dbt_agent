@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from agent.lifecycle_models import ALLOWED_TRANSITIONS
+from agent.metadata_evidence.change_request import normalize_remote_review_id
 from agent.postgres_migrate import apply_migrations
 
 OUTBOX_LEASE_SECONDS = 300
@@ -251,11 +252,14 @@ class PostgresLifecycleStore:
                 (deployment_id, organization_id, repository_id, environment, row["status"], to_status, next_seq),
             )
             self.connection.execute(
+                # dedup_key defaults to '' for deployment events, so the
+                # conflict target must name it to match the unique index.
+                # Behaviour is unchanged: one event per (deployment, status).
                 "INSERT INTO outbox_events (event_id, organization_id, repository_id, environment, "
                 "subject_type, subject_id, deployment_id, event_type, payload) "
                 "VALUES (%s, %s, %s, %s, 'deployment', %s, %s, %s, %s) "
                 "ON CONFLICT (organization_id, repository_id, environment, subject_type, "
-                "subject_id, event_type) DO NOTHING",
+                "subject_id, event_type, dedup_key) DO NOTHING",
                 (str(uuid.uuid4()), organization_id, repository_id, environment, deployment_id,
                  deployment_id, f"deployment.{to_status}",
                  self._Jsonb({"deployment_id": deployment_id, "status": to_status})),
@@ -640,29 +644,184 @@ class PostgresLifecycleStore:
     # -- service tokens (public API authentication) -------------------------
 
     def create_service_token(self, token_id, secret_hash, organization_id, repository_id,
-                             *, environment=None, description=None, expires_at=None):
-        """Persist a token's hash. The secret itself is never stored."""
+                             *, environment=None, description=None, expires_at=None,
+                             scope="collector"):
+        """Persist a token's hash. The secret itself is never stored.
+
+        ``scope`` decides what the token may be used for. It defaults to
+        ``collector`` because that is what every service token is for: a
+        machine submitting the evidence it was asked for. Governance is not a
+        scope any token can hold — that requires a human session.
+        """
         self.connection.execute(
             "INSERT INTO api_service_tokens "
-            "(token_id, secret_hash, organization_id, repository_id, environment, description, expires_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-            (token_id, secret_hash, organization_id, repository_id, environment, description, expires_at),
+            "(token_id, secret_hash, organization_id, repository_id, environment, "
+            "description, expires_at, scope) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            (token_id, secret_hash, organization_id, repository_id, environment,
+             description, expires_at, scope),
         )
         return token_id
 
     def get_service_token(self, token_id):
         row = self.connection.execute(
             "SELECT token_id, secret_hash, organization_id, repository_id, environment, "
-            "expires_at, revoked_at FROM api_service_tokens WHERE token_id=%s",
+            "scope, expires_at, revoked_at FROM api_service_tokens WHERE token_id=%s",
             (token_id,),
         ).fetchone()
         return dict(row) if row else None
 
-    def revoke_service_token(self, token_id):
+    # -- dashboard sessions ------------------------------------------------
+    #
+    # A session is one authenticated GitHub user holding one verified
+    # repository permission. The session id is never stored: the browser holds
+    # it and the server keeps only its hash, so a database disclosure cannot be
+    # replayed as a live session.
+
+    def create_dashboard_session(self, session_id_hash, *, organization_id,
+                                 repository_id, environment, github_login,
+                                 github_user_id, github_permission, may_govern,
+                                 permission_checked_at, csrf_token, expires_at,
+                                 github_access_token=None,
+                                 github_access_expires_at=None,
+                                 github_refresh_token=None,
+                                 github_refresh_expires_at=None):
         self.connection.execute(
-            "UPDATE api_service_tokens SET revoked_at=now() WHERE token_id=%s AND revoked_at IS NULL",
-            (token_id,),
+            "INSERT INTO dashboard_sessions ("
+            "session_id_hash, organization_id, repository_id, environment, "
+            "github_login, github_user_id, github_permission, may_govern, "
+            "permission_checked_at, github_access_token, github_access_expires_at, "
+            "github_refresh_token, github_refresh_expires_at, csrf_token, expires_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (session_id_hash, organization_id, repository_id, environment,
+             github_login, github_user_id, github_permission, may_govern,
+             permission_checked_at, github_access_token, github_access_expires_at,
+             github_refresh_token, github_refresh_expires_at, csrf_token, expires_at),
         )
+        return session_id_hash
+
+    def get_dashboard_session(self, session_id_hash):
+        row = self.connection.execute(
+            "SELECT * FROM dashboard_sessions WHERE session_id_hash=%s",
+            (session_id_hash,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def touch_dashboard_session(self, session_id_hash):
+        self.connection.execute(
+            "UPDATE dashboard_sessions SET last_seen_at=now() WHERE session_id_hash=%s",
+            (session_id_hash,),
+        )
+
+    def update_dashboard_session_permission(self, session_id_hash, *,
+                                            github_permission, may_govern,
+                                            permission_checked_at):
+        self.connection.execute(
+            "UPDATE dashboard_sessions SET github_permission=%s, may_govern=%s, "
+            "permission_checked_at=%s WHERE session_id_hash=%s",
+            (github_permission, may_govern, permission_checked_at, session_id_hash),
+        )
+
+    def update_dashboard_session_credential(self, session_id_hash, *,
+                                            github_access_token,
+                                            github_access_expires_at,
+                                            github_refresh_token,
+                                            github_refresh_expires_at):
+        """Store a rotated credential.
+
+        GitHub issues a new refresh token every time one is used, so the old
+        values must be replaced rather than kept alongside.
+        """
+        self.connection.execute(
+            "UPDATE dashboard_sessions SET github_access_token=%s, "
+            "github_access_expires_at=%s, github_refresh_token=%s, "
+            "github_refresh_expires_at=%s WHERE session_id_hash=%s",
+            (github_access_token, github_access_expires_at, github_refresh_token,
+             github_refresh_expires_at, session_id_hash),
+        )
+
+    def revoke_dashboard_session(self, session_id_hash, reason="logout"):
+        """Revoke and destroy the stored GitHub credentials in one statement.
+
+        The credentials are cleared here rather than left to expire: a logged
+        out session must not leave a usable GitHub token in the database.
+        """
+        row = self.connection.execute(
+            "UPDATE dashboard_sessions SET revoked_at=now(), revocation_reason=%s, "
+            "github_access_token=NULL, github_refresh_token=NULL "
+            "WHERE session_id_hash=%s AND revoked_at IS NULL "
+            "RETURNING session_id_hash",
+            (reason, session_id_hash),
+        ).fetchone()
+        return row is not None
+
+    def delete_expired_dashboard_sessions(self, before):
+        self.connection.execute(
+            "DELETE FROM dashboard_sessions WHERE expires_at < %s", (before,))
+
+    # -- OAuth authorization states ----------------------------------------
+
+    def create_oauth_state(self, state_hash, *, nonce_hash, redirect_to, expires_at):
+        self.connection.execute(
+            "INSERT INTO oauth_authorization_states "
+            "(state_hash, nonce_hash, redirect_to, expires_at) VALUES (%s, %s, %s, %s)",
+            (state_hash, nonce_hash, redirect_to, expires_at),
+        )
+
+    def consume_oauth_state(self, state_hash, *, now):
+        """Claim a state exactly once.
+
+        The UPDATE is the claim: two concurrent callbacks with the same state
+        cannot both match ``consumed_at IS NULL``, so a replayed authorization
+        loses rather than being detected afterwards.
+        """
+        row = self.connection.execute(
+            "UPDATE oauth_authorization_states SET consumed_at=now() "
+            "WHERE state_hash=%s AND consumed_at IS NULL AND expires_at > %s "
+            "RETURNING state_hash, nonce_hash, redirect_to",
+            (state_hash, now),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def delete_expired_oauth_states(self, before):
+        self.connection.execute(
+            "DELETE FROM oauth_authorization_states WHERE expires_at < %s", (before,))
+
+    def list_service_tokens(self, organization_id=None, repository_id=None):
+        """Tokens for an operator to identify later. The hash is never returned.
+
+        A token has to be findable after issuance - to audit it, or to revoke
+        the right one - and that has to be possible without the secret, which
+        is unrecoverable by design.
+        """
+        sql = ("SELECT token_id, organization_id, repository_id, environment, "
+               "description, created_at, expires_at, revoked_at "
+               "FROM api_service_tokens")
+        clauses, args = [], []
+        if organization_id is not None:
+            clauses.append("organization_id=%s")
+            args.append(organization_id)
+        if repository_id is not None:
+            clauses.append("repository_id=%s")
+            args.append(repository_id)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC"
+        return [dict(r) for r in self.connection.execute(sql, tuple(args)).fetchall()]
+
+    def revoke_service_token(self, token_id):
+        """Returns True when this call performed the revocation.
+
+        False means the token does not exist or was already revoked - the
+        caller needs to know which, so it can report honestly rather than
+        claim to have revoked something it did not.
+        """
+        row = self.connection.execute(
+            "UPDATE api_service_tokens SET revoked_at=now() "
+            "WHERE token_id=%s AND revoked_at IS NULL RETURNING token_id",
+            (token_id,),
+        ).fetchone()
+        return row is not None
 
     # -- idempotent event receipts -------------------------------------------
 
@@ -1111,6 +1270,177 @@ class PostgresLifecycleStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def collection_requests_for_review(self, organization_id, repository_id, review_id):
+        """Every collection request raised for one review, in creation order.
+
+        ``pending_collection_requests`` answers the collector's question - what
+        should I work on. This answers the dashboard's - what was asked for and
+        what happened to it - so completed, failed and expired requests are
+        included rather than filtered out.
+        """
+        rows = self.connection.execute(
+            "SELECT * FROM collection_requests "
+            "WHERE organization_id=%s AND repository_id=%s AND review_id=%s "
+            "ORDER BY created_at, request_id",
+            (organization_id, repository_id, review_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def snapshots_for_review(self, organization_id, repository_id, review_id):
+        """Every snapshot submitted against one review, newest first."""
+        rows = self.connection.execute(
+            "SELECT snapshot_id, environment, completeness, freshness_state, "
+            "observed_at, received_at, collected_at, request_id, collector_id, "
+            "collector_version, adapter_type, base_sha, head_sha, "
+            "base_manifest_hash, head_manifest_hash, ttl_seconds "
+            "FROM metadata_snapshots "
+            "WHERE organization_id=%s AND repository_id=%s AND review_id=%s "
+            "ORDER BY received_at DESC, snapshot_id",
+            (organization_id, repository_id, review_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- human governance actions -----------------------------------------
+    #
+    # Neither of these writes to `reviews`. What Relium decided and what a
+    # person decided about it are separate facts, and they stay separate.
+
+    def create_change_request(self, organization_id, repository_id, environment, *,
+                              change_request_id, review_id, attempt, pull_number,
+                              head_sha, actor, message):
+        """Record the intent to submit a GitHub request-changes review.
+
+        Returns (row, created). A second call for the same (review, attempt)
+        returns the existing row with created=False, so a double click cannot
+        submit two GitHub reviews on one pull request.
+        """
+        with self.connection.transaction():
+            row = self.connection.execute(
+                "INSERT INTO review_change_requests (organization_id, repository_id, "
+                "change_request_id, review_id, attempt, environment, pull_number, "
+                "head_sha, actor, message) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT DO NOTHING RETURNING *",
+                (organization_id, repository_id, change_request_id, review_id,
+                 attempt, environment, pull_number, head_sha, actor, message),
+            ).fetchone()
+            if row is not None:
+                return dict(row), True
+            existing = self.connection.execute(
+                "SELECT * FROM review_change_requests WHERE organization_id=%s "
+                "AND repository_id=%s AND review_id=%s AND attempt=%s "
+                "AND state IN ('PENDING','PUBLISHED')",
+                (organization_id, repository_id, review_id, attempt),
+            ).fetchone()
+        return (dict(existing) if existing else None), False
+
+    def complete_change_request(self, organization_id, repository_id,
+                                change_request_id, *, remote_review_id=None,
+                                failure_reason=None):
+        """Mark a change request published or failed. Never both."""
+        state = "FAILED" if failure_reason else "PUBLISHED"
+        normalized_remote_id = (
+            None if failure_reason else normalize_remote_review_id(remote_review_id)
+        )
+        self.connection.execute(
+            "UPDATE review_change_requests SET state=%s, remote_review_id=%s, "
+            "failure_reason=%s, published_at=CASE WHEN %s='PUBLISHED' THEN now() END "
+            "WHERE organization_id=%s AND repository_id=%s AND change_request_id=%s",
+            (state, normalized_remote_id,
+             failure_reason, state, organization_id, repository_id, change_request_id),
+        )
+        return self.get_change_request(organization_id, repository_id, change_request_id)
+
+    def get_change_request(self, organization_id, repository_id, change_request_id):
+        row = self.connection.execute(
+            "SELECT * FROM review_change_requests WHERE organization_id=%s "
+            "AND repository_id=%s AND change_request_id=%s",
+            (organization_id, repository_id, change_request_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def change_requests_for_review(self, organization_id, repository_id, review_id):
+        rows = self.connection.execute(
+            "SELECT * FROM review_change_requests WHERE organization_id=%s "
+            "AND repository_id=%s AND review_id=%s ORDER BY created_at",
+            (organization_id, repository_id, review_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def create_review_exception(self, organization_id, repository_id, environment, *,
+                                exception_id, review_id, attempt, actor, reason,
+                                scope="attempt", overridden_decision=None,
+                                base_sha=None, head_sha=None):
+        """Approve an exception against one attempt's decision.
+
+        Returns (row, created). The review's own decision is never written.
+        """
+        with self.connection.transaction():
+            row = self.connection.execute(
+                "INSERT INTO review_exceptions (organization_id, repository_id, "
+                "exception_id, review_id, attempt, environment, overridden_decision, "
+                "base_sha, head_sha, actor, reason, scope) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT DO NOTHING RETURNING *",
+                (organization_id, repository_id, exception_id, review_id, attempt,
+                 environment, overridden_decision, base_sha, head_sha, actor,
+                 reason, scope),
+            ).fetchone()
+            if row is not None:
+                return dict(row), True
+            existing = self.connection.execute(
+                "SELECT * FROM review_exceptions WHERE organization_id=%s "
+                "AND repository_id=%s AND review_id=%s AND attempt=%s AND state='active'",
+                (organization_id, repository_id, review_id, attempt),
+            ).fetchone()
+        return (dict(existing) if existing else None), False
+
+    def revoke_review_exception(self, organization_id, repository_id, exception_id, *,
+                                actor, reason):
+        self.connection.execute(
+            "UPDATE review_exceptions SET state='revoked', revoked_at=now(), "
+            "revoked_by=%s, revocation_reason=%s "
+            "WHERE organization_id=%s AND repository_id=%s AND exception_id=%s "
+            "AND state='active'",
+            (actor, reason, organization_id, repository_id, exception_id),
+        )
+        return self.get_review_exception(organization_id, repository_id, exception_id)
+
+    def get_review_exception(self, organization_id, repository_id, exception_id):
+        row = self.connection.execute(
+            "SELECT * FROM review_exceptions WHERE organization_id=%s "
+            "AND repository_id=%s AND exception_id=%s",
+            (organization_id, repository_id, exception_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def exceptions_for_review(self, organization_id, repository_id, review_id):
+        """Every exception ever approved for this review, newest first."""
+        rows = self.connection.execute(
+            "SELECT * FROM review_exceptions WHERE organization_id=%s "
+            "AND repository_id=%s AND review_id=%s ORDER BY created_at DESC",
+            (organization_id, repository_id, review_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def active_exception_for_attempt(self, organization_id, repository_id, review_id,
+                                     attempt):
+        """The exception in force for exactly this attempt, if any.
+
+        Attempt-scoped by default: a later attempt analysed newer evidence, and
+        must not inherit an override approved against findings nobody has
+        re-examined. A 'review'-scoped exception is honoured across attempts
+        because that scope was chosen explicitly.
+        """
+        row = self.connection.execute(
+            "SELECT * FROM review_exceptions WHERE organization_id=%s "
+            "AND repository_id=%s AND review_id=%s AND state='active' "
+            "AND (attempt=%s OR scope='review') "
+            "ORDER BY (attempt=%s) DESC, created_at DESC LIMIT 1",
+            (organization_id, repository_id, review_id, attempt, attempt),
+        ).fetchone()
+        return dict(row) if row else None
+
     def record_review_publication(self, organization_id, repository_id, review_id, *,
                                   comment_id=None, check_run_id=None):
         """Remember the sticky comment and check run so a recomputation updates
@@ -1389,14 +1719,17 @@ class PostgresLifecycleStore:
                 for c_index, column in enumerate(relation.get("columns") or ()):
                     self.connection.execute(
                         "INSERT INTO snapshot_columns (organization_id, repository_id, "
-                        "snapshot_id, relation_index, column_index, column_name, data_type, "
+                        "snapshot_id, relation_index, column_index, column_name, "
+                        "exists_in_production, data_type, "
                         "is_nullable, ordinal_position, null_count, null_rate, "
                         "duplicate_count, duplicate_rate, distinct_count, cardinality, "
                         "min_value, max_value, collection_status) "
                         "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                        "%s, %s, %s)",
+                        "%s, %s, %s, %s)",
                         (organization_id, repository_id, snapshot_id, r_index, c_index,
-                         column["column_name"], column.get("data_type"),
+                         column["column_name"],
+                         bool(column.get("exists_in_production", True)),
+                         column.get("data_type"),
                          column.get("is_nullable"), column.get("ordinal_position"),
                          column.get("null_count"), column.get("null_rate"),
                          column.get("duplicate_count"), column.get("duplicate_rate"),
@@ -1504,26 +1837,35 @@ class PostgresLifecycleStore:
 
     def enqueue_review_recomputation(self, organization_id, repository_id, environment, *,
                                      review_id, event_type="review.recompute_requested",
-                                     payload=None):
+                                     payload=None, dedup_key=None):
         """Enqueue on the same durable outbox the deployment path uses.
 
-        The subject-scoped unique index makes this exactly-once per
-        (review, event_type): a duplicate snapshot cannot produce a second
-        recomputation.
+        ``dedup_key`` names the unit of work. Exactly-once is per
+        (review, event_type, dedup_key), so a redelivered duplicate collapses
+        while genuinely new evidence still enqueues. Keying on the review
+        alone froze a review's decision at its first snapshot: every later
+        snapshot was discarded by ON CONFLICT and never recomputed.
+
+        Callers pass the thing that makes the job distinct - the snapshot id
+        for recomputation, the attempt for republication. Omitting it keeps
+        the old subject-scoped behaviour, which is what the deployment
+        lifecycle events want.
         """
+        dedup_key = "" if dedup_key is None else str(dedup_key)
         self.connection.execute(
             "INSERT INTO outbox_events (event_id, organization_id, repository_id, environment, "
-            "subject_type, subject_id, deployment_id, event_type, payload) "
-            "VALUES (%s, %s, %s, %s, 'review', %s, NULL, %s, %s) "
+            "subject_type, subject_id, deployment_id, event_type, payload, dedup_key) "
+            "VALUES (%s, %s, %s, %s, 'review', %s, NULL, %s, %s, %s) "
             "ON CONFLICT (organization_id, repository_id, environment, subject_type, "
-            "subject_id, event_type) DO NOTHING",
+            "subject_id, event_type, dedup_key) DO NOTHING",
             (str(uuid.uuid4()), organization_id, repository_id, environment, review_id,
-             event_type, self._Jsonb(payload or {"review_id": review_id})),
+             event_type, self._Jsonb(payload or {"review_id": review_id}), dedup_key),
         )
         row = self.connection.execute(
             "SELECT * FROM outbox_events WHERE organization_id=%s AND repository_id=%s "
-            "AND environment=%s AND subject_type='review' AND subject_id=%s AND event_type=%s",
-            (organization_id, repository_id, environment, review_id, event_type),
+            "AND environment=%s AND subject_type='review' AND subject_id=%s "
+            "AND event_type=%s AND dedup_key=%s",
+            (organization_id, repository_id, environment, review_id, event_type, dedup_key),
         ).fetchone()
         return dict(row) if row else None
 

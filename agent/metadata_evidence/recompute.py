@@ -15,6 +15,9 @@ from datetime import datetime, timezone
 
 from agent.evidence_policy import default_policy
 from agent.metadata_evidence.decision import evaluate_metadata_decision
+from agent.metadata_evidence.publication_reconcile import (
+    EVENT_TYPE as PUBLICATION_EVENT_TYPE,
+)
 from agent.metadata_evidence.review_lifecycle import _evidence_rows
 
 EVENT_TYPE = "metadata.review_recompute_requested"
@@ -103,6 +106,19 @@ def recompute_review(store, *, organization_id, repository_id, environment,
                  "coverage": decision.coverage,
                  "snapshot_id": snapshot["snapshot_id"]},
     )
+
+    # A decision nobody is told about is not a decision anyone can act on.
+    # Republication runs as its own durable job so a GitHub or Slack outage
+    # retries on the outbox instead of failing the recomputation that already
+    # committed. Dedup is per attempt: each recomputation republishes once.
+    if decision.decision is not None:
+        store.enqueue_review_recomputation(
+            organization_id, repository_id, environment, review_id=review_id,
+            event_type=PUBLICATION_EVENT_TYPE,
+            payload={"review_id": review_id, "attempt": next_attempt,
+                     "decision": decision.decision},
+            dedup_key=f"attempt-{next_attempt}",
+        )
     return {
         "review_id": review_id,
         "status": "recomputed",

@@ -1,0 +1,8 @@
+name: direct_downstream_fixture
+version: 1.0.0
+config-version: 2
+profile: direct_downstream_fixture
+
+model-paths: ["models"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]

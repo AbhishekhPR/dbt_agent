@@ -136,6 +136,38 @@ class MetadataEvidencePlaneTests(unittest.TestCase):
                 (ORG_A, REPO_A, SHARED_SNAPSHOT),
             )
 
+    def test_column_absence_survives_the_round_trip(self):
+        """A column the collector could not find must still be absent on read.
+
+        The evidence plane had nowhere to record column-level existence, so an
+        absent column was stored as a present one with unknown metrics and the
+        decision engine reported nothing. Persistence is the layer that has to
+        hold this fact; asserting it here stops the regression at the store.
+        """
+        self._review()
+        relation = _relation()
+        relation["columns"] = [
+            {"column_name": "order_id", "data_type": "bigint",
+             "exists_in_production": True, "null_rate": 0.0},
+            {"column_name": "discount_amount", "data_type": None,
+             "exists_in_production": False},
+        ]
+        self._snapshot(relations=[relation])
+
+        stored = self.store.get_snapshot(ORG_A, REPO_A, SHARED_SNAPSHOT)
+        by_name = {c["column_name"]: c
+                   for c in stored["relations"][0]["columns"]}
+        self.assertTrue(by_name["order_id"]["exists_in_production"])
+        self.assertFalse(by_name["discount_amount"]["exists_in_production"])
+
+    def test_columns_default_to_existing_when_the_flag_is_absent(self):
+        """Evidence written before the flag existed must not become absent."""
+        self._review()
+        self._snapshot()
+        stored = self.store.get_snapshot(ORG_A, REPO_A, SHARED_SNAPSHOT)
+        for column in stored["relations"][0]["columns"]:
+            self.assertTrue(column["exists_in_production"], column["column_name"])
+
     def test_snapshot_delete_is_rejected(self):
         self._review()
         self._snapshot()
@@ -441,6 +473,63 @@ class MetadataEvidencePlaneTests(unittest.TestCase):
         self.store.enqueue_review_recomputation(ORG_A, REPO_A, ENV, review_id=SHARED_REVIEW)
         jobs = self.store.review_recomputation_jobs(ORG_A, REPO_A, review_id=SHARED_REVIEW)
         self.assertEqual(len(jobs), 1)
+
+    def test_new_evidence_enqueues_another_recomputation(self):
+        """A review whose production state moves must be recomputed again.
+
+        Uniqueness keyed on the review alone froze a decision at its first
+        snapshot: the outbox row stayed COMPLETED and every later enqueue was
+        discarded, so a warehouse that degraded after the first collection was
+        never re-decided. Exactly-once has to mean per unit of evidence.
+        """
+        self._review()
+        claimed = []
+        for snapshot_id in ("snap-a", "snap-b", "snap-c"):
+            self.store.enqueue_review_recomputation(
+                ORG_A, REPO_A, ENV, review_id=SHARED_REVIEW,
+                event_type="metadata.review_recompute_requested",
+                payload={"snapshot_id": snapshot_id}, dedup_key=snapshot_id)
+            event = self.store.claim_outbox(ORG_A, REPO_A, ENV, "worker-under-test")
+            self.assertIsNotNone(event, f"{snapshot_id} produced no job")
+            claimed.append(event["payload"]["snapshot_id"])
+            self.store.complete_outbox(ORG_A, REPO_A, event["event_id"])
+
+        self.assertEqual(claimed, ["snap-a", "snap-b", "snap-c"])
+
+    def test_redelivered_evidence_still_causes_one_recomputation(self):
+        """The duplicate-suppression guarantee must survive the fix."""
+        self._review()
+        for _ in range(3):
+            self.store.enqueue_review_recomputation(
+                ORG_A, REPO_A, ENV, review_id=SHARED_REVIEW,
+                event_type="metadata.review_recompute_requested",
+                payload={"snapshot_id": "snap-same"}, dedup_key="snap-same")
+
+        jobs = [j for j in self.store.review_recomputation_jobs(
+            ORG_A, REPO_A, review_id=SHARED_REVIEW)
+            if j["event_type"] == "metadata.review_recompute_requested"]
+        self.assertEqual(len(jobs), 1)
+
+    def test_binding_a_second_snapshot_enqueues_its_own_recomputation(self):
+        """The real submission path, not a direct enqueue."""
+        from agent.metadata_evidence.review_lifecycle import validate_and_bind_snapshot
+
+        self._review()
+        seen = []
+        for index, snapshot_id in enumerate(("snap-first", "snap-second")):
+            self._snapshot(snapshot_id=snapshot_id,
+                           idempotency_key=f"idem-{index}",
+                           payload_hash=f"ph-{index}")
+            stored = self.store.get_snapshot(ORG_A, REPO_A, snapshot_id)
+            validate_and_bind_snapshot(
+                self.store, organization_id=ORG_A, repository_id=REPO_A,
+                environment=ENV, review_id=SHARED_REVIEW, snapshot=stored)
+            event = self.store.claim_outbox(ORG_A, REPO_A, ENV, "worker-under-test")
+            self.assertIsNotNone(event, f"{snapshot_id} produced no job")
+            seen.append(event["payload"]["snapshot_id"])
+            self.store.complete_outbox(ORG_A, REPO_A, event["event_id"])
+
+        self.assertEqual(seen, ["snap-first", "snap-second"])
 
     def test_recomputation_job_is_claimable_by_the_worker(self):
         """The review job must be claimable through the SAME outbox claim path

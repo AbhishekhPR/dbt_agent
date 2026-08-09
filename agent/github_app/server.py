@@ -130,6 +130,36 @@ def build_application(settings, *, client_factory=None, logger=None, sleep=time.
         logger=logger,
         job_store=storage,
     )
+    # Dashboard sign-in, when the App's user-authorization credentials are
+    # configured. Without them the /auth routes are absent and the dashboard
+    # has no way in — which is the correct outcome, because the alternative
+    # was a service token compiled into its JavaScript.
+    session_manager = None
+    auth_routes = ()
+    if store_pool is not None and settings.dashboard_login_enabled:
+        from agent.api.auth_routes import create_auth_routes
+        from agent.api.sessions import SessionManager
+
+        session_manager = SessionManager(
+            client_id=settings.github_client_id,
+            client_secret=settings.github_client_secret,
+            encryption_key=settings.session_encryption_key,
+        )
+        auth_routes = create_auth_routes(
+            store_pool=store_pool,
+            session_manager=session_manager,
+            dashboard_url=settings.dashboard_url,
+            callback_url=settings.oauth_callback_url,
+            organization_id=settings.dashboard_organization,
+            repository_id=settings.dashboard_repository,
+            environment=settings.metadata_review_environment,
+            secure_cookies=settings.secure_cookies,
+        )
+        logger.info("dashboard login enabled for %s/%s",
+                    settings.dashboard_organization, settings.dashboard_repository)
+    elif store_pool is not None:
+        logger.warning("dashboard login is NOT configured; /auth routes are absent")
+
     app = create_http_app(
         webhook_secret=settings.webhook_secret,
         job_queue=jobs,
@@ -140,6 +170,9 @@ def build_application(settings, *, client_factory=None, logger=None, sleep=time.
         job_store=storage,
         store_pool=store_pool,
         review_lifecycle_mode=lifecycle.mode,
+        cors_allowed_origins=settings.cors_allowed_origins,
+        session_manager=session_manager,
+        auth_routes=auth_routes,
     )
     app.state.job_queue = jobs
     return app

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relium"
+version = "0.1.0"
+description = "Relium - evidence-backed dbt deployment review, and the customer-side metadata collector"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+
+# The collector needs only a PostgreSQL driver and a CLI framework. The rest of
+# the repository's dependencies belong to the Relium service, not to the agent a
+# customer installs, so they are not forced onto a design partner's host.
+dependencies = [
+    "click>=8.1,<9",
+    "psycopg[binary]>=3.2,<4",
+]
+
+[project.scripts]
+relium = "agent.cli:cli"
+
+[project.optional-dependencies]
+# Everything needed to run Relium itself (API, worker, GitHub App). A collector
+# host does not need any of this.
+server = [
+    "starlette>=0.37,<1",
+    "uvicorn>=0.30,<1",
+]
+
+[tool.setuptools.packages.find]
+# The whole agent package, so the CLI is complete rather than partially
+# broken. `relium collect` needs only click and psycopg; commands that need
+# the server extras fail with a clear ImportError rather than being silently
+# absent. The collector itself imports nothing from agent.api,
+# agent.github_app, agent.worker or agent.metadata_evidence.
+include = ["agent*"]
+
+[tool.setuptools]
+include-package-data = false

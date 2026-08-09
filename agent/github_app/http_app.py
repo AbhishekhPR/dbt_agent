@@ -24,6 +24,9 @@ def create_http_app(
     job_store=None,
     store_pool=None,
     review_lifecycle_mode=None,
+    cors_allowed_origins=(),
+    session_manager=None,
+    auth_routes=(),
 ):
     """Build the served application.
 
@@ -189,16 +192,58 @@ def create_http_app(
         Route("/github/webhook", webhook, methods=["POST"]),
     ]
     if store_pool is not None:
-        routes.extend(create_api_routes(store_pool=store_pool))
+        routes.extend(create_api_routes(
+            store_pool=store_pool,
+            session_manager=session_manager,
+            allowed_origins=cors_allowed_origins,
+        ))
+    # Dashboard sign-in. Registered only when the App's user-authorization
+    # credentials are fully configured, so there is never a login route that
+    # cannot complete a login.
+    routes.extend(auth_routes)
+
+    # Browser access to the dashboard API.
+    #
+    # The /api routes are declared dashboard resources, but a browser served
+    # from any other origin could not call them: the Authorization header makes
+    # every request preflighted, and OPTIONS had no handler, so the preflight
+    # answered 405 and the fetch never happened.
+    #
+    # Opt-in and explicit. With no configured origins there is no middleware at
+    # all and behaviour is byte-identical to before. Origins are listed exactly;
+    # there is no wildcard, because these routes carry a bearer token and a
+    # wildcard would invite any page to spend it.
+    middleware = []
+    if cors_allowed_origins:
+        from starlette.middleware import Middleware
+        from starlette.middleware.cors import CORSMiddleware
+
+        middleware.append(Middleware(
+            CORSMiddleware,
+            allow_origins=list(cors_allowed_origins),
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type", "Idempotency-Key",
+                           "X-Request-Id", "X-Relium-CSRF"],
+            expose_headers=["X-Request-Id"],
+            # The dashboard now authenticates with an HttpOnly session cookie,
+            # so credentialed requests are required. This is safe only because
+            # the origins are listed exactly and '*' is rejected at load time:
+            # a wildcard with credentials would let any page in a user's
+            # browser spend their session.
+            allow_credentials=True,
+            max_age=600,
+        ))
 
     app = Starlette(
         debug=False,
         routes=routes,
+        middleware=middleware,
         lifespan=lifespan,
         exception_handlers={Exception: unexpected_error},
     )
     app.state.started = False
     app.state.store_pool = store_pool
+    app.state.cors_allowed_origins = list(cors_allowed_origins or ())
     return app
 
 

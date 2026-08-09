@@ -114,8 +114,34 @@ for _event in ("deployment.reviewed", "deployment.approved", "deployment.deploym
 # Review recomputation runs on this same worker and this same outbox. It is
 # registered here so the supported event set stays inspectable in one place.
 from agent.metadata_evidence.recompute import register as _register_recompute  # noqa: E402
+from agent.metadata_evidence.publication_reconcile import (  # noqa: E402
+    register as _register_publication,
+)
+from agent.metadata_evidence.change_request import (  # noqa: E402
+    register as _register_change_request,
+)
 
 _register_recompute(registry)
+
+# Republication of a recomputed decision. The factory is installed by
+# configure_publisher(); until then the handler runs and records that the
+# decision was not published, rather than reporting a delivery that never
+# happened.
+_publisher_factory = {"build": None}
+
+
+def configure_publisher(factory):
+    """Install the per-tenant publisher factory used by republication."""
+    _publisher_factory["build"] = factory
+
+
+def _build_publisher(**scope):
+    build = _publisher_factory["build"]
+    return build(**scope) if build is not None else None
+
+
+_register_publication(registry, publisher_factory=_build_publisher)
+_register_change_request(registry, publisher_factory=_build_publisher)
 
 
 class WorkerState:
@@ -289,6 +315,29 @@ def main(argv=None):
         return 2
     if not dsn.startswith(("postgresql://", "postgres://")):
         print("RELIUM_DATABASE_URL must be a PostgreSQL DSN", file=sys.stderr)
+        return 2
+
+    # Install the outbound publisher. Without this the republication and
+    # request-changes handlers run, find no publisher, and record that
+    # nothing was published - durable and honest, but never delivered.
+    from agent.worker.publisher_config import build_publisher_factory
+
+    factory = build_publisher_factory()
+    if factory is not None:
+        configure_publisher(factory)
+        logger.info("worker_publisher_configured",
+                    extra={"operation": "startup"})
+    elif str(os.environ.get("RELIUM_WORKER_REQUIRE_PUBLISHER", "")).strip().lower() \
+            in {"1", "true", "yes", "on"}:
+        # A worker with no publisher still runs, and still records honestly
+        # that nothing was published — which is the right behaviour for a
+        # local run and the wrong one for a deployment, where it means every
+        # request-changes review is queued and silently never delivered.
+        # Production sets this so the mistake is a failed boot, not a quiet
+        # backlog nobody looks at.
+        print("RELIUM_WORKER_REQUIRE_PUBLISHER is set but the GitHub App is not "
+              "configured: set RELIUM_GITHUB_APP_ID and a private key",
+              file=sys.stderr)
         return 2
 
     worker = build_worker(dsn, poll_seconds=args.poll_seconds,

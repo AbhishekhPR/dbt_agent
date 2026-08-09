@@ -318,9 +318,18 @@ def verify_recomputation(dsn, owner, repo_name, review_id):
         raise StageFailure(f"expected COMPLETE coverage, got {review['evidence_coverage']}")
     if review["lifecycle_state"] not in ("DECISION_READY", "PUBLISHED"):
         raise StageFailure(f"lifecycle is {review['lifecycle_state']}")
-    completed = [j for j in jobs if j["state"] == "COMPLETED"]
-    if len(jobs) != 1 or len(completed) != 1:
-        raise StageFailure(f"expected exactly one completed job, got {len(jobs)}")
+    # Count the RECOMPUTATION job specifically. A recomputed decision now
+    # also enqueues its republication on the same outbox, so a bare count of
+    # every job for this review is no longer one - and asserting on that
+    # total would fail for a reason that has nothing to do with recomputation.
+    from agent.metadata_evidence.recompute import EVENT_TYPE as RECOMPUTE_EVENT
+
+    recomputes = [j for j in jobs if j["event_type"] == RECOMPUTE_EVENT]
+    completed = [j for j in recomputes if j["state"] == "COMPLETED"]
+    if len(recomputes) != 1 or len(completed) != 1:
+        raise StageFailure(
+            f"expected exactly one completed recomputation job, got "
+            f"{len(recomputes)} ({[j['event_type'] for j in jobs]})")
 
     findings = (attempts[-1].get("payload") or {}).get("findings", [])
     codes = {f.get("code") for f in findings}
@@ -355,6 +364,16 @@ def verify_recomputation(dsn, owner, repo_name, review_id):
 # ------------------------------------------------- GitHub reconciliation
 def verify_reconciliation(gh, token, repo, pr_number, head_sha, expected_app_id,
                           comment_before, check_before):
+    """Prove the sticky comment and check run were updated, not duplicated.
+
+    The ids are compared numerically. Callers reading them from the store hand
+    over TEXT while GitHub returns integers, and a bare != on those two made a
+    correctly reconciled comment look like it had been replaced.
+    """
+    def _id(value):
+        return int(value) if value not in (None, "") else None
+
+    comment_before, check_before = _id(comment_before), _id(check_before)
     status, comments = gh("GET", f"/repos/{repo}/issues/{pr_number}/comments",
                           token, bearer=False)
     owned = [c for c in comments

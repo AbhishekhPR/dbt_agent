@@ -124,6 +124,48 @@ def _serialise_request(request_row):
     }
 
 
+def _relation_evidence_view(relation):
+    """One relation's measured evidence, safe to disclose.
+
+    Aggregates only. ``min_value`` and ``max_value`` are the sole fields in
+    the schema derived from an actual cell, and they are deliberately not
+    projected here: a JSON viewer in the dashboard must not become a way to
+    read customer data.
+    """
+    return {
+        "relation_name": relation.get("relation_name"),
+        "relation_schema": relation.get("relation_schema"),
+        "relation_type": relation.get("relation_type"),
+        "exists_in_production": relation.get("exists_in_production"),
+        "collection_status": relation.get("collection_status"),
+        "schema_fingerprint": relation.get("schema_fingerprint"),
+        "row_count": relation.get("row_count"),
+        "freshness_lag_seconds": relation.get("freshness_lag_seconds"),
+        "unevaluated_checks": relation.get("unevaluated_checks") or [],
+        "collection_error": relation.get("collection_error"),
+        "observed_at": (relation["observed_at"].isoformat()
+                        if hasattr(relation.get("observed_at"), "isoformat")
+                        else relation.get("observed_at")),
+        "columns": [
+            {
+                "column_name": column.get("column_name"),
+                "exists_in_production": column.get("exists_in_production"),
+                "data_type": column.get("data_type"),
+                "is_nullable": column.get("is_nullable"),
+                "ordinal_position": column.get("ordinal_position"),
+                "null_count": column.get("null_count"),
+                "null_rate": column.get("null_rate"),
+                "duplicate_count": column.get("duplicate_count"),
+                "duplicate_rate": column.get("duplicate_rate"),
+                "distinct_count": column.get("distinct_count"),
+                "cardinality": column.get("cardinality"),
+                "collection_status": column.get("collection_status"),
+            }
+            for column in (relation.get("columns") or [])
+        ],
+    }
+
+
 def _parse_relations(body):
     relations = body.get("relations")
     if relations is None:
@@ -155,8 +197,15 @@ def _parse_relations(body):
             if c_status not in COLLECTION_STATUSES:
                 raise ValidationError(
                     f"relations[{index}].columns[{c_index}].collection_status is invalid")
+            # A collector reports every column the request named, including one
+            # it could not find. Dropping that flag stored an absent column as
+            # a present one with unknown metrics, which the decision engine
+            # read as "nothing to report". `exists` is the collector's spelling;
+            # `exists_in_production` matches the relation level and wins.
+            exists = column.get("exists_in_production", column.get("exists", True))
             parsed_columns.append({
                 "column_name": str(column["column_name"])[:200],
+                "exists_in_production": bool(exists),
                 "data_type": _bounded(column.get("data_type")),
                 "is_nullable": column.get("is_nullable"),
                 "ordinal_position": column.get("ordinal_position"),
@@ -397,6 +446,12 @@ def build_handlers():
                 scope.organization_id, scope.repository_id, snapshot["review_id"] or "")
             if b["snapshot_id"] == snapshot_id
         ] if snapshot.get("review_id") else []
+        # The measured evidence itself, not just a count of it. A reviewer
+        # cannot check a null-rate finding against a number the API refuses to
+        # show. Everything here is aggregate metadata the collector computed -
+        # shapes, counts and rates. No warehouse row can reach this payload:
+        # min_value/max_value are the only cell-derived fields the schema has,
+        # and they are omitted rather than disclosed.
         return 200, {
             "status": "ok",
             "snapshot": {
@@ -407,8 +462,21 @@ def build_handlers():
                 "freshness_state": snapshot["freshness_state"],
                 "observed_at": snapshot["observed_at"].isoformat(),
                 "received_at": snapshot["received_at"].isoformat(),
+                "collected_at": (snapshot["collected_at"].isoformat()
+                                 if snapshot.get("collected_at") else None),
+                "ttl_seconds": snapshot.get("ttl_seconds"),
+                "request_id": snapshot.get("request_id"),
+                "collector_id": snapshot.get("collector_id"),
+                "collector_version": snapshot.get("collector_version"),
+                "adapter_type": snapshot.get("adapter_type"),
+                "base_sha": snapshot.get("base_sha"),
+                "head_sha": snapshot.get("head_sha"),
+                "base_manifest_hash": snapshot.get("base_manifest_hash"),
+                "head_manifest_hash": snapshot.get("head_manifest_hash"),
                 "relation_count": len(snapshot.get("relations") or []),
                 "metric_count": len(snapshot.get("metrics") or []),
+                "relations": [_relation_evidence_view(r)
+                              for r in (snapshot.get("relations") or [])],
             },
             "bindings": [
                 {"binding_state": b["binding_state"],

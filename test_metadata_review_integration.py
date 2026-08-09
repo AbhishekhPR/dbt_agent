@@ -170,15 +170,28 @@ class MetadataReviewIntegrationTests(unittest.TestCase):
                           key=key or f"idem-{uuid.uuid4().hex[:12]}")
 
     def _run_worker(self, review_id):
-        """Execute the real registered handler through the worker registry."""
+        """Execute the real recomputation handler through the worker registry.
+
+        The outbox holds more than recomputation jobs - a recomputed decision
+        also enqueues its republication - so this claims until it reaches the
+        recomputation job for THIS review rather than assuming the queue holds
+        exactly one claimable item. Every job it passes over is still
+        dispatched and completed, so nothing is left half-claimed.
+        """
+        from agent.metadata_evidence.recompute import EVENT_TYPE as RECOMPUTE
         from agent.worker.lifecycle_worker import JobContext, registry
 
         with self.pool.acquire() as store:
-            job = store.claim_outbox(self.org, self.repo, self.env, "worker-test")
-            self.assertIsNotNone(job, "expected a claimable recomputation job")
-            result = registry.dispatch(job["event_type"], JobContext(store, job))
-            store.complete_outbox(self.org, self.repo, job["event_id"])
-            return job, result
+            for _ in range(20):
+                job = store.claim_outbox(self.org, self.repo, self.env, "worker-test")
+                if job is None:
+                    break
+                result = registry.dispatch(job["event_type"], JobContext(store, job))
+                store.complete_outbox(self.org, self.repo, job["event_id"])
+                if (job["event_type"] == RECOMPUTE
+                        and (job.get("payload") or {}).get("review_id") == review_id):
+                    return job, result
+        self.fail(f"no recomputation job was claimable for {review_id}")
 
     # -- 1..6 review persistence and waiting ------------------------------
 
