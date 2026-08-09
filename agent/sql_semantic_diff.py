@@ -143,9 +143,23 @@ def _render(node) -> str | None:
     if node is None:
         return None
     try:
-        return _unwrap_redundant_parens(node.copy()).sql(dialect=DIALECT)
+        return _fold_identifiers(
+            _unwrap_redundant_parens(node.copy())).sql(dialect=DIALECT)
     except Exception:
         return None
+
+
+def _fold_identifiers(node):
+    """Case-fold unquoted identifiers so `A` and `a` render alike.
+
+    String literals are untouched — `'Paid'` and `'paid'` are different
+    values, not different spellings — and a quoted identifier keeps its case
+    because the warehouse does too.
+    """
+    for identifier in node.find_all(exp.Identifier):
+        if not identifier.quoted and isinstance(identifier.this, str):
+            identifier.set("this", identifier.this.lower())
+    return node
 
 
 def _unwrap_redundant_parens(node):
@@ -180,9 +194,26 @@ def _projections(tree) -> dict[str, str]:
     ``SELECT *`` carries no output names, so it is skipped rather than
     guessed at; an unresolved star is not evidence of anything.
     """
+    projections = {}
+    # CTE bodies first, namespaced by CTE name. A refund subtraction is very
+    # often computed in a staging CTE and merely selected through at the top
+    # level, so comparing only the outer SELECT would see an unchanged column
+    # reference and call a real change nothing.
+    for cte in tree.find_all(exp.CTE):
+        alias = _text(cte.alias)
+        inner_select = cte.this if isinstance(cte.this, exp.Select) else cte.find(exp.Select)
+        if not alias or inner_select is None:
+            continue
+        for name, rendered in _select_projections(inner_select).items():
+            projections[f"{alias}.{name}"] = rendered
+
     select = _select(tree)
-    if select is None:
-        return {}
+    if select is not None:
+        projections.update(_select_projections(select))
+    return projections
+
+
+def _select_projections(select) -> dict[str, str]:
     projections = {}
     for expression in select.expressions:
         if isinstance(expression, exp.Star):
@@ -198,14 +229,29 @@ def _projections(tree) -> dict[str, str]:
 
 
 def _projection_name(expression) -> str | None:
+    """The output name, case-folded when the identifier is unquoted.
+
+    Unquoted identifiers are case-insensitive in every warehouse Relium
+    targets, so `A` and `a` are the same column and must not read as one
+    output being dropped and another added. A *quoted* identifier is
+    case-sensitive and is left exactly as written.
+    """
     if isinstance(expression, exp.Alias):
-        return _text(expression.alias)
+        return _fold(expression.args.get("alias"), _text(expression.alias))
     alias = getattr(expression, "alias", None)
     if alias:
-        return _text(alias)
+        return _fold(None, _text(alias))
     if isinstance(expression, exp.Column):
-        return _text(expression.name)
+        return _fold(expression.this, _text(expression.name))
     return None
+
+
+def _fold(identifier, text) -> str | None:
+    if text is None:
+        return None
+    if isinstance(identifier, exp.Identifier) and identifier.quoted:
+        return text
+    return text.lower()
 
 
 def _projection_changes(before, after, identity) -> list[dict]:
