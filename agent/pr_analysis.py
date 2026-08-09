@@ -726,7 +726,19 @@ def compare_manifest_sql(previous_manifest, current_manifest, changed_models) ->
         "semantic_comparison_evaluated": evaluated,
         "declared_semantic_evidence_available": declared_available,
         "material_sql_changes": [],
+        "sql_semantic_comparison": {"status": "unavailable", "models": []},
     }
+
+    # Structural SQL comparison. This is the canonical answer to "what changed
+    # in the SQL", and it is independent of the refund heuristic below:
+    # `material_sql_changes` is a narrow decision signal about one business
+    # pattern, whereas this describes the change itself. It therefore runs
+    # even when declared semantics are available, because a declared contract
+    # says what a model promises, not which join was dropped.
+    if evaluated:
+        audit["sql_semantic_comparison"] = _sql_semantic_comparison(
+            previous_manifest, current_manifest, changed_models)
+
     if not evaluated or declared_available:
         return audit
     previous_nodes = _manifest_model_nodes(previous_manifest)
@@ -818,6 +830,42 @@ def _canonical_sql(value) -> str:
         return sqlglot.parse_one(text).sql(dialect="sqlite")
     except Exception:
         return " ".join(text.lower().split())
+
+
+def _sql_semantic_comparison(previous_manifest, current_manifest, changed_models) -> dict:
+    """Compare each changed model's base and head SQL as ASTs.
+
+    One result for the whole review. A model whose SQL cannot be read is
+    reported as unavailable rather than as unchanged, so the caller can always
+    tell "nothing changed" from "we could not look".
+    """
+    from agent.sql_semantic_diff import compare_model_sql
+
+    previous_nodes = _manifest_model_nodes(previous_manifest)
+    current_nodes = _manifest_model_nodes(current_manifest)
+
+    models = []
+    for name in list(changed_models or []):
+        previous = previous_nodes.get(name) or {}
+        current = current_nodes.get(name) or {}
+        comparison = compare_model_sql(
+            name,
+            previous.get("raw_code") or previous.get("compiled_code") or previous.get("sql"),
+            current.get("raw_code") or current.get("compiled_code") or current.get("sql"),
+            model_unique_id=current.get("unique_id") or previous.get("unique_id"),
+        )
+        models.append(comparison.to_dict())
+
+    evaluated = [model for model in models if model["status"] == "evaluated"]
+    return {
+        # `evaluated` means every changed model was readable; `partial` means
+        # some were and some were not. Neither is ever inferred from an empty
+        # change list.
+        "status": ("evaluated" if models and len(evaluated) == len(models)
+                   else "partial" if evaluated else "unavailable"),
+        "models": models,
+        "change_count": sum(len(model["changes"]) for model in models),
+    }
 
 
 def _material_sql_delta(previous_sql: str, current_sql: str) -> bool:
