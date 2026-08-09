@@ -25,6 +25,13 @@ from __future__ import annotations
 
 FACT_PATH = "models/marts/finance/fct_orders.sql"
 
+#: The only models each fixture edits. The E2E asserts presence rather than an
+#: exact change count, so it needs a way to tell "an extra truthful
+#: observation" from "evidence about something we never touched". Any change
+#: attributed outside these names is unexplained and fails the run.
+BLOCK_MUTATED_MODELS = ("fct_orders",)
+ALLOW_MUTATED_MODELS = ("int_customer_orders",)
+
 #: The exact fragments the BLOCK mutation removes, each verified present
 #: before removal so a fixture drift fails loudly instead of quietly
 #: producing a smaller diff.
