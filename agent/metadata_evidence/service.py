@@ -48,7 +48,8 @@ class ReviewLifecycleService:
     def begin(self, *, organization_id, repository_id, pull_number, base_sha,
               head_sha, base_manifest, head_manifest, changed_models,
               enforcement_mode, delivery_id=None, code_health=100,
-              code_findings=(), critical_models=(), environment=None):
+              code_findings=(), critical_models=(), environment=None,
+              semantic_evidence=None):
         """Persist the review and decide whether production evidence is needed."""
         with self._pool.acquire() as store:
             return begin_review(
@@ -59,6 +60,7 @@ class ReviewLifecycleService:
                 pull_number=pull_number,
                 base_sha=base_sha,
                 head_sha=head_sha,
+                semantic_evidence=semantic_evidence,
                 base_manifest=base_manifest,
                 head_manifest=head_manifest,
                 changed_models=changed_models,

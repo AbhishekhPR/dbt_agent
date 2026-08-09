@@ -126,6 +126,12 @@ def _parse(sql):
         return None, "SQL could not be parsed"
     if tree is None:
         return None, "SQL could not be parsed"
+    # sqlglot is lenient and will happily turn nonsense into *some* node. If
+    # there is no SELECT to compare, say so: otherwise a model whose SQL could
+    # not really be read reports every projection as removed, which looks like
+    # evidence and is not.
+    if _select(tree) is None:
+        return None, "no SELECT statement was found to compare"
     return tree, None
 
 

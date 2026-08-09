@@ -195,6 +195,7 @@ class PullRequestReviewRunner:
         incident = result.get("incident") or {}
         health = incident.get("health")
         return self.lifecycle.begin(
+            semantic_evidence=_semantic_evidence(incident),
             organization_id=str(event.repository.owner),
             repository_id=str(event.repository.name),
             pull_number=event.pull_number,
@@ -532,3 +533,22 @@ def _safe_slack_result(value, publication_id):
     if state == "failed" and "error_category" not in result:
         result["error_category"] = "slack_result"
     return result
+
+
+def _semantic_evidence(incident) -> dict | None:
+    """The SQL semantic comparison this review already produced.
+
+    Lifted from the analysis result rather than recomputed: the SQL is parsed
+    exactly once, during the review, and this is that same object on its way
+    to storage.
+
+    Returns None when no comparison ran at all — for example when the base
+    manifest could not be fetched — so an absent comparison is stored as SQL
+    NULL and can never be read back as "compared, nothing changed".
+    """
+    metadata = incident.get("metadata") if isinstance(incident, dict) else None
+    comparison = (metadata or {}).get("manifest_comparison") or {}
+    evidence = comparison.get("sql_semantic_comparison")
+    if not isinstance(evidence, dict) or not evidence.get("models"):
+        return None
+    return evidence

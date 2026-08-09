@@ -126,6 +126,74 @@ _COLLECTOR_CAPABILITY = {
 }
 
 
+# Fields each semantic change kind may disclose. An allowlist rather than a
+# denylist: a new engine field is invisible until someone decides it should be
+# public, which is the safe direction for a projection that carries customer
+# SQL.
+_SEMANTIC_CHANGE_FIELDS = {
+    "projection_added": ("output_name", "after_sql"),
+    "projection_removed": ("output_name", "before_sql"),
+    "projection_expression_changed": ("output_name", "before_sql", "after_sql"),
+    "join_added": ("relation", "after_join_type", "after_condition_sql"),
+    "join_removed": ("relation", "before_join_type", "before_condition_sql"),
+    "join_type_changed": ("relation", "before_join_type", "after_join_type"),
+    "join_condition_changed": ("relation", "before_sql", "after_sql"),
+    "filter_changed": ("scope", "before_sql", "after_sql"),
+    "grouping_changed": ("before_sql", "after_sql"),
+}
+
+_SEMANTIC_STATUSES = {"evaluated", "partial", "unavailable"}
+
+
+def _semantic_evidence_view(stored):
+    """Project stored SQL semantic evidence for the dashboard.
+
+    ``None`` is preserved as ``None``: the comparison never ran, which is a
+    different fact from running and finding nothing, and the frontend has to
+    be able to tell them apart.
+
+    Model identity travels per change rather than per model so a card can name
+    what it describes; base/head SHAs and the attempt are not repeated here
+    because the review and attempt already carry them.
+    """
+    if not isinstance(stored, dict):
+        return None
+    status = stored.get("status")
+    if status not in _SEMANTIC_STATUSES:
+        return None
+
+    changes = []
+    unreadable = []
+    for model in stored.get("models") or []:
+        if not isinstance(model, dict):
+            continue
+        name = model.get("model_name")
+        if model.get("status") != "evaluated":
+            unreadable.append({"model_name": name,
+                               "reason": model.get("unavailable_reason")})
+            continue
+        for change in model.get("changes") or []:
+            kind = change.get("kind")
+            allowed = _SEMANTIC_CHANGE_FIELDS.get(kind)
+            if not allowed:
+                continue
+            view = {"kind": kind, "model_name": name}
+            if change.get("model_unique_id"):
+                view["model_unique_id"] = change["model_unique_id"]
+            for field_name in allowed:
+                view[field_name] = change.get(field_name)
+            changes.append(view)
+
+    return {
+        "status": status,
+        "changes": changes,
+        "change_count": len(changes),
+        # Named so a partial comparison can say which models it could not read
+        # instead of implying they were clean.
+        "unavailable_models": unreadable,
+    }
+
+
 def _governance_actor(body, principal) -> str:
     """The identity recorded against a governance action.
 
@@ -772,6 +840,10 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
                  "enforcement_mode": a.get("enforcement_mode"),
                  "policy_version": a.get("policy_version"),
                  "finding_count": len((a.get("payload") or {}).get("findings", [])),
+                 # Bound to THIS attempt row, so evidence from attempt N can
+                 # never surface on attempt N+1 just because the review id
+                 # matches.
+                 "semantic_evidence": _semantic_evidence_view(a.get("semantic_evidence")),
                  "created_at": isoformat(a.get("created_at"))}
                 for a in attempts
             ],
