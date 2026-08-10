@@ -1,16 +1,27 @@
 """Live proof for SQL semantic Before/After evidence.
 
-One chain, twice, with opposite policy outcomes::
+One chain, twice, with two different evidence shapes::
 
     real fixture SQL -> real dbt parse -> genuine unmerged fixture PR
       -> served webhook runner -> PostgreSQL review_attempts.semantic_evidence
-      -> authenticated public review API
+      -> WAITING_FOR_METADATA -> authenticated public review API
 
-The BLOCK case removes a real refund dependency and must both produce
-semantic evidence and trip the existing refund policy. The ALLOW case makes a
-real but policy-irrelevant SQL change and must produce semantic evidence while
-staying ALLOW. Running only one of them would prove the wrong thing: together
-they show that evidence and finding are separate concepts.
+What this driver owns ends at persisted semantic evidence. It does NOT drive
+the collector, the metadata snapshot, worker recomputation, the final
+ALLOW/WARN/BLOCK verdict, or GitHub publication -- the metadata-review E2E
+already proves those, and waiting for a decision here would fail this run on
+a stage it does not own.
+
+So the two cases are two evidence shapes, not two verdicts. The `block`
+fixture removes a real refund dependency and must yield an expression change
+plus a join removal; the `allow` fixture changes a filter in an unrelated
+model. Both must reach WAITING_FOR_METADATA with durable evidence. Neither
+claims a decision: at that stage `decision` is legitimately NULL, and
+inventing one would be the fabrication this E2E exists to rule out.
+
+That evidence is not automatically a finding is proven locally instead, in
+test_real_fixture_regressions, against the same real fixture SQL: the refund
+change yields BLOCK/65 and the filter change yields ALLOW/100.
 
 Nothing here authors a manifest or a SemanticDiff. The fixtures are text
 mutations of the fixture repository's own SQL; dbt parses whatever they
@@ -281,7 +292,16 @@ def semantic_changes(evidence: dict | None) -> list[dict]:
 
 
 def assert_block_expectations(incident: dict, evidence: dict) -> dict:
-    """The refund removal: evidence AND the existing policy outcome."""
+    """The refund removal: evidence AND the existing policy outcome.
+
+    IN-MEMORY ONLY. `material_sql_changes` lives on the incident that
+    `review_manifest_change` returns and is never persisted -- confirmed by
+    inspecting a real attempt row, whose payload carries findings and plan
+    only. Do not point this at a PostgreSQL row: it would look for a
+    `metadata.manifest_comparison` path that does not exist there and report
+    a missing refund signal for a perfectly good review. The remote driver
+    uses `assert_remote_semantic_evidence` instead.
+    """
     failures = []
     changes = semantic_changes(evidence)
     if (evidence or {}).get("status") != "evaluated":
@@ -1090,14 +1110,27 @@ def _review_diagnostics(dsn: str, pr_number: int, base_sha: str,
                  if isinstance(row, dict)})}
 
 
-def wait_for_decided_attempt(dsn: str, review_id: str, attempt: int) -> dict:
-    """Wait until the attempt row carries a durable decision.
+#: The lifecycle state a review legitimately reaches on the semantic path.
+#: A final ALLOW/WARN/BLOCK requires the collector, a metadata snapshot and
+#: worker recomputation -- all of which the metadata-review E2E already
+#: proves. Waiting for a decision here would make this driver fail on a
+#: stage it does not own, and is what conflated the two E2Es.
+SEMANTIC_TERMINAL_STATE = "WAITING_FOR_METADATA"
 
-    A row can exist before the manifest review path has written its verdict.
-    Reading it early would show decision NULL, and treating NULL as a result
-    would let the E2E report a decision the product never made.
+
+def wait_for_semantic_attempt(dsn: str, review_id: str, attempt: int) -> dict:
+    """Wait until the exact attempt is metadata-waiting with durable evidence.
+
+    `decision` and `health` are deliberately not wait conditions. A NULL
+    decision while WAITING_FOR_METADATA is correct product behaviour, and
+    treating it as failure would have this driver assert a verdict the
+    product has not yet made -- and could not make without the collector.
+
+    `semantic_evidence` NULL is a wait condition, because that column is the
+    entire point of this E2E: SQL NULL means the comparison did not run, and
+    an absent row must never be read as a clean comparison.
     """
-    def decided():
+    def ready():
         store = vf._store(dsn)
         try:
             rows = store.connection.execute(
@@ -1107,48 +1140,87 @@ def wait_for_decided_attempt(dsn: str, review_id: str, attempt: int) -> dict:
             if not rows:
                 return None
             row = dict(rows[0])
-            # decision and health are written together by the review path;
-            # semantic_evidence NULL means the comparison did not run, which
-            # is a real outcome the assertions must be allowed to see.
-            if row.get("decision") is None or row.get("health") is None:
+            if row.get("lifecycle_state") != SEMANTIC_TERMINAL_STATE:
+                return None
+            if row.get("semantic_evidence") is None:
                 return None
             return row
         finally:
             store.close()
 
-    return lf.poll(decided, timeout=ATTEMPT_TIMEOUT, interval=4,
-                   description=(f"a decided review_attempts row for {review_id} "
-                                f"attempt {attempt}"))
+    return lf.poll(ready, timeout=ATTEMPT_TIMEOUT, interval=4,
+                   description=(f"review_attempts {review_id} attempt {attempt} "
+                                f"in {SEMANTIC_TERMINAL_STATE} with semantic "
+                                f"evidence"))
 
 
-def persisted_case_view(row: dict) -> tuple[dict, dict]:
-    """Build the incident/evidence pair the assertions expect, from PostgreSQL.
+# -- what the remote run is responsible for proving ------------------------
+#
+# Semantic evidence only. `material_sql_changes` is an in-memory policy
+# artifact that the lifecycle never persists -- proven by inspecting a real
+# decided attempt -- so requiring it here would assert against a column that
+# does not exist. The evidence-versus-policy behaviour it establishes is
+# proven locally instead, in test_real_fixture_regressions, against the same
+# real fixture SQL.
 
-    Nothing is synthesised: every value comes from the persisted attempt.
+REQUIRED_REMOTE_EVIDENCE = {
+    "block": ({"kind": "projection_expression_changed",
+               "output_name": "net_order_amount"},
+              {"kind": "join_removed", "relation": "int_order_refunds"}),
+    "allow": ({"kind": "filter_changed"},),
+}
+
+_ACCEPTABLE_STATUS = ("evaluated", "partial")
+
+
+def assert_remote_semantic_evidence(case: str, row: dict) -> dict:
+    """Assert the persisted semantic evidence for one case. No verdict.
+
+    Deliberately says nothing about decision or health: at this lifecycle
+    stage the product has not decided, and inventing one would be the exact
+    fabrication this E2E exists to rule out.
     """
-    payload = row.get("payload")
-    if isinstance(payload, str):
+    failures = []
+    evidence = _decode(row.get("semantic_evidence"))
+    if not isinstance(evidence, dict):
+        failures.append("semantic_evidence is not a persisted object")
+        evidence = {}
+    status = evidence.get("status")
+    if status not in _ACCEPTABLE_STATUS:
+        failures.append(f"semantic evidence status is {status!r}, "
+                        f"not one of {list(_ACCEPTABLE_STATUS)}")
+    changes = semantic_changes(evidence)
+    if not changes:
+        failures.append("semantic evidence is empty; the fixture proved nothing")
+    for required in REQUIRED_REMOTE_EVIDENCE.get(case, ()):
+        if not any(_matches(change, required) for change in changes):
+            failures.append(f"required semantic evidence missing: {required}")
+    mutated = (sf.BLOCK_MUTATED_MODELS if case == "block"
+               else sf.ALLOW_MUTATED_MODELS)
+    unexplained = _unexplained(changes, mutated)
+    if unexplained:
+        failures.append(f"semantic changes not backed by the mutation: {unexplained}")
+    state = row.get("lifecycle_state")
+    if state != SEMANTIC_TERMINAL_STATE:
+        failures.append(f"lifecycle state is {state!r}, not {SEMANTIC_TERMINAL_STATE}")
+    return {"case": case, "passed": not failures, "failures": failures,
+            "lifecycle_state": state, "semantic_evidence_status": status,
+            "change_kinds": sorted({c.get("kind") for c in changes}),
+            "change_count": len(changes),
+            # Recorded verbatim, never asserted: at this stage a NULL
+            # decision is the correct product state.
+            "decision_at_this_stage": row.get("decision"),
+            "health_at_this_stage": row.get("health")}
+
+
+def _decode(value):
+    """psycopg may return JSON text rather than a parsed object."""
+    if isinstance(value, str):
         try:
-            payload = json.loads(payload)
+            return json.loads(value)
         except json.JSONDecodeError:
-            payload = {}
-    payload = payload if isinstance(payload, dict) else {}
-    comparison = ((payload.get("metadata") or {}).get("manifest_comparison")
-                  if isinstance(payload.get("metadata"), dict) else None)
-    comparison = comparison if isinstance(comparison, dict) else {}
-    incident = {
-        "decision": row.get("decision"),
-        "health": row.get("health"),
-        "metadata": {"manifest_comparison": {
-            "material_sql_changes": comparison.get("material_sql_changes") or []}},
-    }
-    evidence = row.get("semantic_evidence")
-    if isinstance(evidence, str):
-        try:
-            evidence = json.loads(evidence)
-        except json.JSONDecodeError:
-            evidence = None
-    return incident, (evidence if isinstance(evidence, dict) else {})
+            return None
+    return value
 
 
 def verify_case(dsn: str, case: str, pr_number: int, base_sha: str,
@@ -1165,30 +1237,31 @@ def verify_case(dsn: str, case: str, pr_number: int, base_sha: str,
             f"head {head_sha[:12]}: {exc}. Diagnostics: "
             f"{json.dumps(diagnostics, default=str)[:1200]}") from exc
     try:
-        row = wait_for_decided_attempt(dsn, review["review_id"], review["attempt"])
+        row = wait_for_semantic_attempt(dsn, review["review_id"], review["attempt"])
     except StageFailure as exc:
         diagnostics = _review_diagnostics(dsn, pr_number, base_sha, head_sha, delivery)
         diagnostics["review"] = review
         _write(f"semantic-diff-{case}-attempt-timeout.json", diagnostics)
         raise StageFailure(
             f"{case}: review {review['review_id']} attempt {review['attempt']} "
-            f"never reached a decision: {exc}. Diagnostics: "
+            f"never reached {SEMANTIC_TERMINAL_STATE} with semantic evidence: "
+            f"{exc}. Diagnostics: "
             f"{json.dumps(diagnostics, default=str)[:1200]}") from exc
 
-    incident, evidence = persisted_case_view(row)
-    assertion = (assert_block_expectations if case == "block"
-                 else assert_allow_expectations)
-    verdict = assertion(incident, evidence)
+    evidence = _decode(row.get("semantic_evidence")) or {}
+    verdict = assert_remote_semantic_evidence(case, row)
     record = {
         "case": case, "pull_number": pr_number,
         "base_sha": base_sha, "head_sha": head_sha,
         "review_id": review["review_id"], "attempt": review["attempt"],
         "lifecycle_state": row.get("lifecycle_state"),
-        "decision": incident["decision"], "health": incident["health"],
         "semantic_evidence_status": evidence.get("status"),
         "semantic_changes": semantic_changes(evidence),
-        "material_sql_changes":
-            len(incident["metadata"]["manifest_comparison"]["material_sql_changes"]),
+        # Carried for the record, never asserted remotely: the collector and
+        # worker that produce a verdict belong to the metadata-review E2E.
+        "decision_at_this_stage": row.get("decision"),
+        "health_at_this_stage": row.get("health"),
+        "final_verdict": "NOT_DETERMINED_AT_THIS_STAGE",
         "genuine_delivery": delivery,
         "assertion": verdict,
     }
@@ -1267,8 +1340,10 @@ def main() -> int:
     _write("semantic-diff-run.json", result)
     print(json.dumps({case["case"]: {
         "review_id": case["review_id"], "attempt": case["attempt"],
-        "decision": case["decision"], "health": case["health"],
-        "semantic_changes": len(case["semantic_changes"])} for case in verified},
+        "lifecycle_state": case["lifecycle_state"],
+        "semantic_evidence_status": case["semantic_evidence_status"],
+        "semantic_changes": len(case["semantic_changes"]),
+        "final_verdict": case["final_verdict"]} for case in verified},
         indent=2, sort_keys=True))
 
     outcome = cleanup("normal")

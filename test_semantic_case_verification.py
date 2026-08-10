@@ -80,12 +80,23 @@ def fast_poll(fn, *, timeout=180, interval=3, description="condition"):
     raise StageFailure(f"timed out waiting for {description}")
 
 
-def attempt_row(review_id, attempt, decision, health, changes, material):
-    return {"review_id": review_id, "attempt": attempt, "decision": decision,
-            "health": health, "lifecycle_state": "DECISION_READY",
-            "semantic_evidence": {"status": "evaluated", "changes": changes},
-            "payload": {"metadata": {"manifest_comparison": {
-                "material_sql_changes": material}}}}
+def attempt_row(review_id, attempt, changes, *, state="WAITING_FOR_METADATA",
+                status="evaluated", decision=None, health=65, evidence=...):
+    """The real shape: metadata-waiting, decision NULL, evidence nested.
+
+    Observed on a genuine persisted attempt -- payload carries findings and
+    plan only, and semantic_evidence groups changes under models[].
+    """
+    row = {"review_id": review_id, "attempt": attempt, "decision": decision,
+           "health": health, "lifecycle_state": state,
+           "payload": {"findings": [{"code": "metadata.pending"}],
+                       "plan": {"changed_models": ["fct_orders"]}}}
+    row["semantic_evidence"] = (
+        {"status": status, "change_count": len(changes),
+         "models": [{"model_name": (changes[0].get("model_name") if changes
+                                    else "fct_orders"),
+                     "changes": changes}]} if evidence is ... else evidence)
+    return row
 
 
 def review_row(review_id="rev-1", attempt=1, head=HEAD, base=BASE):
@@ -126,29 +137,27 @@ class CaseVerification(HarnessTestCase):
     # -- the paths that must succeed --------------------------------------
 
     def test_the_correct_block_path_succeeds(self):
-        self.wire([review_row()],
-                  [attempt_row("rev-1", 1, "BLOCK", 65, BLOCK_CHANGES, [{"m": 1}])])
+        self.wire([review_row()], [attempt_row("rev-1", 1, BLOCK_CHANGES)])
         record = self.run_case()
         self.assertTrue(record["assertion"]["passed"], record["assertion"]["failures"])
         self.assertEqual(record["review_id"], "rev-1")
         self.assertEqual(record["attempt"], 1)
-        self.assertEqual((record["decision"], record["health"]), ("BLOCK", 65))
+        self.assertEqual(record["lifecycle_state"], "WAITING_FOR_METADATA")
         self.assertEqual(record["semantic_evidence_status"], "evaluated")
+        self.assertEqual(record["final_verdict"], "NOT_DETERMINED_AT_THIS_STAGE")
 
     def test_the_correct_allow_path_succeeds(self):
-        self.wire([review_row("rev-2")],
-                  [attempt_row("rev-2", 1, "ALLOW", 100, ALLOW_CHANGES, [])])
+        self.wire([review_row("rev-2")], [attempt_row("rev-2", 1, ALLOW_CHANGES)])
         record = self.run_case("allow")
         self.assertTrue(record["assertion"]["passed"], record["assertion"]["failures"])
-        self.assertEqual(record["material_sql_changes"], 0)
+        self.assertEqual(record["lifecycle_state"], "WAITING_FOR_METADATA")
 
     def test_the_verified_record_carries_persisted_provenance(self):
-        self.wire([review_row()],
-                  [attempt_row("rev-1", 1, "BLOCK", 65, BLOCK_CHANGES, [{"m": 1}])])
+        self.wire([review_row()], [attempt_row("rev-1", 1, BLOCK_CHANGES)])
         record = self.run_case()
         for field in ("case", "pull_number", "base_sha", "head_sha", "review_id",
-                      "attempt", "decision", "health", "semantic_evidence_status",
-                      "semantic_changes", "genuine_delivery"):
+                      "attempt", "lifecycle_state", "semantic_evidence_status",
+                      "semantic_changes", "genuine_delivery", "final_verdict"):
             self.assertIn(field, record)
         self.assertTrue((self.evidence / "semantic-diff-block-verified.json").exists())
 
@@ -192,63 +201,81 @@ class CaseVerification(HarnessTestCase):
         self.assertTrue(
             (self.evidence / "semantic-diff-block-review-timeout.json").exists())
 
-    def test_a_review_without_a_decided_attempt_fails(self):
+    def test_a_review_without_persisted_semantic_evidence_fails(self):
         self.wire([review_row()],
-                  [{"review_id": "rev-1", "attempt": 1, "decision": None,
-                    "health": None, "semantic_evidence": None, "payload": {}}])
+                  [attempt_row("rev-1", 1, BLOCK_CHANGES, evidence=None)])
         with self.assertRaises(StageFailure) as caught:
             self.run_case()
-        self.assertIn("never reached a decision", str(caught.exception))
+        self.assertIn("never reached WAITING_FOR_METADATA", str(caught.exception))
         self.assertTrue(
             (self.evidence / "semantic-diff-block-attempt-timeout.json").exists())
 
-    def test_a_partially_written_attempt_is_never_read_as_final(self):
+    def test_an_attempt_not_yet_metadata_waiting_is_not_final(self):
         """decision present, health still NULL: not a durable verdict."""
         self.wire([review_row()],
-                  [{"review_id": "rev-1", "attempt": 1, "decision": "BLOCK",
-                    "health": None, "semantic_evidence": None, "payload": {}}])
+                  [attempt_row("rev-1", 1, BLOCK_CHANGES, state="ANALYZING")])
         with self.assertRaises(StageFailure):
             self.run_case()
 
     # -- assertions actually run -------------------------------------------
 
-    def test_a_block_review_with_the_wrong_decision_fails(self):
+    def test_evidence_with_an_unusable_status_fails(self):
         self.wire([review_row()],
-                  [attempt_row("rev-1", 1, "ALLOW", 100, BLOCK_CHANGES, [])])
+                  [attempt_row("rev-1", 1, BLOCK_CHANGES, status="unavailable")])
         with self.assertRaises(StageFailure) as caught:
             self.run_case()
         self.assertIn("assertions failed against persisted state", str(caught.exception))
 
     def test_a_block_review_missing_required_evidence_fails(self):
         partial = [c for c in BLOCK_CHANGES if c["kind"] != "join_removed"]
-        self.wire([review_row()],
-                  [attempt_row("rev-1", 1, "BLOCK", 65, partial, [{"m": 1}])])
+        self.wire([review_row()], [attempt_row("rev-1", 1, partial)])
         with self.assertRaises(StageFailure) as caught:
             self.run_case()
         self.assertIn("join_removed", str(caught.exception))
 
-    def test_a_block_review_at_the_wrong_health_fails(self):
-        self.wire([review_row()],
-                  [attempt_row("rev-1", 1, "BLOCK", 80, BLOCK_CHANGES, [{"m": 1}])])
-        with self.assertRaises(StageFailure):
+    def test_evidence_about_an_untouched_model_fails(self):
+        stray = BLOCK_CHANGES + [{"kind": "grouping_changed",
+                                  "model_name": "dim_customers",
+                                  "before_sql": "a", "after_sql": "b"}]
+        self.wire([review_row()], [attempt_row("rev-1", 1, stray)])
+        with self.assertRaises(StageFailure) as caught:
             self.run_case()
+        self.assertIn("dim_customers", str(caught.exception))
 
-    def test_an_allow_review_with_a_material_finding_fails(self):
+    def test_a_null_decision_while_waiting_is_accepted(self):
+        """The whole point: no verdict exists yet, and that is correct."""
         self.wire([review_row("rev-3")],
-                  [attempt_row("rev-3", 1, "ALLOW", 100, ALLOW_CHANGES, [{"m": 1}])])
-        with self.assertRaises(StageFailure):
+                  [attempt_row("rev-3", 1, ALLOW_CHANGES, decision=None,
+                               health=None)])
+        record = self.run_case("allow")
+        self.assertTrue(record["assertion"]["passed"], record["assertion"]["failures"])
+        self.assertIsNone(record["decision_at_this_stage"])
+        self.assertIsNone(record["health_at_this_stage"])
+
+    def test_no_final_verdict_is_ever_invented(self):
+        self.wire([review_row()], [attempt_row("rev-1", 1, BLOCK_CHANGES)])
+        record = self.run_case()
+        self.assertEqual(record["final_verdict"], "NOT_DETERMINED_AT_THIS_STAGE")
+        self.assertNotIn("decision", record)
+        self.assertNotIn("health", record)
+        for banned in ("BLOCK", "ALLOW", "WARN"):
+            self.assertNotIn(banned, json.dumps(record["assertion"]))
+
+    def test_an_allow_case_missing_its_filter_evidence_fails(self):
+        self.wire([review_row("rev-4")], [attempt_row("rev-4", 1, BLOCK_CHANGES)])
+        with self.assertRaises(StageFailure) as caught:
             self.run_case("allow")
+        self.assertIn("filter_changed", str(caught.exception))
 
     def test_a_null_semantic_evidence_column_is_never_read_as_no_change(self):
-        row = attempt_row("rev-1", 1, "BLOCK", 65, [], [{"m": 1}])
-        row["semantic_evidence"] = None
-        self.wire([review_row()], [row])
+        self.wire([review_row()],
+                  [attempt_row("rev-1", 1, [], evidence=None)])
         with self.assertRaises(StageFailure):
             self.run_case()
 
     def test_json_encoded_columns_are_decoded(self):
         """psycopg can return JSON text rather than parsed objects."""
-        row = attempt_row("rev-1", 1, "BLOCK", 65, BLOCK_CHANGES, [{"m": 1}])
+        row = attempt_row("rev-1", 1, BLOCK_CHANGES)
         row["semantic_evidence"] = json.dumps(row["semantic_evidence"])
         row["payload"] = json.dumps(row["payload"])
         self.wire([review_row()], [row])
@@ -258,7 +285,7 @@ class CaseVerification(HarnessTestCase):
 
     def test_a_failed_case_writes_a_failure_record_not_a_verified_one(self):
         self.wire([review_row()],
-                  [attempt_row("rev-1", 1, "ALLOW", 100, BLOCK_CHANGES, [])])
+                  [attempt_row("rev-1", 1, BLOCK_CHANGES, status="unavailable")])
         with self.assertRaises(StageFailure):
             self.run_case()
         self.assertTrue((self.evidence / "semantic-diff-block-failed.json").exists())
