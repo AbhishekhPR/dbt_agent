@@ -1047,6 +1047,11 @@ def prepare_case(case: str, main_files: dict[str, str]) -> dict:
 # passing E2E, which is exactly the failure this section exists to prevent.
 
 #: Bounded so a stalled runner fails with diagnostics instead of hanging.
+#: Where the runner looks for the manifest. It fetches this file from the
+#: repository at each SHA rather than parsing dbt itself, so both fixture
+#: branches must carry one or no comparison is possible.
+MANIFEST_PATH = "target/manifest.json"
+
 DELIVERY_TIMEOUT = 240
 REVIEW_TIMEOUT = 240
 ATTEMPT_TIMEOUT = 240
@@ -1335,11 +1340,21 @@ def main() -> int:
         make_branch(base_branch, default_sha)
         for path, content in _changed_files(main_files, prepared["base_files"]):
             commit_file(base_branch, path, content, f"relium semantic e2e {case} base")
+        # The runner fetches the manifest FROM the repository at
+        # config.manifest_path for both SHAs -- it does not parse dbt itself.
+        # Run 31360420394 accepted the delivery and created no review because
+        # this file was never committed, so there was nothing to compare.
+        commit_file(base_branch, MANIFEST_PATH,
+                    json.dumps(prepared["base_manifest"], indent=2, sort_keys=True),
+                    f"relium semantic e2e {case}: parsed base manifest")
         base_head = _load_recovery()["owned_branch_heads"][base_branch]
         make_branch(head_branch, base_head)
         commit_file(head_branch, prepared["changed_path"],
                     prepared["head_files"][prepared["changed_path"]],
                     f"relium semantic e2e {case} head")
+        commit_file(head_branch, MANIFEST_PATH,
+                    json.dumps(prepared["head_manifest"], indent=2, sort_keys=True),
+                    f"relium semantic e2e {case}: parsed head manifest")
         # Captured before the PR so the delivery search cannot match an
         # earlier case's event; correlation to this exact PR follows.
         since = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()

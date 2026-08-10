@@ -342,3 +342,26 @@ class CaseVerification(HarnessTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ManifestContract(HarnessTestCase):
+    """The runner fetches the manifest from the repo; the harness must commit it.
+
+    Run 31360420394 delivered a correlated webhook that the application
+    answered "accepted", and still created no review: neither fixture branch
+    carried target/manifest.json, so there was nothing to compare.
+    """
+
+    def test_the_harness_uses_the_product_manifest_path(self):
+        from agent.github_app.config import DEFAULT_MANIFEST_PATH
+        self.assertEqual(self.driver.MANIFEST_PATH, DEFAULT_MANIFEST_PATH)
+
+    def test_both_branches_receive_a_manifest_commit(self):
+        import inspect
+        source = inspect.getsource(self.driver.main)
+        commits = [line for line in source.splitlines()
+                   if "MANIFEST_PATH" in line]
+        self.assertGreaterEqual(len(commits), 2,
+                                "base and head branches must each get a manifest")
+        self.assertIn("base_manifest", source)
+        self.assertIn("head_manifest", source)
