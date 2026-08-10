@@ -70,9 +70,6 @@ def comparison(*, baseline=SNAP_A, current=SNAP_B, status="evaluated",
          "relation": "raw.orders", "column": "discount_amount",
          "signal": "cardinality", "before": 0.37, "after": 0.42,
          "percentage_point_delta": 5.0},
-        {"kind": "column_availability_changed", "model": "model.a.raw_orders",
-         "relation": "raw.orders", "column": "discount_amount",
-         "signal": "column_exists", "before": True, "after": False},
     ]
     changes = [c for c in changes if c["signal"] not in drop] + list(extra)
     return {"status": status, "baseline_snapshot_id": baseline,
@@ -355,12 +352,14 @@ class ObservationFreshnessTests(DriverTestCase):
 
         now = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
         observed = now - timedelta(seconds=self.d.A_BACKDATE_SECONDS)
-        body = self.d.observation_body(
-            {"review_id": "r", "attempt": 1, "base_sha": "a" * 40,
-             "head_sha": "b" * 40, "base_manifest_hash": "bh",
-             "head_manifest_hash": "hh"},
-            "req-1", row_count=1000, null_rate=0.01, cardinality=0.37,
-            column_exists=True, observed_at=observed)
+        review = {"review_id": "r", "attempt": 1, "base_sha": "a" * 40,
+                  "head_sha": "b" * 40, "base_manifest_hash": "bh",
+                  "head_manifest_hash": "hh"}
+        rel, col = self.d.select_carrier(REQUEST)
+        body = self.d.observation_from_request(
+            review, REQUEST, carrier_relation=rel, carrier_column=col,
+            row_count=1000, null_rate=0.01, cardinality=0.37,
+            observed_at=observed)
         snapshot = {"observed_at": observed,
                     "ttl_seconds": body["ttl_seconds"],
                     "relations": body["relations"]}
@@ -429,10 +428,11 @@ class ComparisonTests(DriverTestCase):
                                      SNAP_A, SNAP_B)
         self.assertIn("row_count", str(caught.exception))
 
-    def test_a_missing_column_existence_change_fails(self):
-        with self.assertRaises(StageFailure):
-            self.d.assert_comparison(comparison(drop=("column_exists",)),
+    def test_a_missing_cardinality_delta_fails(self):
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_comparison(comparison(drop=("cardinality",)),
                                      SNAP_A, SNAP_B)
+        self.assertIn("cardinality", str(caught.exception))
 
     def test_percentage_point_delta_must_be_points_not_percent(self):
         wrong = comparison(drop=("null_rate",), extra=[{
@@ -612,54 +612,194 @@ class ReadinessTests(DriverTestCase):
 
 # ---------------------------------------------------- observation bodies
 
+#: A request shaped exactly as the store returns one, using the identities the
+#: real fixture produced in run 31397009727.
+REQUEST = {
+    "request_id": "req-gh-abc-1",
+    "targets": [
+        {"target_index": 0, "relation_name": "main.dim_customers",
+         "relation_schema": "main", "relation_database": "warehouse",
+         "model_unique_id": "model.relium_e2e_dbt.dim_customers",
+         "columns": ["customer_id"], "criticality": "standard",
+         "dependency_kind": "external"},
+        {"target_index": 1, "relation_name": "main.stg_orders",
+         "relation_schema": "main", "relation_database": "warehouse",
+         "model_unique_id": "model.relium_e2e_dbt.stg_orders",
+         "columns": ["customer_id", "order_id"], "criticality": "standard",
+         "dependency_kind": "external"},
+    ],
+}
+
+
 class ObservationTests(DriverTestCase):
     def review(self):
         return {"review_id": "rev-1", "attempt": 1, "base_sha": "a" * 40,
                 "head_sha": "b" * 40, "base_manifest_hash": "bh",
                 "head_manifest_hash": "hh"}
 
-    def test_a_missing_column_carries_no_metrics(self):
+    def build(self, *, row_count, null_rate, cardinality, request=None):
         from datetime import datetime, timezone
 
-        body = self.d.observation_body(
-            self.review(), "req-1", row_count=800, null_rate=0.82,
-            cardinality=0.42, column_exists=False,
+        request = request or REQUEST
+        rel, col = self.d.select_carrier(request)
+        return self.d.observation_from_request(
+            self.review(), request, carrier_relation=rel, carrier_column=col,
+            row_count=row_count, null_rate=null_rate, cardinality=cardinality,
             observed_at=datetime(2026, 8, 10, tzinfo=timezone.utc))
-        missing = [c for c in body["relations"][0]["columns"]
-                   if c["column_name"] == "discount_amount"][0]
-        self.assertFalse(missing["exists"])
-        self.assertNotIn("null_rate", missing)
-        self.assertNotIn("cardinality", missing)
+
+    # -- REGRESSION for run 31397009727 ----------------------------------
+
+    def test_relation_identity_comes_from_the_request(self):
+        body = self.build(row_count=1000, null_rate=0.01, cardinality=0.37)
+        names = sorted(r["relation_name"] for r in body["relations"])
+        self.assertEqual(names, ["main.dim_customers", "main.stg_orders"])
+        for relation in body["relations"]:
+            self.assertTrue(relation["model_unique_id"].startswith("model."))
+
+    def test_column_identity_comes_from_the_request(self):
+        body = self.build(row_count=1000, null_rate=0.01, cardinality=0.37)
+        by_relation = {r["relation_name"]: sorted(c["column_name"]
+                                                  for c in r["columns"])
+                       for r in body["relations"]}
+        self.assertEqual(by_relation, {"main.dim_customers": ["customer_id"],
+                                       "main.stg_orders": ["customer_id",
+                                                           "order_id"]})
+
+    def test_no_unrequested_column_is_submitted(self):
+        body = self.build(row_count=1000, null_rate=0.01, cardinality=0.37)
+        requested = {(t["relation_name"], c)
+                     for t in REQUEST["targets"] for c in t["columns"]}
+        submitted = {(r["relation_name"], c["column_name"])
+                     for r in body["relations"] for c in r["columns"]}
+        self.assertEqual(submitted, requested)
+
+    def test_every_requested_column_is_present(self):
+        """This fixture does not test missing-production policy."""
+        for values in ((1000, 0.01, 0.37), (800, self.d.B_NULL_RATE, 0.42)):
+            body = self.build(row_count=values[0], null_rate=values[1],
+                              cardinality=values[2])
+            for relation in body["relations"]:
+                self.assertTrue(relation["exists_in_production"])
+                for column in relation["columns"]:
+                    self.assertTrue(column["exists"], column)
+
+    def test_no_hardcoded_raw_orders_fixture_survives(self):
+        source = (REPO_ROOT / "scripts" / "e2e"
+                  / "integrated_product_e2e.py").read_text(encoding="utf-8")
+        self.assertNotIn("raw.orders", source)
+        self.assertNotIn("discount_amount", source)
+        self.assertNotIn("observation_body", source)
+
+    def test_the_carrier_is_a_requested_non_critical_column(self):
+        relation, column = self.d.select_carrier(REQUEST)
+        requested = {(t["relation_name"], c)
+                     for t in REQUEST["targets"] for c in t["columns"]}
+        self.assertIn((relation, column), requested)
+        target = [t for t in REQUEST["targets"]
+                  if t["relation_name"] == relation][0]
+        self.assertNotEqual(target["criticality"], "critical")
+
+    def test_a_critical_target_is_never_chosen_as_carrier(self):
+        """high_null_rate is BLOCK severity on a critical target."""
+        critical = {"request_id": "r", "targets": [
+            dict(REQUEST["targets"][0], criticality="critical"),
+            dict(REQUEST["targets"][1], criticality="standard")]}
+        relation, _column = self.d.select_carrier(critical)
+        self.assertEqual(relation, "main.stg_orders")
+
+    def test_no_carrier_available_fails_loudly(self):
+        allcritical = {"request_id": "r", "targets": [
+            dict(t, criticality="critical") for t in REQUEST["targets"]]}
+        with self.assertRaises(StageFailure):
+            self.d.select_carrier(allcritical)
+
+    # -- the A -> B differences ------------------------------------------
+
+    def test_a_to_b_moves_row_count_null_rate_and_cardinality(self):
+        a = self.build(row_count=1000, null_rate=0.01, cardinality=0.37)
+        b = self.build(row_count=800, null_rate=self.d.B_NULL_RATE,
+                       cardinality=0.42)
+        rel, col = self.d.select_carrier(REQUEST)
+
+        def carrier(body):
+            relation = [r for r in body["relations"]
+                        if r["relation_name"] == rel][0]
+            column = [c for c in relation["columns"]
+                      if c["column_name"] == col][0]
+            return relation, column
+
+        a_rel, a_col = carrier(a)
+        b_rel, b_col = carrier(b)
+        self.assertEqual((a_rel["row_count"], b_rel["row_count"]), (1000, 800))
+        self.assertEqual((a_col["null_rate"], b_col["null_rate"]),
+                         (0.01, self.d.B_NULL_RATE))
+        self.assertEqual((a_col["cardinality"], b_col["cardinality"]),
+                         (0.37, 0.42))
+
+    def test_the_unchanged_signal_is_identical_in_a_and_b(self):
+        a = self.build(row_count=1000, null_rate=0.01, cardinality=0.37)
+        b = self.build(row_count=800, null_rate=self.d.B_NULL_RATE,
+                       cardinality=0.42)
+        for ra, rb in zip(sorted(a["relations"], key=lambda r: r["relation_name"]),
+                          sorted(b["relations"], key=lambda r: r["relation_name"])):
+            self.assertEqual(ra["schema_fingerprint"], rb["schema_fingerprint"])
+
+    def test_non_carrier_signals_do_not_move(self):
+        a = self.build(row_count=1000, null_rate=0.01, cardinality=0.37)
+        b = self.build(row_count=800, null_rate=self.d.B_NULL_RATE,
+                       cardinality=0.42)
+        rel, col = self.d.select_carrier(REQUEST)
+        for ra, rb in zip(sorted(a["relations"], key=lambda r: r["relation_name"]),
+                          sorted(b["relations"], key=lambda r: r["relation_name"])):
+            if ra["relation_name"] != rel:
+                self.assertEqual(ra["row_count"], rb["row_count"])
+            for ca, cb in zip(ra["columns"], rb["columns"]):
+                if (ra["relation_name"], ca["column_name"]) != (rel, col):
+                    self.assertEqual(ca["null_rate"], cb["null_rate"])
 
     def test_no_raw_rows_are_transmitted(self):
         import json
-        from datetime import datetime, timezone
 
-        body = self.d.observation_body(
-            self.review(), "req-1", row_count=1000, null_rate=0.01,
-            cardinality=0.37, column_exists=True,
-            observed_at=datetime(2026, 8, 10, tzinfo=timezone.utc))
-        blob = json.dumps(body)
-        for forbidden in ("rows", "sample", "select ", "min_value", "max_value"):
+        blob = json.dumps(self.build(row_count=1000, null_rate=0.01,
+                                     cardinality=0.37))
+        for forbidden in ("sample", "select ", "min_value", "max_value"):
             self.assertNotIn(forbidden, blob)
-
-    def test_the_unchanged_signal_is_identical_in_a_and_b(self):
-        from datetime import datetime, timezone
-
-        common = dict(observed_at=datetime(2026, 8, 10, tzinfo=timezone.utc))
-        a = self.d.observation_body(self.review(), "req-1", row_count=1000,
-                                    null_rate=0.01, cardinality=0.37,
-                                    column_exists=True, **common)
-        b = self.d.observation_body(self.review(), "req-1", row_count=800,
-                                    null_rate=0.82, cardinality=0.42,
-                                    column_exists=False, **common)
-        self.assertEqual(a["relations"][0]["schema_fingerprint"],
-                         b["relations"][0]["schema_fingerprint"])
 
     def test_b_null_rate_crosses_the_existing_policy_threshold(self):
         """An illustrative 12% would never fire column.high_null_rate."""
         self.assertGreater(self.d.B_NULL_RATE, self.d.NULL_RATE_THRESHOLD)
         self.assertLess(self.d.A_NULL_RATE, self.d.NULL_RATE_THRESHOLD)
+
+
+class MissingProductionPolicyTests(DriverTestCase):
+    """This fixture must not trip missing-production policy at all."""
+
+    def test_the_comparison_refuses_a_column_availability_change(self):
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_comparison(comparison(extra=[{
+                "kind": "column_availability_changed", "relation": "main.stg_orders",
+                "column": "order_id", "signal": "column_exists",
+                "before": True, "after": False}]), SNAP_A, SNAP_B)
+        self.assertIn("requested column", str(caught.exception))
+
+    def test_a_missing_production_finding_fails_the_final_assertion(self):
+        review = {"decision": "BLOCK", "health": 100,
+                  "evidence_coverage": "COMPLETE",
+                  "lifecycle_state": "DECISION_READY"}
+        row = attempt(findings=[
+            {"code": "column.missing_in_production", "category": "production",
+             "severity": "block"}])
+        with self.assertRaises(StageFailure):
+            self.d.assert_final_decision(review, row)
+
+    def test_the_expected_outcome_is_warn_from_the_high_null_rate(self):
+        proof = self.d.assert_final_decision(
+            {"decision": "WARN", "health": 100, "evidence_coverage": "COMPLETE",
+             "lifecycle_state": "DECISION_READY"},
+            attempt(findings=[NULL_RATE_FINDING]))
+        self.assertEqual(proof["decision"], "WARN")
+        self.assertEqual(proof["production_finding"], "column.high_null_rate")
+        self.assertEqual(proof["code_findings"], 0)
 
 
 # --------------------------------------------------------------- cleanup

@@ -640,10 +640,16 @@ def assert_comparison(comparison: dict, snapshot_a: str, snapshot_b: str) -> dic
         raise StageFailure(
             f"cardinality points {cardinality.get('percentage_point_delta')}")
 
-    column = one("column_exists")
-    if column.get("before") is not True or column.get("after") is not False:
+    # A requested column going Present -> Missing is NOT exercised here. That
+    # change is real and is proven by the PostgreSQL comparison tests and the
+    # local A -> B proof, but `column.missing_in_production` is correctly a
+    # BLOCK-severity finding, so requiring it here alongside the WARN
+    # expectation would be asking for two contradictory outcomes from one
+    # review. This run keeps every requested column present.
+    if "column_exists" in by_signal:
         raise StageFailure(
-            f"column existence {column.get('before')} -> {column.get('after')}")
+            "a requested column changed availability; this fixture keeps every "
+            "requested column present so the WARN expectation stays reachable")
 
     if UNCHANGED_SIGNAL in by_signal:
         raise StageFailure(
@@ -660,7 +666,11 @@ def assert_comparison(comparison: dict, snapshot_a: str, snapshot_b: str) -> dic
             "row_count": [A_ROW_COUNT, B_ROW_COUNT],
             "null_rate_percentage_points": points,
             "cardinality_percentage_points": card_points,
-            "column_present_then_missing": True}
+            "column_availability_exercised": False,
+            "column_availability_note": (
+                "proven separately by the PostgreSQL comparison tests; a "
+                "missing requested column is BLOCK severity and would "
+                "contradict the WARN expectation")}
 
 
 def assert_comparison_is_evidence_only(waiting: dict, final: dict) -> dict:
@@ -779,28 +789,88 @@ def assert_final_decision(review: dict, final: dict) -> dict:
 
 # ------------------------------------------------- observations A and B
 
-def observation_body(review, request_id, *, row_count, null_rate, cardinality,
-                     column_exists, observed_at):
-    """One controlled production observation, in the collector's own contract.
+#: Row count for relations that are NOT carrying the controlled deltas. The
+#: same in A and B, so they contribute unchanged signals rather than noise.
+STEADY_ROW_COUNT = 500
 
-    Bounded aggregates and catalogue facts only. No raw row is transmitted,
-    and a column the collector cannot find carries NO metrics - reporting a
-    null rate for a column that is not there would be inventing a measurement,
-    which is exactly the shape the comparison engine refuses to compare.
+
+def _ordered_targets(request):
+    return sorted(request.get("targets") or [],
+                  key=lambda t: (str(t.get("relation_name") or ""),
+                                 int(t.get("target_index") or 0)))
+
+
+def select_carrier(request):
+    """The requested (relation, column) that will carry the controlled deltas.
+
+    Chosen from the request rather than declared, because the request is what
+    the product actually asked for. Two constraints shape the choice:
+
+      * it must be a REQUESTED column - `column.high_null_rate` only fires for
+        columns the plan targeted; and
+      * its target must not be `critical`, because for a critical target that
+        finding is raised at BLOCK severity (decision.py), which would make the
+        WARN expectation unreachable.
     """
-    columns = [{"column_name": "order_id", "data_type": "bigint",
-                "exists": True, "null_rate": 0.0, "is_nullable": False}]
-    if column_exists:
-        columns.append({"column_name": "discount_amount", "data_type": "numeric",
-                        "exists": True, "is_nullable": True,
-                        "null_rate": null_rate,
-                        "distinct_count": int(row_count * cardinality),
-                        "cardinality": cardinality})
-    else:
-        columns.append({"column_name": "discount_amount", "exists": False,
-                        "data_type": None})
+    for target in _ordered_targets(request):
+        if target.get("criticality") == "critical":
+            continue
+        columns = sorted(str(c) for c in (target.get("columns") or []))
+        if columns:
+            return target["relation_name"], columns[0]
+    raise StageFailure(
+        "the metadata request has no non-critical requested column to carry "
+        "the controlled deltas")
+
+
+def observation_from_request(review, request, *, carrier_relation, carrier_column,
+                             row_count, null_rate, cardinality, observed_at):
+    """One controlled production observation, shaped by the REQUEST itself.
+
+    Run 31397009727 hardcoded a relation and column borrowed from a different
+    fixture's snapshot body. The request for THIS fixture targets other
+    relations entirely, so every requested column resolved to "not in the
+    snapshot", the policy correctly raised `column.missing_in_production` at
+    BLOCK severity, and the WARN expectation was unreachable. A collector
+    answers the request it was given; so does this.
+
+    Every requested relation and column is present and answered. Nothing
+    unrequested is added - the real collector iterates the requested column
+    list and would never volunteer an extra one. Bounded aggregates and
+    catalogue facts only; no raw row is transmitted.
+    """
+    relations = []
+    for target in _ordered_targets(request):
+        is_carrier = target["relation_name"] == carrier_relation
+        columns = []
+        for name in sorted(str(c) for c in (target.get("columns") or [])):
+            column = {"column_name": name, "exists": True,
+                      "collection_status": "COLLECTED", "is_nullable": True}
+            if is_carrier and name == carrier_column:
+                column["null_rate"] = null_rate
+                column["cardinality"] = cardinality
+                column["distinct_count"] = int(row_count * cardinality)
+            else:
+                # Identical in A and B: answered, and deliberately steady.
+                column["null_rate"] = 0.0
+            columns.append(column)
+        relations.append({
+            "relation_name": target["relation_name"],
+            "relation_schema": target.get("relation_schema"),
+            "relation_database": target.get("relation_database"),
+            "model_unique_id": target.get("model_unique_id"),
+            "exists_in_production": True,
+            "collection_status": "COLLECTED",
+            # Deliberately identical in A and B: Phase B proves this reaches
+            # the downloadable observation without becoming a dashboard card.
+            "schema_fingerprint": UNCHANGED_FINGERPRINT,
+            "row_count": row_count if is_carrier else STEADY_ROW_COUNT,
+            "columns": columns,
+        })
+    if not relations:
+        raise StageFailure("the metadata request targeted no relation")
     return {
-        "review_id": review["review_id"], "request_id": request_id,
+        "review_id": review["review_id"], "request_id": request["request_id"],
         "environment": ENVIRONMENT, "attempt": review["attempt"],
         "completeness": "COMPLETE", "ttl_seconds": OBSERVATION_TTL_SECONDS,
         "observed_at": observed_at.isoformat(),
@@ -808,13 +878,7 @@ def observation_body(review, request_id, *, row_count, null_rate, cardinality,
         "base_manifest_hash": review["base_manifest_hash"],
         "head_manifest_hash": review["head_manifest_hash"],
         "collector_version": "integrated-e2e", "adapter_type": "postgres",
-        "relations": [{
-            "relation_name": "raw.orders", "relation_schema": "raw",
-            "exists_in_production": True,
-            # Deliberately identical in A and B: Phase B proves this reaches
-            # the downloadable observation without becoming a dashboard card.
-            "schema_fingerprint": UNCHANGED_FINGERPRINT,
-            "row_count": row_count, "columns": columns}],
+        "relations": relations,
     }
 
 
@@ -911,6 +975,25 @@ def wait_for_waiting(dsn, review_id):
 
     return lf.poll(waiting, timeout=240, interval=3,
                    description="WAITING_FOR_METADATA")
+
+
+def load_request(dsn, request_id):
+    """The persisted collection request, with its targets.
+
+    `verify_flow.verify_targeted_request` returns a SUMMARY - flattened
+    relation and column lists across every target. The observation has to be
+    built per relation, so it needs the request itself.
+    """
+    store = _store(dsn)
+    try:
+        request = store.get_collection_request(OWNER, REPO_NAME, request_id)
+    finally:
+        store.close()
+    if request is None:
+        raise StageFailure(f"collection request {request_id} is not persisted")
+    if not request.get("targets"):
+        raise StageFailure(f"collection request {request_id} targets nothing")
+    return request
 
 
 def attempt_row(dsn, review_id, attempt):
@@ -1041,20 +1124,25 @@ def main() -> int:
     baseline_review = resolve_review(dsn, baseline_pull["base_sha"],
                                      baseline_pull["head_sha"])
     baseline_review = wait_for_waiting(dsn, baseline_review["review_id"])
-    baseline_request = vf.verify_targeted_request(
+    baseline_summary = vf.verify_targeted_request(
         dsn, OWNER, REPO_NAME, baseline_review["review_id"])
+    baseline_request = load_request(dsn, baseline_summary["request_id"])
+    carrier_relation, carrier_column = select_carrier(baseline_request)
     observation_a = submit_observation(
         token,
-        observation_body(baseline_review, baseline_request["request_id"],
-                         row_count=A_ROW_COUNT, null_rate=A_NULL_RATE,
-                         cardinality=A_CARDINALITY, column_exists=True,
-                         observed_at=datetime.now(timezone.utc)
-                         - timedelta(seconds=A_BACKDATE_SECONDS)),
+        observation_from_request(
+            baseline_review, baseline_request,
+            carrier_relation=carrier_relation, carrier_column=carrier_column,
+            row_count=A_ROW_COUNT, null_rate=A_NULL_RATE,
+            cardinality=A_CARDINALITY,
+            observed_at=datetime.now(timezone.utc)
+            - timedelta(seconds=A_BACKDATE_SECONDS)),
         "a")
     summary["baseline_review"] = {
         "review_id": baseline_review["review_id"],
         "pr_number": baseline_pull["pr_number"],
         "request_id": baseline_request["request_id"],
+        "carrier": {"relation": carrier_relation, "column": carrier_column},
         "provenance": "genuine PR -> webhook -> review -> targeted request"}
     summary["observation_a"] = observation_a
     summary["observation_a_immutable"] = assert_observation_immutable(
@@ -1086,16 +1174,23 @@ def main() -> int:
     summary["blast_radius_expectation"] = expectation
     plan = (review.get("payload") or {}).get("plan") or {}
     summary["blast_radius"] = assert_blast_radius(plan, expectation)
-    request = vf.verify_targeted_request(dsn, OWNER, REPO_NAME, review_id)
-    summary["metadata_request"] = assert_metadata_request(request)
+    request_summary = vf.verify_targeted_request(dsn, OWNER, REPO_NAME, review_id)
+    summary["metadata_request"] = assert_metadata_request(request_summary)
+    request = load_request(dsn, request_summary["request_id"])
+    main_relation, main_column = select_carrier(request)
+    summary["metadata_request"]["carrier"] = {"relation": main_relation,
+                                              "column": main_column}
 
     # --- observation B ----------------------------------------------------
+    # B answers the SAME requested scope as A, on the same carrier, so every
+    # difference between them is one this fixture chose.
     observation_b = submit_observation(
         token,
-        observation_body(review, request["request_id"],
-                         row_count=B_ROW_COUNT, null_rate=B_NULL_RATE,
-                         cardinality=B_CARDINALITY, column_exists=False,
-                         observed_at=datetime.now(timezone.utc)),
+        observation_from_request(
+            review, request, carrier_relation=main_relation,
+            carrier_column=main_column, row_count=B_ROW_COUNT,
+            null_rate=B_NULL_RATE, cardinality=B_CARDINALITY,
+            observed_at=datetime.now(timezone.utc)),
         "b")
     summary["observation_b"] = observation_b
     summary["observation_b_immutable"] = assert_observation_immutable(
