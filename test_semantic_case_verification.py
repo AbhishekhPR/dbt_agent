@@ -109,19 +109,28 @@ def review_row(review_id="rev-1", attempt=1, head=HEAD, base=BASE):
 
 class CaseVerification(HarnessTestCase):
     def wire(self, reviews, attempts, *, delivery_pr=40, delivery_head=HEAD,
-             delivery=None):
+             delivery=None, guid="guid-900", list_status=200, list_body=...):
+        if list_body is ...:
+            list_body = [{"id": 900, "guid": guid, "event": "pull_request"}]
         d = self.driver
         d.OWNER, d.REPO_NAME = "AbhishekhPR", "relium-e2e-dbt"
         store = FakeStore(reviews, attempts)
         d.vf._store = lambda dsn: store
         d.lf.poll = fast_poll
         d.vf.poll = fast_poll
+        # The real helper returns a SUMMARY, not a raw delivery: delivery_id
+        # is the GUID and there is no "id" key. Run 31360117271 failed
+        # because the fake invented one, so it must not invent one again.
         d.vf.verify_genuine_webhook = (
             delivery or (lambda gh, jwt, since, pr: {
-                "id": 900, "status_code": 202, "event": "pull_request"}))
+                "delivery_id": guid, "status_code": 202,
+                "event": "pull_request", "action": "opened",
+                "application_disposition": "accepted", "pull_request": pr}))
         original = self.gh._route
 
         def route(method, path, body):
+            if path == "/app/hook/deliveries?per_page=50":
+                return list_status, list_body
             if path.startswith("/app/hook/deliveries/"):
                 return 200, {"request": {"payload": {"pull_request": {
                     "number": delivery_pr, "head": {"sha": delivery_head}}}}}
@@ -182,12 +191,36 @@ class CaseVerification(HarnessTestCase):
         with self.assertRaises(StageFailure):
             self.run_case()
 
-    def test_a_delivery_without_an_id_cannot_be_correlated(self):
+    def test_a_delivery_without_a_guid_cannot_be_correlated(self):
         self.wire([review_row()], [],
                   delivery=lambda gh, jwt, since, pr: {"status_code": 202})
         with self.assertRaises(StageFailure) as caught:
             self.run_case()
-        self.assertIn("no id to correlate", str(caught.exception))
+        self.assertIn("no guid to correlate", str(caught.exception))
+
+    def test_the_real_helper_return_shape_is_correlated(self):
+        """Regression for run 31360117271.
+
+        verify_genuine_webhook returns delivery_id (a GUID), never "id".
+        Reading "id" aborted the run after the fixture PR already existed.
+        """
+        self.wire([review_row()], [attempt_row("rev-1", 1, BLOCK_CHANGES)])
+        record = self.run_case()
+        self.assertEqual(record["genuine_delivery"]["delivery_guid"], "guid-900")
+        self.assertEqual(record["genuine_delivery"]["delivery_id"], 900)
+        self.assertTrue(record["genuine_delivery"]["correlated"])
+
+    def test_a_guid_matching_no_listed_delivery_fails(self):
+        self.wire([review_row()], [], list_body=[])
+        with self.assertRaises(StageFailure) as caught:
+            self.run_case()
+        self.assertIn("matched 0 numeric ids", str(caught.exception))
+
+    def test_an_unreadable_delivery_list_fails(self):
+        self.wire([review_row()], [], list_status=503, list_body={})
+        with self.assertRaises(StageFailure) as caught:
+            self.run_case()
+        self.assertIn("cannot list deliveries", str(caught.exception))
 
     # -- review and attempt readiness --------------------------------------
 

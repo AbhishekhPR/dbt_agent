@@ -1062,10 +1062,26 @@ def verify_case_delivery(since_utc: str, pr_number: int, head_sha: str) -> dict:
     and head SHA.
     """
     delivery = vf.verify_genuine_webhook(GH, APP_JWT, since_utc, pr_number)
-    delivery_id = delivery.get("id") if isinstance(delivery, dict) else None
-    if delivery_id is None:
+    # The helper returns a summary, not the raw delivery: `delivery_id` is the
+    # GUID and its `pull_request` field is the argument echoed back, not
+    # anything read from the payload. The detail endpoint is keyed by the
+    # numeric id, so resolve that from the GUID before correlating.
+    guid = delivery.get("delivery_id") if isinstance(delivery, dict) else None
+    if not guid:
         raise StageFailure(
-            f"accepted delivery for PR #{pr_number} carried no id to correlate")
+            f"accepted delivery for PR #{pr_number} carried no guid to correlate")
+    list_status, deliveries = GH(
+        "GET", "/app/hook/deliveries?per_page=50", APP_JWT())
+    if list_status != 200 or not isinstance(deliveries, list):
+        raise StageFailure(
+            f"cannot list deliveries to correlate PR #{pr_number}: HTTP {list_status}")
+    numeric = [item.get("id") for item in deliveries
+               if isinstance(item, dict) and item.get("guid") == guid]
+    if len(numeric) != 1 or numeric[0] is None:
+        raise StageFailure(
+            f"delivery guid {guid} matched {len(numeric)} numeric ids; "
+            f"cannot correlate PR #{pr_number}")
+    delivery_id = numeric[0]
     status, detail = GH("GET", f"/app/hook/deliveries/{delivery_id}", APP_JWT())
     if status != 200 or not isinstance(detail, dict):
         raise StageFailure(
@@ -1080,9 +1096,12 @@ def verify_case_delivery(since_utc: str, pr_number: int, head_sha: str) -> dict:
         raise StageFailure(
             f"delivery {delivery_id} is for PR #{delivered_number} at "
             f"{str(delivered_head)[:12]}, not PR #{pr_number} at {head_sha[:12]}")
-    return {"delivery_id": delivery_id, "pull_number": delivered_number,
-            "head_sha": delivered_head, "status_code": delivery.get("status_code"),
-            "event": delivery.get("event"), "correlated": True}
+    return {"delivery_id": delivery_id, "delivery_guid": guid,
+            "pull_number": delivered_number, "head_sha": delivered_head,
+            "status_code": delivery.get("status_code"),
+            "event": delivery.get("event"),
+            "application_disposition": delivery.get("application_disposition"),
+            "correlated": True}
 
 
 def _review_diagnostics(dsn: str, pr_number: int, base_sha: str,
