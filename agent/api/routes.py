@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime, timezone
 
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from agent.api.collector_routes import COLLECTOR_ROUTES, build_handlers
@@ -23,6 +23,10 @@ from agent.api.authorization import (
     PIPELINE_INGEST, CapabilityError, authorize,
 )
 from agent.api.sessions import CSRF_HEADER, SESSION_COOKIE, SessionError
+from agent.metadata_evidence.evidence_export import (
+    build_evidence_bundle,
+    evidence_filename,
+)
 from agent.api.service import (
     ConflictError,
     LifecycleService,
@@ -194,6 +198,112 @@ def _semantic_evidence_view(stored):
     }
 
 
+# Fields each production-metadata change kind may disclose. An allowlist for
+# the same reason the semantic one is: a field the engine gains later stays
+# invisible until someone decides it is safe to publish. Nothing here can
+# express a raw value, a query, or a collector detail - the widest field is a
+# data type name.
+_METADATA_CHANGE_FIELDS = {
+    "relation_availability_changed": ("before", "after"),
+    "schema_fingerprint_changed": ("before", "after"),
+    "row_count_changed": ("before", "after", "absolute_delta", "relative_delta"),
+    "freshness_changed": ("before", "after", "absolute_delta"),
+    "column_availability_changed": ("before", "after"),
+    "column_type_changed": ("before", "after"),
+    "column_nullability_changed": ("before", "after"),
+    "null_rate_changed": ("before", "after", "percentage_point_delta"),
+    "duplicate_rate_changed": ("before", "after", "percentage_point_delta"),
+    "distinct_count_changed": ("before", "after", "absolute_delta", "relative_delta"),
+    # A ratio, so it carries a percentage-point delta like the other rates.
+    "cardinality_changed": ("before", "after", "percentage_point_delta"),
+}
+
+# All four survive to the client as themselves. Collapsing any pair would erase
+# a distinction the dashboard has to render differently.
+_METADATA_STATUSES = {"evaluated", "partial", "no_baseline", "unavailable"}
+
+
+def _metadata_coverage_view(stored):
+    """Counts and identities only, so ``partial`` can say what it did not cover."""
+    if not isinstance(stored, dict):
+        return None
+
+    def _scope(rows, *, with_column):
+        items = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            item = {"model": row.get("model"), "relation": row.get("relation")}
+            if with_column:
+                item["column"] = row.get("column")
+            items.append(item)
+        return items
+
+    return {
+        "relations_observed": stored.get("relations_observed"),
+        "relations_compared": stored.get("relations_compared"),
+        "relations_without_baseline": _scope(
+            stored.get("relations_without_baseline"), with_column=False),
+        "columns_observed": stored.get("columns_observed"),
+        "columns_compared": stored.get("columns_compared"),
+        "columns_without_baseline": _scope(
+            stored.get("columns_without_baseline"), with_column=True),
+    }
+
+
+def _metadata_comparison_view(stored):
+    """Project stored production metadata comparison evidence for the dashboard.
+
+    ``None`` is preserved as ``None``: the comparison never ran for this
+    attempt, which is a different fact from running and finding no prior
+    observation (``no_baseline``), running and finding nothing changed
+    (``evaluated`` with an empty list), or running with incomplete coverage
+    (``partial``). All four have to reach the client intact because the UI has
+    to say something different about each.
+
+    Snapshot identities and observation timestamps travel, so a reviewer can
+    see WHICH two observations this describes. Nothing else from the snapshot
+    does: no collector identity, no provenance, no evidence hash, no min/max
+    value, no SQL.
+    """
+    if not isinstance(stored, dict):
+        return None
+    status = stored.get("status")
+    if status not in _METADATA_STATUSES:
+        return None
+
+    changes = []
+    for change in stored.get("changes") or []:
+        if not isinstance(change, dict):
+            continue
+        kind = change.get("kind")
+        allowed = _METADATA_CHANGE_FIELDS.get(kind)
+        if not allowed:
+            continue
+        view = {
+            "kind": kind,
+            "model": change.get("model"),
+            "relation": change.get("relation"),
+            "column": change.get("column"),
+            "signal": change.get("signal"),
+        }
+        for field_name in allowed:
+            if field_name in change:
+                view[field_name] = change[field_name]
+        changes.append(view)
+
+    return {
+        "status": status,
+        "baseline_snapshot_id": stored.get("baseline_snapshot_id"),
+        "current_snapshot_id": stored.get("current_snapshot_id"),
+        "baseline_observed_at": stored.get("baseline_observed_at"),
+        "current_observed_at": stored.get("current_observed_at"),
+        "changes": changes,
+        "change_count": len(changes),
+        "coverage": _metadata_coverage_view(stored.get("coverage")),
+    }
+
+
 def _governance_actor(body, principal) -> str:
     """The identity recorded against a governance action.
 
@@ -278,7 +388,16 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
             raise _HttpError(403, {"status": "forbidden",
                                    "detail": "missing or invalid CSRF token"})
 
-    def handler(fn, *, write: bool, capability=None):
+    def handler(fn, *, write: bool, capability=None, download=False):
+        """Wrap one route function with authentication, scoping and error mapping.
+
+        ``download`` changes only how a SUCCESSFUL response is built: the
+        handler returns ``(status, payload, filename)`` and the body is written
+        as the exact artifact, with no ``request_id`` mixed into it, plus a
+        Content-Disposition attachment header. Errors still travel the ordinary
+        JSON path, so a failed download is a normal API error rather than a
+        file containing an error.
+        """
         capability = capability or (GOVERNANCE_WRITE if write else DASHBOARD_READ)
 
         async def wrapped(request):
@@ -295,7 +414,20 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
                         service = LifecycleService(store)
                         return fn(request, body, scope, service)
 
-                status, payload = await run_in_threadpool(work)
+                result = await run_in_threadpool(work)
+                if download:
+                    status, payload, filename = result
+                    return Response(
+                        json.dumps(payload, indent=2, sort_keys=True),
+                        status_code=status,
+                        media_type="application/json",
+                        headers={
+                            "X-Request-Id": request_id,
+                            "Content-Disposition":
+                                f'attachment; filename="{filename}"',
+                        },
+                    )
+                status, payload = result
                 return _json(payload, status, request_id)
             except _HttpError as exc:
                 return _json(exc.payload, exc.status, request_id)
@@ -844,6 +976,11 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
                  # never surface on attempt N+1 just because the review id
                  # matches.
                  "semantic_evidence": _semantic_evidence_view(a.get("semantic_evidence")),
+                 # Same binding rule: this describes the two production
+                 # observations THIS attempt compared, and is never re-derived
+                 # from whatever the newest snapshot happens to be now.
+                 "metadata_comparison": _metadata_comparison_view(
+                     a.get("metadata_comparison")),
                  "created_at": isoformat(a.get("created_at"))}
                 for a in attempts
             ],
@@ -854,6 +991,51 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
                 for t in transitions
             ],
         }
+
+    def review_metadata_evidence(request, body, scope, service):
+        """The downloadable production metadata evidence bundle for one attempt.
+
+        Built from the comparison THAT ATTEMPT recorded, and from the two
+        immutable snapshots whose ids are inside it. The store is never asked
+        for "the latest snapshot" here, so this file does not change when a
+        newer observation arrives - which is the whole reason it is worth
+        keeping.
+
+        A 404 when the attempt recorded no comparison: there is no evidence to
+        download, and a file asserting that would be worse than no file.
+        """
+        review_id = request.path_params["review_id"]
+        try:
+            attempt = int(request.path_params["attempt"])
+        except (TypeError, ValueError):
+            raise NotFoundError("unknown attempt") from None
+
+        review = service.store.get_review(
+            scope.organization_id, scope.repository_id, review_id)
+        if review is None:
+            raise NotFoundError("unknown review")
+
+        rows = service.store.review_attempts(
+            scope.organization_id, scope.repository_id, review_id)
+        row = next((a for a in rows if a["attempt"] == attempt), None)
+        if row is None:
+            raise NotFoundError("unknown attempt")
+
+        # The SAME projection the dashboard reads, so the file and the screen
+        # can never disagree about what changed.
+        comparison = _metadata_comparison_view(row.get("metadata_comparison"))
+        if comparison is None:
+            raise NotFoundError(
+                "no production metadata comparison was computed for this attempt")
+
+        bundle = build_evidence_bundle(
+            service.store,
+            organization_id=scope.organization_id,
+            repository_id=scope.repository_id,
+            environment=review.get("environment"),
+            review_id=review_id, attempt=attempt, comparison=comparison,
+        )
+        return 200, bundle, evidence_filename(review_id, attempt)
 
     def review_collection_requests(request, body, scope, service):
         """Every collection request raised for one review, with its outcome."""
@@ -1105,6 +1287,12 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
               handler(review_findings, write=False), methods=["GET"]),
         Route("/api/reviews/{review_id}/attempts",
               handler(review_attempts, write=False), methods=["GET"]),
+        # Dashboard read, so a collector token cannot fetch it: the capability
+        # model already refuses COLLECTOR_INGEST here, and this route is one
+        # more reason that separation has to hold.
+        Route("/api/reviews/{review_id}/attempts/{attempt}/metadata-evidence.json",
+              handler(review_metadata_evidence, write=False, download=True),
+              methods=["GET"]),
         Route("/api/reviews/{review_id}/collection-requests",
               handler(review_collection_requests, write=False), methods=["GET"]),
         Route("/api/reviews/{review_id}/snapshots",

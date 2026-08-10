@@ -25,6 +25,7 @@ from agent.metadata_evidence.decision import (
     PRODUCTION_METADATA,
     evaluate_metadata_decision,
 )
+from agent.metadata_evidence.production_comparison import compute_comparison
 
 # How long a collection request stays actionable. After this the review stops
 # waiting and the policy applies to the absent evidence.
@@ -191,6 +192,17 @@ def begin_review(store, *, organization_id, repository_id, environment,
         code_health=code_health, code_findings=code_findings, policy=policy, now=now,
     )
 
+    # Only when a current production observation is already durably stored and
+    # accepted for this review - the redelivery case. A review that is still
+    # waiting for metadata records SQL NULL, which reads as "never computed"
+    # and is a different fact from "computed and found no baseline".
+    metadata_comparison = None
+    if snapshot is not None:
+        metadata_comparison = compute_comparison(
+            store, organization_id=organization_id, repository_id=repository_id,
+            environment=environment, current_snapshot=snapshot,
+        )
+
     store.transition_review(organization_id, repository_id, review_id,
                             decision.lifecycle_state,
                             reason="metadata evidence evaluated")
@@ -207,6 +219,7 @@ def begin_review(store, *, organization_id, repository_id, environment,
         # Computed once, upstream, before this attempt existed. Never
         # recomputed for storage.
         semantic_evidence=semantic_evidence,
+        metadata_comparison=metadata_comparison,
     )
     store.record_evidence_states(organization_id, repository_id, review_id, attempt,
                                  _evidence_rows(decision))

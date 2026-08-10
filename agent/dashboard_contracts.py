@@ -23,6 +23,8 @@ DASHBOARD_RESOURCES = {
     "review_exceptions": "/api/reviews/{review_id}/exceptions",
     "review_findings": "/api/reviews/{review_id}/findings",
     "review_attempts": "/api/reviews/{review_id}/attempts",
+    "review_metadata_evidence":
+        "/api/reviews/{review_id}/attempts/{attempt}/metadata-evidence.json",
     "review_collection_requests": "/api/reviews/{review_id}/collection-requests",
     "review_snapshots": "/api/reviews/{review_id}/snapshots",
     "review_publications": "/api/reviews/{review_id}/publications",

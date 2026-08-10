@@ -1,0 +1,314 @@
+{
+  "snapshot_a": "snap-b3899b7fead64982bba52049",
+  "snapshot_b": "snap-d00bf0fe086843f8b01f6590",
+  "evidence_bundle": {
+    "attempt": 3,
+    "baseline_observation": {
+      "collected_at": "2026-08-09T11:30:00+05:30",
+      "completeness": "COMPLETE",
+      "environment": "production",
+      "freshness_state": "STALE",
+      "observed_at": "2026-08-09T11:30:00+05:30",
+      "relations": [
+        {
+          "collection_status": "COLLECTED",
+          "columns": [
+            {
+              "cardinality": null,
+              "collection_status": "COLLECTED",
+              "column_name": "customer_id",
+              "data_type": "BIGINT",
+              "distinct_count": 400,
+              "duplicate_count": null,
+              "duplicate_rate": null,
+              "exists_in_production": true,
+              "is_nullable": true,
+              "null_count": null,
+              "null_rate": null,
+              "ordinal_position": null
+            },
+            {
+              "cardinality": 0.37,
+              "collection_status": "COLLECTED",
+              "column_name": "email",
+              "data_type": "VARCHAR",
+              "distinct_count": 370,
+              "duplicate_count": null,
+              "duplicate_rate": null,
+              "exists_in_production": true,
+              "is_nullable": true,
+              "null_count": 10,
+              "null_rate": 0.01,
+              "ordinal_position": null
+            }
+          ],
+          "exists_in_production": true,
+          "freshness_lag_seconds": 300,
+          "freshness_timestamp": null,
+          "model_unique_id": "model.jaffle.orders",
+          "observed_at": null,
+          "relation_database": "warehouse",
+          "relation_name": "orders",
+          "relation_schema": "analytics",
+          "relation_type": "table",
+          "row_count": 1000,
+          "schema_fingerprint": "sha-orders-v1"
+        }
+      ],
+      "snapshot_id": "snap-b3899b7fead64982bba52049"
+    },
+    "comparison": {
+      "baseline_observed_at": "2026-08-09T11:30:00+05:30",
+      "baseline_snapshot_id": "snap-b3899b7fead64982bba52049",
+      "change_count": 5,
+      "changes": [
+        {
+          "absolute_delta": -200,
+          "after": 800,
+          "before": 1000,
+          "column": null,
+          "kind": "row_count_changed",
+          "model": "model.jaffle.orders",
+          "relation": "orders",
+          "relative_delta": -0.2,
+          "signal": "row_count"
+        },
+        {
+          "after": false,
+          "before": true,
+          "column": "customer_id",
+          "kind": "column_availability_changed",
+          "model": "model.jaffle.orders",
+          "relation": "orders",
+          "signal": "column_exists"
+        },
+        {
+          "after": 0.42,
+          "before": 0.37,
+          "column": "email",
+          "kind": "cardinality_changed",
+          "model": "model.jaffle.orders",
+          "percentage_point_delta": 5.0,
+          "relation": "orders",
+          "signal": "cardinality"
+        },
+        {
+          "absolute_delta": -34,
+          "after": 336,
+          "before": 370,
+          "column": "email",
+          "kind": "distinct_count_changed",
+          "model": "model.jaffle.orders",
+          "relation": "orders",
+          "relative_delta": -0.09189,
+          "signal": "distinct_count"
+        },
+        {
+          "after": 0.12,
+          "before": 0.01,
+          "column": "email",
+          "kind": "null_rate_changed",
+          "model": "model.jaffle.orders",
+          "percentage_point_delta": 11.0,
+          "relation": "orders",
+          "signal": "null_rate"
+        }
+      ],
+      "coverage": {
+        "columns_compared": 2,
+        "columns_observed": 2,
+        "columns_without_baseline": [],
+        "relations_compared": 1,
+        "relations_observed": 1,
+        "relations_without_baseline": []
+      },
+      "current_observed_at": "2026-08-09T17:30:00+05:30",
+      "current_snapshot_id": "snap-d00bf0fe086843f8b01f6590",
+      "status": "evaluated"
+    },
+    "current_observation": {
+      "collected_at": "2026-08-09T17:30:00+05:30",
+      "completeness": "COMPLETE",
+      "environment": "production",
+      "freshness_state": "STALE",
+      "observed_at": "2026-08-09T17:30:00+05:30",
+      "relations": [
+        {
+          "collection_status": "COLLECTED",
+          "columns": [
+            {
+              "cardinality": null,
+              "collection_status": "COLLECTED",
+              "column_name": "customer_id",
+              "data_type": null,
+              "distinct_count": null,
+              "duplicate_count": null,
+              "duplicate_rate": null,
+              "exists_in_production": false,
+              "is_nullable": null,
+              "null_count": null,
+              "null_rate": null,
+              "ordinal_position": null
+            },
+            {
+              "cardinality": 0.42,
+              "collection_status": "COLLECTED",
+              "column_name": "email",
+              "data_type": "VARCHAR",
+              "distinct_count": 336,
+              "duplicate_count": null,
+              "duplicate_rate": null,
+              "exists_in_production": true,
+              "is_nullable": true,
+              "null_count": 96,
+              "null_rate": 0.12,
+              "ordinal_position": null
+            }
+          ],
+          "exists_in_production": true,
+          "freshness_lag_seconds": 300,
+          "freshness_timestamp": null,
+          "model_unique_id": "model.jaffle.orders",
+          "observed_at": null,
+          "relation_database": "warehouse",
+          "relation_name": "orders",
+          "relation_schema": "analytics",
+          "relation_type": "table",
+          "row_count": 800,
+          "schema_fingerprint": "sha-orders-v1"
+        }
+      ],
+      "snapshot_id": "snap-d00bf0fe086843f8b01f6590"
+    },
+    "environment": "production",
+    "evidence_type": "production_metadata_comparison",
+    "evidence_version": 1,
+    "organization_id": "relium-proof",
+    "repository_id": "analytics",
+    "review_id": "rev-proof-1"
+  },
+  "attempts": [
+    {
+      "attempt": 1,
+      "decision": null,
+      "evidence_coverage": "UNKNOWN",
+      "health": 100,
+      "lifecycle_state": "RECEIVED",
+      "trigger": "initial",
+      "snapshot_id": null,
+      "enforcement_mode": null,
+      "policy_version": null,
+      "finding_count": 0,
+      "semantic_evidence": null,
+      "metadata_comparison": null,
+      "created_at": "2026-08-10T11:21:02.728975+00:00"
+    },
+    {
+      "attempt": 2,
+      "decision": "BLOCK",
+      "evidence_coverage": "COMPLETE",
+      "health": 100,
+      "lifecycle_state": "METADATA_STALE",
+      "trigger": "metadata_snapshot",
+      "snapshot_id": "snap-b3899b7fead64982bba52049",
+      "enforcement_mode": "enforce",
+      "policy_version": "default-v1",
+      "finding_count": 1,
+      "semantic_evidence": null,
+      "metadata_comparison": {
+        "status": "no_baseline",
+        "baseline_snapshot_id": null,
+        "current_snapshot_id": "snap-b3899b7fead64982bba52049",
+        "baseline_observed_at": null,
+        "current_observed_at": "2026-08-09T11:30:00+05:30",
+        "changes": [],
+        "change_count": 0,
+        "coverage": null
+      },
+      "created_at": "2026-08-10T11:21:02.789845+00:00"
+    },
+    {
+      "attempt": 3,
+      "decision": "BLOCK",
+      "evidence_coverage": "COMPLETE",
+      "health": 100,
+      "lifecycle_state": "METADATA_STALE",
+      "trigger": "metadata_snapshot",
+      "snapshot_id": "snap-d00bf0fe086843f8b01f6590",
+      "enforcement_mode": "enforce",
+      "policy_version": "default-v1",
+      "finding_count": 1,
+      "semantic_evidence": null,
+      "metadata_comparison": {
+        "status": "evaluated",
+        "baseline_snapshot_id": "snap-b3899b7fead64982bba52049",
+        "current_snapshot_id": "snap-d00bf0fe086843f8b01f6590",
+        "baseline_observed_at": "2026-08-09T11:30:00+05:30",
+        "current_observed_at": "2026-08-09T17:30:00+05:30",
+        "changes": [
+          {
+            "kind": "row_count_changed",
+            "model": "model.jaffle.orders",
+            "relation": "orders",
+            "column": null,
+            "signal": "row_count",
+            "before": 1000,
+            "after": 800,
+            "absolute_delta": -200,
+            "relative_delta": -0.2
+          },
+          {
+            "kind": "column_availability_changed",
+            "model": "model.jaffle.orders",
+            "relation": "orders",
+            "column": "customer_id",
+            "signal": "column_exists",
+            "before": true,
+            "after": false
+          },
+          {
+            "kind": "cardinality_changed",
+            "model": "model.jaffle.orders",
+            "relation": "orders",
+            "column": "email",
+            "signal": "cardinality",
+            "before": 0.37,
+            "after": 0.42,
+            "percentage_point_delta": 5.0
+          },
+          {
+            "kind": "distinct_count_changed",
+            "model": "model.jaffle.orders",
+            "relation": "orders",
+            "column": "email",
+            "signal": "distinct_count",
+            "before": 370,
+            "after": 336,
+            "absolute_delta": -34,
+            "relative_delta": -0.09189
+          },
+          {
+            "kind": "null_rate_changed",
+            "model": "model.jaffle.orders",
+            "relation": "orders",
+            "column": "email",
+            "signal": "null_rate",
+            "before": 0.01,
+            "after": 0.12,
+            "percentage_point_delta": 11.0
+          }
+        ],
+        "change_count": 5,
+        "coverage": {
+          "relations_observed": 1,
+          "relations_compared": 1,
+          "relations_without_baseline": [],
+          "columns_observed": 2,
+          "columns_compared": 2,
+          "columns_without_baseline": []
+        }
+      },
+      "created_at": "2026-08-10T11:21:02.832291+00:00"
+    }
+  ]
+}
