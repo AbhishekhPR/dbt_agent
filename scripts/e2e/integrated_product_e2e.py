@@ -473,25 +473,55 @@ def expected_direct_downstream(manifest: dict, changed_model: str) -> dict:
 
 # --------------------------------------------------------------- assertions
 
+#: The exact semantic change the allow fixture is built to produce. Pinned
+#: rather than merely "non-empty": `allow_fixture_files` inserts a predicate
+#: into the WHERE clause of int_customer_orders, and `_filter_changes` emits
+#: scope="where" for that. Requiring only non-emptiness would pass on a
+#: fixture that had silently started proving something else.
+REQUIRED_SEMANTIC_CHANGE = {"kind": "filter_changed",
+                            "model_name": sf.ALLOW_MUTATED_MODELS[0],
+                            "scope": "where"}
+
+
 def assert_semantic(row: dict) -> dict:
-    """Real AST evidence, attributed only to the model the fixture edited."""
+    """The proven filter_changed evidence, attributed only to the edited model.
+
+    Additional truthful evidence about the SAME model is allowed - the engine
+    may legitimately observe more than one thing about a real SQL change - but
+    the required change must be present, and nothing may be attributed to a
+    model the fixture never touched.
+    """
     evidence = row.get("semantic_evidence")
     if not isinstance(evidence, dict):
         raise StageFailure("attempt recorded no semantic evidence")
     if evidence.get("status") not in ("evaluated", "partial"):
         raise StageFailure(f"semantic status is {evidence.get('status')!r}")
-    changes = [c for m in (evidence.get("models") or [])
-               for c in (m.get("changes") or [])]
+
+    changes = []
+    for model in (evidence.get("models") or []):
+        for change in (model.get("changes") or []):
+            changes.append({**change,
+                            "model_name": change.get("model_name")
+                            or model.get("model_name")})
     if not changes:
         raise StageFailure("semantic evidence is empty; the fixture proved nothing")
-    models = {m.get("model_name") for m in (evidence.get("models") or [])
-              if m.get("changes")}
-    unexplained = sorted(models - set(sf.ALLOW_MUTATED_MODELS))
+
+    matched = [c for c in changes
+               if all(c.get(k) == v for k, v in REQUIRED_SEMANTIC_CHANGE.items())]
+    if not matched:
+        raise StageFailure(
+            f"required semantic change {REQUIRED_SEMANTIC_CHANGE} is absent; "
+            f"observed {[{k: c.get(k) for k in ('kind', 'model_name', 'scope')} for c in changes]}")
+
+    models = {c.get("model_name") for c in changes}
+    unexplained = sorted(m for m in models if m not in sf.ALLOW_MUTATED_MODELS)
     if unexplained:
         raise StageFailure(f"semantic changes about untouched models: {unexplained}")
     return {"status": evidence.get("status"), "change_count": len(changes),
             "change_kinds": sorted({c.get("kind") for c in changes}),
-            "models": sorted(models)}
+            "models": sorted(m for m in models if m),
+            "required_change": dict(REQUIRED_SEMANTIC_CHANGE),
+            "required_change_present": True}
 
 
 def assert_blast_radius(plan: dict, expectation: dict) -> dict:
@@ -591,11 +621,27 @@ def assert_comparison(comparison: dict, snapshot_a: str, snapshot_b: str) -> dic
 
 
 def assert_comparison_is_evidence_only(waiting: dict, final: dict) -> dict:
-    """The comparison must not create a finding or move health.
+    """The comparison must produce no finding and reach no policy input.
 
-    Health is compared against the WAITING attempt, which was computed before
-    any production observation existed. If the comparison contributed a
-    penalty, these two numbers cannot match.
+    An earlier version of this proved the wrong thing. It required
+    `final health == waiting health`, which passes UNCONDITIONALLY: the policy
+    contract in agent/evidence_policy.py states that policy "cannot manufacture
+    a finding or subtract health", and `_coverage` passes `code_health`
+    straight through, so health never moves for ANY metadata finding -
+    including the `column.high_null_rate` this fixture deliberately produces.
+    The equality therefore held whether or not the comparison had contributed
+    a finding, and proved nothing about the comparison at all.
+
+    What actually isolates the comparison is two facts:
+
+      * no persisted finding is attributable to it, and
+      * it is not an INPUT to the decision - `recompute_review` computes it
+        after `evaluate_metadata_decision` has already returned, and never
+        passes it in.
+
+    Health is still recorded, but as the existing policy expectation for this
+    fixture (`semantic_diff_e2e.assert_allow_expectations` pins the allow
+    shape at 100) rather than as a second formula invented here.
     """
     findings = (final.get("payload") or {}).get("findings", [])
     codes = {f.get("code") for f in findings}
@@ -603,21 +649,60 @@ def assert_comparison_is_evidence_only(waiting: dict, final: dict) -> dict:
     comparison_shaped = sorted(
         c for c in codes
         if isinstance(c, str) and (
-            "comparison" in c or "drift" in c or c.startswith("metadata_change")))
+            "comparison" in c or "drift" in c or "metadata_change" in c))
     if comparison_shaped:
         raise StageFailure(
             f"the comparison produced policy findings: {comparison_shaped}")
-    if "metadata_comparison" in categories:
-        raise StageFailure("a finding was categorised as metadata_comparison")
-    if final.get("health") != waiting.get("health"):
+    bad_categories = sorted(
+        c for c in categories
+        if isinstance(c, str) and (
+            "comparison" in c or "drift" in c or "metadata_change" in c))
+    if bad_categories:
         raise StageFailure(
-            f"health moved from {waiting.get('health')} to {final.get('health')} "
-            f"after the comparison ran")
+            f"findings were categorised as comparison-derived: {bad_categories}")
+    if final.get("health") != EXPECTED_CODE_HEALTH:
+        raise StageFailure(
+            f"health is {final.get('health')!r}, expected "
+            f"{EXPECTED_CODE_HEALTH} from the existing policy contract "
+            f"(code health passed through; evidence never subtracts health)")
     return {"finding_codes": sorted(c for c in codes if c),
             "comparison_findings": 0,
+            "comparison_derived_categories": 0,
+            "health": final.get("health"),
+            "health_source": "code health, passed through by evidence policy",
             "health_before_metadata": waiting.get("health"),
-            "health_after_metadata": final.get("health"),
-            "health_unchanged_by_comparison": True}
+            "policy_contract": (
+                "agent/evidence_policy.py: policy cannot manufacture a finding "
+                "or subtract health"),
+            "equality_with_waiting_health_used_as_proof": False}
+
+
+def assert_comparison_is_not_a_policy_input() -> dict:
+    """The comparison cannot reach the decision, structurally.
+
+    This is the assertion the health equality was pretending to be. It reads
+    the real recomputation path and requires that the decision is produced
+    BEFORE the comparison is computed, and that the comparison is never handed
+    to the policy engine. A source-level check because that ordering is the
+    guarantee - no runtime value can demonstrate the absence of an input.
+    """
+    source = (REPO_ROOT / "agent" / "metadata_evidence"
+              / "recompute.py").read_text(encoding="utf-8")
+    decision_at = source.index("decision = evaluate_metadata_decision(")
+    comparison_at = source.index("metadata_comparison = compute_comparison(")
+    if decision_at > comparison_at:
+        raise StageFailure(
+            "the comparison is computed before the decision; it could be an input")
+    call_end = source.index(")", source.index("(", decision_at))
+    decision_call = source[decision_at:call_end]
+    for forbidden in ("comparison", "metadata_comparison"):
+        if forbidden in decision_call:
+            raise StageFailure(
+                f"the decision call references {forbidden!r}; the comparison "
+                f"is feeding policy")
+    return {"decision_computed_before_comparison": True,
+            "comparison_passed_to_policy": False,
+            "checked": "agent/metadata_evidence/recompute.py"}
 
 
 def assert_final_decision(review: dict, final: dict) -> dict:
@@ -983,6 +1068,8 @@ def main() -> int:
     summary["final_decision"] = assert_final_decision(final_review, final_row)
     summary["comparison_is_evidence_only"] = assert_comparison_is_evidence_only(
         waiting_row, final_row)
+    summary["comparison_not_a_policy_input"] = (
+        assert_comparison_is_not_a_policy_input())
 
     # The comparison must still name A and B on the attempt that decided.
     if isinstance(final_row.get("metadata_comparison"), dict):

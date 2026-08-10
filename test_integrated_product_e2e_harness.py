@@ -83,11 +83,16 @@ def comparison(*, baseline=SNAP_A, current=SNAP_B, status="evaluated",
             "coverage": {"relations_observed": 1, "relations_compared": 1}}
 
 
-def semantic_evidence(models=("int_customer_orders",), status="evaluated"):
+def semantic_evidence(models=("int_customer_orders",), status="evaluated",
+                      kind="filter_changed", scope="where", extra=()):
+    """Shaped as sql_semantic_diff emits it: filter_changed carries a scope."""
     return {"status": status,
             "models": [{"model_name": name, "status": "evaluated",
-                        "changes": [{"kind": "filter_changed",
-                                     "model_name": name}]}
+                        "changes": [{"kind": kind, "model_name": name,
+                                     "scope": scope,
+                                     "before_sql": "status is not null",
+                                     "after_sql": "status is not null and x"}]
+                        + list(extra)}
                        for name in models]}
 
 
@@ -189,15 +194,65 @@ class SemanticTests(DriverTestCase):
         self.assertIn("empty", str(caught.exception))
 
     def test_evidence_about_an_untouched_model_fails(self):
+        """The required change is present, but a model the fixture never
+        edited also carries evidence. That is unexplained and must fail."""
         with self.assertRaises(StageFailure) as caught:
+            self.d.assert_semantic(attempt(semantic=semantic_evidence(
+                models=("int_customer_orders", "fct_orders"))))
+        self.assertIn("untouched", str(caught.exception))
+        self.assertIn("fct_orders", str(caught.exception))
+
+    def test_evidence_only_about_an_untouched_model_also_fails(self):
+        with self.assertRaises(StageFailure):
             self.d.assert_semantic(attempt(
                 semantic=semantic_evidence(models=("fct_orders",))))
-        self.assertIn("untouched", str(caught.exception))
 
     def test_real_semantic_evidence_passes(self):
         proof = self.d.assert_semantic(attempt(semantic=semantic_evidence()))
         self.assertEqual(proof["models"], ["int_customer_orders"])
         self.assertEqual(proof["change_kinds"], ["filter_changed"])
+        self.assertTrue(proof["required_change_present"])
+
+    # -- the pinned expectation ------------------------------------------
+
+    def test_a_different_change_kind_fails(self):
+        """Non-empty is not enough: the fixture edits a WHERE clause."""
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_semantic(attempt(
+                semantic=semantic_evidence(kind="grouping_changed")))
+        self.assertIn("filter_changed", str(caught.exception))
+
+    def test_a_filter_change_in_the_wrong_scope_fails(self):
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_semantic(attempt(
+                semantic=semantic_evidence(scope="having")))
+        self.assertIn("scope", str(caught.exception))
+
+    def test_the_required_change_on_the_wrong_model_fails(self):
+        with self.assertRaises(StageFailure):
+            self.d.assert_semantic(attempt(
+                semantic=semantic_evidence(models=("dim_customers",))))
+
+    def test_additional_truthful_evidence_on_the_same_model_is_allowed(self):
+        proof = self.d.assert_semantic(attempt(semantic=semantic_evidence(
+            extra=[{"kind": "projection_expression_changed",
+                    "model_name": "int_customer_orders",
+                    "output_name": "order_total"}])))
+        self.assertEqual(proof["change_count"], 2)
+        self.assertTrue(proof["required_change_present"])
+
+    def test_the_pinned_expectation_matches_the_fixture_and_the_engine(self):
+        """kind/model/scope must be what the fixture and engine really do."""
+        import semantic_fixtures as sf
+
+        self.assertEqual(self.d.REQUIRED_SEMANTIC_CHANGE["model_name"],
+                         sf.ALLOW_MUTATED_MODELS[0])
+        self.assertEqual(self.d.REQUIRED_SEMANTIC_CHANGE["kind"], "filter_changed")
+        # sql_semantic_diff emits scope="where" for a WHERE clause change.
+        engine = (REPO_ROOT / "agent" / "sql_semantic_diff.py").read_text(
+            encoding="utf-8")
+        self.assertIn('("where", "where")', engine)
+        self.assertEqual(self.d.REQUIRED_SEMANTIC_CHANGE["scope"], "where")
 
 
 # -------------------------------------------------------- blast radius
@@ -335,18 +390,68 @@ class EvidenceOnlyTests(DriverTestCase):
         with self.assertRaises(StageFailure):
             self.d.assert_comparison_is_evidence_only(attempt(health=100), final)
 
-    def test_a_health_penalty_after_the_comparison_fails(self):
+    def test_health_other_than_the_policy_expectation_fails(self):
         with self.assertRaises(StageFailure) as caught:
             self.d.assert_comparison_is_evidence_only(
                 attempt(health=100), attempt(health=80,
                                              findings=[NULL_RATE_FINDING]))
-        self.assertIn("health moved", str(caught.exception))
+        self.assertIn("expected 100", str(caught.exception))
 
     def test_evidence_only_comparison_passes(self):
         proof = self.d.assert_comparison_is_evidence_only(
             attempt(health=100), attempt(health=100, findings=[NULL_RATE_FINDING]))
         self.assertEqual(proof["comparison_findings"], 0)
-        self.assertTrue(proof["health_unchanged_by_comparison"])
+        self.assertEqual(proof["health"], 100)
+
+    # -- the corrected assertion -----------------------------------------
+
+    def test_health_equality_is_not_used_as_the_proof(self):
+        """REGRESSION. The first version required
+        `final health == waiting health`. Under the real policy contract
+        (agent/evidence_policy.py: policy "cannot manufacture a finding or
+        subtract health") that equality holds for EVERY metadata finding, so
+        it passed whether or not the comparison had contributed one. A
+        comparison-derived finding must fail even when health is untouched.
+        """
+        final = attempt(health=100,
+                        findings=[NULL_RATE_FINDING,
+                                  {"code": "metadata_comparison.row_count_drop",
+                                   "category": "production"}])
+        with self.assertRaises(StageFailure):
+            self.d.assert_comparison_is_evidence_only(attempt(health=100), final)
+
+        proof = self.d.assert_comparison_is_evidence_only(
+            attempt(health=100), attempt(health=100, findings=[NULL_RATE_FINDING]))
+        self.assertFalse(proof["equality_with_waiting_health_used_as_proof"])
+
+    def test_the_policy_contract_still_passes_health_through(self):
+        """If this ever changes, the health expectation above is wrong."""
+        policy = (REPO_ROOT / "agent" / "evidence_policy.py").read_text(
+            encoding="utf-8")
+        self.assertIn("cannot manufacture a finding or subtract health", policy)
+
+    def test_a_comparison_derived_category_fails(self):
+        final = attempt(findings=[{"code": "x", "category": "metadata_comparison"}])
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_comparison_is_evidence_only(attempt(health=100), final)
+        self.assertIn("comparison-derived", str(caught.exception))
+
+
+class ComparisonNotAPolicyInputTests(DriverTestCase):
+    def test_the_real_recompute_path_decides_before_it_compares(self):
+        proof = self.d.assert_comparison_is_not_a_policy_input()
+        self.assertTrue(proof["decision_computed_before_comparison"])
+        self.assertFalse(proof["comparison_passed_to_policy"])
+
+    def test_a_comparison_fed_into_the_decision_would_fail(self):
+        """The check must actually read the source, not assert a constant."""
+        import agent.metadata_evidence.recompute as recompute
+
+        original = Path(recompute.__file__).read_text(encoding="utf-8")
+        self.assertIn("decision = evaluate_metadata_decision(", original)
+        self.assertIn("metadata_comparison = compute_comparison(", original)
+        self.assertLess(original.index("decision = evaluate_metadata_decision("),
+                        original.index("metadata_comparison = compute_comparison("))
 
 
 # ------------------------------------------------------ final decision
