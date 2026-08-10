@@ -109,31 +109,50 @@ def review_row(review_id="rev-1", attempt=1, head=HEAD, base=BASE):
 
 class CaseVerification(HarnessTestCase):
     def wire(self, reviews, attempts, *, delivery_pr=40, delivery_head=HEAD,
-             delivery=None, guid="guid-900", list_status=200, list_body=...):
-        if list_body is ...:
-            list_body = [{"id": 900, "guid": guid, "event": "pull_request"}]
+             delivery=None, guid="guid-900", list_status=200, list_body=...,
+             disposition="accepted", extra_deliveries=()):
+        """Serve a deliveries list plus per-delivery details.
+
+        The driver selects by payload, not by position, so the list may hold
+        another case's delivery first -- run 31360954740 failed exactly that
+        way -- and the right one must still be found.
+        """
         d = self.driver
         d.OWNER, d.REPO_NAME = "AbhishekhPR", "relium-e2e-dbt"
+        d.DELIVERY_TIMEOUT = 1
         store = FakeStore(reviews, attempts)
         d.vf._store = lambda dsn: store
         d.lf.poll = fast_poll
         d.vf.poll = fast_poll
-        # The real helper returns a SUMMARY, not a raw delivery: delivery_id
-        # is the GUID and there is no "id" key. Run 31360117271 failed
-        # because the fake invented one, so it must not invent one again.
-        d.vf.verify_genuine_webhook = (
-            delivery or (lambda gh, jwt, since, pr: {
-                "delivery_id": guid, "status_code": 202,
-                "event": "pull_request", "action": "opened",
-                "application_disposition": "accepted", "pull_request": pr}))
+        if delivery is not None:
+            d.vf.verify_genuine_webhook = delivery
+
+        details = {}
+        listed = []
+        for number, head, item_guid in list(extra_deliveries) + [
+                (delivery_pr, delivery_head, guid)]:
+            numeric = 900 + len(listed)
+            listed.append({"id": numeric, "guid": item_guid,
+                           "event": "pull_request", "status_code": 202,
+                           "action": "opened",
+                           "delivered_at": "2026-06-01T00:00:00Z"})
+            details[numeric] = {
+                "request": {"payload": {"pull_request": {
+                    "number": number, "head": {"sha": head}}}},
+                "response": {"payload": {"status": disposition}}}
+        if list_body is ...:
+            list_body = listed
+
         original = self.gh._route
 
         def route(method, path, body):
             if path == "/app/hook/deliveries?per_page=50":
                 return list_status, list_body
             if path.startswith("/app/hook/deliveries/"):
-                return 200, {"request": {"payload": {"pull_request": {
-                    "number": delivery_pr, "head": {"sha": delivery_head}}}}}
+                numeric = int(path.rsplit("/", 1)[1])
+                if numeric not in details:
+                    return 404, {}
+                return 200, details[numeric]
             return original(method, path, body)
 
         self.gh._route = route
@@ -172,55 +191,47 @@ class CaseVerification(HarnessTestCase):
 
     # -- delivery correlation ---------------------------------------------
 
-    def test_a_delivery_for_another_pull_request_does_not_satisfy_the_case(self):
-        self.wire([review_row()], [], delivery_pr=41)
-        with self.assertRaises(StageFailure) as caught:
-            self.run_case()
-        self.assertIn("not PR #40", str(caught.exception))
-
     def test_a_delivery_for_another_head_sha_does_not_satisfy_the_case(self):
         self.wire([review_row()], [], delivery_head="z" * 40)
         with self.assertRaises(StageFailure):
             self.run_case()
 
-    def test_no_delivery_at_all_fails(self):
-        def none(gh, jwt, since, pr):
-            raise StageFailure("no accepted pull_request delivery")
+    def test_the_matching_delivery_is_selected_from_several(self):
+        """Regression for run 31360954740.
 
-        self.wire([review_row()], [], delivery=none)
+        The first accepted delivery in the window belonged to the earlier
+        case; selecting by position matched the wrong pull request.
+        """
+        self.wire([review_row()], [attempt_row("rev-1", 1, BLOCK_CHANGES)],
+                  extra_deliveries=[(39, "x" * 40, "guid-other")])
+        record = self.run_case()
+        found = record["genuine_delivery"]
+        self.assertEqual(found["pull_number"], 40)
+        self.assertEqual(found["head_sha"], HEAD)
+        self.assertTrue(found["correlated"])
+
+    def test_no_delivery_for_this_pull_request_fails(self):
+        self.wire([review_row()], [], delivery_pr=41)
+        with self.assertRaises(StageFailure) as caught:
+            self.run_case()
+        self.assertIn("PR #40", str(caught.exception))
+
+    def test_a_delivery_for_another_head_sha_is_not_matched(self):
+        self.wire([review_row()], [], delivery_head="z" * 40)
         with self.assertRaises(StageFailure):
             self.run_case()
 
-    def test_a_delivery_without_a_guid_cannot_be_correlated(self):
-        self.wire([review_row()], [],
-                  delivery=lambda gh, jwt, since, pr: {"status_code": 202})
-        with self.assertRaises(StageFailure) as caught:
-            self.run_case()
-        self.assertIn("no guid to correlate", str(caught.exception))
-
-    def test_the_real_helper_return_shape_is_correlated(self):
-        """Regression for run 31360117271.
-
-        verify_genuine_webhook returns delivery_id (a GUID), never "id".
-        Reading "id" aborted the run after the fixture PR already existed.
-        """
-        self.wire([review_row()], [attempt_row("rev-1", 1, BLOCK_CHANGES)])
-        record = self.run_case()
-        self.assertEqual(record["genuine_delivery"]["delivery_guid"], "guid-900")
-        self.assertEqual(record["genuine_delivery"]["delivery_id"], 900)
-        self.assertTrue(record["genuine_delivery"]["correlated"])
-
-    def test_a_guid_matching_no_listed_delivery_fails(self):
-        self.wire([review_row()], [], list_body=[])
-        with self.assertRaises(StageFailure) as caught:
-            self.run_case()
-        self.assertIn("matched 0 numeric ids", str(caught.exception))
-
     def test_an_unreadable_delivery_list_fails(self):
         self.wire([review_row()], [], list_status=503, list_body={})
+        with self.assertRaises(StageFailure):
+            self.run_case()
+
+    def test_a_delivery_the_application_did_not_accept_fails(self):
+        self.wire([review_row()], [attempt_row("rev-1", 1, BLOCK_CHANGES)],
+                  disposition="ignored")
         with self.assertRaises(StageFailure) as caught:
             self.run_case()
-        self.assertIn("cannot list deliveries", str(caught.exception))
+        self.assertIn("not 'accepted'", str(caught.exception))
 
     # -- review and attempt readiness --------------------------------------
 

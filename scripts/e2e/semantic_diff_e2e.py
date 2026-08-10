@@ -1066,47 +1066,77 @@ def verify_case_delivery(since_utc: str, pr_number: int, head_sha: str) -> dict:
     delivery is then re-read and its payload matched to the exact PR number
     and head SHA.
     """
-    delivery = vf.verify_genuine_webhook(GH, APP_JWT, since_utc, pr_number)
-    # The helper returns a summary, not the raw delivery: `delivery_id` is the
-    # GUID and its `pull_request` field is the argument echoed back, not
-    # anything read from the payload. The detail endpoint is keyed by the
-    # numeric id, so resolve that from the GUID before correlating.
-    guid = delivery.get("delivery_id") if isinstance(delivery, dict) else None
-    if not guid:
+    return _poll_for_correlated_delivery(since_utc, pr_number, head_sha)
+
+
+def _delivery_payload(detail: dict, section: str) -> dict:
+    """One side of a stored delivery, whether GitHub stored text or an object."""
+    payload = ((detail.get(section) or {}).get("payload")
+               if isinstance(detail.get(section), dict) else None)
+    if isinstance(payload, str):
+        try:
+            return json.loads(payload) if payload else {}
+        except json.JSONDecodeError:
+            return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _poll_for_correlated_delivery(since_utc: str, pr_number: int,
+                                  head_sha: str) -> dict:
+    """Find the delivery that carries THIS pull request, not the first one.
+
+    `vf.verify_genuine_webhook` returns the first accepted pull_request
+    delivery in the window. With two PRs in one run the window still holds
+    the earlier case's delivery, so the second case matched the first and was
+    correctly rejected by the payload guard -- run 31360954740 failed with
+    "delivery ... is for PR #44 ... not PR #45". Selecting by payload rather
+    than by position is the actual fix.
+
+    202 alone is not acceptance: the application answers 202 for accepted,
+    ignored and duplicate alike, so the stored response body is read too.
+    """
+    def correlated():
+        status, deliveries = GH(
+            "GET", "/app/hook/deliveries?per_page=50", APP_JWT())
+        if status != 200 or not isinstance(deliveries, list):
+            return None
+        for item in deliveries:
+            if not isinstance(item, dict):
+                continue
+            if (item.get("event") != "pull_request"
+                    or item.get("status_code") != 202
+                    or item.get("delivered_at", "") < since_utc):
+                continue
+            numeric = item.get("id")
+            if numeric is None:
+                continue
+            detail_status, detail = GH(
+                "GET", f"/app/hook/deliveries/{numeric}", APP_JWT())
+            if detail_status != 200 or not isinstance(detail, dict):
+                continue
+            pull = _delivery_payload(detail, "request").get("pull_request") or {}
+            delivered_head = ((pull.get("head") or {}).get("sha")
+                              if isinstance(pull.get("head"), dict) else None)
+            if pull.get("number") != pr_number or delivered_head != head_sha:
+                continue
+            disposition = _delivery_payload(detail, "response").get("status")
+            return {"delivery_id": numeric, "delivery_guid": item.get("guid"),
+                    "pull_number": pull.get("number"), "head_sha": delivered_head,
+                    "status_code": item.get("status_code"),
+                    "event": item.get("event"), "action": pull and item.get("action"),
+                    "application_disposition": disposition, "correlated": True}
+        return None
+
+    found = lf.poll(
+        correlated, timeout=DELIVERY_TIMEOUT, interval=5,
+        description=(f"a pull_request delivery accepted with 202 whose payload "
+                     f"is PR #{pr_number} at {head_sha[:12]}"))
+    if found["application_disposition"] != "accepted":
         raise StageFailure(
-            f"accepted delivery for PR #{pr_number} carried no guid to correlate")
-    list_status, deliveries = GH(
-        "GET", "/app/hook/deliveries?per_page=50", APP_JWT())
-    if list_status != 200 or not isinstance(deliveries, list):
-        raise StageFailure(
-            f"cannot list deliveries to correlate PR #{pr_number}: HTTP {list_status}")
-    numeric = [item.get("id") for item in deliveries
-               if isinstance(item, dict) and item.get("guid") == guid]
-    if len(numeric) != 1 or numeric[0] is None:
-        raise StageFailure(
-            f"delivery guid {guid} matched {len(numeric)} numeric ids; "
-            f"cannot correlate PR #{pr_number}")
-    delivery_id = numeric[0]
-    status, detail = GH("GET", f"/app/hook/deliveries/{delivery_id}", APP_JWT())
-    if status != 200 or not isinstance(detail, dict):
-        raise StageFailure(
-            f"cannot read delivery {delivery_id} for PR #{pr_number}: HTTP {status}")
-    payload = ((detail.get("request") or {}).get("payload")
-               if isinstance(detail.get("request"), dict) else None) or {}
-    pull = payload.get("pull_request") or {}
-    delivered_number = pull.get("number")
-    delivered_head = ((pull.get("head") or {}).get("sha")
-                      if isinstance(pull.get("head"), dict) else None)
-    if delivered_number != pr_number or delivered_head != head_sha:
-        raise StageFailure(
-            f"delivery {delivery_id} is for PR #{delivered_number} at "
-            f"{str(delivered_head)[:12]}, not PR #{pr_number} at {head_sha[:12]}")
-    return {"delivery_id": delivery_id, "delivery_guid": guid,
-            "pull_number": delivered_number, "head_sha": delivered_head,
-            "status_code": delivery.get("status_code"),
-            "event": delivery.get("event"),
-            "application_disposition": delivery.get("application_disposition"),
-            "correlated": True}
+            f"the application answered PR #{pr_number}'s delivery with "
+            f"'{found['application_disposition']}', not 'accepted' -- the event "
+            f"was not taken up for review")
+    return found
 
 
 def _review_diagnostics(dsn: str, pr_number: int, base_sha: str,
