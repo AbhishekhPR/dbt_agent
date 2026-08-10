@@ -734,6 +734,35 @@ def _close_owned_pulls(record: dict, owned: list[str], result: dict) -> bool:
     return all_closed
 
 
+#: A deleted ref is not always immediately absent to a follow-up read.
+#: Run 31361735157 failed cleanup on a ref that GitHub had accepted the
+#: deletion for; the separate cleanup step saw it gone moments later.
+_REF_ABSENCE_ATTEMPTS = 6
+_REF_ABSENCE_INTERVAL = 2.0
+
+
+def _ref_status(ref_path: str) -> int:
+    """Read a ref, retrying while it still reads as present.
+
+    Returns the last observed status so callers can still tell "present"
+    (200) from "unreadable" (anything else) -- a distinction that must not be
+    collapsed, or an unreachable API would look like a surviving ref.
+    """
+    import time
+    status = 0
+    for attempt in range(_REF_ABSENCE_ATTEMPTS):
+        status, _ = GH("GET", ref_path, FIXTURE_TOKEN, bearer=False)
+        if status == 404:
+            return 404
+        if attempt + 1 < _REF_ABSENCE_ATTEMPTS:
+            time.sleep(_REF_ABSENCE_INTERVAL)
+    return status
+
+
+def _ref_absent(ref_path: str) -> bool:
+    return _ref_status(ref_path) == 404
+
+
 def _delete_owned_branches(owned: list[str], result: dict) -> None:
     """Remove each owned ref, deciding from a follow-up read rather than the
     DELETE status alone.
@@ -757,8 +786,7 @@ def _delete_owned_branches(owned: list[str], result: dict) -> None:
             else:
                 # Decide nothing from the status; prove it by reading the ref.
                 try:
-                    verify_status, _ = GH("GET", ref_path, FIXTURE_TOKEN,
-                                          bearer=False)
+                    verify_status = _ref_status(ref_path)
                 except Exception as exc:  # noqa: BLE001
                     result["failures"].append(
                         f"owned branch {branch} deletion returned HTTP {status} and "
@@ -779,8 +807,7 @@ def _delete_owned_branches(owned: list[str], result: dict) -> None:
                         f"owned branch {branch} deletion returned HTTP {status} and "
                         f"the verifying read was ambiguous: HTTP {verify_status}")
                 continue
-            verify_status, _ = GH("GET", ref_path, FIXTURE_TOKEN, bearer=False)
-            if verify_status != 404:
+            if not _ref_absent(ref_path):
                 result["failures"].append(
                     f"owned branch {branch} still present after deletion")
         except Exception as exc:  # noqa: BLE001
@@ -965,10 +992,38 @@ def _stop_processes(record: dict, failures: list[str]) -> list[dict]:
 
 
 def _process_alive(pid: int) -> bool:
+    """Whether a pid is a running process, not merely a signalable one.
+
+    Run 31361735157 reported the api and tunnel as surviving cleanup when
+    both had already exited. They are children of this process, and a child
+    that has exited but not been reaped stays a zombie -- for which
+    `os.kill(pid, 0)` still succeeds. The workflow's separate cleanup step saw
+    them as gone because there they are not children at all.
+
+    So reap first, and treat a zombie as dead.
+    """
+    try:
+        reaped, _status = os.waitpid(pid, os.WNOHANG)
+        if reaped == pid:
+            return False
+    except (ChildProcessError, OSError, AttributeError, ValueError):
+        # Not our child, already reaped, or waitpid unavailable on this OS.
+        pass
     try:
         os.kill(pid, 0)
-        return True
     except OSError:
+        return False
+    return not _is_zombie(pid)
+
+
+def _is_zombie(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
+            fields = handle.read().rsplit(")", 1)[-1].split()
+        return bool(fields) and fields[0] == "Z"
+    except OSError:
+        # No procfs (or no permission): fall back to "not a zombie", which
+        # keeps the previous behaviour rather than inventing an answer.
         return False
 
 

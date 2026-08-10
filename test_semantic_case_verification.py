@@ -431,3 +431,71 @@ class ProcessTermination(HarnessTestCase):
         self.assertEqual(signals, [])
         self.assertEqual(failures, [])
         self.assertFalse(stopped[0]["was_running"])
+
+
+class ZombieAndVisibility(HarnessTestCase):
+    """Two cleanup false positives from run 31361735157.
+
+    The api and tunnel are children of the driver. A child that has exited
+    but not been reaped stays a zombie, and os.kill(pid, 0) succeeds for one,
+    so a clean exit read as "survived cleanup". Separately, a ref GitHub had
+    accepted the deletion for still read as present on the very next GET.
+    """
+
+    def test_a_reaped_child_is_not_alive(self):
+        d = self.driver
+        d.os = type("os_stub", (), {
+            "waitpid": staticmethod(lambda pid, flags: (pid, 0)),
+            "kill": staticmethod(lambda pid, sig: None),
+            "WNOHANG": 1})
+        self.assertFalse(d._process_alive(1234))
+
+    def test_a_zombie_is_not_alive(self):
+        d = self.driver
+        def waitpid(pid, flags):
+            raise ChildProcessError("not our child")
+        d.os = type("os_stub", (), {
+            "waitpid": staticmethod(waitpid),
+            "kill": staticmethod(lambda pid, sig: None),
+            "WNOHANG": 1})
+        d._is_zombie = lambda pid: True
+        self.assertFalse(d._process_alive(1234))
+
+    def test_a_genuinely_running_process_is_alive(self):
+        d = self.driver
+        def waitpid(pid, flags):
+            raise ChildProcessError("still running")
+        d.os = type("os_stub", (), {
+            "waitpid": staticmethod(waitpid),
+            "kill": staticmethod(lambda pid, sig: None),
+            "WNOHANG": 1})
+        d._is_zombie = lambda pid: False
+        self.assertTrue(d._process_alive(1234))
+
+    def test_a_ref_that_disappears_on_a_later_read_counts_as_absent(self):
+        d = self.driver
+        d._REF_ABSENCE_ATTEMPTS = 3
+        d._REF_ABSENCE_INTERVAL = 0.01
+        seen = {"n": 0}
+
+        def route(method, path, body):
+            seen["n"] += 1
+            return (200, {"object": {"sha": "x"}}) if seen["n"] < 3 else (404, {})
+
+        self.gh._route = route
+        self.assertTrue(d._ref_absent("/repos/x/git/ref/heads/b"))
+
+    def test_a_ref_that_never_disappears_is_reported_present(self):
+        d = self.driver
+        d._REF_ABSENCE_ATTEMPTS = 2
+        d._REF_ABSENCE_INTERVAL = 0.01
+        self.gh._route = lambda m, p, b: (200, {"object": {"sha": "x"}})
+        self.assertEqual(d._ref_status("/repos/x/git/ref/heads/b"), 200)
+
+    def test_an_unreadable_ref_is_not_reported_as_present(self):
+        """503 must stay distinguishable from a surviving ref."""
+        d = self.driver
+        d._REF_ABSENCE_ATTEMPTS = 2
+        d._REF_ABSENCE_INTERVAL = 0.01
+        self.gh._route = lambda m, p, b: (503, {})
+        self.assertEqual(d._ref_status("/repos/x/git/ref/heads/b"), 503)
