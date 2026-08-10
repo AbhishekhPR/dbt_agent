@@ -726,17 +726,56 @@ def compare_manifest_sql(previous_manifest, current_manifest, changed_models) ->
         "semantic_comparison_evaluated": evaluated,
         "declared_semantic_evidence_available": declared_available,
         "material_sql_changes": [],
+        "sql_semantic_comparison": {"status": "unavailable", "models": []},
     }
+
+    # Structural SQL comparison. This is the canonical answer to "what changed
+    # in the SQL", and it is independent of the refund heuristic below:
+    # `material_sql_changes` is a narrow decision signal about one business
+    # pattern, whereas this describes the change itself. It therefore runs
+    # even when declared semantics are available, because a declared contract
+    # says what a model promises, not which join was dropped.
+    if evaluated:
+        audit["sql_semantic_comparison"] = _sql_semantic_comparison(
+            previous_manifest, current_manifest, changed_models)
+
     if not evaluated or declared_available:
         return audit
     previous_nodes = _manifest_model_nodes(previous_manifest)
     current_nodes = _manifest_model_nodes(current_manifest)
+    # The AST comparison is authoritative wherever it could read the SQL. The
+    # regex survives only for models it could not parse, so an unsupported
+    # dialect degrades to the old behaviour instead of silently detecting
+    # nothing. Which detector proved a finding is recorded on the finding.
+    parsed_models = {
+        model["model_name"]: model
+        for model in audit["sql_semantic_comparison"]["models"]
+        if model.get("status") == "evaluated"
+    }
+
     changes = []
     for name in list(changed_models or []):
         previous = previous_nodes.get(name)
         current = current_nodes.get(name)
         if not previous or not current:
             continue
+
+        model_comparison = parsed_models.get(str(name))
+        if model_comparison is not None:
+            evidence = _refund_removed_from_projection(model_comparison)
+            if evidence is not None:
+                changes.append(_refund_finding(
+                    name, base_available, head_available, evaluated,
+                    detector="ast_projection_expression",
+                    evidence=evidence))
+                continue
+
+        # The AST did not prove it — either the SQL would not parse, or it
+        # parsed into something with no comparable projection (a bare
+        # expression fragment, a shape this comparison does not model). The
+        # regex still runs there rather than being deleted, because it
+        # genuinely catches cases the AST cannot reach and dropping it would
+        # trade one blind spot for another. Which detector fired is recorded.
         previous_sql = _canonical_sql(previous.get("raw_code") or previous.get("compiled_code") or previous.get("sql"))
         current_sql = _canonical_sql(current.get("raw_code") or current.get("compiled_code") or current.get("sql"))
         if (
@@ -745,21 +784,9 @@ def compare_manifest_sql(previous_manifest, current_manifest, changed_models) ->
             and previous_sql != current_sql
             and _material_sql_delta(previous_sql, current_sql)
         ):
-            changes.append(
-                {
-                    "model_name": str(name),
-                    "finding_owner": "semantic_refund_fallback",
-                    "finding_type": "refund_adjustment_subtraction_removed",
-                    "evidence_source": "trusted_base_head_manifest_sql",
-                    "base_manifest_available": base_available,
-                    "head_manifest_available": head_available,
-                    "semantic_comparison_evaluated": evaluated,
-                    "fallback_used": True,
-                    "fallback_scope": (
-                        "refund_adjustment_subtraction_from_net_or_gross_business_expression"
-                    ),
-                }
-            )
+            changes.append(_refund_finding(
+                name, base_available, head_available, evaluated,
+                detector="regex_fallback_unparsed_sql"))
     audit["material_sql_changes"] = changes
     return audit
 
@@ -820,6 +847,42 @@ def _canonical_sql(value) -> str:
         return " ".join(text.lower().split())
 
 
+def _sql_semantic_comparison(previous_manifest, current_manifest, changed_models) -> dict:
+    """Compare each changed model's base and head SQL as ASTs.
+
+    One result for the whole review. A model whose SQL cannot be read is
+    reported as unavailable rather than as unchanged, so the caller can always
+    tell "nothing changed" from "we could not look".
+    """
+    from agent.sql_semantic_diff import compare_model_sql
+
+    previous_nodes = _manifest_model_nodes(previous_manifest)
+    current_nodes = _manifest_model_nodes(current_manifest)
+
+    models = []
+    for name in list(changed_models or []):
+        previous = previous_nodes.get(name) or {}
+        current = current_nodes.get(name) or {}
+        comparison = compare_model_sql(
+            name,
+            previous.get("raw_code") or previous.get("compiled_code") or previous.get("sql"),
+            current.get("raw_code") or current.get("compiled_code") or current.get("sql"),
+            model_unique_id=current.get("unique_id") or previous.get("unique_id"),
+        )
+        models.append(comparison.to_dict())
+
+    evaluated = [model for model in models if model["status"] == "evaluated"]
+    return {
+        # `evaluated` means every changed model was readable; `partial` means
+        # some were and some were not. Neither is ever inferred from an empty
+        # change list.
+        "status": ("evaluated" if models and len(evaluated) == len(models)
+                   else "partial" if evaluated else "unavailable"),
+        "models": models,
+        "change_count": sum(len(model["changes"]) for model in models),
+    }
+
+
 def _material_sql_delta(previous_sql: str, current_sql: str) -> bool:
     """Detect removal of a refund adjustment from a net/gross KPI expression.
 
@@ -838,14 +901,76 @@ def _has_refund_adjustment(sql: str) -> bool:
         return False
     # Parentheses and COALESCE are deliberately accepted; comments and casing
     # have already been normalised by _canonical_sql.
+    #
+    # The optional `alias.` qualifier is the repair: the pattern previously
+    # required a bare `refund*`, so the idiomatic `r.refund_amount` — the way
+    # anyone actually writes a joined refund column — never matched, and the
+    # single most important refund case went undetected. The shape being
+    # matched is unchanged; only the qualifier is now tolerated.
     return bool(
         re.search(
-            r"\b(?:gross|net|total|revenue|sales|income|amount)[a-z0-9_]*\s*-\s*"
-            r"(?:\(\s*)?(?:coalesce\s*\(\s*)?refund[a-z0-9_.]*",
+            r"\b(?:gross|net|total|revenue|sales|income|amount)[a-z0-9_]*\b[^-]{0,80}?\s*-\s*"
+            r"(?:[a-z0-9_]+\s*\(\s*|\(\s*){0,3}(?:[a-z0-9_]+\s*\.\s*)?refund",
             sql,
             flags=re.I,
         )
     )
+
+
+def _refund_finding(model_name, base_available, head_available, evaluated, *,
+                    detector, evidence=None) -> dict:
+    """The existing finding shape, unchanged.
+
+    `detector` and `evidence` are additive: the decision engine reads none of
+    them, and the fields the policy has always emitted keep their values, so
+    severity and health are unaffected by which detector proved the condition.
+    """
+    finding = {
+        "model_name": str(model_name),
+        "finding_owner": "semantic_refund_fallback",
+        "finding_type": "refund_adjustment_subtraction_removed",
+        "evidence_source": "trusted_base_head_manifest_sql",
+        "base_manifest_available": base_available,
+        "head_manifest_available": head_available,
+        "semantic_comparison_evaluated": evaluated,
+        "fallback_used": True,
+        "fallback_scope": (
+            "refund_adjustment_subtraction_from_net_or_gross_business_expression"
+        ),
+        "detector": detector,
+    }
+    if evidence is not None:
+        # The exact projection that proved it, so the finding can be traced
+        # back to a specific expression rather than to "somewhere in the SQL".
+        finding["output_name"] = evidence.get("output_name")
+        finding["before_sql"] = evidence.get("before_sql")
+        finding["after_sql"] = evidence.get("after_sql")
+    return finding
+
+
+def _refund_removed_from_projection(model_comparison) -> dict | None:
+    """Prove the existing refund condition from AST evidence, per projection.
+
+    The policy this serves has always been one thing: a refund/adjustment
+    subtraction disappearing from a net/gross business expression. That is now
+    read off a single `projection_expression_changed` — the before expression
+    carries the adjustment and the after expression does not — instead of
+    regex-scanning the whole model body, where an unrelated refund mention
+    elsewhere could mask or fake the result.
+
+    Deliberately narrow. `join_removed`, `filter_changed` and
+    `grouping_changed` are NOT treated as refund evidence: the existing policy
+    never claimed to detect them, and turning descriptive evidence into a
+    BLOCK would be inventing a decision rule rather than repairing a detector.
+    """
+    for change in model_comparison.get("changes") or []:
+        if change.get("kind") != "projection_expression_changed":
+            continue
+        before = change.get("before_sql") or ""
+        after = change.get("after_sql") or ""
+        if _has_refund_adjustment(before) and not _has_refund_adjustment(after):
+            return change
+    return None
 
 
 def _signal_metadata_value(signals: list[Signal], key: str, default):

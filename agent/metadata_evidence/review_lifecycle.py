@@ -110,7 +110,7 @@ def begin_review(store, *, organization_id, repository_id, environment,
                  pull_number, base_sha, head_sha, base_manifest, head_manifest,
                  changed_models, enforcement_mode, delivery_id=None,
                  code_health=100, code_findings=(), critical_models=(),
-                 evidence_level="profile", now=None):
+                 evidence_level="profile", now=None, semantic_evidence=None):
     """Persist a genuine GitHub review and decide what to publish.
 
     Returns a LifecycleOutcome. When production evidence is required and not
@@ -204,6 +204,9 @@ def begin_review(store, *, organization_id, repository_id, environment,
         policy_version=decision.policy_version, policy_hash=decision.policy_hash,
         payload={"findings": [f.as_dict() for f in decision.findings],
                  "plan": plan_dict},
+        # Computed once, upstream, before this attempt existed. Never
+        # recomputed for storage.
+        semantic_evidence=semantic_evidence,
     )
     store.record_evidence_states(organization_id, repository_id, review_id, attempt,
                                  _evidence_rows(decision))

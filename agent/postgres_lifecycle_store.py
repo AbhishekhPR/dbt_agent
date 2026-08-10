@@ -1232,7 +1232,8 @@ class PostgresLifecycleStore:
                                decision, evidence_coverage, health, attempt,
                                trigger="initial", snapshot_id=None,
                                enforcement_mode=None, policy_version=None,
-                               policy_hash=None, payload=None):
+                               policy_hash=None, payload=None,
+                               semantic_evidence=None):
         """Record a decision and preserve it as an immutable attempt.
 
         Coverage, health, decision and lifecycle state are stored separately;
@@ -1251,13 +1252,17 @@ class PostgresLifecycleStore:
             self.connection.execute(
                 "INSERT INTO review_attempts (organization_id, repository_id, review_id, "
                 "attempt, lifecycle_state, decision, evidence_coverage, health, "
-                "enforcement_mode, policy_version, policy_hash, trigger, snapshot_id, payload) "
-                "SELECT %s, %s, %s, %s, lifecycle_state, %s, %s, %s, %s, %s, %s, %s, %s, %s "
+                "enforcement_mode, policy_version, policy_hash, trigger, snapshot_id, "
+                "payload, semantic_evidence) "
+                "SELECT %s, %s, %s, %s, lifecycle_state, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s "
                 "FROM reviews WHERE organization_id=%s AND repository_id=%s AND review_id=%s "
                 "ON CONFLICT (organization_id, repository_id, review_id, attempt) DO NOTHING",
                 (organization_id, repository_id, review_id, attempt, decision,
                  evidence_coverage, health, enforcement_mode, policy_version, policy_hash,
                  trigger, snapshot_id, self._Jsonb(payload or {}),
+                 # NULL when no comparison ran: an absent row must never read
+                 # as a clean comparison.
+                 self._Jsonb(semantic_evidence) if semantic_evidence is not None else None,
                  organization_id, repository_id, review_id),
             )
         return self.get_review(organization_id, repository_id, review_id)

@@ -1,0 +1,25 @@
+-- Structured SQL semantic evidence, bound to the exact attempt that produced it.
+--
+-- The dashboard already binds findings, coverage and the decision to a
+-- specific attempt. Semantic evidence has to follow the same rule, or a
+-- reviewer looking at attempt 2 could be shown what attempt 1 proved about a
+-- different head SHA.
+--
+-- It lives on review_attempts rather than on reviews for exactly that reason:
+-- the table's primary key is (organization_id, repository_id, review_id,
+-- attempt), so the binding is structural instead of something the read path
+-- has to remember to filter by.
+--
+-- A dedicated column rather than the existing generic `payload`, because the
+-- distinction between "not computed" and "computed, found nothing" is the
+-- whole point and must be representable:
+--
+--   NULL                                    -> comparison did not run
+--   {"status":"unavailable", ...}           -> ran, could not read the SQL
+--   {"status":"evaluated","changes":[]}     -> ran, nothing changed
+--   {"status":"partial"|"evaluated", ...}   -> ran, evidence exists
+--
+-- SQL NULL carries the first state, so an absent row can never be mistaken
+-- for a clean comparison.
+ALTER TABLE review_attempts
+    ADD COLUMN IF NOT EXISTS semantic_evidence JSONB;
