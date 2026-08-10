@@ -258,37 +258,125 @@ class SemanticTests(DriverTestCase):
 # -------------------------------------------------------- blast radius
 
 class BlastRadiusTests(DriverTestCase):
+    #: Node ids, exactly as collection_plan persists them.
+    DIRECT_IDS = ["model.a.customer_lifetime_value", "model.a.dim_customers"]
+
     def test_expectation_is_derived_from_the_parsed_manifest(self):
         expectation = self.d.expected_direct_downstream(
             MANIFEST, "int_customer_orders")
         self.assertEqual(expectation["direct_downstream_models"],
-                         ["customer_lifetime_value", "dim_customers"])
-        self.assertNotIn("exec_daily_kpis",
+                         self.DIRECT_IDS)
+        self.assertNotIn("model.a.exec_daily_kpis",
                          expectation["direct_downstream_models"])
+
+    def test_the_expectation_is_node_ids_not_names(self):
+        """REGRESSION for run 31394411123.
+
+        `collection_plan` stores `downstream.add(node_id)`, so the persisted
+        set is dbt node ids. Deriving names made the run fail with
+        `['model.relium_e2e_dbt.dim_customers'] != ['dim_customers']` - the
+        right set in the wrong identity. Names are still reported, but only as
+        a human-readable companion.
+        """
+        expectation = self.d.expected_direct_downstream(
+            MANIFEST, "int_customer_orders")
+        for identity in expectation["direct_downstream_models"]:
+            self.assertTrue(identity.startswith("model."), identity)
+        self.assertEqual(expectation["direct_downstream_names"],
+                         ["customer_lifetime_value", "dim_customers"])
+        # The exact shape the product persists must satisfy the expectation.
+        proof = self.d.assert_blast_radius(
+            {"downstream_models": self.DIRECT_IDS}, expectation)
+        self.assertEqual(proof["direct_downstream_models"], self.DIRECT_IDS)
+
+    def test_bare_names_from_the_product_would_fail(self):
+        """If the product ever switched to names, this must not pass silently."""
+        expectation = self.d.expected_direct_downstream(
+            MANIFEST, "int_customer_orders")
+        with self.assertRaises(StageFailure):
+            self.d.assert_blast_radius(
+                {"downstream_models": ["customer_lifetime_value",
+                                       "dim_customers"]}, expectation)
 
     def test_wrong_blast_radius_fails(self):
         expectation = self.d.expected_direct_downstream(
             MANIFEST, "int_customer_orders")
         with self.assertRaises(StageFailure):
-            self.d.assert_blast_radius({"downstream_models": ["dim_customers"]},
-                                       expectation)
+            self.d.assert_blast_radius(
+                {"downstream_models": ["model.a.dim_customers"]}, expectation)
 
     def test_transitive_expansion_fails(self):
         expectation = self.d.expected_direct_downstream(
             MANIFEST, "int_customer_orders")
         with self.assertRaises(StageFailure):
             self.d.assert_blast_radius(
-                {"downstream_models": ["customer_lifetime_value",
-                                       "dim_customers", "exec_daily_kpis"]},
-                expectation)
+                {"downstream_models": self.DIRECT_IDS
+                 + ["model.a.exec_daily_kpis"]}, expectation)
 
     def test_exact_direct_set_passes(self):
         expectation = self.d.expected_direct_downstream(
             MANIFEST, "int_customer_orders")
         proof = self.d.assert_blast_radius(
-            {"downstream_models": ["dim_customers", "customer_lifetime_value"]},
-            expectation)
+            {"downstream_models": list(reversed(self.DIRECT_IDS))}, expectation)
         self.assertFalse(proof["transitive_expansion"])
+
+    def test_the_identity_matches_what_collection_plan_persists(self):
+        """Cross-check against the product, not against this harness."""
+        plan = (REPO_ROOT / "agent" / "metadata_evidence"
+                / "collection_plan.py").read_text(encoding="utf-8")
+        self.assertIn("downstream.add(node_id)", plan)
+        self.assertIn("plan.downstream_models = sorted(downstream)", plan)
+
+
+class ObservationFreshnessTests(DriverTestCase):
+    """REGRESSION for run 31394411123's second, masked defect.
+
+    Observation A was backdated six hours against a one-hour TTL, so
+    `classify_freshness` correctly returned STALE and the baseline review
+    recomputed to METADATA_STALE / BLOCK. The product was right; the fixture
+    was asking it to treat a six-hour-old observation as current.
+    """
+
+    def test_the_backdate_is_well_inside_the_declared_ttl(self):
+        self.assertLess(self.d.A_BACKDATE_SECONDS,
+                        self.d.OBSERVATION_TTL_SECONDS)
+        # Comfortably inside, not marginally: clock skew must not decide this.
+        self.assertLess(self.d.A_BACKDATE_SECONDS,
+                        self.d.OBSERVATION_TTL_SECONDS / 4)
+
+    def test_the_backdate_still_orders_a_strictly_before_b(self):
+        self.assertGreater(self.d.A_BACKDATE_SECONDS, 0)
+
+    def test_a_would_not_be_classified_stale(self):
+        """Run the REAL classifier over the body the driver actually sends."""
+        from datetime import datetime, timedelta, timezone
+
+        from agent.metadata_evidence.decision import classify_freshness
+
+        now = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+        observed = now - timedelta(seconds=self.d.A_BACKDATE_SECONDS)
+        body = self.d.observation_body(
+            {"review_id": "r", "attempt": 1, "base_sha": "a" * 40,
+             "head_sha": "b" * 40, "base_manifest_hash": "bh",
+             "head_manifest_hash": "hh"},
+            "req-1", row_count=1000, null_rate=0.01, cardinality=0.37,
+            column_exists=True, observed_at=observed)
+        snapshot = {"observed_at": observed,
+                    "ttl_seconds": body["ttl_seconds"],
+                    "relations": body["relations"]}
+        self.assertEqual(classify_freshness(snapshot, now=now), "CURRENT")
+
+    def test_a_six_hour_backdate_would_have_been_stale(self):
+        """The exact condition that produced METADATA_STALE."""
+        from datetime import datetime, timedelta, timezone
+
+        from agent.metadata_evidence.decision import classify_freshness
+
+        now = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+        stale = {"observed_at": now - timedelta(hours=6),
+                 "ttl_seconds": self.d.OBSERVATION_TTL_SECONDS,
+                 "relations": []}
+        self.assertEqual(classify_freshness(stale, now=now), "STALE")
 
     def test_a_model_with_no_consumers_cannot_prove_blast_radius(self):
         with self.assertRaises(StageFailure):

@@ -108,6 +108,18 @@ A_NULL_RATE = 0.01
 B_NULL_RATE = vf.HIGH_NULL_RATE
 NULL_RATE_THRESHOLD = vf.NULL_RATE_THRESHOLD
 
+#: Both observations declare a one-hour TTL, so A only has to be far enough
+#: back to order strictly before B - not far enough back to be STALE.
+#:
+#: Run 31394411123 backdated A by six hours against that same one-hour TTL.
+#: `classify_freshness` correctly returned STALE, and the baseline review
+#: recomputed to METADATA_STALE / BLOCK. The product was right; the fixture was
+#: asking it to treat a six-hour-old observation as current. Baseline
+#: SELECTION only needs strict precedence in
+#: (observed_at, received_at, snapshot_id), which two minutes provides.
+OBSERVATION_TTL_SECONDS = 3600
+A_BACKDATE_SECONDS = 120
+
 state = {"procs": [], "tunnel": None, "cleanup_done": False,
          "cleanup_result": None, "expected_slug": APP_SLUG, "mutated": False}
 
@@ -471,6 +483,12 @@ def expected_direct_downstream(manifest: dict, changed_model: str) -> dict:
 
     Derived rather than declared: a hardcoded list would make the assertion an
     opinion of this harness instead of a property of the project.
+
+    The identity is the dbt NODE ID, not the model name. `collection_plan`
+    stores `downstream.add(node_id)`, and the proven blast-radius E2E compares
+    against `direct_model_ids` for the same reason. Run 31394411123 failed here
+    with `['model.relium_e2e_dbt.dim_customers'] != ['dim_customers']` - the
+    set was right and only this harness's identity format was wrong.
     """
     nodes = manifest.get("nodes") or {}
     changed_ids = [nid for nid, node in nodes.items()
@@ -480,16 +498,18 @@ def expected_direct_downstream(manifest: dict, changed_model: str) -> dict:
         raise StageFailure(
             f"manifest has {len(changed_ids)} models named {changed_model}")
     changed_id = changed_ids[0]
-    direct = sorted(
-        node.get("name") for nid, node in nodes.items()
+    direct_ids = sorted(
+        nid for nid, node in nodes.items()
         if node.get("resource_type") == "model"
         and changed_id in ((node.get("depends_on") or {}).get("nodes") or []))
-    if not direct:
+    if not direct_ids:
         raise StageFailure(
             f"{changed_model} has no direct downstream model; the fixture "
             f"cannot exercise blast radius")
     return {"changed_model": changed_model, "changed_model_id": changed_id,
-            "direct_downstream_models": direct,
+            "direct_downstream_models": direct_ids,
+            "direct_downstream_names": [nodes[n].get("name") for n in direct_ids],
+            "identity": "dbt node id, as collection_plan persists it",
             "derived_from": "real dbt-parsed manifest"}
 
 
@@ -554,6 +574,7 @@ def assert_blast_radius(plan: dict, expectation: dict) -> dict:
         raise StageFailure(
             f"direct blast radius is {persisted}, expected {expected}")
     return {"direct_downstream_models": persisted,
+            "direct_downstream_names": expectation.get("direct_downstream_names"),
             "transitive_expansion": False, "exposure_expansion": False,
             "matches_parsed_manifest": True}
 
@@ -781,7 +802,7 @@ def observation_body(review, request_id, *, row_count, null_rate, cardinality,
     return {
         "review_id": review["review_id"], "request_id": request_id,
         "environment": ENVIRONMENT, "attempt": review["attempt"],
-        "completeness": "COMPLETE", "ttl_seconds": 3600,
+        "completeness": "COMPLETE", "ttl_seconds": OBSERVATION_TTL_SECONDS,
         "observed_at": observed_at.isoformat(),
         "base_sha": review["base_sha"], "head_sha": review["head_sha"],
         "base_manifest_hash": review["base_manifest_hash"],
@@ -1027,7 +1048,8 @@ def main() -> int:
         observation_body(baseline_review, baseline_request["request_id"],
                          row_count=A_ROW_COUNT, null_rate=A_NULL_RATE,
                          cardinality=A_CARDINALITY, column_exists=True,
-                         observed_at=datetime.now(timezone.utc) - timedelta(hours=6)),
+                         observed_at=datetime.now(timezone.utc)
+                         - timedelta(seconds=A_BACKDATE_SECONDS)),
         "a")
     summary["baseline_review"] = {
         "review_id": baseline_review["review_id"],
