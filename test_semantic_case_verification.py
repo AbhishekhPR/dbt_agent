@@ -376,3 +376,58 @@ class ManifestContract(HarnessTestCase):
                                 "base and head branches must each get a manifest")
         self.assertIn("base_manifest", source)
         self.assertIn("head_manifest", source)
+
+
+class ProcessTermination(HarnessTestCase):
+    """Cleanup must let a process finish exiting before calling it a survivor.
+
+    Run 31361269836 proved both semantic cases and then failed cleanup with
+    "process api survived cleanup". Liveness was sampled in the same instant
+    as the SIGTERM; the workflow's separate cleanup step passed moments later.
+    """
+
+    def _record_with(self, pid):
+        d = self.driver
+        d._initial_recovery()
+        record = d._load_recovery()
+        record["processes"] = [{"label": "api", "pid": pid, "marker": "m"}]
+        d._write_recovery(record)
+        return d, record
+
+    def test_a_process_that_exits_after_sigterm_is_not_a_survivor(self):
+        d, record = self._record_with(4242)
+        calls = {"n": 0}
+
+        def alive(pid):
+            calls["n"] += 1
+            return calls["n"] < 3  # dies shortly after the signal
+
+        d._process_alive = alive
+        d.os.kill = lambda pid, sig: None
+        failures = []
+        stopped = d._stop_processes(record, failures)
+        self.assertEqual(failures, [])
+        self.assertFalse(stopped[0]["still_running"])
+
+    def test_a_process_that_ignores_sigterm_is_escalated_then_reported(self):
+        d, record = self._record_with(4243)
+        d._process_alive = lambda pid: True
+        d._TERM_GRACE_SECONDS = 0.2
+        signals = []
+        d.os.kill = lambda pid, sig: signals.append(sig)
+        failures = []
+        stopped = d._stop_processes(record, failures)
+        self.assertTrue(stopped[0]["escalated"])
+        self.assertEqual(len(signals), 2)
+        self.assertTrue(any("survived cleanup" in f for f in failures))
+
+    def test_an_already_dead_process_is_never_signalled(self):
+        d, record = self._record_with(4244)
+        d._process_alive = lambda pid: False
+        signals = []
+        d.os.kill = lambda pid, sig: signals.append(sig)
+        failures = []
+        stopped = d._stop_processes(record, failures)
+        self.assertEqual(signals, [])
+        self.assertEqual(failures, [])
+        self.assertFalse(stopped[0]["was_running"])

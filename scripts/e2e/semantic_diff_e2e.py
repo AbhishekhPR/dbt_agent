@@ -909,24 +909,58 @@ def _listener_up(port: int) -> bool:
             return False
 
 
+#: How long a SIGTERM'd process is given to exit before SIGKILL, and again
+#: before it is declared surviving.
+_TERM_GRACE_SECONDS = 10.0
+
+
+def _await_exit(pid: int, seconds: float) -> bool:
+    """Wait for a pid to disappear. Returns True once it has."""
+    import time
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if not _process_alive(pid):
+            return True
+        time.sleep(0.2)
+    return not _process_alive(pid)
+
+
 def _stop_processes(record: dict, failures: list[str]) -> list[dict]:
+    """Stop recorded processes, giving each a chance to actually exit.
+
+    Run 31361269836 proved both cases and then failed cleanup with "process
+    api survived cleanup": liveness was checked in the same instant as the
+    SIGTERM, so a process shutting down cleanly still looked alive. The
+    workflow's separate cleanup step passed moments later, which is the tell.
+    """
     stopped = []
     for entry in list(record.get("processes") or []):
         pid = entry.get("pid")
         if not isinstance(pid, int):
             continue
         alive_before = _process_alive(pid)
+        escalated = False
         if alive_before:
             try:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
                 pass
+            if not _await_exit(pid, globals()["_TERM_GRACE_SECONDS"]):
+                # A graceful stop was offered and declined; take it down so
+                # cleanup never leaves a listener behind.
+                escalated = True
+                try:
+                    os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                except OSError:
+                    pass
+                _await_exit(pid, globals()["_TERM_GRACE_SECONDS"])
         stopped.append({"label": entry.get("label"), "pid": pid,
-                        "was_running": alive_before,
+                        "was_running": alive_before, "escalated": escalated,
                         "still_running": _process_alive(pid)})
     for entry in stopped:
         if entry["still_running"]:
-            failures.append(f"process {entry['label']} (pid {entry['pid']}) survived cleanup")
+            failures.append(
+                f"process {entry['label']} (pid {entry['pid']}) survived cleanup")
     return stopped
 
 
