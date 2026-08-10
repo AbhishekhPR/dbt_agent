@@ -19,7 +19,7 @@ on:
         required: true
         default: "governance"
         type: choice
-        options: [governance, blast-radius, semantic-diff, recover-webhook, cleanup-fixtures]
+        options: [governance, blast-radius, semantic-diff, integrated-product, recover-webhook, cleanup-fixtures]
       enforcement_mode:
         description: "Policy mode for the fixture review"
         required: true
@@ -547,6 +547,195 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: semantic-diff-before-after
+          path: |
+            ${{ env.EVIDENCE_DIR }}/*.json
+            ${{ env.EVIDENCE_DIR }}/*.log
+            ${{ env.EVIDENCE_DIR }}/*.sql
+            ${{ env.EVIDENCE_DIR }}/*.sha256.txt
+          if-no-files-found: error
+
+  # Phase A of the integrated product pass: one review, the whole backend
+  # chain. Cloned from semantic-diff because that job is the one proven end to
+  # end by run 31362379814 — the secret wiring, key handling, role
+  # provisioning, cloudflared pin, cleanup, secret scan and upload below are
+  # deliberately identical. Only the driver and the evidence names differ.
+  #
+  # Migration currency is asserted by /readyz inside the driver, never by a
+  # pinned version list: a pinned list fails the moment a legitimate migration
+  # lands, for a reason unrelated to what this job proves.
+  integrated-product:
+    if: inputs.operation == 'integrated-product'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: bootstrap_only_not_used_by_the_app
+          POSTGRES_DB: postgres
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      RELIUM_E2E_REPOSITORY: AbhishekhPR/relium-e2e-dbt
+      RELIUM_E2E_APP_SLUG: relium-e2e
+      EVIDENCE_DIR: ${{ github.workspace }}/integrated-product-evidence
+
+    steps:
+      # The dispatched ref, so the job tests the application code under review.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Record the exact PostgreSQL service
+        run: |
+          mapfile -t POSTGRES_IDS < <(docker ps --filter ancestor=postgres:18 --format '{{.ID}}')
+          if [ "${#POSTGRES_IDS[@]}" -ne 1 ]; then
+            echo "expected one PostgreSQL 18 service, found ${#POSTGRES_IDS[@]}"; exit 1
+          fi
+          echo "POSTGRES_SERVICE_ID=${POSTGRES_IDS[0]}" >> "$GITHUB_ENV"
+
+      - name: Install the application and pinned dbt parse runtimes
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip install -r requirements-direct-downstream-e2e.txt
+          python -m pip check
+          dbt --version
+
+      - name: Install PostgreSQL 18 client tools
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-18
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+
+      - name: Provision the least-privileged application role
+        env:
+          PGPASSWORD: bootstrap_only_not_used_by_the_app
+        run: |
+          APP_PW="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 32)"
+          psql -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 -q <<SQL
+          CREATE ROLE relium_app LOGIN PASSWORD '${APP_PW}'
+            NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+            CONNECTION LIMIT 20;
+          CREATE DATABASE relium_e2e OWNER relium_app;
+          SQL
+          psql -h 127.0.0.1 -U postgres -d relium_e2e -v ON_ERROR_STOP=1 -q <<SQL
+          ALTER SCHEMA public OWNER TO relium_app;
+          SQL
+          echo "::add-mask::${APP_PW}"
+          echo "RELIUM_DATABASE_URL=postgresql://relium_app:${APP_PW}@127.0.0.1:5432/relium_e2e" >> "$GITHUB_ENV"
+
+      - name: Assert the application role is least-privileged
+        env:
+          PGPASSWORD: bootstrap_only_not_used_by_the_app
+        run: |
+          VERDICT="$(psql -h 127.0.0.1 -U postgres -tAc "
+            SELECT CASE WHEN NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole
+                         AND NOT rolreplication AND NOT rolbypassrls
+                        THEN 'LEAST_PRIVILEGED' ELSE 'OVER_PRIVILEGED' END
+              FROM pg_roles WHERE rolname='relium_app'")"
+          echo "app role: $VERDICT"
+          [ "$VERDICT" = "LEAST_PRIVILEGED" ] || exit 1
+
+      - name: Write the dedicated E2E App private key outside the workspace
+        env:
+          RELIUM_GITHUB_PRIVATE_KEY: ${{ secrets.RELIUM_E2E_PRIVATE_KEY }}
+        run: |
+          install -m 700 -d "$RUNNER_TEMP/relium-secrets"
+          printf '%s' "$RELIUM_GITHUB_PRIVATE_KEY" > "$RUNNER_TEMP/relium-secrets/app.pem"
+          chmod 600 "$RUNNER_TEMP/relium-secrets/app.pem"
+          test -s "$RUNNER_TEMP/relium-secrets/app.pem" || exit 1
+          echo "RELIUM_GITHUB_PRIVATE_KEY_PATH=$RUNNER_TEMP/relium-secrets/app.pem" >> "$GITHUB_ENV"
+
+      - name: Install pinned cloudflared
+        run: |
+          curl -fsSL -o /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/download/2026.7.2/cloudflared-linux-amd64
+          echo "ec905ea7b7e327ff8abdde8cb64697a2152de74dbcdbf6aec9db8364eb3886cd  /tmp/cloudflared" \
+            | sha256sum --check --strict
+          sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Prove the harness before it is allowed to touch the fixture repo
+        run: |
+          python -m unittest test_integrated_product_e2e_harness -v
+
+      - name: Run the integrated product E2E (phase A)
+        env:
+          RELIUM_GITHUB_APP_ID: ${{ secrets.RELIUM_E2E_APP_ID }}
+          RELIUM_GITHUB_WEBHOOK_SECRET: ${{ secrets.RELIUM_E2E_WEBHOOK_SECRET }}
+          RELIUM_E2E_INSTALLATION_ID: ${{ secrets.RELIUM_E2E_INSTALLATION_ID }}
+          # Fixture branch/commit/PR operations ONLY. App authentication owns
+          # every webhook and publication operation; this token never reaches one.
+          RELIUM_E2E_FIXTURE_TOKEN: ${{ secrets.RELIUM_E2E_FIXTURE_TOKEN }}
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          python scripts/e2e/integrated_product_e2e.py "$EVIDENCE_DIR"
+
+      # Exported before cleanup stops the service. Phase B reads THIS database
+      # rather than a handcrafted replay.
+      - name: Export the isolated review database
+        if: always()
+        env:
+          PGPASSWORD: bootstrap_only_not_used_by_the_app
+        run: |
+          set -o pipefail
+          pg_dump -h 127.0.0.1 -U postgres -d relium_e2e \
+            --no-owner --no-privileges \
+            -f "$EVIDENCE_DIR/integrated-product-review-state.sql"
+          test -s "$EVIDENCE_DIR/integrated-product-review-state.sql"
+          sha256sum "$EVIDENCE_DIR/integrated-product-review-state.sql" \
+            | tee "$EVIDENCE_DIR/integrated-product-review-state.sha256.txt"
+
+      - name: Mandatory exact integrated-product cleanup
+        if: always()
+        env:
+          RELIUM_GITHUB_APP_ID: ${{ secrets.RELIUM_E2E_APP_ID }}
+          RELIUM_E2E_INSTALLATION_ID: ${{ secrets.RELIUM_E2E_INSTALLATION_ID }}
+          RELIUM_E2E_FIXTURE_TOKEN: ${{ secrets.RELIUM_E2E_FIXTURE_TOKEN }}
+        run: |
+          rc=0
+          python scripts/e2e/integrated_product_e2e.py "$EVIDENCE_DIR" --cleanup-only || rc=$?
+          if ss -ltnp | grep -qE ':(8791|5181)'; then
+            echo "INTEGRATED API/FRONTEND LISTENER STILL UP"; rc=1
+          fi
+          if [ -z "$POSTGRES_SERVICE_ID" ]; then
+            echo "POSTGRES SERVICE ID IS UNAVAILABLE"; rc=1
+          else
+            docker stop "$POSTGRES_SERVICE_ID" || rc=1
+          fi
+          if ss -ltnp | grep -qE ':(5432)'; then
+            echo "INTEGRATED POSTGRES LISTENER STILL UP"; rc=1
+          fi
+          if [ $rc -ne 0 ]; then
+            echo "INTEGRATED-PRODUCT CLEANUP FAILED (rc=$rc)"; exit $rc
+          fi
+
+      - name: Scan integrated-product evidence for secrets
+        id: integrated_secret_scan
+        if: always()
+        run: |
+          python scripts/live_e2e/secret_scan.py "$EVIDENCE_DIR" || {
+            echo "SECRET SCAN FAILED - refusing to upload evidence"; exit 1; }
+
+      - name: Upload integrated-product evidence
+        if: always() && steps.integrated_secret_scan.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: integrated-product-phase-a
           path: |
             ${{ env.EVIDENCE_DIR }}/*.json
             ${{ env.EVIDENCE_DIR }}/*.log

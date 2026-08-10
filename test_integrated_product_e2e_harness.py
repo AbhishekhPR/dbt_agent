@@ -1,0 +1,691 @@
+"""The integrated product E2E harness, driven against fakes.
+
+No test here touches GitHub, PostgreSQL or the network. The driver is
+orchestration over already-proven helpers, so what needs proving is the
+orchestration itself: does every assertion actually fail when the product
+would be wrong, and does cleanup still run when a stage dies.
+
+The fakes mirror shapes observed in real runs — attempt rows as
+`review_attempts` returns them, comparisons as `_metadata_comparison_view`
+projects them, plans as `collection_plan` persists them. A fake that invented
+its own shape would let the harness pass against data the product never
+produces.
+
+Every failure case asserts StageFailure specifically, not "an exception":
+an AttributeError that happens to abort the run is not the driver noticing a
+product defect.
+"""
+from __future__ import annotations
+
+import importlib
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "e2e"))
+
+from live_flow import StageFailure  # noqa: E402
+
+
+def load_driver(evidence_dir):
+    """Import the driver with a private evidence directory per test."""
+    argv = sys.argv
+    sys.argv = ["integrated_product_e2e.py", str(evidence_dir)]
+    try:
+        module = importlib.import_module("integrated_product_e2e")
+        return importlib.reload(module)
+    finally:
+        sys.argv = argv
+
+
+class DriverTestCase(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.evidence = Path(self._tmp.name)
+        self.d = load_driver(self.evidence)
+        self.addCleanup(self._tmp.cleanup)
+
+
+# ------------------------------------------------------------- fixtures
+
+SNAP_A = "snap-aaaaaaaaaaaaaaaa"
+SNAP_B = "snap-bbbbbbbbbbbbbbbb"
+
+
+def comparison(*, baseline=SNAP_A, current=SNAP_B, status="evaluated",
+               drop=(), extra=()):
+    """A comparison shaped exactly as the API projection produces one."""
+    changes = [
+        {"kind": "row_count_changed", "model": "model.a.raw_orders",
+         "relation": "raw.orders", "column": None, "signal": "row_count",
+         "before": 1000, "after": 800, "absolute_delta": -200,
+         "relative_delta": -0.2},
+        {"kind": "null_rate_changed", "model": "model.a.raw_orders",
+         "relation": "raw.orders", "column": "discount_amount",
+         "signal": "null_rate", "before": 0.01, "after": 0.82,
+         "percentage_point_delta": 81.0},
+        {"kind": "cardinality_changed", "model": "model.a.raw_orders",
+         "relation": "raw.orders", "column": "discount_amount",
+         "signal": "cardinality", "before": 0.37, "after": 0.42,
+         "percentage_point_delta": 5.0},
+        {"kind": "column_availability_changed", "model": "model.a.raw_orders",
+         "relation": "raw.orders", "column": "discount_amount",
+         "signal": "column_exists", "before": True, "after": False},
+    ]
+    changes = [c for c in changes if c["signal"] not in drop] + list(extra)
+    return {"status": status, "baseline_snapshot_id": baseline,
+            "current_snapshot_id": current,
+            "baseline_observed_at": "2026-08-10T00:00:00+00:00",
+            "current_observed_at": "2026-08-10T06:00:00+00:00",
+            "changes": changes, "change_count": len(changes),
+            "coverage": {"relations_observed": 1, "relations_compared": 1}}
+
+
+def semantic_evidence(models=("int_customer_orders",), status="evaluated"):
+    return {"status": status,
+            "models": [{"model_name": name, "status": "evaluated",
+                        "changes": [{"kind": "filter_changed",
+                                     "model_name": name}]}
+                       for name in models]}
+
+
+def attempt(*, number=2, health=100, findings=(), comparison_doc=None,
+            semantic=None, decision=None):
+    return {"attempt": number, "health": health, "decision": decision,
+            "snapshot_id": SNAP_B,
+            "payload": {"findings": list(findings)},
+            "semantic_evidence": semantic,
+            "metadata_comparison": comparison_doc}
+
+
+NULL_RATE_FINDING = {"code": "column.high_null_rate", "category": "production",
+                     "severity": "medium"}
+
+MANIFEST = {"nodes": {
+    "model.a.int_customer_orders": {
+        "resource_type": "model", "name": "int_customer_orders",
+        "depends_on": {"nodes": ["model.a.stg_orders"]}},
+    "model.a.dim_customers": {
+        "resource_type": "model", "name": "dim_customers",
+        "depends_on": {"nodes": ["model.a.int_customer_orders"]}},
+    "model.a.customer_lifetime_value": {
+        "resource_type": "model", "name": "customer_lifetime_value",
+        "depends_on": {"nodes": ["model.a.int_customer_orders"]}},
+    "model.a.exec_daily_kpis": {
+        "resource_type": "model", "name": "exec_daily_kpis",
+        # Transitive only: must never appear in direct blast radius.
+        "depends_on": {"nodes": ["model.a.dim_customers"]}},
+}}
+
+
+# ------------------------------------------------------- baseline / A
+
+class BaselineTests(DriverTestCase):
+    def test_missing_baseline_fails(self):
+        """no_baseline means A never existed; the run must not pass."""
+        with self.assertRaises(StageFailure):
+            self.d.assert_comparison(
+                comparison(status="no_baseline", baseline=None), SNAP_A, SNAP_B)
+
+    def test_comparison_against_a_different_baseline_fails(self):
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_comparison(
+                comparison(baseline="snap-someone-else"), SNAP_A, SNAP_B)
+        self.assertIn("baseline", str(caught.exception))
+
+    def test_baseline_from_another_environment_cannot_be_accepted(self):
+        """A baseline the engine did not choose is a different snapshot id."""
+        with self.assertRaises(StageFailure):
+            self.d.assert_comparison(
+                comparison(baseline="snap-staging-observation"), SNAP_A, SNAP_B)
+
+    def test_exact_a_to_b_binding_passes(self):
+        proof = self.d.assert_comparison(comparison(), SNAP_A, SNAP_B)
+        self.assertEqual(proof["baseline_snapshot_id"], SNAP_A)
+        self.assertEqual(proof["current_snapshot_id"], SNAP_B)
+
+
+# ------------------------------------------------------------ webhook
+
+class DeliveryTests(DriverTestCase):
+    def test_a_delivery_for_another_pull_request_is_not_accepted(self):
+        """Payload correlation, not position: the driver delegates to the
+        proven selector, so the guard must be the one that rejects PR #44
+        when PR #45 is under test."""
+        import semantic_diff_e2e as sd
+
+        seen = {}
+
+        def fake(since, pr_number, head_sha):
+            seen.update({"pr": pr_number, "head": head_sha})
+            raise StageFailure(
+                f"delivery is for PR #44 {'x' * 4}, not PR #{pr_number}")
+
+        original = sd._poll_for_correlated_delivery
+        sd._poll_for_correlated_delivery = fake
+        try:
+            with self.assertRaises(StageFailure) as caught:
+                self.d._poll_correlated_delivery("2026-01-01T00:00:00+00:00",
+                                                 45, "b" * 40)
+        finally:
+            sd._poll_for_correlated_delivery = original
+        self.assertEqual(seen["pr"], 45)
+        self.assertIn("not PR #45", str(caught.exception))
+
+
+# ----------------------------------------------------------- semantic
+
+class SemanticTests(DriverTestCase):
+    def test_missing_semantic_evidence_fails(self):
+        with self.assertRaises(StageFailure):
+            self.d.assert_semantic(attempt(semantic=None))
+
+    def test_empty_semantic_evidence_fails(self):
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_semantic(attempt(
+                semantic={"status": "evaluated", "models": []}))
+        self.assertIn("empty", str(caught.exception))
+
+    def test_evidence_about_an_untouched_model_fails(self):
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_semantic(attempt(
+                semantic=semantic_evidence(models=("fct_orders",))))
+        self.assertIn("untouched", str(caught.exception))
+
+    def test_real_semantic_evidence_passes(self):
+        proof = self.d.assert_semantic(attempt(semantic=semantic_evidence()))
+        self.assertEqual(proof["models"], ["int_customer_orders"])
+        self.assertEqual(proof["change_kinds"], ["filter_changed"])
+
+
+# -------------------------------------------------------- blast radius
+
+class BlastRadiusTests(DriverTestCase):
+    def test_expectation_is_derived_from_the_parsed_manifest(self):
+        expectation = self.d.expected_direct_downstream(
+            MANIFEST, "int_customer_orders")
+        self.assertEqual(expectation["direct_downstream_models"],
+                         ["customer_lifetime_value", "dim_customers"])
+        self.assertNotIn("exec_daily_kpis",
+                         expectation["direct_downstream_models"])
+
+    def test_wrong_blast_radius_fails(self):
+        expectation = self.d.expected_direct_downstream(
+            MANIFEST, "int_customer_orders")
+        with self.assertRaises(StageFailure):
+            self.d.assert_blast_radius({"downstream_models": ["dim_customers"]},
+                                       expectation)
+
+    def test_transitive_expansion_fails(self):
+        expectation = self.d.expected_direct_downstream(
+            MANIFEST, "int_customer_orders")
+        with self.assertRaises(StageFailure):
+            self.d.assert_blast_radius(
+                {"downstream_models": ["customer_lifetime_value",
+                                       "dim_customers", "exec_daily_kpis"]},
+                expectation)
+
+    def test_exact_direct_set_passes(self):
+        expectation = self.d.expected_direct_downstream(
+            MANIFEST, "int_customer_orders")
+        proof = self.d.assert_blast_radius(
+            {"downstream_models": ["dim_customers", "customer_lifetime_value"]},
+            expectation)
+        self.assertFalse(proof["transitive_expansion"])
+
+    def test_a_model_with_no_consumers_cannot_prove_blast_radius(self):
+        with self.assertRaises(StageFailure):
+            self.d.expected_direct_downstream(MANIFEST, "exec_daily_kpis")
+
+
+# ----------------------------------------------------- metadata request
+
+class MetadataRequestTests(DriverTestCase):
+    def test_absent_request_fails(self):
+        with self.assertRaises(StageFailure):
+            self.d.assert_metadata_request({})
+
+    def test_unbounded_request_fails(self):
+        with self.assertRaises(StageFailure):
+            self.d.assert_metadata_request(
+                {"request_id": "req-1", "bounded": False})
+
+    def test_raw_row_request_fails(self):
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_metadata_request(
+                {"request_id": "req-1", "bounded": True,
+                 "required_signals": ["row_count", "raw_rows"]})
+        self.assertIn("prohibited", str(caught.exception))
+
+    def test_arbitrary_sql_request_fails(self):
+        with self.assertRaises(StageFailure):
+            self.d.assert_metadata_request(
+                {"request_id": "req-1", "bounded": True,
+                 "required_signals": ["arbitrary_sql"]})
+
+    def test_bounded_targeted_request_passes(self):
+        proof = self.d.assert_metadata_request(
+            {"request_id": "req-1", "bounded": True,
+             "relations": ["raw.orders"], "columns": ["discount_amount"],
+             "required_signals": ["row_count", "null_rate"]})
+        self.assertFalse(proof["raw_row_request"])
+
+
+# -------------------------------------------------------- comparison
+
+class ComparisonTests(DriverTestCase):
+    def test_missing_comparison_fails(self):
+        with self.assertRaises(StageFailure):
+            self.d.assert_comparison(None, SNAP_A, SNAP_B)
+
+    def test_a_missing_expected_delta_fails(self):
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_comparison(comparison(drop=("row_count",)),
+                                     SNAP_A, SNAP_B)
+        self.assertIn("row_count", str(caught.exception))
+
+    def test_a_missing_column_existence_change_fails(self):
+        with self.assertRaises(StageFailure):
+            self.d.assert_comparison(comparison(drop=("column_exists",)),
+                                     SNAP_A, SNAP_B)
+
+    def test_percentage_point_delta_must_be_points_not_percent(self):
+        wrong = comparison(drop=("null_rate",), extra=[{
+            "kind": "null_rate_changed", "relation": "raw.orders",
+            "column": "discount_amount", "signal": "null_rate",
+            "before": 0.01, "after": 0.82,
+            # 8100% as a percent change; not what was measured.
+            "percentage_point_delta": 8100.0}])
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_comparison(wrong, SNAP_A, SNAP_B)
+        self.assertIn("points", str(caught.exception))
+
+    def test_an_unchanged_signal_reported_as_a_change_fails(self):
+        noisy = comparison(extra=[{
+            "kind": "schema_fingerprint_changed", "relation": "raw.orders",
+            "column": None, "signal": "schema_fingerprint",
+            "before": "fp-integrated-e2e", "after": "fp-integrated-e2e"}])
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_comparison(noisy, SNAP_A, SNAP_B)
+        self.assertIn("schema_fingerprint", str(caught.exception))
+
+    def test_the_unchanged_signal_is_recorded_for_phase_b(self):
+        proof = self.d.assert_comparison(comparison(), SNAP_A, SNAP_B)
+        self.assertEqual(proof["unchanged_signal_for_phase_b"],
+                         "schema_fingerprint")
+        self.assertNotIn("schema_fingerprint", proof["signals_changed"])
+
+
+# ------------------------------------------------- comparison is evidence
+
+class EvidenceOnlyTests(DriverTestCase):
+    def test_a_comparison_shaped_finding_fails(self):
+        final = attempt(findings=[NULL_RATE_FINDING,
+                                  {"code": "metadata_comparison.row_count_drop",
+                                   "category": "production"}])
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_comparison_is_evidence_only(attempt(health=100), final)
+        self.assertIn("comparison produced policy findings",
+                      str(caught.exception))
+
+    def test_a_drift_finding_fails(self):
+        final = attempt(findings=[{"code": "metadata.drift_detected"}])
+        with self.assertRaises(StageFailure):
+            self.d.assert_comparison_is_evidence_only(attempt(health=100), final)
+
+    def test_a_health_penalty_after_the_comparison_fails(self):
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_comparison_is_evidence_only(
+                attempt(health=100), attempt(health=80,
+                                             findings=[NULL_RATE_FINDING]))
+        self.assertIn("health moved", str(caught.exception))
+
+    def test_evidence_only_comparison_passes(self):
+        proof = self.d.assert_comparison_is_evidence_only(
+            attempt(health=100), attempt(health=100, findings=[NULL_RATE_FINDING]))
+        self.assertEqual(proof["comparison_findings"], 0)
+        self.assertTrue(proof["health_unchanged_by_comparison"])
+
+
+# ------------------------------------------------------ final decision
+
+class FinalDecisionTests(DriverTestCase):
+    def decided(self, **overrides):
+        review = {"decision": "WARN", "health": 100,
+                  "evidence_coverage": "COMPLETE",
+                  "lifecycle_state": "DECISION_READY"}
+        review.update(overrides)
+        return review
+
+    def test_a_review_that_never_decides_fails(self):
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_final_decision(self.decided(decision=None),
+                                         attempt(findings=[NULL_RATE_FINDING]))
+        self.assertIn("never reached a decision", str(caught.exception))
+
+    def test_a_review_still_waiting_fails(self):
+        with self.assertRaises(StageFailure):
+            self.d.assert_final_decision(
+                self.decided(lifecycle_state="WAITING_FOR_METADATA"),
+                attempt(findings=[NULL_RATE_FINDING]))
+
+    def test_a_different_decision_than_the_policy_establishes_fails(self):
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_final_decision(self.decided(decision="ALLOW"),
+                                         attempt(findings=[NULL_RATE_FINDING]))
+        self.assertIn("expected 'WARN'", str(caught.exception))
+
+    def test_a_missing_production_finding_fails(self):
+        with self.assertRaises(StageFailure):
+            self.d.assert_final_decision(self.decided(), attempt(findings=[]))
+
+    def test_a_code_finding_fails_the_code_neutral_fixture(self):
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_final_decision(
+                self.decided(),
+                attempt(findings=[NULL_RATE_FINDING,
+                                  {"code": "sql.x", "category": "code"}]))
+        self.assertIn("code findings", str(caught.exception))
+
+    def test_the_established_policy_outcome_passes(self):
+        proof = self.d.assert_final_decision(
+            self.decided(), attempt(findings=[NULL_RATE_FINDING]))
+        self.assertEqual(proof["decision"], "WARN")
+        self.assertEqual(proof["production_finding"], "column.high_null_rate")
+
+
+# ------------------------------------------------------------ readiness
+
+class ReadinessTests(DriverTestCase):
+    def test_stale_migrations_fail(self):
+        with self.assertRaises(StageFailure):
+            self.d.readiness_gate({"migrations": "pending", "database": "ok",
+                                   "review_lifecycle": "postgresql"})
+
+    def test_current_migrations_pass_without_a_pinned_version_list(self):
+        proof = self.d.readiness_gate({"migrations": "current", "database": "ok",
+                                       "review_lifecycle": "postgresql"})
+        self.assertFalse(proof["pinned_version_list_used"])
+
+    def test_the_driver_pins_no_migration_version_list(self):
+        """The stale metadata-review gate must not be copied in."""
+        source = (REPO_ROOT / "scripts" / "e2e"
+                  / "integrated_product_e2e.py").read_text(encoding="utf-8")
+        self.assertNotIn("[1, 2, 3, 4]", source)
+        self.assertNotIn("migrations 1-4", source)
+
+
+# ---------------------------------------------------- observation bodies
+
+class ObservationTests(DriverTestCase):
+    def review(self):
+        return {"review_id": "rev-1", "attempt": 1, "base_sha": "a" * 40,
+                "head_sha": "b" * 40, "base_manifest_hash": "bh",
+                "head_manifest_hash": "hh"}
+
+    def test_a_missing_column_carries_no_metrics(self):
+        from datetime import datetime, timezone
+
+        body = self.d.observation_body(
+            self.review(), "req-1", row_count=800, null_rate=0.82,
+            cardinality=0.42, column_exists=False,
+            observed_at=datetime(2026, 8, 10, tzinfo=timezone.utc))
+        missing = [c for c in body["relations"][0]["columns"]
+                   if c["column_name"] == "discount_amount"][0]
+        self.assertFalse(missing["exists"])
+        self.assertNotIn("null_rate", missing)
+        self.assertNotIn("cardinality", missing)
+
+    def test_no_raw_rows_are_transmitted(self):
+        import json
+        from datetime import datetime, timezone
+
+        body = self.d.observation_body(
+            self.review(), "req-1", row_count=1000, null_rate=0.01,
+            cardinality=0.37, column_exists=True,
+            observed_at=datetime(2026, 8, 10, tzinfo=timezone.utc))
+        blob = json.dumps(body)
+        for forbidden in ("rows", "sample", "select ", "min_value", "max_value"):
+            self.assertNotIn(forbidden, blob)
+
+    def test_the_unchanged_signal_is_identical_in_a_and_b(self):
+        from datetime import datetime, timezone
+
+        common = dict(observed_at=datetime(2026, 8, 10, tzinfo=timezone.utc))
+        a = self.d.observation_body(self.review(), "req-1", row_count=1000,
+                                    null_rate=0.01, cardinality=0.37,
+                                    column_exists=True, **common)
+        b = self.d.observation_body(self.review(), "req-1", row_count=800,
+                                    null_rate=0.82, cardinality=0.42,
+                                    column_exists=False, **common)
+        self.assertEqual(a["relations"][0]["schema_fingerprint"],
+                         b["relations"][0]["schema_fingerprint"])
+
+    def test_b_null_rate_crosses_the_existing_policy_threshold(self):
+        """An illustrative 12% would never fire column.high_null_rate."""
+        self.assertGreater(self.d.B_NULL_RATE, self.d.NULL_RATE_THRESHOLD)
+        self.assertLess(self.d.A_NULL_RATE, self.d.NULL_RATE_THRESHOLD)
+
+
+# --------------------------------------------------------------- cleanup
+
+class FakeProc:
+    def __init__(self, alive=True):
+        self._alive = alive
+        self.returncode = None if alive else 0
+        self.terminated = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = 0
+
+    def kill(self):
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        self.returncode = self.returncode if self.returncode is not None else 0
+        return self.returncode
+
+
+class CleanupTests(DriverTestCase):
+    def arrange(self, *, branches=(), pulls=()):
+        record = self.d._initial_recovery()
+        record["branches"] = list(branches)
+        record["pulls"] = list(pulls)
+        record["webhook_preserved"] = True
+        record["original_webhook"] = {"url": "https://original.example/hook",
+                                      "content_type": "json", "insecure_ssl": "0"}
+        self.d._write_recovery(record)
+
+    def install_github(self, *, deleted_ok=True, closed_ok=True):
+        calls = []
+
+        def fake_gh(method, path, token, body=None, bearer=True):
+            calls.append((method, path))
+            if path == "/app/hook/config":
+                return 200, {"url": "https://original.example/hook",
+                             "content_type": "json", "insecure_ssl": "0"}
+            if method == "DELETE":
+                return (204, {}) if deleted_ok else (500, {})
+            if path.startswith("/repos/") and "/git/ref/heads/" in path:
+                return (404, {}) if deleted_ok else (200, {"ref": path})
+            if method == "GET" and "/pulls/" in path:
+                return 200, {"state": "open", "merged": False}
+            if method == "PATCH" and "/pulls/" in path:
+                return (200, {}) if closed_ok else (500, {})
+            return 200, {}
+
+        self.d.GH = fake_gh
+        self.d.APP_JWT = lambda: "jwt"
+        self.d._REF_ABSENCE_INTERVAL = 0.0
+        return calls
+
+    def test_cleanup_restores_the_webhook_first(self):
+        self.arrange(branches=["e2e/x"], pulls=[7])
+        calls = self.install_github()
+        self.d.cleanup("test")
+        patches = [c for c in calls if c[0] == "PATCH"
+                   and c[1] == "/app/hook/config"]
+        self.assertEqual(len(patches), 1)
+        first_mutation = next(i for i, c in enumerate(calls)
+                              if c[0] in ("PATCH", "DELETE"))
+        self.assertEqual(calls[first_mutation][1], "/app/hook/config")
+
+    def test_cleanup_closes_owned_pulls_and_deletes_owned_branches(self):
+        self.arrange(branches=["e2e/a", "e2e/b"], pulls=[7])
+        self.install_github()
+        result = self.d.cleanup("test")
+        self.assertEqual(result["pulls_closed_unmerged"], [7])
+        self.assertEqual(sorted(result["branches_deleted"]), ["e2e/a", "e2e/b"])
+        self.assertTrue(result["passed"])
+
+    def test_cleanup_touches_nothing_it_does_not_own(self):
+        self.arrange(branches=["e2e/mine"], pulls=[])
+        calls = self.install_github()
+        self.d.cleanup("test")
+        deleted = [c[1] for c in calls if c[0] == "DELETE"]
+        self.assertEqual(deleted, ["/repos/" + self.d.REPO
+                                   + "/git/refs/heads/e2e/mine"])
+
+    def test_a_branch_that_survives_deletion_fails_cleanup(self):
+        self.arrange(branches=["e2e/stuck"])
+        self.install_github(deleted_ok=False)
+        result = self.d.cleanup("test")
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("still exists" in f for f in result["failures"]))
+
+    def test_a_merged_owned_pull_fails_cleanup(self):
+        self.arrange(pulls=[9])
+
+        def fake_gh(method, path, token, body=None, bearer=True):
+            if path == "/app/hook/config":
+                return 200, {"url": "https://original.example/hook",
+                             "content_type": "json", "insecure_ssl": "0"}
+            if method == "GET" and "/pulls/" in path:
+                return 200, {"state": "closed", "merged": True}
+            return 200, {}
+
+        self.d.GH = fake_gh
+        self.d.APP_JWT = lambda: "jwt"
+        result = self.d.cleanup("test")
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("MERGED" in f for f in result["failures"]))
+
+    def test_cleanup_stops_and_reaps_processes(self):
+        self.arrange()
+        self.install_github()
+        proc = FakeProc(alive=True)
+        self.d.state["procs"] = [("api", proc)]
+        self.d.cleanup("test")
+        self.assertTrue(proc.terminated)
+        self.assertIsNotNone(proc.returncode)
+
+    def test_cleanup_is_idempotent(self):
+        self.arrange(branches=["e2e/a"])
+        calls = self.install_github()
+        first = self.d.cleanup("one")
+        count = len(calls)
+        second = self.d.cleanup("two")
+        self.assertEqual(len(calls), count)
+        self.assertTrue(second.get("repeat") or second is first)
+
+    def test_cleanup_runs_after_a_stage_failure_in_any_stage(self):
+        """Every major stage failure must still reach cleanup."""
+        for stage in ("semantic", "blast_radius", "metadata_request",
+                      "comparison", "final_decision"):
+            with self.subTest(stage=stage):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                driver = load_driver(Path(tmp.name))
+                record = driver._initial_recovery()
+                record["branches"] = ["e2e/after-" + stage]
+                record["webhook_preserved"] = True
+                record["original_webhook"] = {"url": "https://o.example/h",
+                                              "content_type": "json",
+                                              "insecure_ssl": "0"}
+                driver._write_recovery(record)
+                driver.GH = lambda m, p, t, b=None, bearer=True: (
+                    (200, {"url": "https://o.example/h", "content_type": "json",
+                           "insecure_ssl": "0"}) if p == "/app/hook/config"
+                    else (404, {}) if m == "GET" else (204, {}))
+                driver.APP_JWT = lambda: "jwt"
+                driver._REF_ABSENCE_INTERVAL = 0.0
+                result = driver.cleanup(f"stage-failure: {stage}")
+                self.assertIn(stage, result["reason"])
+                self.assertEqual(result["branches_deleted"],
+                                 ["e2e/after-" + stage])
+
+
+class EvidenceOrderingTests(DriverTestCase):
+    def test_the_summary_is_not_written_before_assertions_pass(self):
+        """A failed run must not leave an artifact that looks like a pass."""
+        self.assertFalse((self.evidence / "integrated-product-summary.json").exists())
+        source = (REPO_ROOT / "scripts" / "e2e"
+                  / "integrated_product_e2e.py").read_text(encoding="utf-8")
+        summary_write = source.index('_write("integrated-product-summary.json"')
+        for assertion in ("assert_semantic(", "assert_blast_radius(",
+                          "assert_metadata_request(", "assert_comparison(",
+                          "assert_final_decision(",
+                          "assert_comparison_is_evidence_only("):
+            self.assertLess(source.index(assertion), summary_write,
+                            f"{assertion} must run before the summary is written")
+
+    def test_ownership_is_recorded_before_the_mutating_call(self):
+        source = (REPO_ROOT / "scripts" / "e2e"
+                  / "integrated_product_e2e.py").read_text(encoding="utf-8")
+        branch_fn = source[source.index("def make_branch("):
+                           source.index("def commit_file(")]
+        self.assertLess(branch_fn.index("_write_recovery(record)"),
+                        branch_fn.index('GH("POST"'))
+
+
+class WorkflowSelectionTests(unittest.TestCase):
+    """Static checks on the workflow, so a dispatch cannot silently no-op."""
+
+    def setUp(self):
+        self.text = (REPO_ROOT / ".github" / "workflows"
+                     / "governance-e2e.yml").read_text(encoding="utf-8")
+
+    def test_the_operation_is_selectable(self):
+        self.assertIn("integrated-product", self.text)
+        self.assertIn("if: inputs.operation == 'integrated-product'", self.text)
+
+    def test_every_required_secret_is_wired(self):
+        job = self.text[self.text.index("  integrated-product:"):
+                        self.text.index("  webhook-recovery:")]
+        for secret in ("RELIUM_E2E_APP_ID", "RELIUM_E2E_PRIVATE_KEY",
+                       "RELIUM_E2E_WEBHOOK_SECRET", "RELIUM_E2E_INSTALLATION_ID",
+                       "RELIUM_E2E_FIXTURE_TOKEN"):
+            self.assertIn(f"secrets.{secret}", job, f"{secret} is not wired")
+
+    def test_the_private_key_is_written_outside_the_workspace(self):
+        job = self.text[self.text.index("  integrated-product:"):
+                        self.text.index("  webhook-recovery:")]
+        self.assertIn("$RUNNER_TEMP/relium-secrets/app.pem", job)
+        self.assertNotIn("github.workspace }}/app.pem", job)
+
+    def test_cleanup_secret_scan_and_upload_are_always_run(self):
+        job = self.text[self.text.index("  integrated-product:"):
+                        self.text.index("  webhook-recovery:")]
+        self.assertIn("Mandatory exact integrated-product cleanup", job)
+        self.assertIn("--cleanup-only", job)
+        self.assertIn("secret_scan.py", job)
+        self.assertIn("integrated_secret_scan.outcome == 'success'", job)
+
+    def test_the_job_shares_the_webhook_concurrency_group(self):
+        self.assertIn("group: metadata-review-e2e", self.text)
+
+    def test_the_harness_tests_gate_the_fixture_repository(self):
+        job = self.text[self.text.index("  integrated-product:"):
+                        self.text.index("  webhook-recovery:")]
+        self.assertLess(job.index("test_integrated_product_e2e_harness"),
+                        job.index("integrated_product_e2e.py \"$EVIDENCE_DIR\""))
+
+
+if __name__ == "__main__":
+    unittest.main()

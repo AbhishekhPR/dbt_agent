@@ -19,9 +19,11 @@ import yaml
 
 WORKFLOW = Path(__file__).resolve().parent / ".github" / "workflows" / "governance-e2e.yml"
 
-#: Every operation the dispatch input offers.
+#: Every operation the dispatch input offers. Adding a job means adding it
+#: here: the gating test reads this list, so an unregistered job would be
+#: reported as ungated rather than silently accepted.
 OPERATIONS = ("governance", "blast-radius", "semantic-diff",
-              "recover-webhook", "cleanup-fixtures")
+              "integrated-product", "recover-webhook", "cleanup-fixtures")
 
 
 def load() -> dict:
