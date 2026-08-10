@@ -129,6 +129,17 @@ GH = gh
 APP_JWT = app_jwt
 
 
+def INSTALLATION_TOKEN():
+    """Mint an installation token for reading App-authored publications.
+
+    Separate from `GH`/`APP_JWT` only so a test can substitute it without a
+    private key on disk. The real implementation is the proven one.
+    """
+    from metadata_review_e2e import installation_token
+
+    return installation_token()
+
+
 # --------------------------------------------------------------- evidence
 
 def _write(name: str, document) -> None:
@@ -1271,7 +1282,17 @@ def _poll_correlated_delivery(since_utc, pr_number, head_sha):
 
 
 def _verify_publication(dsn, review_id, pr_number, head_sha, expected_app_id):
-    """The existing publication contract: one sticky comment, one check run."""
+    """The existing publication contract: one sticky comment, one check run.
+
+    Read with an INSTALLATION token, never the fixture token. Run 31406121190
+    polled with the fixture token and timed out while the product had in fact
+    published correctly - the persisted comment and check ids were already on
+    the review. A fine-grained fixture PAT does not carry `checks: read`, and
+    `assert_fixture_token_scope` already documents that this token is never
+    used for comments, check runs or App authentication. Using it here broke
+    that boundary as well as the read.
+    """
+    read_token = INSTALLATION_TOKEN()
     store = _store(dsn)
     try:
         review = store.get_review(OWNER, REPO_NAME, review_id)
@@ -1280,7 +1301,7 @@ def _verify_publication(dsn, review_id, pr_number, head_sha, expected_app_id):
 
     def reconciled():
         status, comments = GH("GET", f"/repos/{REPO}/issues/{pr_number}/comments",
-                              FIXTURE_TOKEN, bearer=False)
+                              read_token, bearer=False)
         if status != 200:
             return None
         owned = [c for c in comments
@@ -1290,7 +1311,7 @@ def _verify_publication(dsn, review_id, pr_number, head_sha, expected_app_id):
             return None
         check_status, checks = GH(
             "GET", f"/repos/{REPO}/commits/{head_sha}/check-runs",
-            FIXTURE_TOKEN, bearer=False)
+            read_token, bearer=False)
         if check_status != 200:
             return None
         runs = [c for c in checks.get("check_runs", [])
@@ -1301,13 +1322,32 @@ def _verify_publication(dsn, review_id, pr_number, head_sha, expected_app_id):
 
     published = lf.poll(reconciled, timeout=300, interval=5,
                         description="the App to publish the final review")
+
+    # The remote ids must be the ones the review recorded, so the publication
+    # is bound to THIS review rather than merely present on the pull request.
+    def _id(value):
+        return int(value) if value not in (None, "") else None
+
+    stored_comment = _id(review.get("github_comment_id"))
+    stored_check = _id(review.get("github_check_run_id"))
+    if stored_comment != published["comment"]["id"]:
+        raise StageFailure(
+            f"published comment {published['comment']['id']} is not the one the "
+            f"review recorded ({stored_comment})")
+    if stored_check != published["check"]["id"]:
+        raise StageFailure(
+            f"published check {published['check']['id']} is not the one the "
+            f"review recorded ({stored_check})")
     return {"comment_id": published["comment"]["id"],
             "check_run_id": published["check"]["id"],
             "check_conclusion": published["check"].get("conclusion"),
+            "check_status": published["check"].get("status"),
             "duplicate_comments": 0, "duplicate_checks": 0,
-            "stored_comment_id": review.get("github_comment_id"),
-            "stored_check_run_id": review.get("github_check_run_id"),
-            "bound_to_review": review_id}
+            "stored_comment_id": stored_comment,
+            "stored_check_run_id": stored_check,
+            "remote_ids_bound_to_review": True,
+            "read_with": "installation token",
+            "bound_to_review": review_id, "attempt": review.get("attempt")}
 
 
 if __name__ == "__main__":

@@ -1046,6 +1046,114 @@ class TunnelWiringTests(DriverTestCase):
         self.assertIn("lf.point_webhook(state, GH, APP_JWT, public_url)", source)
 
 
+class PublicationReadTests(DriverTestCase):
+    """REGRESSION for run 31406121190.
+
+    The product published correctly - the review carried both remote ids and
+    both outbox jobs completed - but the verifier polled GitHub with the
+    FIXTURE token, which carries no `checks: read`, so it never saw the
+    publication and timed out. `assert_fixture_token_scope` already documents
+    that this token is never used for comments, check runs or App
+    authentication.
+    """
+
+    def install(self, *, comment_id=111, check_id=222, stored_comment=111,
+                stored_check=222, check_status="completed"):
+        seen = []
+
+        def fake_gh(method, path, token, body=None, bearer=True):
+            seen.append((path, token))
+            if "access_tokens" in path:
+                return 201, {"token": "ghs_installation_token"}
+            if path.endswith("/comments"):
+                return 200, [{"id": comment_id,
+                              "performed_via_github_app": {"id": 4456468}}]
+            if "check-runs" in path:
+                return 200, {"check_runs": [{"id": check_id, "app": {"id": 4456468},
+                                             "status": check_status,
+                                             "conclusion": "neutral"}]}
+            return 200, {}
+
+        self.d.GH = fake_gh
+        self.d.APP_JWT = lambda: "jwt"
+        self.d.INSTALLATION_TOKEN = lambda: "ghs_installation_token"
+        self.d.FIXTURE_TOKEN = "github_pat_fixture_only"
+        self.d._store = lambda dsn: _FakeStore(stored_comment, stored_check)
+        return seen
+
+    def test_publications_are_read_with_an_installation_token(self):
+        seen = self.install()
+        proof = self.d._verify_publication("dsn", "rev-1", 57, "b" * 40, 4456468)
+        reads = [(p, t) for p, t in seen
+                 if p.endswith("/comments") or "check-runs" in p]
+        self.assertTrue(reads)
+        for path, token in reads:
+            self.assertNotEqual(token, self.d.FIXTURE_TOKEN,
+                                f"{path} was read with the fixture token")
+            self.assertEqual(token, "ghs_installation_token")
+        self.assertEqual(proof["read_with"], "installation token")
+
+    def test_remote_ids_must_match_the_ids_the_review_recorded(self):
+        self.install(comment_id=111, stored_comment=999)
+        with self.assertRaises(StageFailure) as caught:
+            self.d._verify_publication("dsn", "rev-1", 57, "b" * 40, 4456468)
+        self.assertIn("not the one the review recorded", str(caught.exception))
+
+    def _poll_once(self):
+        """Run the readiness predicate exactly once and return its verdict.
+
+        `lf` is the SHARED live_flow module, so the patch is undone on cleanup
+        or it leaks into every later test in this file.
+        """
+        outcome = {}
+
+        def once(fn, **_kw):
+            outcome["value"] = fn()
+            if outcome["value"] is None:
+                raise StageFailure("predicate rejected the publication")
+            return outcome["value"]
+
+        original = self.d.lf.poll
+        self.addCleanup(setattr, self.d.lf, "poll", original)
+        self.d.lf.poll = once
+        return outcome
+
+    def test_a_check_that_is_not_completed_is_not_accepted(self):
+        seen = self.install(check_status="in_progress")
+        outcome = self._poll_once()
+        with self.assertRaises(StageFailure):
+            self.d._verify_publication("dsn", "rev-1", 57, "b" * 40, 4456468)
+        # The predicate ran, read GitHub, and refused the incomplete check.
+        self.assertIsNone(outcome["value"])
+        self.assertTrue(any("check-runs" in path for path, _ in seen))
+
+    def test_a_completed_check_is_accepted(self):
+        self.install(check_status="completed")
+        outcome = self._poll_once()
+        proof = self.d._verify_publication("dsn", "rev-1", 57, "b" * 40, 4456468)
+        self.assertIsNotNone(outcome["value"])
+        self.assertEqual(proof["check_status"], "completed")
+
+    def test_the_driver_never_reads_publications_with_the_fixture_token(self):
+        source = (REPO_ROOT / "scripts" / "e2e"
+                  / "integrated_product_e2e.py").read_text(encoding="utf-8")
+        publication = source[source.index("def _verify_publication("):]
+        self.assertNotIn("FIXTURE_TOKEN", publication)
+        self.assertIn("INSTALLATION_TOKEN()", publication)
+
+
+class _FakeStore:
+    def __init__(self, comment_id, check_id):
+        self._comment, self._check = comment_id, check_id
+
+    def get_review(self, *_a, **_k):
+        return {"github_comment_id": str(self._comment),
+                "github_check_run_id": str(self._check), "attempt": 2}
+
+    def close(self):
+        pass
+
+
 class EvidenceOrderingTests(DriverTestCase):
     def test_the_summary_is_not_written_before_assertions_pass(self):
         """A failed run must not leave an artifact that looks like a pass."""
