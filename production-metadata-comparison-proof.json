@@ -1,0 +1,107 @@
+{
+  "snapshot_a": "snap-d592cc6a0f0f41ac96cc5805",
+  "snapshot_b": "snap-f850d81d973446ef94e9c6ab",
+  "attempts": [
+    {
+      "attempt": 1,
+      "decision": null,
+      "evidence_coverage": "UNKNOWN",
+      "health": 100,
+      "lifecycle_state": "RECEIVED",
+      "trigger": "initial",
+      "snapshot_id": null,
+      "enforcement_mode": null,
+      "policy_version": null,
+      "finding_count": 0,
+      "semantic_evidence": null,
+      "metadata_comparison": null,
+      "created_at": "2026-08-10T08:55:11.779670+00:00"
+    },
+    {
+      "attempt": 2,
+      "decision": "BLOCK",
+      "evidence_coverage": "COMPLETE",
+      "health": 100,
+      "lifecycle_state": "METADATA_STALE",
+      "trigger": "metadata_snapshot",
+      "snapshot_id": "snap-d592cc6a0f0f41ac96cc5805",
+      "enforcement_mode": "enforce",
+      "policy_version": "default-v1",
+      "finding_count": 1,
+      "semantic_evidence": null,
+      "metadata_comparison": {
+        "status": "no_baseline",
+        "baseline_snapshot_id": null,
+        "current_snapshot_id": "snap-d592cc6a0f0f41ac96cc5805",
+        "baseline_observed_at": null,
+        "current_observed_at": "2026-08-09T11:30:00+05:30",
+        "changes": [],
+        "change_count": 0,
+        "coverage": null
+      },
+      "created_at": "2026-08-10T08:55:11.827445+00:00"
+    },
+    {
+      "attempt": 3,
+      "decision": "BLOCK",
+      "evidence_coverage": "COMPLETE",
+      "health": 100,
+      "lifecycle_state": "METADATA_STALE",
+      "trigger": "metadata_snapshot",
+      "snapshot_id": "snap-f850d81d973446ef94e9c6ab",
+      "enforcement_mode": "enforce",
+      "policy_version": "default-v1",
+      "finding_count": 1,
+      "semantic_evidence": null,
+      "metadata_comparison": {
+        "status": "evaluated",
+        "baseline_snapshot_id": "snap-d592cc6a0f0f41ac96cc5805",
+        "current_snapshot_id": "snap-f850d81d973446ef94e9c6ab",
+        "baseline_observed_at": "2026-08-09T11:30:00+05:30",
+        "current_observed_at": "2026-08-09T17:30:00+05:30",
+        "changes": [
+          {
+            "kind": "row_count_changed",
+            "model": "model.jaffle.orders",
+            "relation": "orders",
+            "column": null,
+            "signal": "row_count",
+            "before": 1000,
+            "after": 800,
+            "absolute_delta": -200,
+            "relative_delta": -0.2
+          },
+          {
+            "kind": "column_availability_changed",
+            "model": "model.jaffle.orders",
+            "relation": "orders",
+            "column": "customer_id",
+            "signal": "column_exists",
+            "before": true,
+            "after": false
+          },
+          {
+            "kind": "null_rate_changed",
+            "model": "model.jaffle.orders",
+            "relation": "orders",
+            "column": "email",
+            "signal": "null_rate",
+            "before": 0.01,
+            "after": 0.12,
+            "percentage_point_delta": 11.0
+          }
+        ],
+        "change_count": 3,
+        "coverage": {
+          "relations_observed": 1,
+          "relations_compared": 1,
+          "relations_without_baseline": [],
+          "columns_observed": 2,
+          "columns_compared": 2,
+          "columns_without_baseline": []
+        }
+      },
+      "created_at": "2026-08-10T08:55:11.857665+00:00"
+    }
+  ]
+}

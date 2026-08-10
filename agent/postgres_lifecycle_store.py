@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 
 from agent.lifecycle_models import ALLOWED_TRANSITIONS
 from agent.metadata_evidence.change_request import normalize_remote_review_id
+from agent.metadata_evidence.production_comparison import ELIGIBLE_COMPLETENESS
 from agent.postgres_migrate import apply_migrations
 
 OUTBOX_LEASE_SECONDS = 300
@@ -1233,7 +1234,7 @@ class PostgresLifecycleStore:
                                trigger="initial", snapshot_id=None,
                                enforcement_mode=None, policy_version=None,
                                policy_hash=None, payload=None,
-                               semantic_evidence=None):
+                               semantic_evidence=None, metadata_comparison=None):
         """Record a decision and preserve it as an immutable attempt.
 
         Coverage, health, decision and lifecycle state are stored separately;
@@ -1253,8 +1254,8 @@ class PostgresLifecycleStore:
                 "INSERT INTO review_attempts (organization_id, repository_id, review_id, "
                 "attempt, lifecycle_state, decision, evidence_coverage, health, "
                 "enforcement_mode, policy_version, policy_hash, trigger, snapshot_id, "
-                "payload, semantic_evidence) "
-                "SELECT %s, %s, %s, %s, lifecycle_state, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s "
+                "payload, semantic_evidence, metadata_comparison) "
+                "SELECT %s, %s, %s, %s, lifecycle_state, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s "
                 "FROM reviews WHERE organization_id=%s AND repository_id=%s AND review_id=%s "
                 "ON CONFLICT (organization_id, repository_id, review_id, attempt) DO NOTHING",
                 (organization_id, repository_id, review_id, attempt, decision,
@@ -1263,6 +1264,10 @@ class PostgresLifecycleStore:
                  # NULL when no comparison ran: an absent row must never read
                  # as a clean comparison.
                  self._Jsonb(semantic_evidence) if semantic_evidence is not None else None,
+                 # Same rule for the production metadata comparison. NULL is
+                 # "never computed"; status=no_baseline is "computed, and there
+                 # was no prior observation to compare against".
+                 self._Jsonb(metadata_comparison) if metadata_comparison is not None else None,
                  organization_id, repository_id, review_id),
             )
         return self.get_review(organization_id, repository_id, review_id)
@@ -1833,6 +1838,48 @@ class PostgresLifecycleStore:
             "WHERE b.organization_id=%s AND b.repository_id=%s AND b.review_id=%s "
             "AND b.binding_state='ACCEPTED' ORDER BY s.observed_at DESC LIMIT 1",
             (organization_id, repository_id, review_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return self.get_snapshot(organization_id, repository_id, row["snapshot_id"])
+
+    def previous_production_snapshot(self, organization_id, repository_id, environment, *,
+                                     snapshot_id, observed_at, received_at=None):
+        """The most recent eligible production observation strictly preceding
+        this one, for the same tenant, repository and environment.
+
+        "Strictly preceding" is defined against the total order
+        ``(observed_at, received_at, snapshot_id)`` rather than against
+        ``observed_at`` alone. Two collections can share an observation
+        timestamp, and "the previous one" has to be a single, repeatable answer
+        - otherwise an idempotent recomputation could pick a different baseline
+        on a second run and silently change what an attempt claims.
+
+        The row comparison enforces four things at once, in the database rather
+        than in a later filter: the baseline precedes the current snapshot, is
+        never the current snapshot, is never from another repository or
+        organization, and is never from another environment.
+
+        A snapshot whose collection FAILED is excluded: it is a record that
+        collection did not work, not an observation of production.
+        """
+        if received_at is None:
+            # Only reachable for a snapshot that has not been read back from
+            # the database. Falling back to the observation time keeps the
+            # ordering total instead of comparing against NULL, which would
+            # make the whole row comparison NULL and silently return no
+            # baseline at all.
+            received_at = observed_at
+        row = self.connection.execute(
+            "SELECT snapshot_id FROM metadata_snapshots "
+            "WHERE organization_id=%s AND repository_id=%s AND environment=%s "
+            "AND completeness = ANY(%s) "
+            "AND snapshot_id <> %s "
+            "AND (observed_at, received_at, snapshot_id) < (%s, %s, %s) "
+            "ORDER BY observed_at DESC, received_at DESC, snapshot_id DESC LIMIT 1",
+            (organization_id, repository_id, environment,
+             list(ELIGIBLE_COMPLETENESS), snapshot_id,
+             observed_at, received_at, snapshot_id),
         ).fetchone()
         if row is None:
             return None

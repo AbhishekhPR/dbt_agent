@@ -96,9 +96,14 @@ class SemanticEvidencePersistenceTests(unittest.TestCase):
     # -- migration ---------------------------------------------------------
 
     def test_migration_0010_applied_after_0009(self):
+        # The claim is about ORDER, not about 0010 being the newest migration.
+        # Asserting on the tail made every later migration break this test for
+        # a reason that has nothing to do with semantic evidence.
         versions = [r["version"] for r in self.store.connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version").fetchall()]
-        self.assertEqual(versions[-2:], [9, 10])
+        self.assertIn(9, versions)
+        self.assertIn(10, versions)
+        self.assertLess(versions.index(9), versions.index(10))
 
     def test_the_column_is_nullable(self):
         row = self.store.connection.execute(

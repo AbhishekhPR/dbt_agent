@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 
 from agent.evidence_policy import default_policy
 from agent.metadata_evidence.decision import evaluate_metadata_decision
+from agent.metadata_evidence.production_comparison import compute_comparison
 from agent.metadata_evidence.publication_reconcile import (
     EVENT_TYPE as PUBLICATION_EVENT_TYPE,
 )
@@ -78,6 +79,18 @@ def recompute_review(store, *, organization_id, repository_id, environment,
     # history exactly as it was published.
     next_attempt = max([a["attempt"] for a in attempts] or [attempt]) + 1
 
+    # Computed exactly once, here, where the current snapshot is already known
+    # to be durably stored and accepted - and then written down. The read path
+    # never re-selects "the latest previous snapshot", so an attempt keeps
+    # naming the same baseline after newer observations arrive.
+    #
+    # This is evidence only. It is deliberately computed AFTER the decision and
+    # is not an input to it: no change found here can move a verdict.
+    metadata_comparison = compute_comparison(
+        store, organization_id=organization_id, repository_id=repository_id,
+        environment=environment, current_snapshot=snapshot,
+    )
+
     store.transition_review(organization_id, repository_id, review_id,
                             decision.lifecycle_state,
                             reason="production metadata evaluated")
@@ -90,6 +103,7 @@ def recompute_review(store, *, organization_id, repository_id, environment,
         policy_version=decision.policy_version, policy_hash=decision.policy_hash,
         payload={"findings": [f.as_dict() for f in decision.findings],
                  "snapshot_id": snapshot["snapshot_id"]},
+        metadata_comparison=metadata_comparison,
     )
     store.record_evidence_states(organization_id, repository_id, review_id,
                                  next_attempt, _evidence_rows(decision))
@@ -129,6 +143,7 @@ def recompute_review(store, *, organization_id, repository_id, environment,
         "lifecycle_state": decision.lifecycle_state,
         "snapshot_id": snapshot["snapshot_id"],
         "findings": [f.as_dict() for f in decision.findings],
+        "metadata_comparison": metadata_comparison,
         "applied": True,
     }
 

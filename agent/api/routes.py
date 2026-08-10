@@ -194,6 +194,111 @@ def _semantic_evidence_view(stored):
     }
 
 
+# Fields each production-metadata change kind may disclose. An allowlist for
+# the same reason the semantic one is: a field the engine gains later stays
+# invisible until someone decides it is safe to publish. Nothing here can
+# express a raw value, a query, or a collector detail - the widest field is a
+# data type name.
+_METADATA_CHANGE_FIELDS = {
+    "relation_availability_changed": ("before", "after"),
+    "schema_fingerprint_changed": ("before", "after"),
+    "row_count_changed": ("before", "after", "absolute_delta", "relative_delta"),
+    "freshness_changed": ("before", "after", "absolute_delta"),
+    "column_availability_changed": ("before", "after"),
+    "column_type_changed": ("before", "after"),
+    "column_nullability_changed": ("before", "after"),
+    "null_rate_changed": ("before", "after", "percentage_point_delta"),
+    "duplicate_rate_changed": ("before", "after", "percentage_point_delta"),
+    "distinct_count_changed": ("before", "after", "absolute_delta", "relative_delta"),
+    "cardinality_changed": ("before", "after", "absolute_delta", "relative_delta"),
+}
+
+# All four survive to the client as themselves. Collapsing any pair would erase
+# a distinction the dashboard has to render differently.
+_METADATA_STATUSES = {"evaluated", "partial", "no_baseline", "unavailable"}
+
+
+def _metadata_coverage_view(stored):
+    """Counts and identities only, so ``partial`` can say what it did not cover."""
+    if not isinstance(stored, dict):
+        return None
+
+    def _scope(rows, *, with_column):
+        items = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            item = {"model": row.get("model"), "relation": row.get("relation")}
+            if with_column:
+                item["column"] = row.get("column")
+            items.append(item)
+        return items
+
+    return {
+        "relations_observed": stored.get("relations_observed"),
+        "relations_compared": stored.get("relations_compared"),
+        "relations_without_baseline": _scope(
+            stored.get("relations_without_baseline"), with_column=False),
+        "columns_observed": stored.get("columns_observed"),
+        "columns_compared": stored.get("columns_compared"),
+        "columns_without_baseline": _scope(
+            stored.get("columns_without_baseline"), with_column=True),
+    }
+
+
+def _metadata_comparison_view(stored):
+    """Project stored production metadata comparison evidence for the dashboard.
+
+    ``None`` is preserved as ``None``: the comparison never ran for this
+    attempt, which is a different fact from running and finding no prior
+    observation (``no_baseline``), running and finding nothing changed
+    (``evaluated`` with an empty list), or running with incomplete coverage
+    (``partial``). All four have to reach the client intact because the UI has
+    to say something different about each.
+
+    Snapshot identities and observation timestamps travel, so a reviewer can
+    see WHICH two observations this describes. Nothing else from the snapshot
+    does: no collector identity, no provenance, no evidence hash, no min/max
+    value, no SQL.
+    """
+    if not isinstance(stored, dict):
+        return None
+    status = stored.get("status")
+    if status not in _METADATA_STATUSES:
+        return None
+
+    changes = []
+    for change in stored.get("changes") or []:
+        if not isinstance(change, dict):
+            continue
+        kind = change.get("kind")
+        allowed = _METADATA_CHANGE_FIELDS.get(kind)
+        if not allowed:
+            continue
+        view = {
+            "kind": kind,
+            "model": change.get("model"),
+            "relation": change.get("relation"),
+            "column": change.get("column"),
+            "signal": change.get("signal"),
+        }
+        for field_name in allowed:
+            if field_name in change:
+                view[field_name] = change[field_name]
+        changes.append(view)
+
+    return {
+        "status": status,
+        "baseline_snapshot_id": stored.get("baseline_snapshot_id"),
+        "current_snapshot_id": stored.get("current_snapshot_id"),
+        "baseline_observed_at": stored.get("baseline_observed_at"),
+        "current_observed_at": stored.get("current_observed_at"),
+        "changes": changes,
+        "change_count": len(changes),
+        "coverage": _metadata_coverage_view(stored.get("coverage")),
+    }
+
+
 def _governance_actor(body, principal) -> str:
     """The identity recorded against a governance action.
 
@@ -844,6 +949,11 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
                  # never surface on attempt N+1 just because the review id
                  # matches.
                  "semantic_evidence": _semantic_evidence_view(a.get("semantic_evidence")),
+                 # Same binding rule: this describes the two production
+                 # observations THIS attempt compared, and is never re-derived
+                 # from whatever the newest snapshot happens to be now.
+                 "metadata_comparison": _metadata_comparison_view(
+                     a.get("metadata_comparison")),
                  "created_at": isoformat(a.get("created_at"))}
                 for a in attempts
             ],
