@@ -195,13 +195,33 @@ class NumericSemanticsTests(unittest.TestCase):
         self.assertEqual(change["absolute_delta"], -1000)
         self.assertEqual(change["relative_delta"], -0.25)
 
-    def test_cardinality_change(self):
-        before = snapshot("s1", [relation(columns=[column("id", cardinality=100)])])
-        after = snapshot("s2", [relation(columns=[column("id", cardinality=80)])],
+    def test_cardinality_is_a_ratio_compared_in_percentage_points(self):
+        """distinct_count / row_count, so it is a rate, not a count."""
+        before = snapshot("s1", [relation(columns=[column("id", cardinality=0.37)])])
+        after = snapshot("s2", [relation(columns=[column("id", cardinality=0.42)])],
                          observed_at=T1)
         change = only(build_comparison(before, after), "cardinality_changed")
         self.assertEqual(change["signal"], "cardinality")
-        self.assertEqual(change["absolute_delta"], -20)
+        self.assertEqual(change["before"], 0.37)
+        self.assertEqual(change["after"], 0.42)
+        self.assertEqual(change["percentage_point_delta"], 5.0)
+        self.assertNotIn("absolute_delta", change)
+        self.assertNotIn("relative_delta", change)
+
+    def test_a_fractional_cardinality_is_never_truncated_to_zero(self):
+        """The defect 0012 closes: int(0.37) is 0, and 0 is a lie."""
+        before = snapshot("s1", [relation(columns=[column("id", cardinality=0.37)])])
+        after = snapshot("s2", [relation(columns=[column("id", cardinality=0.37)])],
+                         observed_at=T1)
+        # Equal fractional values are equal, not two zeros that happen to match.
+        self.assertEqual(build_comparison(before, after)["changes"], [])
+
+        moved = snapshot("s3", [relation(columns=[column("id", cardinality=0.44)])],
+                         observed_at=T1)
+        change = only(build_comparison(before, moved), "cardinality_changed")
+        self.assertNotEqual(change["before"], 0)
+        self.assertEqual(change["before"], 0.37)
+        self.assertEqual(change["percentage_point_delta"], 7.0)
 
     def test_freshness_change_uses_the_persisted_lag(self):
         before = snapshot("s1", [relation(freshness_lag_seconds=300)])
@@ -224,7 +244,7 @@ class UnchangedTests(unittest.TestCase):
                          freshness_lag_seconds=60,
                          columns=[column("id", data_type="BIGINT", is_nullable=False,
                                          null_rate=0.01, duplicate_rate=0.0,
-                                         distinct_count=1000, cardinality=1)])]
+                                         distinct_count=1000, cardinality=1.0)])]
         result = build_comparison(snapshot("s1", rows), snapshot("s2", rows,
                                                                  observed_at=T1))
         self.assertEqual(result["status"], STATUS_EVALUATED)
@@ -431,6 +451,19 @@ class ApiProjectionTests(unittest.TestCase):
                                      "current_snapshot_id", "baseline_observed_at",
                                      "current_observed_at", "changes",
                                      "change_count", "coverage"})
+
+    def test_cardinality_projects_percentage_points_not_count_deltas(self):
+        view = _metadata_comparison_view({
+            "status": "evaluated",
+            "changes": [{"kind": "cardinality_changed", "model": "m",
+                         "relation": "r", "column": "id", "signal": "cardinality",
+                         "before": 0.37, "after": 0.42,
+                         "percentage_point_delta": 5.0}]})
+        change = view["changes"][0]
+        self.assertEqual(change["before"], 0.37)
+        self.assertEqual(change["percentage_point_delta"], 5.0)
+        self.assertNotIn("absolute_delta", change)
+        self.assertNotIn("relative_delta", change)
 
     def test_percentage_point_delta_is_projected_and_relative_delta_is_not(self):
         view = _metadata_comparison_view({

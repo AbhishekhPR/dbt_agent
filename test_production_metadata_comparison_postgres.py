@@ -314,6 +314,267 @@ class ProductionComparisonPostgresTests(unittest.TestCase):
 
 
 @unittest.skipUnless(DSN, "RELIUM_TEST_POSTGRES_DSN not set")
+class ObservationImmutabilityTests(unittest.TestCase):
+    """The whole observation is immutable, not just its header.
+
+    Before migration 0012 only `metadata_snapshots` was protected. Every
+    measured value - row counts, rates, data types, existence flags - lives in
+    the child tables, and all of them could be rewritten in place while the
+    header stayed byte-identical. An attempt that promises "baseline X against
+    current Y" is only as good as X and Y being unable to change.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import psycopg
+
+        from agent.postgres_lifecycle_store import PostgresLifecycleStore
+
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute("DROP SCHEMA public CASCADE")
+            conn.execute("CREATE SCHEMA public")
+        cls.store = PostgresLifecycleStore(DSN)
+        cls.store.ensure_tenant(ORG, REPO, ENV)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.store.close()
+
+    def setUp(self):
+        self.snapshot_id = f"snap-{uuid.uuid4().hex[:16]}"
+        self.store.submit_metadata_snapshot(
+            ORG, REPO, ENV, snapshot_id=self.snapshot_id,
+            idempotency_key=f"idem-{self.snapshot_id}",
+            payload_hash=f"ph-{self.snapshot_id}",
+            evidence_hash=f"eh-{self.snapshot_id}",
+            observed_at=at(500), collected_at=at(500),
+            relations=[orders(row_count=1000)],
+            metrics=[{"metric_name": "orders_total", "metric_value": 1000.0,
+                      "relation_name": "orders"}])
+
+    def _refused(self, sql):
+        """Run a statement that must be refused, and report why it was."""
+        try:
+            self.store.connection.execute(sql, (ORG, REPO, self.snapshot_id))
+        except Exception as exc:
+            self.store.connection.rollback()
+            return str(exc)
+        self.store.connection.rollback()
+        self.fail(f"the database accepted a mutation it must refuse: {sql}")
+
+    _WHERE = ("WHERE organization_id=%s AND repository_id=%s AND snapshot_id=%s")
+
+    # -- parent ------------------------------------------------------------
+
+    def test_parent_snapshot_update_is_rejected(self):
+        self.assertIn("immutable", self._refused(
+            f"UPDATE metadata_snapshots SET completeness='FAILED' {self._WHERE}"))
+
+    def test_parent_snapshot_delete_is_rejected(self):
+        self.assertIn("immutable", self._refused(
+            f"DELETE FROM metadata_snapshots {self._WHERE}"))
+
+    # -- relations ---------------------------------------------------------
+
+    def test_relation_update_is_rejected(self):
+        self.assertIn("immutable", self._refused(
+            f"UPDATE snapshot_relations SET row_count=1 {self._WHERE}"))
+
+    def test_relation_delete_is_rejected(self):
+        self.assertIn("immutable", self._refused(
+            f"DELETE FROM snapshot_relations {self._WHERE}"))
+
+    # -- columns -----------------------------------------------------------
+
+    def test_column_update_is_rejected(self):
+        self.assertIn("immutable", self._refused(
+            f"UPDATE snapshot_columns SET null_rate=0.99 {self._WHERE}"))
+
+    def test_column_delete_is_rejected(self):
+        self.assertIn("immutable", self._refused(
+            f"DELETE FROM snapshot_columns {self._WHERE}"))
+
+    # -- metrics -----------------------------------------------------------
+
+    def test_metric_update_is_rejected(self):
+        self.assertIn("immutable", self._refused(
+            f"UPDATE snapshot_metrics SET metric_value=0 {self._WHERE}"))
+
+    def test_metric_delete_is_rejected(self):
+        self.assertIn("immutable", self._refused(
+            f"DELETE FROM snapshot_metrics {self._WHERE}"))
+
+    # -- the observation survives every refusal ----------------------------
+
+    def test_the_observation_is_unchanged_after_every_refused_mutation(self):
+        before = self.store.get_snapshot(ORG, REPO, self.snapshot_id)
+        for sql in (
+            f"UPDATE metadata_snapshots SET completeness='FAILED' {self._WHERE}",
+            f"UPDATE snapshot_relations SET row_count=1 {self._WHERE}",
+            f"UPDATE snapshot_columns SET null_rate=0.99 {self._WHERE}",
+            f"UPDATE snapshot_metrics SET metric_value=0 {self._WHERE}",
+            f"DELETE FROM snapshot_columns {self._WHERE}",
+            f"DELETE FROM snapshot_relations {self._WHERE}",
+            f"DELETE FROM snapshot_metrics {self._WHERE}",
+            f"DELETE FROM metadata_snapshots {self._WHERE}",
+        ):
+            self._refused(sql)
+        self.assertEqual(self.store.get_snapshot(ORG, REPO, self.snapshot_id),
+                         before)
+
+    # -- ingest is untouched -----------------------------------------------
+
+    def test_normal_ingest_still_succeeds(self):
+        """The triggers fire on UPDATE and DELETE only; INSERT is the whole
+        point of the table and must be unaffected."""
+        snapshot_id = f"snap-{uuid.uuid4().hex[:16]}"
+        snapshot, created = self.store.submit_metadata_snapshot(
+            ORG, REPO, ENV, snapshot_id=snapshot_id,
+            idempotency_key=f"idem-{snapshot_id}", payload_hash="ph",
+            evidence_hash="eh", observed_at=at(510), collected_at=at(510),
+            relations=[orders(row_count=1234)],
+            metrics=[{"metric_name": "m", "metric_value": 1.0}])
+        self.assertTrue(created)
+        stored = self.store.get_snapshot(ORG, REPO, snapshot_id)
+        self.assertEqual(stored["relations"][0]["row_count"], 1234)
+        self.assertEqual(len(stored["relations"][0]["columns"]), 1)
+        self.assertEqual(len(stored["metrics"]), 1)
+
+    def test_idempotent_replay_still_works(self):
+        snapshot_id = f"snap-{uuid.uuid4().hex[:16]}"
+        kwargs = dict(
+            snapshot_id=snapshot_id, idempotency_key=f"idem-{snapshot_id}",
+            payload_hash="same-payload", evidence_hash="eh",
+            observed_at=at(520), collected_at=at(520),
+            relations=[orders(row_count=42)])
+        first, created_first = self.store.submit_metadata_snapshot(
+            ORG, REPO, ENV, **kwargs)
+        second, created_second = self.store.submit_metadata_snapshot(
+            ORG, REPO, ENV, **dict(kwargs, snapshot_id=f"snap-{uuid.uuid4().hex[:16]}"))
+        self.assertTrue(created_first)
+        # A replay of the same key with the same payload returns the ORIGINAL
+        # snapshot and writes nothing - it must not be turned into a mutation
+        # attempt by the new triggers.
+        self.assertFalse(created_second)
+        self.assertEqual(second["snapshot_id"], first["snapshot_id"])
+        self.assertEqual(
+            self.store.get_snapshot(ORG, REPO, snapshot_id)["relations"][0]["row_count"],
+            42)
+
+    def test_a_conflicting_replay_is_still_a_conflict_not_a_mutation(self):
+        from agent.postgres_lifecycle_store import SnapshotConflict
+
+        snapshot_id = f"snap-{uuid.uuid4().hex[:16]}"
+        kwargs = dict(
+            idempotency_key=f"idem-{snapshot_id}", evidence_hash="eh",
+            observed_at=at(530), collected_at=at(530))
+        self.store.submit_metadata_snapshot(
+            ORG, REPO, ENV, snapshot_id=snapshot_id, payload_hash="first",
+            relations=[orders(row_count=7)], **kwargs)
+        with self.assertRaises(SnapshotConflict):
+            self.store.submit_metadata_snapshot(
+                ORG, REPO, ENV, snapshot_id=f"snap-{uuid.uuid4().hex[:16]}",
+                payload_hash="second", relations=[orders(row_count=8)], **kwargs)
+        self.assertEqual(
+            self.store.get_snapshot(ORG, REPO, snapshot_id)["relations"][0]["row_count"],
+            7)
+
+
+@unittest.skipUnless(DSN, "RELIUM_TEST_POSTGRES_DSN not set")
+class CardinalityContractTests(unittest.TestCase):
+    """Cardinality is distinct_count / row_count, and must survive the round trip.
+
+    Stored as BIGINT it did not: PostgreSQL rounds on the way in, so a column
+    that is 37% distinct was persisted as 0 - not an imprecise 0.37, but a
+    positive claim that the column had no distinct values.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import psycopg
+
+        from agent.postgres_lifecycle_store import PostgresLifecycleStore
+
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute("DROP SCHEMA public CASCADE")
+            conn.execute("CREATE SCHEMA public")
+        cls.store = PostgresLifecycleStore(DSN)
+        cls.store.ensure_tenant(ORG, REPO, ENV)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.store.close()
+
+    def submit(self, *, observed_at, cardinality, distinct_count, row_count):
+        snapshot_id = f"snap-{uuid.uuid4().hex[:16]}"
+        relation = orders(row_count=row_count)
+        relation["columns"][0].update({"cardinality": cardinality,
+                                       "distinct_count": distinct_count})
+        self.store.submit_metadata_snapshot(
+            ORG, REPO, ENV, snapshot_id=snapshot_id,
+            idempotency_key=f"idem-{snapshot_id}", payload_hash=f"ph-{snapshot_id}",
+            evidence_hash=f"eh-{snapshot_id}", observed_at=observed_at,
+            collected_at=observed_at, relations=[relation])
+        return self.store.get_snapshot(ORG, REPO, snapshot_id)
+
+    def test_the_column_is_a_floating_point_type(self):
+        row = self.store.connection.execute(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_name='snapshot_columns' AND column_name='cardinality'"
+        ).fetchone()
+        self.assertEqual(row["data_type"], "double precision")
+
+    def test_row_count_100_distinct_37_persists_as_0_37(self):
+        """The named regression: 37/100 must not read back as 0."""
+        stored = self.submit(observed_at=at(600), row_count=100,
+                             distinct_count=37, cardinality=37 / 100)
+        value = stored["relations"][0]["columns"][0]["cardinality"]
+        self.assertAlmostEqual(value, 0.37, places=9)
+        self.assertNotEqual(value, 0)
+
+    def test_a_fractional_cardinality_survives_the_comparison(self):
+        self.submit(observed_at=at(610), row_count=100, distinct_count=37,
+                    cardinality=0.37)
+        current = self.submit(observed_at=at(620), row_count=100,
+                              distinct_count=44, cardinality=0.44)
+        result = compute_comparison(
+            self.store, organization_id=ORG, repository_id=REPO,
+            environment=ENV, current_snapshot=current)
+        by_kind = {c["kind"]: c for c in result["changes"]}
+
+        cardinality = by_kind["cardinality_changed"]
+        self.assertAlmostEqual(cardinality["before"], 0.37, places=9)
+        self.assertAlmostEqual(cardinality["after"], 0.44, places=9)
+        self.assertAlmostEqual(cardinality["percentage_point_delta"], 7.0, places=6)
+        # Not a count: a percentage-point delta, like the other rates.
+        self.assertNotIn("absolute_delta", cardinality)
+
+        # distinct_count keeps count semantics alongside it.
+        distinct = by_kind["distinct_count_changed"]
+        self.assertEqual(distinct["absolute_delta"], 7)
+
+    def test_the_api_projects_a_truthful_fractional_cardinality(self):
+        self.submit(observed_at=at(630), row_count=100, distinct_count=37,
+                    cardinality=0.37)
+        current = self.submit(observed_at=at(640), row_count=100,
+                              distinct_count=44, cardinality=0.44)
+        view = _metadata_comparison_view(compute_comparison(
+            self.store, organization_id=ORG, repository_id=REPO,
+            environment=ENV, current_snapshot=current))
+        cardinality = next(c for c in view["changes"]
+                           if c["kind"] == "cardinality_changed")
+        self.assertAlmostEqual(cardinality["before"], 0.37, places=9)
+        self.assertNotIn("absolute_delta", cardinality)
+
+    def test_a_value_outside_zero_to_one_is_refused(self):
+        """The contract is enforced, not merely documented."""
+        with self.assertRaises(Exception):
+            self.submit(observed_at=at(650), row_count=100, distinct_count=37,
+                        cardinality=37.0)
+        self.store.connection.rollback()
+
+
+@unittest.skipUnless(DSN, "RELIUM_TEST_POSTGRES_DSN not set")
 class ComparisonPersistenceTests(unittest.TestCase):
     """The four states, and the binding that must not drift."""
 

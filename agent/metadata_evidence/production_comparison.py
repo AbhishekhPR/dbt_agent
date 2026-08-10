@@ -242,12 +242,21 @@ def _compare_relation(baseline, current):
 
 _COUNT_SIGNALS = (
     ("distinct_count", "distinct_count_changed"),
-    ("cardinality", "cardinality_changed"),
 )
 
+# Rates are fractions in [0, 1] and are compared in PERCENTAGE POINTS.
+#
+# `cardinality` belongs here, not with the counts. The collector computes it as
+# distinct_count / row_count (agent/collector/warehouse.py), so it is a ratio -
+# the rate-shaped twin of distinct_count, exactly as duplicate_rate is the twin
+# of duplicate_count. Treating it as a count meant coercing it with int(),
+# which turned a cardinality of 0.37 into 0 and reported a real change as
+# either nothing or a total collapse. Migration 0012 fixes the storage type;
+# this fixes the arithmetic that reads it.
 _RATE_SIGNALS = (
     ("null_rate", "null_rate_changed"),
     ("duplicate_rate", "duplicate_rate_changed"),
+    ("cardinality", "cardinality_changed"),
 )
 
 

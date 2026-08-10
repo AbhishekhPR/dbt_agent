@@ -210,7 +210,8 @@ _METADATA_CHANGE_FIELDS = {
     "null_rate_changed": ("before", "after", "percentage_point_delta"),
     "duplicate_rate_changed": ("before", "after", "percentage_point_delta"),
     "distinct_count_changed": ("before", "after", "absolute_delta", "relative_delta"),
-    "cardinality_changed": ("before", "after", "absolute_delta", "relative_delta"),
+    # A ratio, so it carries a percentage-point delta like the other rates.
+    "cardinality_changed": ("before", "after", "percentage_point_delta"),
 }
 
 # All four survive to the client as themselves. Collapsing any pair would erase

@@ -64,7 +64,7 @@ class _StubQueue:
 
 
 def snapshot_body(*, observed_at, row_count, null_rate, customer_id_exists,
-                  review_id, idempotency_key):
+                  distinct_emails, review_id, idempotency_key):
     """Exactly the payload the collector posts, no more."""
     return {
         "organization_id": ORG,
@@ -113,9 +113,23 @@ def snapshot_body(*, observed_at, row_count, null_rate, customer_id_exists,
                     "is_nullable": True,
                     "null_rate": null_rate,
                     "null_count": int(row_count * null_rate),
-                    "distinct_count": 380,
+                    "distinct_count": distinct_emails,
+                    # The ratio the collector actually computes:
+                    # distinct_count / row_count. A: 370/1000 = 0.37, which is
+                    # exactly the value BIGINT storage used to round to 0.
+                    "cardinality": distinct_emails / row_count,
                 },
             ],
+        }],
+        # A bounded scalar metric, so the immutability check on
+        # snapshot_metrics has an actual row to refuse. An UPDATE that matches
+        # zero rows fires no row-level trigger and succeeds trivially, which
+        # would make that check prove nothing.
+        "metrics": [{
+            "metric_name": "orders_total",
+            "relation_name": "orders",
+            "model_unique_id": "model.jaffle.orders",
+            "metric_value": float(row_count),
         }],
     }
 
@@ -133,7 +147,7 @@ def main():
     from agent.metadata_evidence.review_lifecycle import validate_and_bind_snapshot
     from agent.postgres_lifecycle_store import PostgresLifecycleStore
 
-    print("\n== 0. clean database, migrations 0001-0011 via the real migrator ==")
+    print("\n== 0. clean database, migrations 0001-0012 via the real migrator ==")
     with psycopg.connect(DSN, autocommit=True) as conn:
         conn.execute("DROP SCHEMA public CASCADE")
         conn.execute("CREATE SCHEMA public")
@@ -141,7 +155,7 @@ def main():
     with pool.acquire() as store:
         versions = [r["version"] for r in store.connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version").fetchall()]
-    check("migrations 0001-0011 applied", versions == list(range(1, 12)), str(versions))
+    check("migrations 0001-0012 applied", versions == list(range(1, 13)), str(versions))
 
     app = create_http_app(
         webhook_secret="proof-webhook-secret", job_queue=_StubQueue(),
@@ -189,8 +203,8 @@ def main():
     response = client.post("/api/metadata-snapshots", headers=collector_auth,
                            json=snapshot_body(
                                observed_at=T0, row_count=1000, null_rate=0.01,
-                               customer_id_exists=True, review_id=review_id,
-                               idempotency_key="proof-a"))
+                               customer_id_exists=True, distinct_emails=370,
+                               review_id=review_id, idempotency_key="proof-a"))
     # 202: the ingest route accepts evidence and returns the snapshot identity.
     check("POST /api/metadata-snapshots accepted A",
           response.status_code == 202, f"HTTP {response.status_code}")
@@ -211,26 +225,43 @@ def main():
           first["metadata_comparison"]["changes"] == []
           and first["metadata_comparison"]["baseline_snapshot_id"] is None)
 
-    print("\n== 3. snapshot A is immutable ==")
+    print("\n== 3. snapshot A is immutable, header AND observations ==")
+    where = "WHERE organization_id=%s AND repository_id=%s AND snapshot_id=%s"
+    mutations = [
+        ("parent UPDATE", f"UPDATE metadata_snapshots SET completeness='FAILED' {where}"),
+        ("parent DELETE", f"DELETE FROM metadata_snapshots {where}"),
+        ("relation UPDATE", f"UPDATE snapshot_relations SET row_count=1 {where}"),
+        ("relation DELETE", f"DELETE FROM snapshot_relations {where}"),
+        ("column UPDATE", f"UPDATE snapshot_columns SET null_rate=0.99 {where}"),
+        ("column DELETE", f"DELETE FROM snapshot_columns {where}"),
+        ("metric UPDATE", f"UPDATE snapshot_metrics SET metric_value=0 {where}"),
+        ("metric DELETE", f"DELETE FROM snapshot_metrics {where}"),
+    ]
     with pool.acquire() as store:
         frozen = store.get_snapshot(ORG, REPO, snapshot_a_id)
-        try:
-            store.connection.execute(
-                "UPDATE metadata_snapshots SET completeness='FAILED' "
-                "WHERE organization_id=%s AND repository_id=%s AND snapshot_id=%s",
-                (ORG, REPO, snapshot_a_id))
-            rejected = False
-        except Exception as exc:
-            rejected = "immutable" in str(exc)
-            store.connection.rollback()
-    check("the database refuses to mutate an accepted snapshot", rejected)
+        for label, sql in mutations:
+            try:
+                store.connection.execute(sql, (ORG, REPO, snapshot_a_id))
+                rejected, why = False, "the database ACCEPTED it"
+            except Exception as exc:
+                rejected, why = "immutable" in str(exc), "rejected as immutable"
+                store.connection.rollback()
+            check(f"A: direct {label} is rejected", rejected, why)
+        check("A is byte-for-byte unchanged after every refused mutation",
+              store.get_snapshot(ORG, REPO, snapshot_a_id) == frozen)
+
+    email_cardinality = next(c["cardinality"] for c in frozen["relations"][0]["columns"]
+                             if c["column_name"] == "email")
+    check("A persisted a fractional cardinality, not a rounded 0",
+          abs(email_cardinality - 0.37) < 1e-9, str(email_cardinality))
 
     print("\n== 4. snapshot B: the controlled change ==")
     response = client.post("/api/metadata-snapshots", headers=collector_auth,
                            json=snapshot_body(
                                observed_at=T0 + timedelta(hours=6), row_count=800,
                                null_rate=0.12, customer_id_exists=False,
-                               review_id=review_id, idempotency_key="proof-b"))
+                               distinct_emails=336, review_id=review_id,
+                               idempotency_key="proof-b"))
     check("POST /api/metadata-snapshots accepted B",
           response.status_code == 202, f"HTTP {response.status_code}")
     snapshot_b_id = response.json()["snapshot_id"]
@@ -274,6 +305,16 @@ def main():
     check("a vanished column reports no invented metrics",
           not [c for c in comparison["changes"]
                if c["column"] == "customer_id" and c["signal"] != "column_exists"])
+    check("cardinality 0.37 -> 0.42 as +5.0 PERCENTAGE POINTS, never 0",
+          abs(by_kind.get("cardinality_changed", {}).get("before", 0) - 0.37) < 1e-9
+          and abs(by_kind["cardinality_changed"]["after"] - 0.42) < 1e-9
+          and abs(by_kind["cardinality_changed"]["percentage_point_delta"] - 5.0) < 1e-6,
+          str(by_kind.get("cardinality_changed", {}).get("percentage_point_delta")))
+    check("cardinality is a rate, so it carries no count-shaped delta",
+          "absolute_delta" not in by_kind.get("cardinality_changed", {}))
+    check("distinct_count keeps count semantics alongside it",
+          by_kind.get("distinct_count_changed", {}).get("absolute_delta") == -34,
+          str(by_kind.get("distinct_count_changed", {}).get("absolute_delta")))
     check("no severity, verdict or threshold appears in the evidence",
           not ({"severity", "decision", "verdict", "threshold", "finding"}
                & set().union(*[set(c) for c in comparison["changes"]])))
