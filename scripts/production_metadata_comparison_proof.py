@@ -363,10 +363,93 @@ def main():
     check("no raw snapshot internals, credentials or SQL in the response",
           not leaks, ", ".join(leaks) or "clean")
 
+    print("\n== 7. the dashboard shows WHAT CHANGED; the download carries the rest ==")
+    export_url = (f"/api/reviews/{review_id}/attempts/{second['attempt']}"
+                  f"/metadata-evidence.json")
+    export = client.get(export_url, headers=read_auth)
+    check("GET the per-attempt evidence export", export.status_code == 200,
+          f"HTTP {export.status_code}")
+    check("served as a named attachment",
+          export.headers.get("content-disposition")
+          == f'attachment; filename="relium-metadata-evidence-{review_id}'
+             f'-attempt-{second["attempt"]}.json"',
+          export.headers.get("content-disposition", "(none)"))
+    bundle = export.json()
+
+    check("the download binds the same exact A -> B pair the dashboard shows",
+          bundle["comparison"]["baseline_snapshot_id"] == snapshot_a_id
+          and bundle["comparison"]["current_snapshot_id"] == snapshot_b_id
+          and bundle["baseline_observation"]["snapshot_id"] == snapshot_a_id
+          and bundle["current_observation"]["snapshot_id"] == snapshot_b_id)
+
+    # Every card the dashboard renders comes from api_view["changes"]; the
+    # download must contain each of them, identically.
+    dashboard_changes = {(c["kind"], c["relation"], c["column"], c["signal"])
+                         for c in api_view["changes"]}
+    download_changes = {(c["kind"], c["relation"], c["column"], c["signal"])
+                        for c in bundle["comparison"]["changes"]}
+    check("every dashboard change exists in the downloaded comparison",
+          dashboard_changes and dashboard_changes <= download_changes,
+          f"{len(dashboard_changes)} dashboard / {len(download_changes)} download")
+
+    # The signal that did NOT move. It is real, it was observed on both sides,
+    # and it belongs in the file - but putting it on the dashboard would turn a
+    # change summary into a metadata catalogue.
+    unchanged_signals = [
+        ("schema_fingerprint",
+         bundle["baseline_observation"]["relations"][0]["schema_fingerprint"],
+         bundle["current_observation"]["relations"][0]["schema_fingerprint"]),
+    ]
+    email_baseline = next(c for c in bundle["baseline_observation"]["relations"][0]["columns"]
+                          if c["column_name"] == "email")
+    email_current = next(c for c in bundle["current_observation"]["relations"][0]["columns"]
+                         if c["column_name"] == "email")
+    unchanged_signals.append(
+        ("data_type", email_baseline["data_type"], email_current["data_type"]))
+
+    for signal, before, after in unchanged_signals:
+        check(f"{signal} is present in BOTH downloaded observations",
+              before is not None and after is not None and before == after,
+              f"{before!r} == {after!r}")
+        check(f"{signal} is NOT a dashboard change card",
+              not [c for c in api_view["changes"] if c["signal"] == signal])
+
+    check("the download carries the full bounded observation, not only the deltas",
+          len(bundle["baseline_observation"]["relations"][0]["columns"]) == 2
+          and len(bundle["current_observation"]["relations"][0]["columns"]) == 2,
+          "2 columns on each side")
+
+    export_blob = export.text
+    export_leaks = [term for term in
+                    ("evidence_hash", "idempotency_key", "payload_hash",
+                     "provenance", "collector_id", "collector_version",
+                     "adapter_type", "min_value", "max_value", "base_sha",
+                     "head_sha", "manifest", "Bearer", "postgresql://",
+                     "password", "PRIVATE KEY", "relation_index")
+                    if term in export_blob]
+    check("the downloadable file leaks no internals, credentials or paths",
+          not export_leaks, ", ".join(export_leaks) or "clean")
+
+    check("two downloads are byte-identical",
+          client.get(export_url, headers=read_auth).content == export.content)
+
+    collector_export = client.get(export_url, headers=collector_auth)
+    check("a collector token cannot download dashboard evidence",
+          collector_export.status_code in (403, 404)
+          and "baseline_observation" not in collector_export.text,
+          f"HTTP {collector_export.status_code}")
+
+    waiting_export = client.get(
+        f"/api/reviews/{review_id}/attempts/1/metadata-evidence.json",
+        headers=read_auth)
+    check("an attempt that never compared has nothing to download",
+          waiting_export.status_code == 404, f"HTTP {waiting_export.status_code}")
+
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                        "production-metadata-comparison-proof.json")
     with open(out, "w", encoding="utf-8") as handle:
         json.dump({"snapshot_a": snapshot_a_id, "snapshot_b": snapshot_b_id,
+                   "evidence_bundle": bundle,
                    "attempts": payload["attempts"]}, handle, indent=2)
     print(f"\n  API response written to {os.path.normpath(out)}")
 

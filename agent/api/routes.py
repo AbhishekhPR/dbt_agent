@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime, timezone
 
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from agent.api.collector_routes import COLLECTOR_ROUTES, build_handlers
@@ -23,6 +23,10 @@ from agent.api.authorization import (
     PIPELINE_INGEST, CapabilityError, authorize,
 )
 from agent.api.sessions import CSRF_HEADER, SESSION_COOKIE, SessionError
+from agent.metadata_evidence.evidence_export import (
+    build_evidence_bundle,
+    evidence_filename,
+)
 from agent.api.service import (
     ConflictError,
     LifecycleService,
@@ -384,7 +388,16 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
             raise _HttpError(403, {"status": "forbidden",
                                    "detail": "missing or invalid CSRF token"})
 
-    def handler(fn, *, write: bool, capability=None):
+    def handler(fn, *, write: bool, capability=None, download=False):
+        """Wrap one route function with authentication, scoping and error mapping.
+
+        ``download`` changes only how a SUCCESSFUL response is built: the
+        handler returns ``(status, payload, filename)`` and the body is written
+        as the exact artifact, with no ``request_id`` mixed into it, plus a
+        Content-Disposition attachment header. Errors still travel the ordinary
+        JSON path, so a failed download is a normal API error rather than a
+        file containing an error.
+        """
         capability = capability or (GOVERNANCE_WRITE if write else DASHBOARD_READ)
 
         async def wrapped(request):
@@ -401,7 +414,20 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
                         service = LifecycleService(store)
                         return fn(request, body, scope, service)
 
-                status, payload = await run_in_threadpool(work)
+                result = await run_in_threadpool(work)
+                if download:
+                    status, payload, filename = result
+                    return Response(
+                        json.dumps(payload, indent=2, sort_keys=True),
+                        status_code=status,
+                        media_type="application/json",
+                        headers={
+                            "X-Request-Id": request_id,
+                            "Content-Disposition":
+                                f'attachment; filename="{filename}"',
+                        },
+                    )
+                status, payload = result
                 return _json(payload, status, request_id)
             except _HttpError as exc:
                 return _json(exc.payload, exc.status, request_id)
@@ -966,6 +992,51 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
             ],
         }
 
+    def review_metadata_evidence(request, body, scope, service):
+        """The downloadable production metadata evidence bundle for one attempt.
+
+        Built from the comparison THAT ATTEMPT recorded, and from the two
+        immutable snapshots whose ids are inside it. The store is never asked
+        for "the latest snapshot" here, so this file does not change when a
+        newer observation arrives - which is the whole reason it is worth
+        keeping.
+
+        A 404 when the attempt recorded no comparison: there is no evidence to
+        download, and a file asserting that would be worse than no file.
+        """
+        review_id = request.path_params["review_id"]
+        try:
+            attempt = int(request.path_params["attempt"])
+        except (TypeError, ValueError):
+            raise NotFoundError("unknown attempt") from None
+
+        review = service.store.get_review(
+            scope.organization_id, scope.repository_id, review_id)
+        if review is None:
+            raise NotFoundError("unknown review")
+
+        rows = service.store.review_attempts(
+            scope.organization_id, scope.repository_id, review_id)
+        row = next((a for a in rows if a["attempt"] == attempt), None)
+        if row is None:
+            raise NotFoundError("unknown attempt")
+
+        # The SAME projection the dashboard reads, so the file and the screen
+        # can never disagree about what changed.
+        comparison = _metadata_comparison_view(row.get("metadata_comparison"))
+        if comparison is None:
+            raise NotFoundError(
+                "no production metadata comparison was computed for this attempt")
+
+        bundle = build_evidence_bundle(
+            service.store,
+            organization_id=scope.organization_id,
+            repository_id=scope.repository_id,
+            environment=review.get("environment"),
+            review_id=review_id, attempt=attempt, comparison=comparison,
+        )
+        return 200, bundle, evidence_filename(review_id, attempt)
+
     def review_collection_requests(request, body, scope, service):
         """Every collection request raised for one review, with its outcome."""
         review_id = request.path_params["review_id"]
@@ -1216,6 +1287,12 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
               handler(review_findings, write=False), methods=["GET"]),
         Route("/api/reviews/{review_id}/attempts",
               handler(review_attempts, write=False), methods=["GET"]),
+        # Dashboard read, so a collector token cannot fetch it: the capability
+        # model already refuses COLLECTOR_INGEST here, and this route is one
+        # more reason that separation has to hold.
+        Route("/api/reviews/{review_id}/attempts/{attempt}/metadata-evidence.json",
+              handler(review_metadata_evidence, write=False, download=True),
+              methods=["GET"]),
         Route("/api/reviews/{review_id}/collection-requests",
               handler(review_collection_requests, write=False), methods=["GET"]),
         Route("/api/reviews/{review_id}/snapshots",

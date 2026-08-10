@@ -62,6 +62,11 @@ MANDATORY_ROUTES = {
     ("POST", "/api/reviews/{review_id}/exceptions/{exception_id}/revoke"),
     ("GET", "/api/reviews/{review_id}/findings"),
     ("GET", "/api/reviews/{review_id}/attempts"),
+    # The downloadable evidence bundle for ONE attempt. Declared separately
+    # from the attempt list because it is a different disclosure decision: the
+    # list carries the comparison, this carries the full bounded observations
+    # behind it.
+    ("GET", "/api/reviews/{review_id}/attempts/{attempt}/metadata-evidence.json"),
     ("GET", "/api/reviews/{review_id}/collection-requests"),
     ("GET", "/api/reviews/{review_id}/snapshots"),
     ("GET", "/api/reviews/{review_id}/publications"),

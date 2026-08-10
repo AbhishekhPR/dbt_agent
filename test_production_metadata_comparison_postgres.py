@@ -575,6 +575,265 @@ class CardinalityContractTests(unittest.TestCase):
 
 
 @unittest.skipUnless(DSN, "RELIUM_TEST_POSTGRES_DSN not set")
+class EvidenceBundleTests(unittest.TestCase):
+    """The downloadable bundle: bound to two snapshot ids, and bounded in what
+    it discloses.
+
+    The dashboard answers "what changed". This file answers "and what were the
+    full observations behind it", which is why it carries signals that did NOT
+    change — and why every field in it is named by an allowlist rather than
+    copied from a row.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import psycopg
+
+        from agent.postgres_lifecycle_store import PostgresLifecycleStore
+
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute("DROP SCHEMA public CASCADE")
+            conn.execute("CREATE SCHEMA public")
+        cls.store = PostgresLifecycleStore(DSN)
+        cls.store.ensure_tenant(ORG, REPO, ENV)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.store.close()
+
+    _envs = iter(range(1, 400))
+
+    def environment(self):
+        """A private environment per case.
+
+        Baselines are selected per environment, so tests sharing one would
+        legitimately pick up each other's snapshots and the assertions would be
+        testing the harness rather than the export.
+        """
+        name = f"export-{next(self._envs)}"
+        self.store.ensure_tenant(ORG, REPO, name)
+        return name
+
+    def submit(self, *, observed_at, relations, environment=ENV, snapshot_id=None):
+        snapshot_id = snapshot_id or f"snap-{uuid.uuid4().hex[:16]}"
+        self.store.submit_metadata_snapshot(
+            ORG, REPO, environment, snapshot_id=snapshot_id,
+            idempotency_key=f"idem-{snapshot_id}", payload_hash=f"ph-{snapshot_id}",
+            evidence_hash=f"eh-{snapshot_id}", observed_at=observed_at,
+            collected_at=observed_at, relations=list(relations),
+            collector_id=None, collector_version="1.4.2", adapter_type="postgres",
+            provenance={"host": "warehouse.internal", "note": "internal only"})
+        return self.store.get_snapshot(ORG, REPO, snapshot_id)
+
+    def bundle_for(self, comparison, *, review_id="rev-export", attempt=2,
+                   environment=ENV):
+        from agent.api.routes import _metadata_comparison_view
+        from agent.metadata_evidence.evidence_export import build_evidence_bundle
+
+        return build_evidence_bundle(
+            self.store, organization_id=ORG, repository_id=REPO,
+            environment=environment, review_id=review_id, attempt=attempt,
+            comparison=_metadata_comparison_view(comparison))
+
+    def _pair(self, *, before_rows=1000, after_rows=800):
+        environment = self.environment()
+        baseline = self.submit(observed_at=at(700), environment=environment,
+                               relations=[orders(row_count=before_rows)])
+        current = self.submit(observed_at=at(710), environment=environment,
+                              relations=[orders(row_count=after_rows)])
+        comparison = compute_comparison(
+            self.store, organization_id=ORG, repository_id=REPO,
+            environment=environment, current_snapshot=current)
+        return baseline, current, comparison
+
+    # -- binding -----------------------------------------------------------
+
+    def test_the_bundle_names_the_exact_snapshot_ids(self):
+        baseline, current, comparison = self._pair()
+        bundle = self.bundle_for(comparison)
+        self.assertEqual(bundle["comparison"]["baseline_snapshot_id"],
+                         baseline["snapshot_id"])
+        self.assertEqual(bundle["baseline_observation"]["snapshot_id"],
+                         baseline["snapshot_id"])
+        self.assertEqual(bundle["current_observation"]["snapshot_id"],
+                         current["snapshot_id"])
+
+    def test_a_newer_snapshot_does_not_change_an_older_bundle(self):
+        baseline, current, comparison = self._pair()
+        first = self.bundle_for(comparison)
+
+        # A third observation arrives. The stored comparison is untouched, so
+        # the bundle built from it must be identical - not merely similar.
+        self.submit(observed_at=at(720), relations=[orders(row_count=5)])
+        second = self.bundle_for(comparison)
+        self.assertEqual(first, second)
+        self.assertEqual(second["baseline_observation"]["snapshot_id"],
+                         baseline["snapshot_id"])
+        self.assertEqual(second["current_observation"]["snapshot_id"],
+                         current["snapshot_id"])
+
+    def test_the_bundle_is_deterministic(self):
+        """Two downloads of one attempt are the same bytes, with no
+        export timestamp or request id mixed in."""
+        _baseline, _current, comparison = self._pair()
+        import json
+
+        self.assertEqual(json.dumps(self.bundle_for(comparison), sort_keys=True),
+                         json.dumps(self.bundle_for(comparison), sort_keys=True))
+
+    # -- content -----------------------------------------------------------
+
+    def test_both_observations_carry_the_bounded_metadata(self):
+        _baseline, _current, comparison = self._pair()
+        bundle = self.bundle_for(comparison)
+        for side, expected_rows in (("baseline_observation", 1000),
+                                    ("current_observation", 800)):
+            observation = bundle[side]
+            relation = observation["relations"][0]
+            self.assertEqual(relation["relation_name"], "orders")
+            self.assertEqual(relation["row_count"], expected_rows)
+            self.assertEqual(relation["model_unique_id"], "model.jaffle.orders")
+            self.assertTrue(relation["exists_in_production"])
+            self.assertEqual(relation["schema_fingerprint"], "fp-a")
+            column = relation["columns"][0]
+            self.assertEqual(column["column_name"], "customer_id")
+            self.assertEqual(column["data_type"], "BIGINT")
+            self.assertEqual(column["collection_status"], "COLLECTED")
+
+    def test_the_comparison_evidence_travels_with_it(self):
+        _baseline, _current, comparison = self._pair()
+        bundle = self.bundle_for(comparison)
+        kinds = {c["kind"] for c in bundle["comparison"]["changes"]}
+        self.assertIn("row_count_changed", kinds)
+        self.assertEqual(bundle["comparison"]["status"], "evaluated")
+
+    def test_an_unchanged_signal_is_in_the_bundle_but_not_in_the_changes(self):
+        """The reason the file exists: steady signals are context, not changes."""
+        _baseline, _current, comparison = self._pair()
+        bundle = self.bundle_for(comparison)
+
+        changed = {(c["relation"], c["column"], c["signal"])
+                   for c in bundle["comparison"]["changes"]}
+        self.assertNotIn(("orders", "customer_id", "data_type"), changed)
+        self.assertNotIn(("orders", None, "schema_fingerprint"), changed)
+
+        for side in ("baseline_observation", "current_observation"):
+            relation = bundle[side]["relations"][0]
+            self.assertEqual(relation["schema_fingerprint"], "fp-a")
+            self.assertEqual(relation["columns"][0]["data_type"], "BIGINT")
+
+    def test_the_review_and_tenant_identity_travel(self):
+        _baseline, _current, comparison = self._pair()
+        bundle = self.bundle_for(comparison, review_id="rev-99", attempt=7)
+        self.assertEqual(bundle["review_id"], "rev-99")
+        self.assertEqual(bundle["attempt"], 7)
+        self.assertEqual(bundle["organization_id"], ORG)
+        self.assertEqual(bundle["repository_id"], REPO)
+        self.assertEqual(bundle["environment"], ENV)
+
+    def test_a_no_baseline_bundle_carries_the_current_observation_only(self):
+        environment = self.environment()
+        alone = self.submit(observed_at=at(740), environment=environment,
+                            relations=[orders()])
+        comparison = compute_comparison(
+            self.store, organization_id=ORG, repository_id=REPO,
+            environment=environment, current_snapshot=alone)
+        self.assertEqual(comparison["status"], "no_baseline")
+
+        bundle = self.bundle_for(comparison, environment=environment)
+        self.assertIsNone(bundle["baseline_observation"])
+        self.assertEqual(bundle["current_observation"]["snapshot_id"],
+                         alone["snapshot_id"])
+        self.assertEqual(bundle["comparison"]["changes"], [])
+
+    def test_a_partial_bundle_carries_both_observations_and_the_coverage(self):
+        environment = self.environment()
+        payments = dict(orders())
+        payments.update({"relation_name": "payments",
+                         "model_unique_id": "model.jaffle.payments"})
+        self.submit(observed_at=at(750), environment=environment,
+                    relations=[orders()])
+        current = self.submit(observed_at=at(760), environment=environment,
+                              relations=[orders(row_count=900), payments])
+        comparison = compute_comparison(
+            self.store, organization_id=ORG, repository_id=REPO,
+            environment=environment, current_snapshot=current)
+        self.assertEqual(comparison["status"], "partial")
+
+        bundle = self.bundle_for(comparison, environment=environment)
+        self.assertEqual(bundle["comparison"]["status"], "partial")
+        self.assertEqual(bundle["comparison"]["coverage"]["relations_compared"], 1)
+        # Both relations are in the observation even though only one compared.
+        self.assertEqual(len(bundle["current_observation"]["relations"]), 2)
+        self.assertEqual(len(bundle["baseline_observation"]["relations"]), 1)
+
+    # -- disclosure --------------------------------------------------------
+
+    def test_the_allowlist_is_exactly_what_is_emitted(self):
+        _baseline, _current, comparison = self._pair()
+        bundle = self.bundle_for(comparison)
+        self.assertEqual(
+            set(bundle),
+            {"evidence_type", "evidence_version", "review_id", "attempt",
+             "organization_id", "repository_id", "environment", "comparison",
+             "baseline_observation", "current_observation"})
+        observation = bundle["current_observation"]
+        self.assertEqual(set(observation),
+                         {"snapshot_id", "environment", "completeness",
+                          "freshness_state", "observed_at", "collected_at",
+                          "relations"})
+        relation = observation["relations"][0]
+        self.assertEqual(
+            set(relation),
+            {"model_unique_id", "relation_database", "relation_schema",
+             "relation_name", "relation_type", "exists_in_production",
+             "schema_fingerprint", "row_count", "freshness_timestamp",
+             "freshness_lag_seconds", "collection_status", "observed_at",
+             "columns"})
+        self.assertEqual(
+            set(relation["columns"][0]),
+            {"column_name", "exists_in_production", "data_type", "is_nullable",
+             "ordinal_position", "null_count", "null_rate", "duplicate_count",
+             "duplicate_rate", "distinct_count", "cardinality",
+             "collection_status"})
+
+    def test_nothing_forbidden_appears_anywhere_in_the_bundle(self):
+        import json
+
+        _baseline, _current, comparison = self._pair()
+        blob = json.dumps(self.bundle_for(comparison))
+        for forbidden in (
+            # snapshot bookkeeping and integrity hashes
+            "evidence_hash", "idempotency_key", "payload_hash", "provenance",
+            "received_at", "expires_at", "ttl_seconds", "configuration_version",
+            # collector identity
+            "collector_id", "collector_version", "adapter_type",
+            "warehouse.internal",
+            # actual cell values from a customer table
+            "min_value", "max_value",
+            # code and manifest internals
+            "manifest", "compiled_code", "raw_code", "base_manifest_hash",
+            "head_manifest_hash", "base_sha", "head_sha",
+            # credentials, connection strings and paths
+            "password", "secret", "token", "postgresql://", "BEGIN PRIVATE KEY",
+            "/home/", "C:\\\\", "dsn",
+            # positional internals that mean nothing outside one snapshot
+            "relation_index", "column_index",
+        ):
+            self.assertNotIn(forbidden, blob, f"{forbidden} leaked into the bundle")
+
+    def test_no_sql_appears_in_the_bundle(self):
+        import json
+        import re
+
+        _baseline, _current, comparison = self._pair()
+        blob = json.dumps(self.bundle_for(comparison))
+        for pattern in (r"\bselect\b.+\bfrom\b", r"\binsert into\b",
+                        r"\bcreate table\b"):
+            self.assertIsNone(re.search(pattern, blob, re.IGNORECASE))
+
+
+@unittest.skipUnless(DSN, "RELIUM_TEST_POSTGRES_DSN not set")
 class ComparisonPersistenceTests(unittest.TestCase):
     """The four states, and the binding that must not drift."""
 

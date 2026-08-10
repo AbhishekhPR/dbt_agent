@@ -22,6 +22,7 @@
     "review_exceptions": "/api/reviews/{review_id}/exceptions",
     "review_findings": "/api/reviews/{review_id}/findings",
     "review_list": "/api/reviews",
+    "review_metadata_evidence": "/api/reviews/{review_id}/attempts/{attempt}/metadata-evidence.json",
     "review_publications": "/api/reviews/{review_id}/publications",
     "review_rerun": "/api/reviews/{review_id}/rerun",
     "review_snapshots": "/api/reviews/{review_id}/snapshots"
@@ -46,6 +47,7 @@
     "GET /api/reviews",
     "GET /api/reviews/{review_id}",
     "GET /api/reviews/{review_id}/attempts",
+    "GET /api/reviews/{review_id}/attempts/{attempt}/metadata-evidence.json",
     "GET /api/reviews/{review_id}/change-requests",
     "GET /api/reviews/{review_id}/collection-requests",
     "GET /api/reviews/{review_id}/evidence-coverage",
@@ -216,6 +218,11 @@
       "authentication": "service-token",
       "method": "GET",
       "path": "/api/reviews/{review_id}/attempts"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/reviews/{review_id}/attempts/{attempt}/metadata-evidence.json"
     },
     {
       "authentication": "service-token",
