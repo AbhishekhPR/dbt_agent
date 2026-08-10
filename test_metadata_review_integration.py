@@ -31,6 +31,26 @@ BASE_SHA = "1" * 40
 HEAD_SHA = "2" * 40
 OTHER_HEAD_SHA = "3" * 40
 
+# The exact document shape run 31410071252 certified for PR #57, so the
+# preservation tests assert against real persisted evidence rather than an
+# invented one.
+CERTIFIED_SEMANTIC = {
+    "status": "evaluated",
+    "change_count": 1,
+    "models": [{
+        "model_name": "int_customer_orders",
+        "status": "evaluated",
+        "changes": [{
+            "kind": "filter_changed",
+            "scope": "where",
+            "before_sql": None,
+            "after_sql": "NOT status IS NULL /* relium semantic e2e 629de6afc0-main */",
+            "model_name": "int_customer_orders",
+            "model_unique_id": "model.relium_e2e_dbt.int_customer_orders",
+        }],
+    }],
+}
+
 
 class _StubQueue:
     is_running = False
@@ -448,6 +468,146 @@ class MetadataReviewIntegrationTests(unittest.TestCase):
             snapshot = store.latest_accepted_snapshot(self.org, self.repo,
                                                       outcome.review_id)
         self.assertIsNotNone(snapshot)
+
+    # -- semantic evidence survives metadata recomputation ------------------
+    #
+    # A recomputation changes production evidence, not code provenance. A
+    # review is bound to one pull_number/head_sha and attempts carry no SHA of
+    # their own, so attempt 2 describes exactly the code attempt 1 described
+    # and the semantic evidence computed for it is still true. Attempt 2
+    # previously stored NULL, and the dashboard - which correctly reads only
+    # the current attempt - therefore told the customer that semantic
+    # differences "were not persisted" while the product held them.
+
+    def _begin_with_semantic(self, evidence, *, pull_number=41,
+                             head_sha=None):
+        from agent.metadata_evidence.review_lifecycle import begin_review
+
+        with self.pool.acquire() as store:
+            return begin_review(
+                store, organization_id=self.org, repository_id=self.repo,
+                environment=self.env, pull_number=pull_number,
+                base_sha=BASE_SHA, head_sha=head_sha or HEAD_SHA,
+                base_manifest=self.base_manifest, head_manifest=self.head_manifest,
+                changed_models=["fct_orders"], enforcement_mode="enforce",
+                delivery_id=f"delivery-{uuid.uuid4().hex[:8]}",
+                semantic_evidence=evidence)
+
+    def _attempts_by_number(self, review_id):
+        with self.pool.acquire() as store:
+            return {a["attempt"]: a
+                    for a in store.review_attempts(self.org, self.repo, review_id)}
+
+    def test_semantic_evidence_is_preserved_onto_the_recomputed_attempt(self):
+        outcome = self._begin_with_semantic(CERTIFIED_SEMANTIC)
+        self._submit(outcome)
+        self._run_worker(outcome.review_id)
+
+        attempts = self._attempts_by_number(outcome.review_id)
+        self.assertEqual(sorted(attempts), [1, 2])
+        self.assertEqual(attempts[2]["semantic_evidence"],
+                         attempts[1]["semantic_evidence"])
+        self.assertEqual(attempts[2]["semantic_evidence"], CERTIFIED_SEMANTIC)
+
+    def test_recomputed_attempt_carries_comparison_and_decision_too(self):
+        """Preserving semantics must not displace the new metadata evidence."""
+        outcome = self._begin_with_semantic(CERTIFIED_SEMANTIC, pull_number=42)
+        self._submit(outcome)
+        self._run_worker(outcome.review_id)
+
+        second = self._attempts_by_number(outcome.review_id)[2]
+        self.assertIsNotNone(second["semantic_evidence"])
+        self.assertIsNotNone(second["metadata_comparison"])
+        self.assertIsNotNone(second["decision"])
+        self.assertEqual(second["trigger"], "metadata_snapshot")
+        self.assertIsNotNone(second["snapshot_id"])
+
+    def test_semantic_evidence_is_never_taken_from_another_review(self):
+        """The carry-forward is scoped to one review, not to 'the latest'."""
+        donor = self._begin_with_semantic(CERTIFIED_SEMANTIC, pull_number=43)
+        self._submit(donor)
+        self._run_worker(donor.review_id)
+
+        # A different review, on a different head, that compared nothing.
+        bare = self._begin(pull_number=44, head_sha=OTHER_HEAD_SHA)
+        self._submit(bare)
+        self._run_worker(bare.review_id)
+
+        self.assertIsNotNone(
+            self._attempts_by_number(donor.review_id)[2]["semantic_evidence"])
+        self.assertIsNone(
+            self._attempts_by_number(bare.review_id)[2]["semantic_evidence"],
+            "evidence leaked across review ids")
+
+    def test_absent_semantic_evidence_stays_absent(self):
+        """NULL means no comparison ran. It must not become 'found nothing'."""
+        outcome = self._begin(pull_number=45)
+        self._submit(outcome)
+        self._run_worker(outcome.review_id)
+
+        attempts = self._attempts_by_number(outcome.review_id)
+        self.assertIsNone(attempts[1]["semantic_evidence"])
+        self.assertIsNone(attempts[2]["semantic_evidence"])
+
+    def test_repeated_recomputation_does_not_diverge(self):
+        outcome = self._begin_with_semantic(CERTIFIED_SEMANTIC, pull_number=46)
+        self._submit(outcome)
+        self._run_worker(outcome.review_id)
+        first = self._attempts_by_number(outcome.review_id)[2]["semantic_evidence"]
+
+        from agent.metadata_evidence.recompute import recompute_review
+
+        with self.pool.acquire() as store:
+            repeat = recompute_review(
+                store, organization_id=self.org, repository_id=self.repo,
+                environment=self.env, review_id=outcome.review_id)
+        self.assertEqual(repeat["status"], "already_recomputed")
+
+        attempts = self._attempts_by_number(outcome.review_id)
+        self.assertEqual(sorted(attempts), [1, 2])
+        self.assertEqual(attempts[2]["semantic_evidence"], first)
+
+    def test_api_current_attempt_projection_exposes_the_evidence(self):
+        outcome = self._begin_with_semantic(CERTIFIED_SEMANTIC, pull_number=47)
+        self._submit(outcome)
+        self._run_worker(outcome.review_id)
+
+        body = self._get(f"/api/reviews/{outcome.review_id}/attempts").json()
+        current = body["current_attempt"]
+        self.assertEqual(current, 2)
+        projected = next(a for a in body["attempts"] if a["attempt"] == current)
+        evidence = projected["semantic_evidence"]
+        self.assertIsNotNone(evidence, "current attempt projects no semantics")
+        self.assertEqual(evidence["status"], "evaluated")
+        self.assertEqual([c["kind"] for c in evidence["changes"]],
+                         ["filter_changed"])
+
+    def test_the_certified_phase_b_scenario(self):
+        """attempt 1 filter_changed -> recompute -> attempt 2 WARN, same evidence."""
+        outcome = self._begin_with_semantic(CERTIFIED_SEMANTIC, pull_number=48)
+        self.assertIsNone(outcome.decision)
+        self._submit(outcome, columns=[
+            {"column_name": "order_id", "data_type": "bigint", "null_rate": 0.0},
+            {"column_name": "discount_amount", "data_type": "numeric",
+             "null_rate": 0.82}])
+        _, result = self._run_worker(outcome.review_id)
+
+        self.assertEqual(result["decision"], "WARN")
+        self.assertIn("column.high_null_rate",
+                      {f["code"] for f in result["findings"]})
+
+        second = self._attempts_by_number(outcome.review_id)[2]
+        self.assertEqual(second["decision"], "WARN")
+        change = second["semantic_evidence"]["models"][0]["changes"][0]
+        self.assertEqual(change["kind"], "filter_changed")
+        self.assertEqual(change["model_unique_id"],
+                         "model.relium_e2e_dbt.int_customer_orders")
+        self.assertEqual(change["scope"], "where")
+
+        with self.pool.acquire() as store:
+            review = store.get_review(self.org, self.repo, outcome.review_id)
+        self.assertEqual(review["lifecycle_state"], "DECISION_READY")
+        self.assertEqual(review["health"], 100)
 
     # -- 22..27 metadata changes the decision ------------------------------
 

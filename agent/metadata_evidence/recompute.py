@@ -77,7 +77,28 @@ def recompute_review(store, *, organization_id, repository_id, environment,
 
     # The recomputed attempt is the next one, so the waiting attempt stays in
     # history exactly as it was published.
-    next_attempt = max([a["attempt"] for a in attempts] or [attempt]) + 1
+    previous = max(attempts, key=lambda a: a["attempt"]) if attempts else None
+    next_attempt = (previous["attempt"] if previous else attempt) + 1
+
+    # SQL semantic evidence describes the review's CODE state, and a
+    # recomputation changes production evidence rather than code provenance.
+    # Under the current model a review is bound to one pull_number/head_sha
+    # (uq_reviews_pr_head) and attempts carry no SHA of their own, so every
+    # attempt of this review describes the same base/head pair and the
+    # evidence computed for it stays true here.
+    #
+    # It is carried from THIS review's previous attempt only - never selected
+    # globally, never taken from another review - and never recomputed, since
+    # the durable document already exists. A previous attempt that compared
+    # nothing carries NULL forward, because "no comparison ran" must not
+    # become "a comparison found no changes". Copying rather than referencing
+    # keeps the new attempt self-contained, which is what lets the dashboard
+    # keep reading exactly one attempt.
+    #
+    # This is safe only while attempts cannot describe different head SHAs. If
+    # the schema ever admits that, this must become a provenance check rather
+    # than an unconditional carry-forward.
+    semantic_evidence = previous.get("semantic_evidence") if previous else None
 
     # Computed exactly once, here, where the current snapshot is already known
     # to be durably stored and accepted - and then written down. The read path
@@ -103,6 +124,7 @@ def recompute_review(store, *, organization_id, repository_id, environment,
         policy_version=decision.policy_version, policy_hash=decision.policy_hash,
         payload={"findings": [f.as_dict() for f in decision.findings],
                  "snapshot_id": snapshot["snapshot_id"]},
+        semantic_evidence=semantic_evidence,
         metadata_comparison=metadata_comparison,
     )
     store.record_evidence_states(organization_id, repository_id, review_id,

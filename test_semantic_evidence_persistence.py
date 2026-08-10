@@ -4,9 +4,14 @@ Requires RELIUM_TEST_POSTGRES_DSN; skipped without it, like the other
 PostgreSQL suites.
 
 The rule these enforce is the one the dashboard already applies to findings
-and coverage: evidence belongs to an exact attempt. Showing attempt 1's
-comparison next to attempt 2's decision would describe a different head SHA
-than the one under review.
+and coverage: evidence belongs to an exact attempt, and each attempt is
+self-contained. The store never copies evidence between attempts on its own -
+a caller that records an attempt without semantic evidence gets NULL.
+
+Carrying evidence FORWARD is a decision the recompute path makes explicitly,
+because a metadata recomputation describes the same base/head pair (a review
+is bound to one pull_number/head_sha and attempts carry no SHA of their own).
+That carry-forward is covered in test_metadata_review_integration.py.
 """
 from __future__ import annotations
 
@@ -155,7 +160,13 @@ class SemanticEvidencePersistenceTests(unittest.TestCase):
 
     # -- attempt binding ---------------------------------------------------
 
-    def test_evidence_does_not_leak_from_attempt_one_into_attempt_two(self):
+    def test_the_store_never_copies_evidence_between_attempts_by_itself(self):
+        """Carry-forward is the caller's explicit decision, not the store's.
+
+        The recompute path does pass the previous attempt's evidence forward;
+        this asserts the layer beneath it stays dumb, so an attempt recorded
+        without evidence is NULL rather than silently inheriting.
+        """
         pull = next(self._pull)
         _incident, outcome = self._begin(REFUND_BASE, REFUND_HEAD, pull_number=pull)
         first = self._stored(outcome.review_id, outcome.attempt)
@@ -167,7 +178,7 @@ class SemanticEvidencePersistenceTests(unittest.TestCase):
             evidence_coverage="COMPLETE", health=100, attempt=outcome.attempt + 1,
             trigger="metadata_snapshot", payload={"findings": []})
         second = self._stored(outcome.review_id, outcome.attempt + 1)
-        self.assertIsNone(second, "attempt 1 evidence surfaced on attempt 2")
+        self.assertIsNone(second, "the store copied evidence on its own")
         self.assertIsNotNone(self._stored(outcome.review_id, outcome.attempt))
 
     def test_provenance_comes_from_the_review_not_the_evidence(self):
