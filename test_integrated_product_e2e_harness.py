@@ -252,6 +252,71 @@ class SemanticTests(DriverTestCase):
         self.assertEqual(self.d.REQUIRED_SEMANTIC_CHANGE["scope"], "where")
 
 
+# ------------------------------- semantic evidence across recomputation
+
+class SemanticPreservationTests(DriverTestCase):
+    """The regression this remote run exists to confirm.
+
+    A metadata recomputation must carry the review's code evidence onto the
+    attempt it creates, because the dashboard renders exactly one attempt.
+    """
+
+    def _pair(self, *, final_semantic="same", final_attempt=2,
+              comparison_doc="default"):
+        waiting = attempt(number=1, semantic=semantic_evidence())
+        semantic = (waiting["semantic_evidence"] if final_semantic == "same"
+                    else final_semantic)
+        doc = comparison() if comparison_doc == "default" else comparison_doc
+        final = attempt(number=final_attempt, semantic=semantic,
+                        decision="WARN", findings=[NULL_RATE_FINDING],
+                        comparison_doc=doc)
+        return waiting, final
+
+    def test_preserved_evidence_and_new_comparison_coexist(self):
+        waiting, final = self._pair()
+        proof = self.d.assert_semantic_preserved(waiting, final)
+        self.assertEqual(proof["waiting_attempt"], 1)
+        self.assertEqual(proof["final_attempt"], 2)
+        self.assertTrue(proof["semantic_evidence_present_on_final"])
+        self.assertTrue(proof["identical_to_waiting_attempt"])
+        self.assertTrue(proof["required_change_present_on_final"])
+        self.assertTrue(proof["metadata_comparison_present_on_final"])
+        self.assertEqual(proof["change_kinds"], ["filter_changed"])
+        self.assertEqual(proof["models"], ["int_customer_orders"])
+        # The same final attempt still carries the decision and the finding.
+        self.assertEqual(final["decision"], "WARN")
+        self.assertEqual(final["health"], 100)
+        self.assertIn("column.high_null_rate",
+                      {f["code"] for f in final["payload"]["findings"]})
+
+    def test_a_final_attempt_with_null_semantic_evidence_fails(self):
+        """The exact defect: attempt 2 stored SQL NULL. Must fail the run."""
+        waiting, final = self._pair(final_semantic=None)
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_semantic_preserved(waiting, final)
+        self.assertIn("NO semantic evidence", str(caught.exception))
+
+    def test_altered_evidence_fails_rather_than_being_accepted(self):
+        waiting, final = self._pair(
+            final_semantic=semantic_evidence(kind="grouping_changed"))
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_semantic_preserved(waiting, final)
+        self.assertIn("changed across recomputation", str(caught.exception))
+
+    def test_an_attempt_that_never_advanced_fails(self):
+        waiting, final = self._pair(final_attempt=1)
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_semantic_preserved(waiting, final)
+        self.assertIn("did not advance", str(caught.exception))
+
+    def test_preserved_evidence_without_a_comparison_fails(self):
+        """Preservation must not come at the cost of the metadata evidence."""
+        waiting, final = self._pair(comparison_doc=None)
+        with self.assertRaises(StageFailure) as caught:
+            self.d.assert_semantic_preserved(waiting, final)
+        self.assertIn("no metadata comparison", str(caught.exception))
+
+
 # -------------------------------------------------------- blast radius
 
 class BlastRadiusTests(DriverTestCase):

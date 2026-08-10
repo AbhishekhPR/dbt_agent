@@ -577,6 +577,61 @@ def assert_semantic(row: dict) -> dict:
             "required_change_present": True}
 
 
+def assert_semantic_preserved(waiting: dict, final: dict) -> dict:
+    """The same code evidence must survive onto the metadata-decided attempt.
+
+    The dashboard renders exactly one attempt - the review's current one - so
+    evidence that exists only on the waiting attempt is evidence the customer
+    is told does not exist. That is precisely the defect this run confirms
+    fixed: `recompute_review` created the final attempt without carrying the
+    semantic evidence forward, and the review page then stated that semantic
+    differences "were not persisted" for a review that had them.
+
+    Equality is asserted against the WAITING attempt captured earlier in this
+    same run, not against a literal pinned here, so this proves preservation
+    rather than re-proving the fixture. No older attempt is consulted as a
+    fallback, and nothing is recomputed: if the final attempt is empty the run
+    fails instead of reaching backwards to make the report look complete.
+    """
+    waiting_attempt = int(waiting.get("attempt"))
+    final_attempt = int(final.get("attempt"))
+    if final_attempt <= waiting_attempt:
+        raise StageFailure(
+            f"final attempt {final_attempt} did not advance past the waiting "
+            f"attempt {waiting_attempt}; no recomputation happened")
+
+    evidence = final.get("semantic_evidence")
+    if evidence is None:
+        raise StageFailure(
+            f"attempt {final_attempt} carries NO semantic evidence while "
+            f"attempt {waiting_attempt} does: the recomputation dropped the "
+            f"review's code evidence")
+
+    if evidence != waiting.get("semantic_evidence"):
+        raise StageFailure(
+            "semantic evidence changed across recomputation; it must be "
+            "carried forward unchanged, never recomputed")
+
+    # The required change must still be readable ON the final attempt, by the
+    # same assertion used before metadata arrived.
+    preserved = assert_semantic(final)
+
+    if not isinstance(final.get("metadata_comparison"), dict):
+        raise StageFailure(
+            f"attempt {final_attempt} carries semantic evidence but no "
+            f"metadata comparison; the two must coexist on one attempt")
+
+    return {"waiting_attempt": waiting_attempt,
+            "final_attempt": final_attempt,
+            "semantic_evidence_present_on_final": True,
+            "identical_to_waiting_attempt": True,
+            "required_change": dict(REQUIRED_SEMANTIC_CHANGE),
+            "required_change_present_on_final": True,
+            "metadata_comparison_present_on_final": True,
+            "change_kinds": preserved["change_kinds"],
+            "models": preserved["models"]}
+
+
 def assert_blast_radius(plan: dict, expectation: dict) -> dict:
     """Exactly the direct consumers; no transitive or exposure expansion."""
     persisted = sorted(plan.get("downstream_models") or [])
@@ -1223,11 +1278,18 @@ def main() -> int:
     summary["comparison_not_a_policy_input"] = (
         assert_comparison_is_not_a_policy_input())
 
+    # The decisive confirmation: the same code evidence, the new production
+    # evidence and the decision must all sit on ONE final attempt.
+    summary["semantic_preserved"] = assert_semantic_preserved(
+        waiting_row, final_row)
+
     # The comparison must still name A and B on the attempt that decided.
-    if isinstance(final_row.get("metadata_comparison"), dict):
-        summary["final_attempt_comparison"] = assert_comparison(
-            final_row["metadata_comparison"], observation_a["snapshot_id"],
-            observation_b["snapshot_id"])
+    # Required, not conditional: `assert_semantic_preserved` has already
+    # established the comparison is present, so an absent one here is a
+    # failure rather than a section to skip.
+    summary["final_attempt_comparison"] = assert_comparison(
+        final_row["metadata_comparison"], observation_a["snapshot_id"],
+        observation_b["snapshot_id"])
 
     # --- publication ------------------------------------------------------
     summary["publication"] = _verify_publication(
