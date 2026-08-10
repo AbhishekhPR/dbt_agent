@@ -19,7 +19,11 @@ on:
         required: true
         default: "governance"
         type: choice
-        options: [governance, blast-radius, semantic-diff, integrated-product, recover-webhook, cleanup-fixtures]
+        options: [governance, blast-radius, semantic-diff, integrated-product, certify-phase-a, recover-webhook, cleanup-fixtures]
+      source_run_id:
+        description: "certify-phase-a only: the completed integrated-product run to certify"
+        required: false
+        default: "31406121190"
       enforcement_mode:
         description: "Policy mode for the fixture review"
         required: true
@@ -741,6 +745,154 @@ jobs:
             ${{ env.EVIDENCE_DIR }}/*.log
             ${{ env.EVIDENCE_DIR }}/*.sql
             ${{ env.EVIDENCE_DIR }}/*.sha256.txt
+          if-no-files-found: error
+
+  # Read-only certification of an already-completed integrated-product run.
+  #
+  # It creates nothing: no fixture pull request, no webhook change, no snapshot
+  # ingest, no recomputation. It restores THAT run's database dump locally,
+  # reads the persisted result, verifies the exact publication ids it recorded,
+  # and emits the Phase B summary the failed run never got to write.
+  #
+  # `actions: read` is the one added permission, and it is what lets this job
+  # download the source run's artifact. No write scope is requested.
+  certify-phase-a:
+    if: inputs.operation == 'certify-phase-a'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: bootstrap_only_not_used_by_the_app
+          POSTGRES_DB: postgres
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      RELIUM_E2E_REPOSITORY: AbhishekhPR/relium-e2e-dbt
+      RELIUM_E2E_APP_SLUG: relium-e2e
+      EVIDENCE_DIR: ${{ github.workspace }}/phase-b-evidence
+      SOURCE_DIR: ${{ github.workspace }}/source-artifact
+      RELIUM_SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install the application
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip check
+
+      - name: Install PostgreSQL 18 client tools
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-18
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+
+      # The dump is restored as a least-privileged role, exactly as the
+      # application runs. Nothing here touches the product's own database.
+      - name: Provision the least-privileged restore role
+        env:
+          PGPASSWORD: bootstrap_only_not_used_by_the_app
+        run: |
+          APP_PW="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 32)"
+          psql -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 -q <<SQL
+          CREATE ROLE relium_app LOGIN PASSWORD '${APP_PW}'
+            NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+            CONNECTION LIMIT 20;
+          CREATE DATABASE relium_restored OWNER relium_app;
+          SQL
+          psql -h 127.0.0.1 -U postgres -d relium_restored -v ON_ERROR_STOP=1 -q <<SQL
+          ALTER SCHEMA public OWNER TO relium_app;
+          SQL
+          echo "::add-mask::${APP_PW}"
+          echo "RELIUM_RESTORED_DSN=postgresql://relium_app:${APP_PW}@127.0.0.1:5432/relium_restored" >> "$GITHUB_ENV"
+
+      - name: Download the source integrated-product artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: integrated-product-phase-a
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ env.SOURCE_DIR }}
+
+      - name: Restore the exact database from that run
+        run: |
+          test -s "$SOURCE_DIR/integrated-product-review-state.sql"
+          psql "$RELIUM_RESTORED_DSN" -v ON_ERROR_STOP=1 -q \
+            -f "$SOURCE_DIR/integrated-product-review-state.sql"
+          psql "$RELIUM_RESTORED_DSN" -tAc \
+            "SELECT count(*) || ' reviews restored' FROM reviews"
+
+      - name: Write the dedicated E2E App private key outside the workspace
+        env:
+          RELIUM_GITHUB_PRIVATE_KEY: ${{ secrets.RELIUM_E2E_PRIVATE_KEY }}
+        run: |
+          install -m 700 -d "$RUNNER_TEMP/relium-secrets"
+          printf '%s' "$RELIUM_GITHUB_PRIVATE_KEY" > "$RUNNER_TEMP/relium-secrets/app.pem"
+          chmod 600 "$RUNNER_TEMP/relium-secrets/app.pem"
+          test -s "$RUNNER_TEMP/relium-secrets/app.pem" || exit 1
+          echo "RELIUM_GITHUB_PRIVATE_KEY_PATH=$RUNNER_TEMP/relium-secrets/app.pem" >> "$GITHUB_ENV"
+
+      - name: Prove the certifier before it reads anything
+        run: |
+          python -m unittest test_certify_phase_a -v
+
+      # RELIUM_E2E_FIXTURE_TOKEN is deliberately NOT provided to this step.
+      # Publication surfaces are read with an App installation token, and the
+      # fixture token carries no `checks: read` in any case.
+      - name: Certify Phase A and emit the Phase B summary
+        env:
+          RELIUM_GITHUB_APP_ID: ${{ secrets.RELIUM_E2E_APP_ID }}
+          RELIUM_E2E_INSTALLATION_ID: ${{ secrets.RELIUM_E2E_INSTALLATION_ID }}
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          python scripts/e2e/certify_phase_a.py "$EVIDENCE_DIR" "$SOURCE_DIR"
+
+      - name: Remove the key material and stop PostgreSQL
+        if: always()
+        run: |
+          shred -u "$RUNNER_TEMP/relium-secrets/app.pem" 2>/dev/null || \
+            rm -f "$RUNNER_TEMP/relium-secrets/app.pem"
+          rm -rf "$RUNNER_TEMP/relium-secrets"
+          test ! -e "$RUNNER_TEMP/relium-secrets/app.pem"
+          mapfile -t IDS < <(docker ps --filter ancestor=postgres:18 --format '{{.ID}}')
+          for id in "${IDS[@]}"; do docker stop "$id" || true; done
+          if ss -ltn | grep -qE ':5432'; then echo "POSTGRES LISTENER STILL UP"; exit 1; fi
+
+      - name: Scan the Phase B evidence for secrets
+        id: phase_b_secret_scan
+        if: always()
+        run: |
+          python scripts/live_e2e/secret_scan.py "$EVIDENCE_DIR" || {
+            echo "SECRET SCAN FAILED - refusing to upload evidence"; exit 1; }
+
+      - name: Upload the Phase B input artifact
+        if: always() && steps.phase_b_secret_scan.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: integrated-product-phase-b-input
+          path: |
+            ${{ env.EVIDENCE_DIR }}/*.json
+            ${{ env.EVIDENCE_DIR }}/*.sql
+            ${{ env.EVIDENCE_DIR }}/*.txt
           if-no-files-found: error
 
   webhook-recovery:

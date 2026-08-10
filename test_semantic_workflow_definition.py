@@ -23,7 +23,8 @@ WORKFLOW = Path(__file__).resolve().parent / ".github" / "workflows" / "governan
 #: here: the gating test reads this list, so an unregistered job would be
 #: reported as ungated rather than silently accepted.
 OPERATIONS = ("governance", "blast-radius", "semantic-diff",
-              "integrated-product", "recover-webhook", "cleanup-fixtures")
+              "integrated-product", "certify-phase-a", "recover-webhook",
+              "cleanup-fixtures")
 
 
 def load() -> dict:
