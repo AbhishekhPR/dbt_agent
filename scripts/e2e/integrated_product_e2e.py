@@ -324,6 +324,38 @@ def _listener_up(port: int) -> bool:
         return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
+def register_process(label, proc, marker=None):
+    """Record a child so cleanup stops it.
+
+    `live_flow.start_api` appends to `state["procs"]` itself; `start_tunnel`
+    does NOT - it stores `{"proc": ..., "url": ...}` under `state["tunnel"]`
+    and reports the process only through this callback. Run 31392463042 tried
+    to stop the tunnel by calling `.poll()` on that dict, which is not a
+    process, so cleanup raised inside atexit. Registering it here puts the
+    tunnel through the same SIGTERM/grace/SIGKILL/reap path as everything else.
+    """
+    state["procs"].append((label, proc))
+    return {"label": label, "pid": getattr(proc, "pid", None), "marker": marker}
+
+
+def tunnel_url(state_mapping):
+    """The public URL `start_tunnel` recorded, as a string.
+
+    `start_tunnel` RETURNS a proof mapping and PUBLISHES the URL into
+    `state["tunnel"]["url"]`. Run 31392463042 passed the returned mapping
+    straight into `point_webhook`, which does `tunnel_url.rstrip("/")` - a
+    dict has no `rstrip`, so the run died before the webhook was ever
+    repointed.
+    """
+    tunnel = state_mapping.get("tunnel")
+    if not isinstance(tunnel, dict):
+        raise StageFailure("no tunnel was started")
+    url = tunnel.get("url")
+    if not isinstance(url, str) or not url.startswith("https://"):
+        raise StageFailure(f"tunnel URL is {url!r}, not a public https URL")
+    return url
+
+
 def _stop_processes(result: dict) -> bool:
     """SIGTERM, grace, SIGKILL, then reap. A zombie is not a live process."""
     import time
@@ -352,16 +384,6 @@ def _stop_processes(result: dict) -> bool:
             ok = False
             result.setdefault("failures", []).append(f"{label} did not exit")
         stopped.append({"label": label, "returncode": proc.returncode})
-    tunnel = state.get("tunnel")
-    if tunnel is not None and tunnel.poll() is None:
-        try:
-            tunnel.terminate()
-            tunnel.wait(timeout=5)
-        except Exception:                 # noqa: BLE001
-            try:
-                tunnel.kill()
-            except OSError:
-                pass
     result["processes_stopped"] = stopped
     return ok
 
@@ -978,9 +1000,11 @@ def main() -> int:
 
     # --- webhook: preserve BEFORE the tunnel can repoint it ---------------
     summary["webhook_preserved"] = preserve_webhook()
-    tunnel_url = lf.start_tunnel(state, EV / "tunnel.log")
-    summary["webhook_pointed"] = lf.point_webhook(state, GH, APP_JWT, tunnel_url)
-    summary["webhook_verified"] = lf.verify_webhook(GH, APP_JWT, tunnel_url)
+    summary["tunnel"] = lf.start_tunnel(state, EV / "tunnel.log",
+                                        on_start=register_process)
+    public_url = tunnel_url(state)
+    summary["webhook_pointed"] = lf.point_webhook(state, GH, APP_JWT, public_url)
+    summary["webhook_verified"] = lf.verify_webhook(GH, APP_JWT, public_url)
 
     main_sha, main_files = _fixture_main()
     summary["fixture_commit"] = main_sha

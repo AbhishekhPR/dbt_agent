@@ -726,6 +726,98 @@ class CleanupTests(DriverTestCase):
                                  ["e2e/after-" + stage])
 
 
+class TunnelWiringTests(DriverTestCase):
+    """REGRESSION for run 31392463042.
+
+    The 69 tests before this one exercised every assertion and never the
+    wiring, so two contract mistakes reached a live run: `start_tunnel`
+    RETURNS a proof mapping and PUBLISHES the URL into
+    `state["tunnel"]["url"]`, and `state["tunnel"]` is a mapping rather than a
+    process. The fake below behaves exactly as live_flow does, so a driver that
+    misreads either contract fails here instead of on a runner.
+    """
+
+    def faithful_start_tunnel(self, state, log_path, on_start=None):
+        """Byte-for-byte the shape live_flow.start_tunnel leaves behind."""
+        proc = FakeProc(alive=True)
+        state["tunnel"] = {"proc": proc, "url": None}
+        if on_start is not None:
+            on_start("tunnel", proc, "cloudflared")
+        state["tunnel"]["url"] = "https://fake-tunnel.trycloudflare.com"
+        return {"pid": 4242, "url_host": "fake-tunnel.trycloudflare.com",
+                "scheme": "https", "edge_reachable_from_public_internet": True,
+                "verified_before_webhook_repoint": True}
+
+    def test_the_tunnel_url_is_a_string_not_the_proof_mapping(self):
+        proof = self.faithful_start_tunnel(self.d.state, "ignored",
+                                           on_start=self.d.register_process)
+        url = self.d.tunnel_url(self.d.state)
+        self.assertIsInstance(url, str)
+        self.assertTrue(url.startswith("https://"))
+        # The returned proof is NOT the URL; passing it on is what broke.
+        self.assertIsInstance(proof, dict)
+        self.assertNotEqual(proof, url)
+
+    def test_point_webhook_receives_something_it_can_rstrip(self):
+        self.faithful_start_tunnel(self.d.state, "ignored",
+                                   on_start=self.d.register_process)
+        url = self.d.tunnel_url(self.d.state)
+        # The exact operation live_flow.point_webhook performs.
+        self.assertEqual(url.rstrip("/") + "/github/webhook",
+                         "https://fake-tunnel.trycloudflare.com/github/webhook")
+
+    def test_a_tunnel_without_a_url_fails_loudly(self):
+        self.d.state["tunnel"] = {"proc": FakeProc(), "url": None}
+        with self.assertRaises(StageFailure):
+            self.d.tunnel_url(self.d.state)
+
+    def test_no_tunnel_at_all_fails_loudly(self):
+        self.d.state["tunnel"] = None
+        with self.assertRaises(StageFailure):
+            self.d.tunnel_url(self.d.state)
+
+    def test_the_tunnel_process_is_registered_for_cleanup(self):
+        self.d.state["procs"] = []
+        self.faithful_start_tunnel(self.d.state, "ignored",
+                                   on_start=self.d.register_process)
+        labels = [label for label, _ in self.d.state["procs"]]
+        self.assertIn("tunnel", labels)
+
+    def test_cleanup_stops_the_tunnel_without_touching_the_mapping(self):
+        """The old code called .poll() on state['tunnel'], a dict."""
+        record = self.d._initial_recovery()
+        record["webhook_preserved"] = True
+        record["original_webhook"] = {"url": "https://o.example/h",
+                                      "content_type": "json", "insecure_ssl": "0"}
+        self.d._write_recovery(record)
+        self.d.GH = lambda m, p, t, b=None, bearer=True: (
+            (200, {"url": "https://o.example/h", "content_type": "json",
+                   "insecure_ssl": "0"}) if p == "/app/hook/config" else (200, {}))
+        self.d.APP_JWT = lambda: "jwt"
+        self.d.state["procs"] = []
+        self.faithful_start_tunnel(self.d.state, "ignored",
+                                   on_start=self.d.register_process)
+        tunnel_proc = self.d.state["tunnel"]["proc"]
+
+        result = self.d.cleanup("test")
+
+        self.assertTrue(tunnel_proc.terminated)
+        self.assertTrue(result["passed"], result.get("failures"))
+        self.assertIn("tunnel", [p["label"] for p in result["processes_stopped"]])
+
+    def test_the_driver_never_polls_the_tunnel_mapping(self):
+        source = (REPO_ROOT / "scripts" / "e2e"
+                  / "integrated_product_e2e.py").read_text(encoding="utf-8")
+        self.assertNotIn("tunnel.poll()", source)
+        self.assertNotIn('state["tunnel"].poll', source)
+
+    def test_the_driver_reads_the_url_from_state(self):
+        source = (REPO_ROOT / "scripts" / "e2e"
+                  / "integrated_product_e2e.py").read_text(encoding="utf-8")
+        self.assertIn("public_url = tunnel_url(state)", source)
+        self.assertIn("lf.point_webhook(state, GH, APP_JWT, public_url)", source)
+
+
 class EvidenceOrderingTests(DriverTestCase):
     def test_the_summary_is_not_written_before_assertions_pass(self):
         """A failed run must not leave an artifact that looks like a pass."""
