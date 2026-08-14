@@ -203,11 +203,42 @@ class LifecycleWorker:
         Includes tenants whose only rows are CLAIMED with an expired lease: a
         crashed worker leaves those behind, and if they did not appear here the
         lease would never be recovered because recovery runs inside the claim.
+
+        Collection-request expiry is lifecycle work too. It has no outbox row,
+        so expired actionable requests and already-expired refreshes awaiting
+        reconciliation are selected explicitly.
         """
         rows = store.connection.execute(
-            "SELECT DISTINCT organization_id, repository_id, environment FROM outbox_events "
-            "WHERE (state='PENDING' AND next_attempt_at <= now()) "
-            "   OR (state='CLAIMED' AND lease_expires_at < now())"
+            "SELECT organization_id, repository_id, environment FROM ("
+            "  SELECT organization_id, repository_id, environment FROM outbox_events "
+            "  WHERE (state='PENDING' AND next_attempt_at <= now()) "
+            "     OR (state='CLAIMED' AND lease_expires_at < now()) "
+            "  UNION "
+            "  SELECT organization_id, repository_id, environment "
+            "  FROM collection_requests "
+            "  WHERE state IN ('PENDING','ACKNOWLEDGED') AND expires_at <= now() "
+            "  UNION "
+            "  SELECT r.organization_id, r.repository_id, r.environment "
+            "  FROM reviews r "
+            "  JOIN LATERAL ("
+            "    SELECT cr.state FROM collection_requests cr "
+            "    WHERE cr.organization_id=r.organization_id "
+            "      AND cr.repository_id=r.repository_id "
+            "      AND cr.review_id=r.review_id "
+            "    ORDER BY cr.created_at DESC, cr.request_id DESC LIMIT 1"
+            "  ) latest ON TRUE "
+            "  WHERE r.lifecycle_state='METADATA_REQUESTED' "
+            "    AND r.decision IS NOT NULL "
+            "    AND latest.state IN ('EXPIRED','FAILED') "
+            "    AND NOT EXISTS ("
+            "      SELECT 1 FROM collection_requests active "
+            "      WHERE active.organization_id=r.organization_id "
+            "        AND active.repository_id=r.repository_id "
+            "        AND active.review_id=r.review_id "
+            "        AND active.state IN ('PENDING','ACKNOWLEDGED') "
+            "        AND active.expires_at > now()"
+            "    )"
+            ") lifecycle_work"
         ).fetchall()
         return [(r["organization_id"], r["repository_id"], r["environment"]) for r in rows]
 
@@ -215,6 +246,8 @@ class LifecycleWorker:
         """Claim and process at most one job per eligible tenant. Returns the count."""
         processed = 0
         for organization_id, repository_id, environment in self._tenants(store):
+            store.reconcile_terminal_collection_requests(
+                organization_id, repository_id, environment=environment)
             event = store.claim_outbox(organization_id, repository_id, environment, self.identity)
             if event is None:
                 continue

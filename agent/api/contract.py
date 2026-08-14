@@ -67,6 +67,9 @@ MANDATORY_ROUTES = {
     # list carries the comparison, this carries the full bounded observations
     # behind it.
     ("GET", "/api/reviews/{review_id}/attempts/{attempt}/metadata-evidence.json"),
+    # The human-readable counterpart: the canonical impact report for ONE
+    # attempt, as Markdown. Same evidence, different artifact.
+    ("GET", "/api/reviews/{review_id}/attempts/{attempt}/impact-report.md"),
     ("GET", "/api/reviews/{review_id}/collection-requests"),
     ("GET", "/api/reviews/{review_id}/snapshots"),
     ("GET", "/api/reviews/{review_id}/publications"),

@@ -27,6 +27,10 @@ from agent.metadata_evidence.evidence_export import (
     build_evidence_bundle,
     evidence_filename,
 )
+from agent.metadata_evidence.impact_report import (
+    impact_report_filename,
+    render_review_impact_report,
+)
 from agent.api.service import (
     ConflictError,
     LifecycleService,
@@ -417,10 +421,19 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
                 result = await run_in_threadpool(work)
                 if download:
                     status, payload, filename = result
+                    # A str payload is already the artifact and is written
+                    # verbatim: re-encoding Markdown as JSON would change the
+                    # bytes the caller asked for. Anything else is a JSON
+                    # bundle, exactly as before.
+                    if isinstance(payload, str):
+                        body_text, media_type = payload, "text/markdown"
+                    else:
+                        body_text = json.dumps(payload, indent=2, sort_keys=True)
+                        media_type = "application/json"
                     return Response(
-                        json.dumps(payload, indent=2, sort_keys=True),
+                        body_text,
                         status_code=status,
-                        media_type="application/json",
+                        media_type=media_type,
                         headers={
                             "X-Request-Id": request_id,
                             "Content-Disposition":
@@ -1037,6 +1050,79 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
         )
         return 200, bundle, evidence_filename(review_id, attempt)
 
+    def review_impact_report(request, body, scope, service):
+        """The canonical per-review impact report, as Markdown.
+
+        Assembled from the SAME projections the dashboard reads, then handed
+        to the one renderer. The in-app report view and this download are
+        therefore the same bytes: there is no second generator that could
+        drift from what the screen shows.
+
+        Scoped like every other review read, so a collector token cannot
+        reach it and a cross-tenant review is indistinguishable from one that
+        does not exist.
+        """
+        review_id = request.path_params["review_id"]
+        try:
+            attempt = int(request.path_params["attempt"])
+        except (TypeError, ValueError):
+            raise NotFoundError("unknown attempt") from None
+
+        record = service.store.get_review(
+            scope.organization_id, scope.repository_id, review_id)
+        if record is None:
+            raise NotFoundError("unknown review")
+
+        rows = service.store.review_attempts(
+            scope.organization_id, scope.repository_id, review_id)
+        row = next((a for a in rows if a["attempt"] == attempt), None)
+        if row is None:
+            raise NotFoundError("unknown attempt")
+
+        payload = row.get("payload") or {}
+        snapshot_id = row.get("snapshot_id")
+        snapshot = None
+        if snapshot_id:
+            snapshot = next(
+                (s for s in service.store.snapshots_for_review(
+                    scope.organization_id, scope.repository_id, review_id)
+                 if s.get("snapshot_id") == snapshot_id), None)
+
+        review_view = dict(_review_view(record))
+        review_view["repository"] = (
+            f"{scope.organization_id}/{scope.repository_id}")
+
+        markdown = render_review_impact_report(
+            review=review_view,
+            attempt={
+                "attempt": row.get("attempt"),
+                "decision": row.get("decision"),
+                "evidence_coverage": row.get("evidence_coverage"),
+                "health": row.get("health"),
+                "trigger": row.get("trigger"),
+                "snapshot_id": snapshot_id,
+                "policy_version": row.get("policy_version"),
+            },
+            findings=[_finding_view(f)
+                      for f in (payload.get("findings") or [])],
+            semantic=row.get("semantic_evidence"),
+            change_plan=_change_plan_view(record),
+            comparison=_metadata_comparison_view(row.get("metadata_comparison")),
+            snapshot={
+                "completeness": snapshot.get("completeness"),
+                "freshness_state": snapshot.get("freshness_state"),
+                "observed_at": isoformat(snapshot.get("observed_at")),
+            } if snapshot else None,
+            attempts=[
+                {"attempt": a.get("attempt"), "trigger": a.get("trigger"),
+                 "decision": a.get("decision"),
+                 "evidence_coverage": a.get("evidence_coverage"),
+                 "lifecycle_state": a.get("lifecycle_state")}
+                for a in rows
+            ],
+        )
+        return 200, markdown, impact_report_filename(review_id, attempt)
+
     def review_collection_requests(request, body, scope, service):
         """Every collection request raised for one review, with its outcome."""
         review_id = request.path_params["review_id"]
@@ -1290,6 +1376,12 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
         # Dashboard read, so a collector token cannot fetch it: the capability
         # model already refuses COLLECTOR_INGEST here, and this route is one
         # more reason that separation has to hold.
+        # Same capability and same scoping as the JSON bundle beside it: the
+        # report is review evidence, so DASHBOARD_READ governs it and a
+        # collector credential is refused.
+        Route("/api/reviews/{review_id}/attempts/{attempt}/impact-report.md",
+              handler(review_impact_report, write=False, download=True),
+              methods=["GET"]),
         Route("/api/reviews/{review_id}/attempts/{attempt}/metadata-evidence.json",
               handler(review_metadata_evidence, write=False, download=True),
               methods=["GET"]),
@@ -1360,11 +1452,37 @@ def _change_plan_view(record):
             if isinstance(target.get("reason"), str) else None,
         })
 
+    # Direct blast-radius edges, when the analysis that produced this review
+    # recorded them. The distinction between "not recorded" and "recorded and
+    # empty" is load-bearing and must survive the boundary: null means this
+    # review predates the evidence and a graph cannot be drawn for it, while
+    # [] means the analysis ran and found no direct downstream. Reconstructing
+    # edges from the flat lists would be inference, so it is not done here.
+    edge_values = plan.get("direct_edges")
+    if isinstance(edge_values, list):
+        direct_edges = []
+        for edge in edge_values:
+            if not isinstance(edge, dict):
+                continue
+            source = edge.get("source_model_unique_id")
+            target = edge.get("target_model_unique_id")
+            if not isinstance(source, str) or not isinstance(target, str):
+                continue
+            if not source or not target:
+                continue
+            direct_edges.append({
+                "source_model_unique_id": source,
+                "target_model_unique_id": target,
+            })
+    else:
+        direct_edges = None
+
     return {
         "changed_models": string_list("changed_models"),
         "added_dependencies": string_list("added_dependencies"),
         "removed_dependencies": string_list("removed_dependencies"),
         "downstream_models": string_list("downstream_models"),
+        "direct_edges": direct_edges,
         "targets": targets,
     }
 

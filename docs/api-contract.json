@@ -222,6 +222,11 @@
     {
       "authentication": "service-token",
       "method": "GET",
+      "path": "/api/reviews/{review_id}/attempts/{attempt}/impact-report.md"
+    },
+    {
+      "authentication": "service-token",
+      "method": "GET",
       "path": "/api/reviews/{review_id}/attempts/{attempt}/metadata-evidence.json"
     },
     {

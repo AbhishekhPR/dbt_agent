@@ -1080,7 +1080,7 @@ class ReviewDetailSurfaceTests(PublicApiTestCase):
 
         self.assertEqual(set(body["change_plan"]), {
             "changed_models", "added_dependencies", "removed_dependencies",
-            "downstream_models", "targets",
+            "downstream_models", "direct_edges", "targets",
         })
         self.assertEqual(body["change_plan"]["changed_models"], ["fct_orders"])
         self.assertIsInstance(body["change_plan"]["added_dependencies"], list)
@@ -1104,6 +1104,7 @@ class ReviewDetailSurfaceTests(PublicApiTestCase):
             "added_dependencies": [],
             "removed_dependencies": [],
             "downstream_models": [],
+            "direct_edges": None,
             "targets": [],
         }
         malformed_payloads = (

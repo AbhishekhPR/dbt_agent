@@ -1,0 +1,18 @@
+# Allowlist the runtime source instead of trying to enumerate every local
+# artifact that must not reach the build context.
+**
+!Dockerfile
+!requirements.lock
+!agent/
+!agent/**
+
+# Source-adjacent generated and sensitive files remain excluded if they are
+# ever introduced under agent/.
+agent/**/__pycache__/
+agent/**/*.py[cod]
+agent/**/*.pem
+agent/**/*.key
+agent/**/*.p12
+agent/**/*.pfx
+agent/**/*.secret
+agent/**/secrets/

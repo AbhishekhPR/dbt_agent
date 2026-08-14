@@ -81,6 +81,13 @@ class CollectionPlan:
     added_dependencies: list[str] = field(default_factory=list)
     removed_dependencies: list[str] = field(default_factory=list)
     downstream_models: list[str] = field(default_factory=list)
+    #: Direct source -> target pairs behind ``downstream_models``. The planner
+    #: already knows which changed model each downstream node reads; keeping
+    #: it means a blast-radius graph is evidence rather than inference. Two
+    #: changed models and three downstream models leave the flat lists
+    #: ambiguous, and guessing an edge is indistinguishable from fabricating
+    #: one. DIRECT edges only: no transitive closure, no exposures.
+    direct_edges: list[dict] = field(default_factory=list)
     required_evidence_level: str = "profile"
     metadata_required: bool = True
     notes: list[str] = field(default_factory=list)
@@ -92,6 +99,7 @@ class CollectionPlan:
             "added_dependencies": list(self.added_dependencies),
             "removed_dependencies": list(self.removed_dependencies),
             "downstream_models": list(self.downstream_models),
+            "direct_edges": [dict(e) for e in self.direct_edges],
             "required_evidence_level": self.required_evidence_level,
             "metadata_required": self.metadata_required,
             "notes": list(self.notes),
@@ -315,13 +323,31 @@ def build_collection_plan(*, base_manifest, head_manifest, changed_models,
                 ))
 
     # Downstream blast radius: models that read a changed model.
+    #
+    # The intersection below names WHICH changed models each downstream node
+    # reads. Recording only the target would throw that away and leave the
+    # graph unrecoverable whenever more than one model changed, so the pairs
+    # are kept alongside the flat list the rest of the plan already uses.
     downstream = set()
+    edges: list[dict] = []
     for node_id, node in head_nodes.items():
         if node_id in changed_ids:
             continue
-        if set(_depends_on(node)) & changed_ids:
-            downstream.add(node_id)
+        sources = set(_depends_on(node)) & changed_ids
+        if not sources:
+            continue
+        downstream.add(node_id)
+        # A node reading two changed models yields two truthful edges, never
+        # the cartesian product of changed x downstream.
+        for source_id in sources:
+            edges.append({
+                "source_model_unique_id": source_id,
+                "target_model_unique_id": node_id,
+            })
     plan.downstream_models = sorted(downstream)
+    plan.direct_edges = sorted(
+        edges,
+        key=lambda e: (e["source_model_unique_id"], e["target_model_unique_id"]))
 
     for node_id in sorted(downstream):
         node = head_nodes[node_id]
