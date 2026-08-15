@@ -1,3 +1,4 @@
+-- hosted Relium webhook test
 SELECT
     customer_id,
     SUM(order_total) as total_revenue,
