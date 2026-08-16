@@ -52,21 +52,17 @@ class GitHubWorkflowTests(unittest.TestCase):
                 result = run_bash(["-n"], input_text=block)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_workflow_uses_truthful_skip_and_supported_review_path(self):
+    def test_workflow_uses_hosted_manifest_handoff_only(self):
         text = WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn(
-            "Relium skipped: no dbt manifest was available for this repository.",
-            text,
-        )
-        self.assertIn("python -m agent.cli review-deployment", text)
-        self.assertIn("--dbt-manifest target/manifest.json", text)
-        self.assertIn('enforcement_mode="shadow"', text)
-        self.assertIn("load_repository_config", text)
-        self.assertIn("--enforcement-mode", text)
-        self.assertIn('"$enforcement_mode"', text)
-        self.assertIn('cp .relium/manifest-status.md relium-review.md\n            exit 0', text)
-        self.assertNotIn("github_pr_commenter", text)
-        self.assertNotIn("pr_guard", text)
+        self.assertIn("github.event.pull_request.base.sha", text)
+        self.assertIn("github.event.pull_request.head.sha", text)
+        self.assertIn("/api/manifest-evidence", text)
+        self.assertIn("secrets.RELIUM_CI_TOKEN", text)
+        self.assertIn("head.repo.full_name == github.repository", text)
+        self.assertNotIn("review-deployment", text)
+        self.assertNotIn("github-script", text)
+        self.assertNotIn("pull-requests: write", text)
+        self.assertNotIn("checks: write", text)
 
 
 if __name__ == "__main__":

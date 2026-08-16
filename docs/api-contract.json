@@ -47,6 +47,7 @@
     "GET /api/reviews",
     "GET /api/reviews/{review_id}",
     "GET /api/reviews/{review_id}/attempts",
+    "GET /api/reviews/{review_id}/attempts/{attempt}/impact-report.md",
     "GET /api/reviews/{review_id}/attempts/{attempt}/metadata-evidence.json",
     "GET /api/reviews/{review_id}/change-requests",
     "GET /api/reviews/{review_id}/collection-requests",
@@ -63,6 +64,7 @@
     "POST /api/collectors",
     "POST /api/deployments/events",
     "POST /api/incidents",
+    "POST /api/manifest-evidence",
     "POST /api/metadata-snapshots",
     "POST /api/monitoring/baselines",
     "POST /api/monitoring/observations",
@@ -158,6 +160,11 @@
       "authentication": "service-token",
       "method": "GET",
       "path": "/api/kpis/{kpi}/impact"
+    },
+    {
+      "authentication": "service-token",
+      "method": "POST",
+      "path": "/api/manifest-evidence"
     },
     {
       "authentication": "service-token",

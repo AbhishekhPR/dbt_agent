@@ -51,6 +51,30 @@ def issue_collector_token(store, *, organization_id, repository_id, environment,
     return token_id, presented
 
 
+def issue_ci_token(store, *, organization_id, repository_id,
+                   description=None, expires_at=None):
+    """Create a repository-scoped token for manifest evidence submission.
+
+    Returns ``(token_id, presented_secret)`` exactly once. The database keeps
+    only the existing service-token digest and uses the existing authenticator
+    and revocation path. CI tokens intentionally have no environment scope:
+    manifests are bound to a repository and exact commit SHA, not a warehouse.
+    """
+    if not organization_id or not repository_id:
+        raise ProvisioningError("organization and repository are both required")
+
+    store.ensure_repository(organization_id, repository_id)
+    token_id, secret, presented = generate_token()
+    store.create_service_token(
+        token_id, hash_secret(secret), organization_id, repository_id,
+        environment=None,
+        description=description or "GitHub Actions manifest handoff",
+        expires_at=expires_at,
+        scope="ci",
+    )
+    return token_id, presented
+
+
 def list_collector_tokens(store, *, organization_id=None, repository_id=None):
     """Tokens an operator can identify and revoke. Secrets are not returned."""
     return store.list_service_tokens(organization_id=organization_id,

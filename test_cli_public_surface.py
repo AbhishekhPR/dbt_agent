@@ -27,6 +27,7 @@ SUPPORTED_COMMANDS = frozenset(
         "init-baseline",
         # Operator commands. Authorization is possession of
         # RELIUM_DATABASE_URL, which a customer never has.
+        "issue-ci-token",
         "issue-collector-token",
         "list-collector-tokens",
         "outcome-summary",

@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 
 from agent.metadata_evidence.review_lifecycle import begin_review
+from agent.metadata_evidence.manifest_handoff import begin_manifest_wait
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,27 @@ class ReviewLifecycleService:
                 organization_id, repository_id, review_id,
                 comment_id=comment_id, check_run_id=check_run_id)
 
+    def wait_for_manifest(self, *, organization_id, repository_id, pull_number,
+                          base_sha, head_sha, base_manifest, head_manifest=None,
+                          changed_files=(),
+                          enforcement_mode, delivery_id=None, environment=None):
+        with self._pool.acquire() as store:
+            return begin_manifest_wait(
+                store,
+                organization_id=organization_id, repository_id=repository_id,
+                environment=environment or self.environment,
+                pull_number=pull_number, base_sha=base_sha, head_sha=head_sha,
+                base_manifest=base_manifest, head_manifest=head_manifest,
+                changed_files=changed_files,
+                enforcement_mode=enforcement_mode, delivery_id=delivery_id,
+            )
+
+    def get_manifest_evidence(self, *, organization_id, repository_id,
+                              commit_sha):
+        with self._pool.acquire() as store:
+            return store.get_manifest_evidence(
+                organization_id, repository_id, commit_sha)
+
     def get_review(self, *, organization_id, repository_id, review_id):
         with self._pool.acquire() as store:
             return store.get_review(organization_id, repository_id, review_id)
@@ -102,6 +124,12 @@ class DisabledReviewLifecycle:
         return None
 
     def record_publication(self, **_kwargs):
+        return None
+
+    def wait_for_manifest(self, **_kwargs):
+        return None
+
+    def get_manifest_evidence(self, **_kwargs):
         return None
 
     def get_review(self, **_kwargs):

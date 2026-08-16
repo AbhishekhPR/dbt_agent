@@ -1,184 +1,213 @@
-name: Relium PR Review
+name: Relium manifest handoff
 
 on:
   pull_request:
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
-  pr-review:
+  compile-manifests:
+    name: Compile ${{ matrix.side }} manifest
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - side: base
+            sha: ${{ github.event.pull_request.base.sha }}
+          - side: head
+            sha: ${{ github.event.pull_request.head.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository-provided build configuration
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: configuration
+          persist-credentials: false
+
+      - name: Check out exact ${{ matrix.side }} revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
+          path: source
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Resolve dbt project and manifest paths
+        id: paths
+        working-directory: source
+        env:
+          RELIUM_DBT_PROJECT_DIR: ${{ vars.RELIUM_DBT_PROJECT_DIR }}
+          RELIUM_MANIFEST_PATH: ${{ vars.RELIUM_MANIFEST_PATH }}
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          root = Path.cwd().resolve()
+          configured_project = os.environ.get("RELIUM_DBT_PROJECT_DIR", "").strip()
+          if configured_project:
+              project = (root / configured_project).resolve()
+          else:
+              candidates = [
+                  path.parent for path in root.rglob("dbt_project.yml")
+                  if not {"dbt_packages", "target", ".venv"}.intersection(path.parts)
+              ]
+              if root in candidates:
+                  project = root
+              elif len(candidates) == 1:
+                  project = candidates[0]
+              else:
+                  raise SystemExit(
+                      "Set repository variable RELIUM_DBT_PROJECT_DIR when the "
+                      "dbt project is not unique."
+                  )
+          if root != project and root not in project.parents:
+              raise SystemExit("RELIUM_DBT_PROJECT_DIR must stay inside the checkout")
+          if not (project / "dbt_project.yml").is_file():
+              raise SystemExit(f"No dbt_project.yml found in {project.relative_to(root)}")
+
+          configured_manifest = os.environ.get("RELIUM_MANIFEST_PATH", "").strip()
+          if not configured_manifest:
+              config = root / "relium.yml"
+              if config.is_file():
+                  match = re.search(
+                      r"(?m)^\s*manifest_path\s*:\s*['\"]?([^'\"#\r\n]+)",
+                      config.read_text(encoding="utf-8"),
+                  )
+                  if match:
+                      configured_manifest = match.group(1).strip()
+          manifest = ((root / configured_manifest).resolve()
+                      if configured_manifest else (project / "target/manifest.json"))
+          if root != manifest and root not in manifest.parents:
+              raise SystemExit("RELIUM_MANIFEST_PATH must stay inside the checkout")
+
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as stream:
+              stream.write(f"project_dir={project.relative_to(root).as_posix() or '.'}\n")
+              stream.write(f"manifest_path={manifest}\n")
+          PY
+
+      - name: Install repository dbt dependencies
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          project_dir="${{ steps.paths.outputs.project_dir }}"
           if [ -f requirements.txt ]; then
             python -m pip install -r requirements.txt
+          elif [ -f ../configuration/requirements.txt ]; then
+            python -m pip install -r ../configuration/requirements.txt
           fi
+          if [ "$project_dir" != "." ] && [ -f "$project_dir/requirements.txt" ]; then
+            python -m pip install -r "$project_dir/requirements.txt"
+          elif [ "$project_dir" != "." ] && [ -f "../configuration/$project_dir/requirements.txt" ]; then
+            python -m pip install -r "../configuration/$project_dir/requirements.txt"
+          fi
+          command -v dbt >/dev/null
 
-      - name: Collect changed files
+      - name: Compile exact ${{ matrix.side }} dbt manifest
+        working-directory: source
         shell: bash
         run: |
           set -euo pipefail
-          git fetch origin "${{ github.base_ref }}"
-          git diff --name-only "origin/${{ github.base_ref }}...HEAD" > changed_files.txt
-          cat changed_files.txt
+          project_dir="${{ steps.paths.outputs.project_dir }}"
+          profiles_dir=""
+          if [ -f "$project_dir/profiles.yml" ]; then
+            profiles_dir="$project_dir"
+          elif [ -f "../configuration/$project_dir/profiles.yml" ]; then
+            profiles_dir="../configuration/$project_dir"
+          fi
+          dbt_args=(--project-dir "$project_dir")
+          if [ -n "$profiles_dir" ]; then
+            dbt_args+=(--profiles-dir "$profiles_dir")
+          fi
+          if [ -f "$project_dir/packages.yml" ] || [ -f "$project_dir/dependencies.yml" ]; then
+            dbt deps "${dbt_args[@]}"
+          fi
+          dbt compile "${dbt_args[@]}"
+          test -f "${{ steps.paths.outputs.manifest_path }}"
 
-      - name: Prepare dbt manifest when supported
-        id: manifest
+      - name: Stage manifest only
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p .relium
+          mkdir staged
+          cp "${{ steps.paths.outputs.manifest_path }}" staged/manifest.json
 
-          if [ -f target/manifest.json ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [ ! -f dbt_project.yml ]; then
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            cat > .relium/manifest-status.md <<'EOF'
-          ## Relium deployment review
-
-          Status: **SKIPPED**
-
-          Relium skipped: no dbt manifest was available for this repository.
-          EOF
-            exit 0
-          fi
-
-          if ! command -v dbt >/dev/null 2>&1; then
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            cat > .relium/manifest-status.md <<'EOF'
-          ## Relium deployment review
-
-          Status: **SKIPPED**
-
-          Relium skipped: no dbt manifest was available for this repository.
-
-          The repository dependencies do not provide the documented `dbt` command, so no semantic review ran.
-          EOF
-            exit 0
-          fi
-
-          if [ -f packages.yml ] || [ -f dependencies.yml ]; then
-            dbt deps
-          fi
-          dbt compile
-          test -f target/manifest.json
-          echo "available=true" >> "$GITHUB_OUTPUT"
-
-      - name: Generate Relium PR review
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ "${{ steps.manifest.outputs.available }}" != "true" ]; then
-            cp .relium/manifest-status.md relium-review.md
-            exit 0
-          fi
-
-          mapfile -t changed_files < changed_files.txt
-          enforcement_mode="shadow"
-          if [ -f relium.yml ]; then
-            enforcement_mode="$(python -c 'from pathlib import Path; from agent.github_app.config import load_repository_config; print(load_repository_config(Path("relium.yml").read_bytes()).enforcement_mode)')"
-          fi
-          echo "Relium enforcement mode: $enforcement_mode"
-
-          if [ "${#changed_files[@]}" -eq 0 ]; then
-            cat > relium-review.md <<'EOF'
-          ## Relium deployment review
-
-          Status: **SKIPPED**
-
-          No changed files were detected, so Relium did not run a semantic review.
-          EOF
-            exit 0
-          fi
-
-          command=(
-            python -m agent.cli review-deployment
-            --dbt-manifest target/manifest.json
-            --history-path .relium/deployment_history.json
-            --deployment-id "pr-${{ github.event.pull_request.number }}-${{ github.sha }}"
-            --enforcement-mode "$enforcement_mode"
-            --format markdown
-            --output relium-review.md
-          )
-
-          for file in "${changed_files[@]}"; do
-            command+=(--changed-file "$file")
-          done
-
-          set +e
-          "${command[@]}" 2>&1 | tee relium-review.log
-          exit_code="${PIPESTATUS[0]}"
-          set -e
-
-          if [ "$exit_code" -eq 0 ]; then
-            exit 0
-          fi
-
-          if grep -q "At least one changed model is required" relium-review.log; then
-            cat > relium-review.md <<'EOF'
-          ## Relium deployment review
-
-          Status: **SKIPPED**
-
-          No changed dbt models were detected, so Relium did not run a semantic review.
-          EOF
-            exit 0
-          fi
-
-          exit "$exit_code"
-
-      - name: Upload Relium PR review
+      - name: Upload exact ${{ matrix.side }} manifest
         uses: actions/upload-artifact@v4
         with:
-          name: relium-pr-review
-          path: relium-review.md
+          name: relium-manifest-${{ matrix.side }}
+          path: staged/manifest.json
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Comment Relium PR review
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+  submit-manifests:
+    name: Submit exact manifests to Relium
+    needs: compile-manifests
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download BASE manifest
+        uses: actions/download-artifact@v4
         with:
-          script: |
-            const fs = require('fs');
-            const marker = '<!-- relium-pr-review -->';
-            const markdown = fs.readFileSync('relium-review.md', 'utf8');
-            const body = `${marker}\n\n${markdown}`;
-            const issue_number = context.payload.pull_request.number;
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number,
-            });
-            const existing = comments.find((comment) =>
-              comment.body && comment.body.includes(marker)
-            );
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number,
-                body,
-              });
-            }
+          name: relium-manifest-base
+          path: evidence/base
+
+      - name: Download HEAD manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: relium-manifest-head
+          path: evidence/head
+
+      - name: POST both exact manifests
+        env:
+          RELIUM_API_URL: ${{ vars.RELIUM_API_URL }}
+          RELIUM_CI_TOKEN: ${{ secrets.RELIUM_CI_TOKEN }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+
+          api_url = os.environ.get("RELIUM_API_URL", "").rstrip("/")
+          token = os.environ.get("RELIUM_CI_TOKEN", "")
+          if not api_url or not token:
+              raise SystemExit("RELIUM_API_URL and RELIUM_CI_TOKEN are required")
+
+          for side, sha in (("base", os.environ["BASE_SHA"]),
+                            ("head", os.environ["HEAD_SHA"])):
+              manifest = json.loads(
+                  Path(f"evidence/{side}/manifest.json").read_text(encoding="utf-8")
+              )
+              body = json.dumps({"commit_sha": sha, "manifest": manifest}).encode()
+              request = Request(
+                  f"{api_url}/api/manifest-evidence",
+                  data=body,
+                  method="POST",
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Content-Type": "application/json",
+                      "Idempotency-Key": (
+                          f"github-actions:{os.environ['REPOSITORY_ID']}:{sha}"
+                      ),
+                  },
+              )
+              with urlopen(request, timeout=60) as response:
+                  if response.status not in (200, 202):
+                      raise SystemExit(f"Relium rejected {side} manifest")
+          PY
