@@ -19,6 +19,13 @@ jobs:
           - side: head
             sha: ${{ github.event.pull_request.head.sha }}
     steps:
+      - name: Check out repository-provided build configuration
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: configuration
+          persist-credentials: false
+
       - name: Check out exact ${{ matrix.side }} revision
         uses: actions/checkout@v4
         with:
@@ -96,9 +103,13 @@ jobs:
           project_dir="${{ steps.paths.outputs.project_dir }}"
           if [ -f requirements.txt ]; then
             python -m pip install -r requirements.txt
+          elif [ -f ../configuration/requirements.txt ]; then
+            python -m pip install -r ../configuration/requirements.txt
           fi
           if [ "$project_dir" != "." ] && [ -f "$project_dir/requirements.txt" ]; then
             python -m pip install -r "$project_dir/requirements.txt"
+          elif [ "$project_dir" != "." ] && [ -f "../configuration/$project_dir/requirements.txt" ]; then
+            python -m pip install -r "../configuration/$project_dir/requirements.txt"
           fi
           command -v dbt >/dev/null
 
@@ -108,10 +119,20 @@ jobs:
         run: |
           set -euo pipefail
           project_dir="${{ steps.paths.outputs.project_dir }}"
-          if [ -f "$project_dir/packages.yml" ] || [ -f "$project_dir/dependencies.yml" ]; then
-            dbt deps --project-dir "$project_dir"
+          profiles_dir=""
+          if [ -f "$project_dir/profiles.yml" ]; then
+            profiles_dir="$project_dir"
+          elif [ -f "../configuration/$project_dir/profiles.yml" ]; then
+            profiles_dir="../configuration/$project_dir"
           fi
-          dbt compile --project-dir "$project_dir"
+          dbt_args=(--project-dir "$project_dir")
+          if [ -n "$profiles_dir" ]; then
+            dbt_args+=(--profiles-dir "$profiles_dir")
+          fi
+          if [ -f "$project_dir/packages.yml" ] || [ -f "$project_dir/dependencies.yml" ]; then
+            dbt deps "${dbt_args[@]}"
+          fi
+          dbt compile "${dbt_args[@]}"
           test -f "${{ steps.paths.outputs.manifest_path }}"
 
       - name: Stage manifest only

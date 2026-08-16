@@ -2,8 +2,12 @@
 from pathlib import Path
 import unittest
 
+import yaml
+
 
 WORKFLOW = Path(__file__).parent / ".github" / "workflows" / "relium-pr-review.yml"
+PROJECT_REQUIREMENTS = Path(__file__).parent / "test_project" / "requirements.txt"
+PROJECT_PROFILE = Path(__file__).parent / "test_project" / "profiles.yml"
 
 
 class HostedManifestWorkflowTests(unittest.TestCase):
@@ -27,6 +31,19 @@ class HostedManifestWorkflowTests(unittest.TestCase):
         self.assertIn("ref: ${{ matrix.sha }}", self.compile_job)
         self.assertIn("dbt compile", self.compile_job)
         self.assertIn("relium-manifest-${{ matrix.side }}", self.compile_job)
+
+    def test_uses_head_declared_build_config_for_an_older_base_revision(self):
+        self.assertIn("path: configuration", self.compile_job)
+        self.assertIn(
+            "ref: ${{ github.event.pull_request.head.sha }}",
+            self.compile_job,
+        )
+        self.assertIn(
+            'configuration/$project_dir/requirements.txt',
+            self.compile_job,
+        )
+        self.assertIn('--profiles-dir "$profiles_dir"', self.compile_job)
+        self.assertNotIn("dbt-duckdb", self.compile_job)
 
     def test_supports_subdirectories_and_configured_manifest_paths(self):
         self.assertIn("RELIUM_DBT_PROJECT_DIR", self.compile_job)
@@ -56,6 +73,30 @@ class HostedManifestWorkflowTests(unittest.TestCase):
         )
         for value in forbidden:
             self.assertNotIn(value, self.text)
+
+    def test_test_project_declares_the_verified_dbt_toolchain(self):
+        self.assertEqual(
+            PROJECT_REQUIREMENTS.read_text(encoding="utf-8").splitlines(),
+            ["dbt-core==1.11.8", "dbt-duckdb==1.10.1"],
+        )
+
+    def test_test_project_profile_is_credential_free_in_memory_duckdb(self):
+        profile = yaml.safe_load(PROJECT_PROFILE.read_text(encoding="utf-8"))
+        self.assertEqual(
+            profile,
+            {
+                "test_project": {
+                    "target": "dev",
+                    "outputs": {
+                        "dev": {
+                            "type": "duckdb",
+                            "path": ":memory:",
+                            "threads": 1,
+                        }
+                    },
+                }
+            },
+        )
 
 
 if __name__ == "__main__":
