@@ -66,6 +66,14 @@ class HostedManifestWorkflowTests(unittest.TestCase):
         self.assertIn('"commit_sha"', self.submit_job)
         self.assertIn('"manifest"', self.submit_job)
 
+    def test_reports_only_the_serialized_payload_byte_size_before_posting(self):
+        diagnostic = 'print(f"Relium {side} manifest payload bytes: {len(body)}")'
+        self.assertIn(diagnostic, self.submit_job)
+        self.assertLess(self.submit_job.index(diagnostic),
+                        self.submit_job.index("request = Request("))
+        self.assertNotIn("print(manifest", self.submit_job)
+        self.assertNotIn("print(token", self.submit_job)
+
     def test_does_not_review_or_publish_from_customer_ci(self):
         forbidden = (
             "review-deployment", "semantic review", "github-script",

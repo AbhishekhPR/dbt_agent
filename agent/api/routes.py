@@ -62,6 +62,7 @@ def _utcnow():
 logger = logging.getLogger(__name__)
 
 MAX_API_BODY_BYTES = 512 * 1024
+MAX_MANIFEST_BODY_BYTES = 20 * 1024 * 1024
 
 DEPLOYMENT_EVENT_TYPES = {"created"} | set(ALLOWED_TRANSITIONS) | {
     target for targets in ALLOWED_TRANSITIONS.values() for target in targets
@@ -89,17 +90,17 @@ def _json(payload: dict, status: int, request_id: str) -> JSONResponse:
     )
 
 
-async def _read_json(request, request_id):
+async def _read_json(request, request_id, *, max_body_bytes=MAX_API_BODY_BYTES):
     length = request.headers.get("content-length")
     if length is not None:
         try:
-            if int(length) > MAX_API_BODY_BYTES:
+            if int(length) > max_body_bytes:
                 raise _HttpError(413, {"status": "payload_too_large"})
         except ValueError:
             pass
     body = bytearray()
     async for chunk in request.stream():
-        if len(body) + len(chunk) > MAX_API_BODY_BYTES:
+        if len(body) + len(chunk) > max_body_bytes:
             raise _HttpError(413, {"status": "payload_too_large"})
         body.extend(chunk)
     if not body:
@@ -393,7 +394,8 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
             raise _HttpError(403, {"status": "forbidden",
                                    "detail": "missing or invalid CSRF token"})
 
-    def handler(fn, *, write: bool, capability=None, download=False):
+    def handler(fn, *, write: bool, capability=None, download=False,
+                max_body_bytes=MAX_API_BODY_BYTES):
         """Wrap one route function with authentication, scoping and error mapping.
 
         ``download`` changes only how a SUCCESSFUL response is built: the
@@ -410,7 +412,8 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
             body = None
             try:
                 if write:
-                    body = await _read_json(request, request_id)
+                    body = await _read_json(
+                        request, request_id, max_body_bytes=max_body_bytes)
 
                 def work():
                     with store_pool.acquire() as store:
@@ -1406,12 +1409,23 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
 
         # Collector control and metadata snapshot surface. Registered on the
         # same application, behind the same authentication and tenant scoping.
+        Route(
+            "/api/manifest-evidence",
+            handler(
+                _collector["submit_manifest_evidence"],
+                write=True,
+                capability=_COLLECTOR_CAPABILITY["submit_manifest_evidence"],
+                max_body_bytes=MAX_MANIFEST_BODY_BYTES,
+            ),
+            methods=["POST"],
+        ),
         *[
             Route(path,
                   handler(_collector[name], write=write,
                           capability=_COLLECTOR_CAPABILITY[name]),
                   methods=[method])
             for method, path, name, write in COLLECTOR_ROUTES
+            if name != "submit_manifest_evidence"
         ],
     ]
     return routes

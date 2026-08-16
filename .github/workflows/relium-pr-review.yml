@@ -194,7 +194,10 @@ jobs:
               manifest = json.loads(
                   Path(f"evidence/{side}/manifest.json").read_text(encoding="utf-8")
               )
-              body = json.dumps({"commit_sha": sha, "manifest": manifest}).encode()
+              body = json.dumps(
+                  {"commit_sha": sha, "manifest": manifest}
+              ).encode("utf-8")
+              print(f"Relium {side} manifest payload bytes: {len(body)}")
               request = Request(
                   f"{api_url}/api/manifest-evidence",
                   data=body,
