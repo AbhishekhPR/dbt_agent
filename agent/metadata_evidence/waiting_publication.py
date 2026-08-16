@@ -11,6 +11,50 @@ from __future__ import annotations
 # not recognise as a pass or a failure to the neutral conclusion, so this
 # deliberately falls through to neutral.
 WAITING_DECISION = "WAITING_FOR_METADATA"
+WAITING_FOR_MANIFEST_DECISION = "WAITING_FOR_MANIFEST"
+
+
+def render_manifest_waiting_result(outcome, *, base_sha, head_sha):
+    """Neutral publication for a webhook that arrived before CI evidence."""
+    markdown = "\n".join([
+        "## Relium deployment review",
+        "",
+        "**This review is waiting for the CI-generated dbt manifests and has "
+        "not reached a decision yet.**",
+        "",
+        "| | |",
+        "|---|---|",
+        "| Decision | _not yet decided_ |",
+        f"| Lifecycle | `{outcome.lifecycle_state}` |",
+        f"| Base commit | `{base_sha}` |",
+        f"| Head commit | `{head_sha}` |",
+        "",
+        "Relium will update **this comment** and **this check** once CI "
+        "submits manifests for both exact commits. No approval is "
+        "implied until then.",
+    ])
+    return {
+        "decision": WAITING_FOR_MANIFEST_DECISION,
+        "final": False,
+        "coverage": outcome.coverage,
+        "health": outcome.health,
+        "lifecycle_state": outcome.lifecycle_state,
+        "review_id": outcome.review_id,
+        "attempt": outcome.attempt,
+        "evidence": dict(outcome.evidence),
+        "rendered": {"markdown": markdown},
+        "incident": {
+            "decision": WAITING_FOR_MANIFEST_DECISION,
+            "health": outcome.health,
+            "severity": "LOW",
+            "confidence": 0,
+            "top_reasons": [
+                "Both exact BASE and HEAD manifests are required before review."
+            ],
+            "recommendation": "Wait for the repository CI manifest handoff.",
+            "affected_models": [],
+        },
+    }
 
 
 def render_waiting_markdown(outcome, *, base_sha, head_sha):

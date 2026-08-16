@@ -32,6 +32,10 @@ class SnapshotConflict(ValueError):
     """
 
 
+class ManifestEvidenceConflict(ValueError):
+    """A commit or idempotency key was replayed with different evidence."""
+
+
 
 def _bounded_text(value, limit: int = 256):
     """Never persist an unbounded text value from a warehouse.
@@ -72,6 +76,20 @@ class PostgresLifecycleStore:
 
     def ensure_schema(self):
         apply_migrations(self.connection)
+
+    def ensure_repository(self, organization_id, repository_id):
+        """Create only the tenant/repository identity, without an environment."""
+        with self.connection.transaction():
+            self.connection.execute(
+                "INSERT INTO organizations (organization_id) VALUES (%s) "
+                "ON CONFLICT DO NOTHING",
+                (organization_id,),
+            )
+            self.connection.execute(
+                "INSERT INTO repositories (organization_id, repository_id) "
+                "VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                (organization_id, repository_id),
+            )
 
     def ensure_tenant(self, organization_id, repository_id, environment):
         with self.connection.transaction():
@@ -115,7 +133,7 @@ class PostgresLifecycleStore:
                 "monitoring_observations", "metadata_baselines", "kpi_impact",
                 "lineage_records", "outbox_dead_letters", "outbox_events",
                 "deployment_transitions", "deployments", "evidence", "configuration_versions",
-                "delivery_journal", "environments", "repositories",
+                "manifest_evidence", "delivery_journal", "environments", "repositories",
             ):
                 self.connection.execute(f"DELETE FROM {table} WHERE organization_id=%s", (organization_id,))
             # Audit events are retained across tenant deletion for compliance; they are
@@ -649,10 +667,9 @@ class PostgresLifecycleStore:
                              scope="collector"):
         """Persist a token's hash. The secret itself is never stored.
 
-        ``scope`` decides what the token may be used for. It defaults to
-        ``collector`` because that is what every service token is for: a
-        machine submitting the evidence it was asked for. Governance is not a
-        scope any token can hold — that requires a human session.
+        ``scope`` decides what evidence the machine token may submit. It
+        defaults to ``collector`` for backwards compatibility. Governance is
+        not a scope any token can hold — that requires a human session.
         """
         self.connection.execute(
             "INSERT INTO api_service_tokens "
@@ -1129,6 +1146,7 @@ class PostgresLifecycleStore:
 
     REVIEW_LIFECYCLE_STATES = (
         "RECEIVED",
+        "WAITING_FOR_MANIFEST",
         "CODE_ANALYSIS_COMPLETE",
         "METADATA_NOT_REQUIRED",
         "METADATA_REQUESTED",
@@ -1140,6 +1158,121 @@ class PostgresLifecycleStore:
         "PUBLISHED",
         "FAILED",
     )
+
+    # -- immutable CI manifest evidence ----------------------------------
+
+    def submit_manifest_evidence(self, organization_id, repository_id, *,
+                                 commit_sha, manifest, manifest_hash,
+                                 idempotency_key, payload_hash):
+        """Insert one immutable manifest for an exact commit SHA.
+
+        Both uniqueness decisions happen inside one PostgreSQL transaction.
+        ``INSERT .. ON CONFLICT`` serializes concurrent submitters; the loser
+        then reads the committed winner and can distinguish an identical retry
+        from a conflicting replay without leaking another tenant's row.
+        """
+        evidence_id = f"manifest-{uuid.uuid4().hex[:24]}"
+        with self.connection.transaction():
+            # Serialize evidence arrivals per repository. Without this lock,
+            # simultaneous BASE and HEAD transactions can each take a
+            # statement snapshot before the other commits and both miss the
+            # now-ready pair, leaving a waiting review without resume work.
+            tenant = self.connection.execute(
+                "SELECT 1 FROM repositories WHERE organization_id=%s "
+                "AND repository_id=%s FOR UPDATE",
+                (organization_id, repository_id),
+            ).fetchone()
+            if tenant is None:
+                raise RuntimeError("manifest evidence repository does not exist")
+            row = self.connection.execute(
+                "INSERT INTO manifest_evidence (organization_id, repository_id, "
+                "evidence_id, commit_sha, manifest_hash, manifest, idempotency_key, "
+                "payload_hash) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT DO NOTHING RETURNING *",
+                (organization_id, repository_id, evidence_id, commit_sha,
+                 manifest_hash, self._Jsonb(manifest), idempotency_key,
+                 payload_hash),
+            ).fetchone()
+
+            created = row is not None
+            if row is None:
+                by_key = self.connection.execute(
+                    "SELECT * FROM manifest_evidence WHERE organization_id=%s "
+                    "AND repository_id=%s AND idempotency_key=%s",
+                    (organization_id, repository_id, idempotency_key),
+                ).fetchone()
+                if by_key is not None:
+                    if (by_key["payload_hash"] == payload_hash
+                            and by_key["commit_sha"] == commit_sha):
+                        row = by_key
+                    else:
+                        raise ManifestEvidenceConflict(
+                            "idempotency key already used with different manifest evidence")
+                else:
+                    by_sha = self.connection.execute(
+                        "SELECT * FROM manifest_evidence WHERE organization_id=%s "
+                        "AND repository_id=%s AND commit_sha=%s",
+                        (organization_id, repository_id, commit_sha),
+                    ).fetchone()
+                    if by_sha is not None and by_sha["manifest_hash"] == manifest_hash:
+                        row = by_sha
+                    elif by_sha is not None:
+                        raise ManifestEvidenceConflict(
+                            "commit SHA already has different manifest evidence")
+                    else:
+                        # The insert can only lose to one of the two unique keys. If
+                        # neither scoped row is visible, surface a real persistence
+                        # error instead of pretending the request was accepted.
+                        raise RuntimeError(
+                            "manifest evidence conflict could not be reconciled")
+
+            waiting = self.connection.execute(
+                "SELECT r.review_id, r.environment, r.base_sha, r.head_sha, "
+                "base_evidence.evidence_id AS base_evidence_id, "
+                "head_evidence.evidence_id AS head_evidence_id "
+                "FROM reviews r "
+                "JOIN manifest_evidence base_evidence "
+                "ON base_evidence.organization_id=r.organization_id "
+                "AND base_evidence.repository_id=r.repository_id "
+                "AND base_evidence.commit_sha=r.base_sha "
+                "JOIN manifest_evidence head_evidence "
+                "ON head_evidence.organization_id=r.organization_id "
+                "AND head_evidence.repository_id=r.repository_id "
+                "AND head_evidence.commit_sha=r.head_sha "
+                "WHERE r.organization_id=%s AND r.repository_id=%s "
+                "AND (r.base_sha=%s OR r.head_sha=%s) "
+                "AND r.lifecycle_state='WAITING_FOR_MANIFEST' "
+                "FOR UPDATE OF r",
+                (organization_id, repository_id, commit_sha, commit_sha),
+            ).fetchall()
+            for review in waiting:
+                pair_key = f"{review['base_sha']}:{review['head_sha']}"
+                self.connection.execute(
+                    "INSERT INTO outbox_events (event_id, organization_id, "
+                    "repository_id, environment, subject_type, subject_id, "
+                    "deployment_id, event_type, payload, dedup_key) "
+                    "VALUES (%s, %s, %s, %s, 'review', %s, NULL, "
+                    "'review.manifest_resume_requested', %s, %s) "
+                    "ON CONFLICT (organization_id, repository_id, environment, "
+                    "subject_type, subject_id, event_type, dedup_key) DO NOTHING",
+                    (str(uuid.uuid4()), organization_id, repository_id,
+                     review["environment"], review["review_id"],
+                     self._Jsonb({"review_id": review["review_id"],
+                                  "commit_sha": review["head_sha"],
+                                  "base_evidence_id": review["base_evidence_id"],
+                                  "head_evidence_id": review["head_evidence_id"]}),
+                     pair_key),
+                )
+        return dict(row), created
+
+    def get_manifest_evidence(self, organization_id, repository_id, commit_sha):
+        """Return evidence only for the tenant, repository and exact SHA."""
+        row = self.connection.execute(
+            "SELECT * FROM manifest_evidence WHERE organization_id=%s "
+            "AND repository_id=%s AND commit_sha=%s",
+            (organization_id, repository_id, commit_sha),
+        ).fetchone()
+        return dict(row) if row else None
 
     # -- reviews -----------------------------------------------------------
 
@@ -1178,6 +1311,25 @@ class PostgresLifecycleStore:
                     "AND review_id=%s",
                     (organization_id, repository_id, review_id),
                 ).fetchone()
+                # A webhook may have created the stable review identity before
+                # CI delivered its manifest. Once that exact artifact arrives,
+                # fill in the analysis binding on the SAME review; do not make
+                # a second review or lose the sticky GitHub publication IDs.
+                if (row is not None
+                        and row["lifecycle_state"] == "WAITING_FOR_MANIFEST"
+                        and lifecycle_state != "WAITING_FOR_MANIFEST"):
+                    row = self.connection.execute(
+                        "UPDATE reviews SET base_manifest_hash=%s, "
+                        "head_manifest_hash=%s, enforcement_mode=%s, "
+                        "policy_version=%s, policy_hash=%s, "
+                        "metadata_required=%s, payload=%s, updated_at=now() "
+                        "WHERE organization_id=%s AND repository_id=%s "
+                        "AND review_id=%s RETURNING *",
+                        (base_manifest_hash, head_manifest_hash,
+                         enforcement_mode, policy_version, policy_hash,
+                         bool(metadata_required), self._Jsonb(payload or {}),
+                         organization_id, repository_id, review_id),
+                    ).fetchone()
             else:
                 self.connection.execute(
                     "INSERT INTO review_lifecycle_transitions "

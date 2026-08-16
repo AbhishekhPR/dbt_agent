@@ -65,6 +65,12 @@ COLLECTOR_INGEST = _cap("collector_ingest", token_scopes={"collector"})
 #: Deployment and monitoring ingestion from a customer's own pipeline.
 PIPELINE_INGEST = _cap("pipeline_ingest", token_scopes={"collector"})
 
+# A CI credential may hand off the generated dbt manifest for one exact
+# commit. It cannot read the dashboard, submit warehouse observations, or
+# perform governance. Keeping it separate limits a workflow-token leak to the
+# one artifact channel the workflow actually needs.
+CI_MANIFEST_INGEST = _cap("ci_manifest_ingest", token_scopes={"ci"})
+
 #: One collection request, by id.
 #:
 #: The only endpoint both kinds of caller genuinely need: the collector reads

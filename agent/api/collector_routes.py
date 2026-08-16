@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 from agent.api.service import ConflictError, NotFoundError
@@ -33,7 +34,8 @@ from agent.api.validation import (
     require_str,
     require_timestamp,
 )
-from agent.postgres_lifecycle_store import SnapshotConflict
+from agent.postgres_lifecycle_store import ManifestEvidenceConflict, SnapshotConflict
+from agent.metadata_evidence.collection_plan import manifest_hash
 from agent.metadata_evidence.decision import classify_freshness
 from agent.metadata_evidence.review_lifecycle import (
     SnapshotRejected,
@@ -58,6 +60,8 @@ _FORBIDDEN_KEYS = {
     "sql", "query", "statement", "dsn", "password", "token", "secret",
     "private_key", "credentials", "connection_string",
 }
+
+_COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 
 
 def _reject_forbidden(payload, path="body"):
@@ -338,6 +342,30 @@ def build_handlers():
 
     # -- snapshots ---------------------------------------------------------
 
+    def submit_manifest_evidence(request, body, scope, service):
+        key = require_idempotency_key(body, request.headers)
+        commit_sha = require_str(body, "commit_sha")
+        if not _COMMIT_SHA.fullmatch(commit_sha):
+            raise ValidationError("commit_sha must be an exact 40- or 64-character SHA")
+        manifest = require_object(body, "manifest")
+        canonical = {"commit_sha": commit_sha.lower(), "manifest": manifest}
+        try:
+            evidence, created = service.store.submit_manifest_evidence(
+                scope.organization_id, scope.repository_id,
+                commit_sha=commit_sha.lower(), manifest=manifest,
+                manifest_hash=manifest_hash(manifest),
+                idempotency_key=key, payload_hash=_payload_hash(canonical),
+            )
+        except ManifestEvidenceConflict as exc:
+            raise ConflictError(str(exc)) from None
+        return (202 if created else 200), {
+            "status": "accepted",
+            "evidence_id": evidence["evidence_id"],
+            "commit_sha": evidence["commit_sha"],
+            "manifest_hash": evidence["manifest_hash"],
+            "created": created,
+        }
+
     def submit_snapshot(request, body, scope, service):
         key = require_idempotency_key(body, request.headers)
         _reject_forbidden(body)
@@ -529,6 +557,7 @@ def build_handlers():
         "get_collection_request": get_collection_request,
         "acknowledge_collection_request": acknowledge_collection_request,
         "report_collection_failure": report_collection_failure,
+        "submit_manifest_evidence": submit_manifest_evidence,
         "submit_snapshot": submit_snapshot,
         "get_snapshot_status": get_snapshot_status,
         "get_review_evidence_coverage": get_review_evidence_coverage,
@@ -543,6 +572,7 @@ COLLECTOR_ROUTES = (
      "acknowledge_collection_request", True),
     ("POST", "/api/collection-requests/{request_id}/failure",
      "report_collection_failure", True),
+    ("POST", "/api/manifest-evidence", "submit_manifest_evidence", True),
     ("POST", "/api/metadata-snapshots", "submit_snapshot", True),
     ("GET", "/api/metadata-snapshots/{snapshot_id}", "get_snapshot_status", False),
     ("GET", "/api/reviews/{review_id}/evidence-coverage",

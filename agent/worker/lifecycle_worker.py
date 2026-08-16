@@ -120,8 +120,12 @@ from agent.metadata_evidence.publication_reconcile import (  # noqa: E402
 from agent.metadata_evidence.change_request import (  # noqa: E402
     register as _register_change_request,
 )
+from agent.metadata_evidence.manifest_handoff import (  # noqa: E402
+    register as _register_manifest_handoff,
+)
 
 _register_recompute(registry)
+_register_manifest_handoff(registry)
 
 # Republication of a recomputed decision. The factory is installed by
 # configure_publisher(); until then the handler runs and records that the

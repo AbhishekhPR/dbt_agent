@@ -19,8 +19,8 @@ from starlette.routing import Route
 from agent.api.collector_routes import COLLECTOR_ROUTES, build_handlers
 from agent.api.auth import AuthenticationError, AuthorizationError, ServiceTokenAuthenticator, bearer_token
 from agent.api.authorization import (
-    COLLECTION_REQUEST_READ, COLLECTOR_INGEST, DASHBOARD_READ, GOVERNANCE_WRITE,
-    PIPELINE_INGEST, CapabilityError, authorize,
+    CI_MANIFEST_INGEST, COLLECTION_REQUEST_READ, COLLECTOR_INGEST, DASHBOARD_READ,
+    GOVERNANCE_WRITE, PIPELINE_INGEST, CapabilityError, authorize,
 )
 from agent.api.sessions import CSRF_HEADER, SESSION_COOKIE, SessionError
 from agent.metadata_evidence.evidence_export import (
@@ -126,6 +126,7 @@ _COLLECTOR_CAPABILITY = {
     "get_collection_request": COLLECTION_REQUEST_READ,
     "acknowledge_collection_request": COLLECTOR_INGEST,
     "report_collection_failure": COLLECTOR_INGEST,
+    "submit_manifest_evidence": CI_MANIFEST_INGEST,
     "submit_snapshot": COLLECTOR_INGEST,
     "register_collector": COLLECTOR_INGEST,
     # Read by the dashboard only; the collector never asks for these.

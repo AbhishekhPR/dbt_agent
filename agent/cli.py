@@ -1327,6 +1327,37 @@ def issue_collector_token(organization, repository, environment, description):
     click.echo(presented)
 
 
+@cli.command(name="issue-ci-token")
+@click.option('--organization', required=True, help='Tenant organization id')
+@click.option('--repository', required=True, help='Tenant repository id')
+@click.option('--description', default=None, help='How to recognise this token later')
+def issue_ci_token(organization, repository, description):
+    """Operator: issue a repository-scoped CI token. Shows the secret ONCE."""
+    import sys
+
+    from agent.collector.provisioning import ProvisioningError, issue_ci_token
+
+    store = _admin_store()
+    try:
+        token_id, presented = issue_ci_token(
+            store, organization_id=organization, repository_id=repository,
+            description=description)
+    except ProvisioningError as exc:
+        click.echo(f"cannot issue token: {exc}", err=True)
+        sys.exit(2)
+    finally:
+        store.close()
+
+    click.echo(f"token_id     {token_id}")
+    click.echo(f"scope        {organization}/{repository} [ci]")
+    click.echo("")
+    click.echo("RELIUM_CI_TOKEN below is shown ONCE and is not recoverable.")
+    click.echo("Store it as the customer repository's GitHub Actions secret,")
+    click.echo("then delete it from your terminal history.")
+    click.echo("")
+    click.echo(presented)
+
+
 @cli.command(name="list-collector-tokens")
 @click.option('--organization', default=None, help='Filter by organization')
 @click.option('--repository', default=None, help='Filter by repository')

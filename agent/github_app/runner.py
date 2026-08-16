@@ -8,7 +8,10 @@ from agent.github_app.comments import upsert_review_comment
 from agent.github_app.config import DEFAULT_MANIFEST_PATH, load_repository_config
 from agent.github_app.review_comment import render_review_comment
 from agent.metadata_evidence.service import DisabledReviewLifecycle
-from agent.metadata_evidence.waiting_publication import render_waiting_result
+from agent.metadata_evidence.waiting_publication import (
+    render_manifest_waiting_result,
+    render_waiting_result,
+)
 
 
 class ReviewRunnerError(ValueError):
@@ -57,39 +60,77 @@ class PullRequestReviewRunner:
         if not config.enabled:
             return {"status": "disabled", "delivery_id": event.delivery_id}
 
+        manifest = None
         try:
             manifest_content = client.get_file(
                 owner, repository, config.manifest_path, event.head_sha
             )
         except GitHubNotFoundError:
             manifest_content = None
+        if manifest_content is None and getattr(self.lifecycle, "enabled", False):
+            evidence = self.lifecycle.get_manifest_evidence(
+                organization_id=str(owner), repository_id=str(repository),
+                commit_sha=event.head_sha)
+            if evidence is not None:
+                manifest = evidence["manifest"]
         if manifest_content is None:
-            if config.manifest_path == DEFAULT_MANIFEST_PATH:
-                message = (
-                    "Relium could not find target/manifest.json. "
-                    "Run dbt compile before the Relium review."
-                )
+            if getattr(self.lifecycle, "enabled", False):
+                try:
+                    base_content = client.get_file(
+                        owner, repository, config.manifest_path, event.base_sha)
+                except GitHubNotFoundError:
+                    base_content = None
+                base_manifest = None
+                if base_content is not None:
+                    try:
+                        base_manifest = json.loads(base_content.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise ReviewRunnerError(
+                            "Base manifest must contain valid UTF-8 JSON.") from exc
+                    if not isinstance(base_manifest, dict):
+                        raise ReviewRunnerError("Base manifest must be a JSON object.")
+                else:
+                    base_evidence = self.lifecycle.get_manifest_evidence(
+                        organization_id=str(owner), repository_id=str(repository),
+                        commit_sha=event.base_sha)
+                    if base_evidence is not None:
+                        base_manifest = base_evidence["manifest"]
+                # A CI-provided HEAD starts hosted mode. In that mode BASE is
+                # equally mandatory: never turn a missing BASE into a silent
+                # ``previous_manifest=None`` comparison.
+                if manifest is None or base_manifest is None:
+                    return self._wait_for_manifest(
+                        event, client, config, base_manifest=base_manifest,
+                        head_manifest=manifest,
+                        expected_app_id=expected_app_id)
             else:
-                message = (
-                    f"Relium could not find {config.manifest_path}. "
-                    "Generate the configured dbt manifest before the Relium review."
+                if config.manifest_path == DEFAULT_MANIFEST_PATH:
+                    message = (
+                        "Relium could not find target/manifest.json. "
+                        "Run dbt compile before the Relium review."
+                    )
+                else:
+                    message = (
+                        f"Relium could not find {config.manifest_path}. "
+                        "Generate the configured dbt manifest before the Relium review."
+                    )
+                return self._publish_neutral(
+                    event,
+                    client,
+                    config.enforcement_mode,
+                    status="missing_manifest",
+                    message=message,
+                    expected_app_id=expected_app_id,
+                    evidence_policy=config.evidence_policy,
+                    missing_evidence="head_manifest",
                 )
-            return self._publish_neutral(
-                event,
-                client,
-                config.enforcement_mode,
-                status="missing_manifest",
-                message=message,
-                expected_app_id=expected_app_id,
-                evidence_policy=config.evidence_policy,
-                missing_evidence="head_manifest",
-            )
-        try:
-            manifest = json.loads(manifest_content.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ReviewRunnerError("Manifest must contain valid UTF-8 JSON.") from exc
-        if not isinstance(manifest, dict):
-            raise ReviewRunnerError("Manifest must be a JSON object.")
+        if manifest is None:
+            try:
+                manifest = json.loads(manifest_content.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ReviewRunnerError("Manifest must contain valid UTF-8 JSON.") from exc
+            if not isinstance(manifest, dict):
+                raise ReviewRunnerError("Manifest must be a JSON object.")
 
         try:
             base_manifest_content = client.get_file(
@@ -105,6 +146,12 @@ class PullRequestReviewRunner:
                 raise ReviewRunnerError("Base manifest must contain valid UTF-8 JSON.") from exc
             if not isinstance(previous_manifest, dict):
                 raise ReviewRunnerError("Base manifest must be a JSON object.")
+        elif getattr(self.lifecycle, "enabled", False):
+            base_evidence = self.lifecycle.get_manifest_evidence(
+                organization_id=str(owner), repository_id=str(repository),
+                commit_sha=event.base_sha)
+            if base_evidence is not None:
+                previous_manifest = base_evidence["manifest"]
 
         changed_files = client.compare_files(owner, repository, event.base_sha, event.head_sha)
         if not getattr(changed_files, "complete", True):
@@ -120,6 +167,11 @@ class PullRequestReviewRunner:
                 ),
                 expected_app_id=expected_app_id,
             )
+        if (getattr(self.lifecycle, "enabled", False)
+                and previous_manifest is None):
+            return self._wait_for_manifest(
+                event, client, config, base_manifest=None,
+                head_manifest=manifest, expected_app_id=expected_app_id)
         try:
             result = self.reviewer(
                 manifest=manifest,
@@ -179,6 +231,44 @@ class PullRequestReviewRunner:
             published["review_attempt"] = outcome.attempt
             published["lifecycle_state"] = outcome.lifecycle_state
             published["collection_request_id"] = outcome.request_id
+        return published
+
+    def _wait_for_manifest(self, event, client, config, *, base_manifest,
+                           head_manifest=None, expected_app_id):
+        changed_files = client.compare_files(
+            event.repository.owner, event.repository.name,
+            event.base_sha, event.head_sha)
+        if not getattr(changed_files, "complete", True):
+            return self._publish_neutral(
+                event, client, config.enforcement_mode,
+                status="large_pr",
+                message=(
+                    "Relium could not safely enumerate every changed file in this "
+                    "pull request. The review was skipped because GitHub may have "
+                    "truncated the compare response."
+                ),
+                expected_app_id=expected_app_id,
+            )
+        outcome = self.lifecycle.wait_for_manifest(
+            organization_id=str(event.repository.owner),
+            repository_id=str(event.repository.name),
+            pull_number=event.pull_number,
+            base_sha=event.base_sha, head_sha=event.head_sha,
+            base_manifest=base_manifest, head_manifest=head_manifest,
+            changed_files=list(changed_files),
+            enforcement_mode=config.enforcement_mode,
+            delivery_id=event.delivery_id,
+        )
+        waiting_result = render_manifest_waiting_result(
+            outcome, base_sha=event.base_sha, head_sha=event.head_sha)
+        published = self._publish(
+            event, client, config.enforcement_mode, waiting_result,
+            status="waiting_for_manifest", expected_app_id=expected_app_id)
+        self._record_publication_identity(event, outcome, published)
+        published["review_id"] = outcome.review_id
+        published["review_attempt"] = outcome.attempt
+        published["lifecycle_state"] = outcome.lifecycle_state
+        published["collection_request_id"] = None
         return published
 
     def _begin_lifecycle(self, event, config, *, manifest, previous_manifest,

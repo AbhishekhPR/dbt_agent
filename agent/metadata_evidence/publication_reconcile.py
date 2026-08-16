@@ -20,6 +20,8 @@ ALLOW and WAITING never - and are neither consulted nor relaxed here.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from agent.github_app.checks import CHECK_NAME, build_check_run_payload
 from agent.github_app.review_comment import render_review_comment
 
@@ -42,6 +44,24 @@ def build_review_result(review, attempt):
     """
     findings = list((attempt.get("payload") or {}).get("findings") or [])
     decision = attempt.get("decision") or review.get("decision")
+
+    if decision is None:
+        from agent.metadata_evidence.waiting_publication import render_waiting_result
+
+        plan = (attempt.get("payload") or {}).get("plan") or {}
+        outcome = SimpleNamespace(
+            review_id=review["review_id"], attempt=attempt.get("attempt"),
+            lifecycle_state=attempt.get("lifecycle_state"),
+            coverage=attempt.get("evidence_coverage") or "INCOMPLETE",
+            health=attempt.get("health") or review.get("health") or 100,
+            request_id=None, plan=plan, evidence={},
+        )
+        result = render_waiting_result(
+            outcome, base_sha=review.get("base_sha"),
+            head_sha=review.get("head_sha"))
+        result["enforcement_mode"] = (
+            attempt.get("enforcement_mode") or review.get("enforcement_mode"))
+        return result
 
     # The renderer's finding contract is title/impact/recommended_fix. A
     # metadata finding already carries all three in its own vocabulary, so it
@@ -91,7 +111,8 @@ def build_review_result(review, attempt):
 
 
 def reconcile_publication(store, *, organization_id, repository_id, environment,
-                          review_id, publisher, attempt=None):
+                          review_id, publisher, attempt=None,
+                          publish_waiting=False):
     """Update the sticky comment, the check run and Slack for one review.
 
     ``publisher`` supplies the outbound surfaces. When it is None the review
@@ -113,9 +134,10 @@ def reconcile_publication(store, *, organization_id, repository_id, environment,
             raise ReconciliationError(f"attempt {attempt} is not recorded")
         record = matching[0]
 
-    if record.get("decision") is None:
-        # A review still waiting was already published as waiting by the
-        # webhook path. There is nothing new to say.
+    if record.get("decision") is None and not publish_waiting:
+        # Ordinary WAITING_FOR_METADATA reviews were already published by the
+        # webhook path. Only a manifest-resume job needs to replace its older
+        # WAITING_FOR_MANIFEST surface with the newly computed waiting state.
         return {"review_id": review_id, "status": "no_decision_yet",
                 "attempt": record["attempt"], "published": False}
 
@@ -239,6 +261,7 @@ def register(registry, publisher_factory=None):
             repository_id=context.repository_id,
             environment=context.environment,
             review_id=review_id, publisher=publisher,
-            attempt=payload.get("attempt"))
+            attempt=payload.get("attempt"),
+            publish_waiting=bool(payload.get("publish_waiting")))
 
     return _handle
