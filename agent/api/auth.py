@@ -46,6 +46,10 @@ class TenantScope:
     #: Distinguishes a token from a signed-in person. Governance actions
     #: require a human, and a human is never accepted as a collector.
     is_human = False
+    #: A machine has no identity provider. Present so every principal answers
+    #: the same question; never consulted, because the human branch of
+    #: ``authorize`` is the only place it is read.
+    identity_provider = None
 
     @property
     def actor(self) -> None:

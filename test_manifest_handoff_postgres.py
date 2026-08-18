@@ -81,12 +81,19 @@ class ManifestMigration0013Tests(unittest.TestCase):
     def setUp(self):
         _reset_schema()
 
+    # These assert facts about migration 0013. They deliberately do NOT assert
+    # that 13 is the highest version in the repository: it was when they were
+    # written, and every later migration would otherwise break a test that has
+    # nothing to do with it. What matters — that 0013 is applied, in order,
+    # after 12, and creates its table without losing earlier state — is
+    # asserted exactly as before.
+
     def test_0013_applies_from_an_empty_database(self):
         from agent.postgres_migrate import apply_migrations, applied_versions
 
         with _connect() as connection:
             self.assertIn(13, apply_migrations(connection))
-            self.assertEqual(applied_versions(connection)[-1], 13)
+            self.assertIn(13, applied_versions(connection))
             table = connection.execute(
                 "SELECT to_regclass('public.manifest_evidence') AS name"
             ).fetchone()["name"]
@@ -98,8 +105,12 @@ class ManifestMigration0013Tests(unittest.TestCase):
         with _connect() as connection:
             _apply_through(connection, 12)
             connection.execute("INSERT INTO organizations (organization_id) VALUES ('kept-org')")
-            self.assertEqual(apply_migrations(connection), [13])
-            self.assertEqual(applied_versions(connection)[-2:], [12, 13])
+            newly_applied = apply_migrations(connection)
+            self.assertEqual(newly_applied[0], 13,
+                             "13 must be the first version applied after 12")
+            versions = applied_versions(connection)
+            self.assertEqual(versions[versions.index(13) - 1], 12,
+                             "13 must be applied immediately after 12")
             kept = connection.execute(
                 "SELECT organization_id FROM organizations WHERE organization_id='kept-org'"
             ).fetchone()

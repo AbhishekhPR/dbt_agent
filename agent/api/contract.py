@@ -74,13 +74,53 @@ MANDATORY_ROUTES = {
     ("GET", "/api/reviews/{review_id}/collection-requests"),
     ("GET", "/api/reviews/{review_id}/snapshots"),
     ("GET", "/api/reviews/{review_id}/publications"),
+    # First-run onboarding. Authenticated by a server-verified Clerk session
+    # token rather than a service token — see ONBOARDING_AUTHENTICATED below.
+    ("GET", "/api/onboarding/state"),
+    ("PUT", "/api/tenants"),
+    ("POST", "/api/onboarding/github/identity"),
+    ("POST", "/api/onboarding/github/install"),
+    ("GET", "/api/onboarding/repositories"),
+    ("PUT", "/api/onboarding/repositories/{repository_id}"),
+    ("PUT", "/api/onboarding/dbt"),
+    ("POST", "/api/onboarding/ci-token"),
+    ("POST", "/api/onboarding/complete"),
+    ("POST", "/api/onboarding/dashboard-session"),
 }
 
 AUTHENTICATION = {
     "/healthz": "none",
     "/readyz": "none",
     "/github/webhook": "github-webhook-signature",
+    # A Clerk session token, verified server-side against Clerk's JWKS. Named
+    # distinctly from "service-token" because it is a different principal with
+    # a different authorization model, and the contract should say so rather
+    # than blur two credentials into one label.
+    "/api/onboarding/state": "clerk-session",
+    "/api/tenants": "clerk-session",
+    "/api/onboarding/github/identity": "clerk-session",
+    "/api/onboarding/github/install": "clerk-session",
+    "/api/onboarding/repositories": "clerk-session",
+    "/api/onboarding/repositories/{repository_id}": "clerk-session",
+    "/api/onboarding/dbt": "clerk-session",
+    "/api/onboarding/ci-token": "clerk-session",
+    "/api/onboarding/complete": "clerk-session",
+    # Authenticated by the Clerk bearer; SETS the GitHub dashboard session
+    # cookie. The two credentials meet here and nowhere else.
+    "/api/onboarding/dashboard-session": "clerk-session",
+    # Browser redirects arriving from github.com. They cannot carry a header,
+    # and a cookie would be sent cross-site, so the credential is the
+    # single-use installation state itself. Named distinctly because it is a
+    # weaker claim than a session: it says which flow this is, not what was
+    # installed — every other value on the request is verified against GitHub.
+    "/auth/github/link/callback": "installation-state",
+    "/github/setup": "installation-state",
 }
+
+#: Every authentication mode that counts as authenticated. An /api route whose
+#: mode is absent from this set is unauthenticated, which is the thing the
+#: contract test exists to prevent.
+AUTHENTICATED_MODES = frozenset({"service-token", "clerk-session"})
 
 
 def served_routes(app) -> list[dict]:

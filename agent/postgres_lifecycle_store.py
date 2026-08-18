@@ -36,6 +36,27 @@ class ManifestEvidenceConflict(ValueError):
     """A commit or idempotency key was replayed with different evidence."""
 
 
+class TenantRepositoryConflict(ValueError):
+    """A repository or an onboarding row is claimed by a different tenant.
+
+    Store-level so the persistence layer stays independent of the API layer.
+    The HTTP boundary renders it as the same non-disclosing 404 an unknown
+    repository would produce: telling a caller that a private repository exists
+    but belongs to somebody else is a disclosure in itself.
+    """
+
+
+class TenantInstallationConflict(ValueError):
+    """A GitHub App installation is already bound to a different tenant.
+
+    Store-level so the persistence layer does not depend on the API layer; the
+    HTTP boundary translates it to a non-disclosing 409. Never re-point a
+    binding to resolve this: doing so would hand one customer's repositories
+    to another, which is precisely what a spoofed installation id would be
+    trying to achieve.
+    """
+
+
 
 def _bounded_text(value, limit: int = 256):
     """Never persist an unbounded text value from a warehouse.
@@ -114,6 +135,584 @@ class PostgresLifecycleStore:
             "UPDATE environments SET connected = FALSE WHERE organization_id=%s AND repository_id=%s",
             (organization_id, repository_id),
         )
+
+    # -- Clerk-identified tenants and onboarding ---------------------------
+    #
+    # The workspace-level tenant, keyed by an immutable Clerk organization id.
+    # Distinct from the (organization_id, repository_id) pilot scope above,
+    # which is a repository, not a customer.
+
+    def tenant_by_clerk_organization(self, clerk_organization_id):
+        """The tenant for one Clerk organization, or None.
+
+        The lookup key is always the Clerk organization id from a verified
+        token. There is deliberately no lookup by tenant_id alone: a caller
+        naming a tenant is not evidence they belong to it, and offering that
+        query would make it easy to write a route that trusts one.
+        """
+        row = self.connection.execute(
+            "SELECT t.tenant_id, t.clerk_organization_id, t.organization_name, "
+            "       t.role, t.team_size, t.created_at, t.updated_at, "
+            "       s.current_step, s.completed_at "
+            "FROM tenants t "
+            "LEFT JOIN tenant_onboarding_state s ON s.tenant_id = t.tenant_id "
+            "WHERE t.clerk_organization_id = %s",
+            (clerk_organization_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_tenant_for_clerk_organization(self, clerk_organization_id, *,
+                                             organization_name, role=None,
+                                             team_size=None):
+        """Create the tenant for a Clerk organization, or update it in place.
+
+        IDEMPOTENT, AND SAFE UNDER CONCURRENCY. The idempotency is the UNIQUE
+        constraint on ``clerk_organization_id``, resolved by the database in
+        one statement — not a read-then-write, which two simultaneous
+        first-time requests would both pass before either inserted.
+
+        ``ON CONFLICT DO UPDATE`` rather than ``DO NOTHING`` because the losing
+        request must still receive the winning row: ``DO NOTHING`` returns no
+        rows on conflict, and the caller would have to re-read, which reopens
+        the race it just closed.
+
+        The generated ``tenant_id`` on the conflicting path is discarded by the
+        database. That is intentional: an identifier is cheap, and generating
+        it before the insert is what lets this be a single atomic statement.
+        """
+        candidate_id = f"ten_{uuid.uuid4().hex}"
+        with self.connection.transaction():
+            row = self.connection.execute(
+                "INSERT INTO tenants (tenant_id, clerk_organization_id, "
+                "                     organization_name, role, team_size) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON CONFLICT (clerk_organization_id) DO UPDATE SET "
+                "    organization_name = EXCLUDED.organization_name, "
+                "    role = EXCLUDED.role, "
+                "    team_size = EXCLUDED.team_size, "
+                "    updated_at = now() "
+                "RETURNING tenant_id, clerk_organization_id, organization_name, "
+                "          role, team_size, created_at, updated_at",
+                (candidate_id, clerk_organization_id, organization_name, role, team_size),
+            ).fetchone()
+            tenant = dict(row)
+            # The onboarding row is created with the tenant and never
+            # separately, so a tenant can never exist without state to read.
+            # DO NOTHING on replay: re-submitting the workspace step must not
+            # rewind progress made on a later step.
+            state = self.connection.execute(
+                "INSERT INTO tenant_onboarding_state (tenant_id) VALUES (%s) "
+                "ON CONFLICT (tenant_id) DO NOTHING "
+                "RETURNING current_step, completed_at",
+                (tenant["tenant_id"],),
+            ).fetchone()
+            if state is None:
+                state = self.connection.execute(
+                    "SELECT current_step, completed_at FROM tenant_onboarding_state "
+                    "WHERE tenant_id = %s",
+                    (tenant["tenant_id"],),
+                ).fetchone()
+        tenant.update(dict(state))
+        return tenant
+
+    def onboarding_state_for_tenant(self, tenant_id):
+        """Durable onboarding progress for one tenant, or None."""
+        row = self.connection.execute(
+            "SELECT tenant_id, current_step, completed_at, created_at, updated_at "
+            "FROM tenant_onboarding_state WHERE tenant_id = %s",
+            (tenant_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    # -- GitHub App installation binding -----------------------------------
+    #
+    # See migration 0015. The rule these methods exist to hold up: an
+    # installation is bound to a tenant only after three independent
+    # verifications, and never because a browser supplied an installation id.
+
+    def create_github_installation_state(self, *, state_hash, tenant_id,
+                                         clerk_user_id, expires_at,
+                                         purpose="github_app_install",
+                                         created_at=None):
+        """Mint one single-use installation-flow state.
+
+        Only the hash is stored. The value itself lives in the redirect URL and
+        in the customer's browser, and nowhere else, so a database disclosure
+        cannot be replayed as a live installation flow.
+
+        ``created_at`` is written explicitly rather than left to the column
+        default. The two timestamps have to come from the SAME clock: the
+        expiry is computed by the application, and if the row is stamped with
+        the database's clock instead, any skew between them shifts the real
+        lifetime. Far enough and the CHECK refuses the row; a little, and the
+        state silently expires early or late. One clock, one consistent pair.
+        """
+        state_id = f"ist_{uuid.uuid4().hex}"
+        self.connection.execute(
+            "INSERT INTO github_installation_states "
+            "(installation_state_id, state_hash, tenant_id, clerk_user_id, "
+            " purpose, created_at, expires_at) "
+            "VALUES (%s, %s, %s, %s, %s, COALESCE(%s, now()), %s)",
+            (state_id, state_hash, tenant_id, clerk_user_id, purpose,
+             created_at, expires_at),
+        )
+        return state_id
+
+    def consume_github_installation_state(self, state_hash, *, now,
+                                          purpose="github_app_install"):
+        """Claim a state exactly once, or return None.
+
+        ###############################################################
+        # SINGLE-USE IS ENFORCED BY THIS ONE STATEMENT.               #
+        ###############################################################
+
+        The guard lives in the WHERE clause, so the check and the claim are the
+        same atomic operation. A read-then-write would let two concurrent
+        redirects — a double-click, a retried request, or a deliberate replay —
+        both observe an unconsumed state and both proceed. Here PostgreSQL
+        serialises the UPDATE on the row and exactly one caller gets a row
+        back; every other caller gets None and is refused.
+
+        Expiry is part of the same guard rather than a separate check, so an
+        expired state cannot be claimed by winning a race against a cleanup
+        job that has not run yet.
+
+        Returns the tenant and Clerk user recorded AT MINT TIME. Callers must
+        use these and never any equivalent value from the request.
+        """
+        row = self.connection.execute(
+            "UPDATE github_installation_states SET consumed_at = %s "
+            "WHERE state_hash = %s AND purpose = %s "
+            "  AND consumed_at IS NULL AND expires_at > %s "
+            "RETURNING installation_state_id, tenant_id, clerk_user_id, "
+            "          purpose, created_at, expires_at",
+            (now, state_hash, purpose, now),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def github_installation_state(self, state_hash):
+        """Read a state without consuming it. Tests and diagnostics only."""
+        row = self.connection.execute(
+            "SELECT installation_state_id, tenant_id, clerk_user_id, purpose, "
+            "       created_at, expires_at, consumed_at "
+            "FROM github_installation_states WHERE state_hash = %s",
+            (state_hash,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def delete_expired_github_installation_states(self, *, now):
+        """Housekeeping. Consumed and expired states carry no further value."""
+        return self.connection.execute(
+            "DELETE FROM github_installation_states "
+            "WHERE expires_at <= %s OR consumed_at IS NOT NULL",
+            (now,),
+        ).rowcount
+
+    # -- Clerk user to GitHub user links -----------------------------------
+
+    def upsert_clerk_github_identity(self, clerk_user_id, *, github_user_id,
+                                     github_login, access_token=None,
+                                     access_expires_at=None, refresh_token=None,
+                                     refresh_expires_at=None):
+        """Record that a Clerk user has proved control of a GitHub account.
+
+        Only ever called after a completed GitHub OAuth exchange. Re-linking
+        replaces the credential, which is what happens when a token is
+        refreshed or the customer re-authorises.
+        """
+        row = self.connection.execute(
+            "INSERT INTO clerk_github_identities "
+            "(clerk_user_id, github_user_id, github_login, access_token, "
+            " access_expires_at, refresh_token, refresh_expires_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (clerk_user_id) DO UPDATE SET "
+            "  github_user_id = EXCLUDED.github_user_id, "
+            "  github_login = EXCLUDED.github_login, "
+            "  access_token = EXCLUDED.access_token, "
+            "  access_expires_at = EXCLUDED.access_expires_at, "
+            "  refresh_token = EXCLUDED.refresh_token, "
+            "  refresh_expires_at = EXCLUDED.refresh_expires_at, "
+            "  revoked_at = NULL, updated_at = now() "
+            "RETURNING clerk_user_id, github_user_id, github_login, linked_at, "
+            "          updated_at",
+            (clerk_user_id, github_user_id, github_login, access_token,
+             access_expires_at, refresh_token, refresh_expires_at),
+        ).fetchone()
+        return dict(row)
+
+    def clerk_github_identity(self, clerk_user_id):
+        """The GitHub identity linked to a Clerk user, or None.
+
+        Returns the encrypted credential columns as stored. Decryption happens
+        in the application, never in SQL, and the plaintext never leaves the
+        server.
+        """
+        row = self.connection.execute(
+            "SELECT clerk_user_id, github_user_id, github_login, access_token, "
+            "       access_expires_at, refresh_token, refresh_expires_at, "
+            "       linked_at, updated_at, revoked_at "
+            "FROM clerk_github_identities "
+            "WHERE clerk_user_id = %s AND revoked_at IS NULL",
+            (clerk_user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def revoke_clerk_github_identity(self, clerk_user_id):
+        """Drop the stored credential and mark the link revoked."""
+        return self.connection.execute(
+            "UPDATE clerk_github_identities "
+            "SET revoked_at = now(), access_token = NULL, refresh_token = NULL, "
+            "    updated_at = now() "
+            "WHERE clerk_user_id = %s AND revoked_at IS NULL",
+            (clerk_user_id,),
+        ).rowcount
+
+    # -- installation facts -------------------------------------------------
+
+    def record_github_installation(self, github_installation_id, *,
+                                   github_account_id, github_account_login,
+                                   github_account_type, github_app_id=None,
+                                   repository_selection=None, status="active",
+                                   suspended_at=None, deleted_at=None):
+        """Record what GitHub says about an installation. Tenant-agnostic.
+
+        IDEMPOTENT, because webhook deliveries are retried and may arrive out
+        of order, and because the Setup redirect and the webhook both land
+        here. An upsert keyed on the installation id means a duplicate
+        delivery is a no-op rather than a second row or an error.
+
+        Says nothing about tenancy on purpose: a webhook payload contains
+        nothing that identifies a Relium tenant, and guessing one from the
+        account login would let anyone who can name a GitHub organization
+        attach themselves to another customer's workspace.
+        """
+        row = self.connection.execute(
+            "INSERT INTO github_installations "
+            "(github_installation_id, github_app_id, github_account_id, "
+            " github_account_login, github_account_type, repository_selection, "
+            " status, suspended_at, deleted_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (github_installation_id) DO UPDATE SET "
+            "  github_app_id = COALESCE(EXCLUDED.github_app_id, "
+            "                           github_installations.github_app_id), "
+            "  github_account_id = EXCLUDED.github_account_id, "
+            "  github_account_login = EXCLUDED.github_account_login, "
+            "  github_account_type = EXCLUDED.github_account_type, "
+            "  repository_selection = COALESCE(EXCLUDED.repository_selection, "
+            "                                  github_installations.repository_selection), "
+            "  status = EXCLUDED.status, "
+            "  suspended_at = EXCLUDED.suspended_at, "
+            "  deleted_at = EXCLUDED.deleted_at, "
+            "  updated_at = now() "
+            "RETURNING github_installation_id, github_app_id, github_account_id, "
+            "          github_account_login, github_account_type, "
+            "          repository_selection, status, suspended_at, deleted_at, "
+            "          first_seen_at, updated_at",
+            (github_installation_id, github_app_id, github_account_id,
+             github_account_login, github_account_type, repository_selection,
+             status, suspended_at, deleted_at),
+        ).fetchone()
+        return dict(row)
+
+    def github_installation(self, github_installation_id):
+        row = self.connection.execute(
+            "SELECT github_installation_id, github_app_id, github_account_id, "
+            "       github_account_login, github_account_type, "
+            "       repository_selection, status, suspended_at, deleted_at, "
+            "       first_seen_at, updated_at "
+            "FROM github_installations WHERE github_installation_id = %s",
+            (github_installation_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def set_github_installation_status(self, github_installation_id, status, *,
+                                       suspended_at=None, deleted_at=None):
+        """Lifecycle transition from a signature-verified webhook.
+
+        Writes nothing if the installation is unknown: a status update is not a
+        reason to invent a row, and doing so would let a delivery for another
+        App's installation create one here.
+        """
+        return self.connection.execute(
+            "UPDATE github_installations "
+            "SET status = %s, suspended_at = %s, deleted_at = %s, updated_at = now() "
+            "WHERE github_installation_id = %s",
+            (status, suspended_at, deleted_at, github_installation_id),
+        ).rowcount
+
+    # -- the binding --------------------------------------------------------
+
+    def bind_github_installation_to_tenant(self, github_installation_id, *,
+                                           tenant_id, bound_by_clerk_user_id,
+                                           verified_github_user_id,
+                                           bound_via_state_id=None):
+        """Attach a verified installation to a tenant, idempotently.
+
+        Returns ``(binding, created)``. Re-running the same binding is a
+        success with ``created=False`` — a customer who reloads the Setup
+        redirect must not see an error.
+
+        A DIFFERENT tenant claiming an already-bound installation is refused,
+        not silently re-pointed. Re-pointing would hand one customer's
+        repositories to another, and it is the exact outcome a spoofed
+        installation id would be aiming for. The refusal is a
+        ``TenantInstallationConflict``, which the HTTP layer renders as a
+        non-disclosing 409.
+        """
+        row = self.connection.execute(
+            "INSERT INTO tenant_github_installations "
+            "(github_installation_id, tenant_id, bound_by_clerk_user_id, "
+            " verified_github_user_id, bound_via_state_id) "
+            "VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (github_installation_id) DO UPDATE SET "
+            "  updated_at = now() "
+            # The guard is what makes a cross-tenant claim fail instead of
+            # overwriting. On conflict with the SAME tenant this updates and
+            # returns the row; with a different tenant the WHERE excludes it,
+            # no row is returned, and the caller raises.
+            "  WHERE tenant_github_installations.tenant_id = EXCLUDED.tenant_id "
+            "RETURNING github_installation_id, tenant_id, bound_by_clerk_user_id, "
+            "          verified_github_user_id, bound_via_state_id, bound_at, "
+            "          updated_at, (xmax = 0) AS inserted",
+            (github_installation_id, tenant_id, bound_by_clerk_user_id,
+             verified_github_user_id, bound_via_state_id),
+        ).fetchone()
+
+        if row is None:
+            existing = self.connection.execute(
+                "SELECT tenant_id FROM tenant_github_installations "
+                "WHERE github_installation_id = %s",
+                (github_installation_id,),
+            ).fetchone()
+            if existing is not None:
+                raise TenantInstallationConflict(
+                    "this GitHub App installation is already connected to a "
+                    "different Relium workspace")
+            raise TenantInstallationConflict(
+                "the installation binding could not be created")
+
+        binding = dict(row)
+        created = bool(binding.pop("inserted", False))
+        return binding, created
+
+    def tenant_github_installations(self, tenant_id, *, include_deleted=False):
+        """Every installation bound to one tenant, newest binding first.
+
+        Joined to the facts table so a caller gets account and status in one
+        read. No credential or token is selected, because none is stored.
+        """
+        clause = "" if include_deleted else " AND i.status <> 'deleted'"
+        rows = self.connection.execute(
+            "SELECT b.github_installation_id, b.tenant_id, b.bound_at, "
+            "       b.bound_by_clerk_user_id, b.verified_github_user_id, "
+            "       i.github_app_id, i.github_account_id, i.github_account_login, "
+            "       i.github_account_type, i.repository_selection, i.status, "
+            "       i.suspended_at, i.deleted_at "
+            "FROM tenant_github_installations b "
+            "JOIN github_installations i "
+            "  ON i.github_installation_id = b.github_installation_id "
+            f"WHERE b.tenant_id = %s{clause} "
+            "ORDER BY b.bound_at DESC, b.github_installation_id",
+            (tenant_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def tenant_for_github_installation(self, github_installation_id):
+        """Which tenant owns an installation, or None if it is unbound."""
+        row = self.connection.execute(
+            "SELECT tenant_id FROM tenant_github_installations "
+            "WHERE github_installation_id = %s",
+            (github_installation_id,),
+        ).fetchone()
+        return row["tenant_id"] if row else None
+
+    # -- repository selection, dbt configuration, CI state ------------------
+    #
+    # See migration 0016. Every method here takes a tenant_id and includes it
+    # in the WHERE clause, so an id that belongs to another tenant matches no
+    # row rather than being corrected after the fact.
+
+    def select_tenant_repository(self, github_repository_id, *, tenant_id,
+                                 github_installation_id, owner_login, name,
+                                 default_branch=None, private=None,
+                                 dbt_detected=None, dbt_project_dir=None,
+                                 dbt_checked_at=None):
+        """Record the tenant's chosen repository, idempotently.
+
+        Re-selecting the same repository refreshes the display metadata and the
+        detection result without disturbing the dbt configuration or the CI
+        token state — a customer stepping back and forward must not lose work.
+
+        A repository already claimed by a DIFFERENT tenant raises rather than
+        being re-pointed. Re-pointing would move a configured repository
+        between customers, which is exactly what a spoofed id would attempt.
+        """
+        row = self.connection.execute(
+            "INSERT INTO tenant_repositories "
+            "(github_repository_id, tenant_id, github_installation_id, "
+            " owner_login, name, default_branch, private, dbt_detected, "
+            " dbt_project_dir, dbt_checked_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (github_repository_id) DO UPDATE SET "
+            "  github_installation_id = EXCLUDED.github_installation_id, "
+            "  owner_login = EXCLUDED.owner_login, "
+            "  name = EXCLUDED.name, "
+            "  default_branch = EXCLUDED.default_branch, "
+            "  private = EXCLUDED.private, "
+            "  dbt_detected = EXCLUDED.dbt_detected, "
+            "  dbt_project_dir = EXCLUDED.dbt_project_dir, "
+            "  dbt_checked_at = EXCLUDED.dbt_checked_at, "
+            "  updated_at = now() "
+            # The guard. On conflict with the SAME tenant this updates and
+            # returns; with a different tenant no row is returned and the
+            # caller raises.
+            "  WHERE tenant_repositories.tenant_id = EXCLUDED.tenant_id "
+            "RETURNING github_repository_id, tenant_id, github_installation_id, "
+            "          owner_login, name, default_branch, private, "
+            "          dbt_detected, dbt_project_dir, dbt_checked_at, "
+            "          project_dir, manifest_path, enforcement_mode, "
+            "          ci_token_id, ci_token_issued_at, ci_token_delivery, "
+            "          selected_at, configured_at",
+            (github_repository_id, tenant_id, github_installation_id,
+             owner_login, name, default_branch, private, dbt_detected,
+             dbt_project_dir, dbt_checked_at),
+        ).fetchone()
+
+        if row is None:
+            raise TenantRepositoryConflict(
+                "this repository is already connected to a different Relium "
+                "workspace")
+        return dict(row)
+
+    def tenant_repository(self, tenant_id, github_repository_id):
+        """One repository, scoped to the tenant. None if it is not theirs."""
+        row = self.connection.execute(
+            "SELECT github_repository_id, tenant_id, github_installation_id, "
+            "       owner_login, name, default_branch, private, dbt_detected, "
+            "       dbt_project_dir, dbt_checked_at, project_dir, manifest_path, "
+            "       enforcement_mode, ci_token_id, ci_token_issued_at, "
+            "       ci_token_delivery, selected_at, configured_at "
+            "FROM tenant_repositories "
+            "WHERE tenant_id = %s AND github_repository_id = %s",
+            (tenant_id, github_repository_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def tenant_repositories(self, tenant_id):
+        rows = self.connection.execute(
+            "SELECT github_repository_id, tenant_id, github_installation_id, "
+            "       owner_login, name, default_branch, private, dbt_detected, "
+            "       dbt_project_dir, project_dir, manifest_path, "
+            "       enforcement_mode, ci_token_id, ci_token_delivery, "
+            "       selected_at, configured_at "
+            "FROM tenant_repositories WHERE tenant_id = %s "
+            "ORDER BY owner_login, name",
+            (tenant_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def configured_tenant_repository(self, tenant_id):
+        """The tenant's configured repository, if there is one.
+
+        Onboarding configures one repository; this is what completion checks
+        and what the onboarding state reports.
+        """
+        row = self.connection.execute(
+            "SELECT github_repository_id, tenant_id, github_installation_id, "
+            "       owner_login, name, default_branch, private, project_dir, "
+            "       manifest_path, enforcement_mode, ci_token_id, "
+            "       ci_token_issued_at, ci_token_delivery, configured_at "
+            "FROM tenant_repositories "
+            "WHERE tenant_id = %s AND manifest_path IS NOT NULL "
+            "ORDER BY configured_at DESC NULLS LAST, github_repository_id "
+            "LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def configure_tenant_repository(self, github_repository_id, *, tenant_id,
+                                    project_dir, manifest_path,
+                                    enforcement_mode, configured_at):
+        """Persist the dbt configuration. Idempotent by being a plain UPDATE.
+
+        The tenant is in the WHERE clause, so a repository belonging to someone
+        else matches nothing and the caller sees the same not-found it would
+        see for an id that does not exist.
+        """
+        row = self.connection.execute(
+            "UPDATE tenant_repositories "
+            "SET project_dir = %s, manifest_path = %s, enforcement_mode = %s, "
+            "    configured_at = %s, updated_at = now() "
+            "WHERE tenant_id = %s AND github_repository_id = %s "
+            "RETURNING github_repository_id, tenant_id, owner_login, name, "
+            "          project_dir, manifest_path, enforcement_mode, "
+            "          ci_token_id, ci_token_delivery, configured_at",
+            (project_dir, manifest_path, enforcement_mode, configured_at,
+             tenant_id, github_repository_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def record_tenant_repository_ci_token(self, github_repository_id, *,
+                                          tenant_id, ci_token_id, delivery,
+                                          issued_at):
+        """Record THAT a CI token exists, and how it was delivered.
+
+        The token id is the non-secret half; the secret is never stored here or
+        anywhere else. issue_ci_token keeps only sha256(secret) on
+        api_service_tokens, which is the sole record of it.
+        """
+        row = self.connection.execute(
+            "UPDATE tenant_repositories "
+            "SET ci_token_id = %s, ci_token_delivery = %s, "
+            "    ci_token_issued_at = %s, updated_at = now() "
+            "WHERE tenant_id = %s AND github_repository_id = %s "
+            "RETURNING github_repository_id, ci_token_id, ci_token_delivery, "
+            "          ci_token_issued_at",
+            (ci_token_id, delivery, issued_at, tenant_id, github_repository_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def complete_tenant_onboarding(self, tenant_id, *, completed_at,
+                                   repository_id=None, clerk_user_id=None):
+        """Mark onboarding finished. Safe under concurrent completion.
+
+        ``completed_at IS NULL`` in the WHERE clause is what makes this
+        single-shot: two simultaneous completions race on the row and exactly
+        one performs the write. The loser reads the winner's values and returns
+        them, so both callers see the same completion rather than one seeing an
+        error for having been a millisecond late.
+
+        current_step is moved to 'ready' in the same statement, because the
+        CHECK constraint in migration 0014 refuses a completed row that still
+        points at an unfinished step.
+        """
+        row = self.connection.execute(
+            "UPDATE tenant_onboarding_state "
+            "SET completed_at = %s, current_step = 'ready', "
+            "    completed_repository_id = %s, completed_by_clerk_user_id = %s, "
+            "    updated_at = now() "
+            "WHERE tenant_id = %s AND completed_at IS NULL "
+            "RETURNING tenant_id, completed_at, completed_repository_id, "
+            "          completed_by_clerk_user_id",
+            (completed_at, repository_id, clerk_user_id, tenant_id),
+        ).fetchone()
+        if row is not None:
+            record = dict(row)
+            record["created"] = True
+            return record
+
+        existing = self.connection.execute(
+            "SELECT tenant_id, completed_at, completed_repository_id, "
+            "       completed_by_clerk_user_id "
+            "FROM tenant_onboarding_state WHERE tenant_id = %s",
+            (tenant_id,),
+        ).fetchone()
+        if existing is None:
+            raise TenantRepositoryConflict(
+                "there is no onboarding state for this workspace")
+        record = dict(existing)
+        record["created"] = False
+        return record
 
     def delete_tenant(self, organization_id):
         now = datetime.now(timezone.utc)

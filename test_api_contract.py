@@ -91,14 +91,53 @@ class RouteContractTests(unittest.TestCase):
             "docs/api-contract.json has drifted from the served route table",
         )
 
-    def test_api_routes_require_service_token_authentication(self):
-        from agent.api.contract import served_routes
+    def test_every_api_route_is_authenticated(self):
+        """No /api route may be reachable without a credential.
+
+        Widened from "service-token" to an allow-list of authenticated modes
+        when Clerk sessions were introduced. The guarantee is unchanged and the
+        check is no weaker: a mode absent from AUTHENTICATED_MODES — "none"
+        above all — still fails, and adding a new mode is a deliberate edit to
+        that set rather than something a new route can do on its own.
+        """
+        from agent.api.contract import AUTHENTICATED_MODES, served_routes
 
         for entry in served_routes(self.app):
             if entry["path"].startswith("/api/"):
+                self.assertIn(
+                    entry["authentication"], AUTHENTICATED_MODES,
+                    f"{entry['method']} {entry['path']} is not marked authenticated",
+                )
+
+    def test_onboarding_routes_are_clerk_authenticated(self):
+        """Onboarding is a Clerk principal, and is declared as one."""
+        from agent.api.contract import served_routes
+
+        modes = {
+            (e["method"], e["path"]): e["authentication"]
+            for e in served_routes(self.app)
+        }
+        self.assertEqual(modes[("GET", "/api/onboarding/state")], "clerk-session")
+        self.assertEqual(modes[("PUT", "/api/tenants")], "clerk-session")
+
+    def test_service_token_routes_did_not_become_clerk_routes(self):
+        """The pre-existing API surface keeps the credential it always had."""
+        from agent.api.contract import served_routes
+
+        clerk_paths = {"/api/onboarding/state", "/api/tenants",
+                       "/api/onboarding/github/identity",
+                       "/api/onboarding/github/install",
+                       "/api/onboarding/repositories",
+                       "/api/onboarding/repositories/{repository_id}",
+                       "/api/onboarding/dbt",
+                       "/api/onboarding/ci-token",
+                       "/api/onboarding/complete",
+                       "/api/onboarding/dashboard-session"}
+        for entry in served_routes(self.app):
+            if entry["path"].startswith("/api/") and entry["path"] not in clerk_paths:
                 self.assertEqual(
                     entry["authentication"], "service-token",
-                    f"{entry['method']} {entry['path']} is not marked authenticated",
+                    f"{entry['method']} {entry['path']} changed authentication mode",
                 )
 
     def test_webhook_keeps_its_own_signature_authentication(self):

@@ -32,19 +32,51 @@ class CapabilityError(Exception):
     """The credential is valid but does not carry the required capability."""
 
 
+#: Which identity provider authenticated a human principal.
+#:
+#: ``github`` is a GitHub OAuth dashboard session (agent/api/sessions.py) and
+#: carries a live, re-verified repository permission. ``clerk`` is a verified
+#: Clerk session (agent/api/clerk_identity.py) and carries no repository
+#: permission at all.
+#:
+#: They are kept apart because "is a human" stopped being a sufficient answer
+#: the moment a second kind of human session existed. Without this distinction
+#: a Clerk session would satisfy every ``human=True`` capability below —
+#: including governance — purely by being human.
+GITHUB_IDENTITY = "github"
+CLERK_IDENTITY = "clerk"
+
+
 @dataclass(frozen=True)
 class Capability:
     """One named thing a caller may be permitted to do."""
 
     name: str
-    #: A human GitHub session may hold this.
+    #: A human session may hold this.
     human: bool
     #: A machine service token may hold this, and with which scopes.
     token_scopes: frozenset
+    #: Which human identity providers may hold it.
+    #:
+    #: Meaningful ONLY when ``human`` is true, and empty otherwise — a
+    #: machine-only capability has no human holder to qualify, and leaving a
+    #: default provider on one would suggest a human could hold it if only they
+    #: used the right identity provider. They cannot: the ``human`` flag
+    #: refuses every human first.
+    #:
+    #: For human capabilities it defaults to GitHub only, so every capability
+    #: that existed before Clerk keeps exactly the meaning it had. A Clerk
+    #: session cannot acquire one by default; granting it has to be written
+    #: down deliberately.
+    human_identities: frozenset = frozenset({GITHUB_IDENTITY})
 
 
-def _cap(name, *, human=False, token_scopes=()):
-    return Capability(name, human, frozenset(token_scopes))
+def _cap(name, *, human=False, token_scopes=(), human_identities=(GITHUB_IDENTITY,)):
+    # A machine-only capability carries no identity providers. Enforced here
+    # rather than trusted to each call site, so the invariant holds for every
+    # capability defined below and for any added later.
+    providers = frozenset(human_identities) if human else frozenset()
+    return Capability(name, human, frozenset(token_scopes), providers)
 
 
 #: Reading the dashboard. Not granted to a collector: a collector needs its own
@@ -79,6 +111,20 @@ CI_MANIFEST_INGEST = _cap("ci_manifest_ingest", token_scopes={"ci"})
 #: rule for reads in general, so the overlap stays visible and stays at one.
 COLLECTION_REQUEST_READ = _cap(
     "collection_request_read", human=True, token_scopes={"collector", "operator_read"})
+
+#: Reading one's own onboarding state, and creating the workspace.
+#:
+#: Clerk only, and human only. A machine token has no onboarding: no service
+#: credential should be able to enumerate setup progress or mint a tenant, and
+#: a GitHub dashboard session is scoped to a repository that by definition does
+#: not exist yet during first-run setup.
+#:
+#: Neither of these grants anything over repository data. They are confined to
+#: the tenant the verified Clerk token resolves to.
+ONBOARDING_READ = _cap("onboarding_read", human=True,
+                       human_identities={CLERK_IDENTITY})
+ONBOARDING_WRITE = _cap("onboarding_write", human=True,
+                        human_identities={CLERK_IDENTITY})
 
 
 def highest_permission(permissions) -> str | None:
@@ -124,6 +170,14 @@ def authorize(principal, capability: Capability) -> None:
         if not capability.human:
             raise CapabilityError(
                 f"{capability.name} is not available to a dashboard session")
+        # Which kind of human. A capability that was written for a
+        # GitHub-authenticated session is not silently inherited by a Clerk one
+        # just because both are people: a Clerk session carries no repository
+        # permission, so it could not satisfy the check below honestly.
+        provider = getattr(principal, "identity_provider", GITHUB_IDENTITY)
+        if provider not in capability.human_identities:
+            raise CapabilityError(
+                f"{capability.name} is not available to a {provider} session")
         if capability is GOVERNANCE_WRITE and not principal.may_govern:
             raise CapabilityError(
                 "this GitHub account does not have write access to the repository")
