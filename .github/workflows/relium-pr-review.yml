@@ -196,23 +196,65 @@ jobs:
           # nowhere else -- which made an unchanged commit look like changed
           # evidence and produced a 409 on re-submission.
           #
-          # Nothing in Relium's review path reads them: it reads nodes,
-          # sources and depends_on. Dropping them makes the submitted document
-          # a function of the commit alone, so re-submitting the same commit is
-          # byte-identical and the API treats it as the idempotent retry it is.
+          # VERIFIED UNUSED BY THE REVIEW PATH before removal. What Relium
+          # actually reads from a node is: unique_id, name, resource_type,
+          # database, schema, alias, identifier, depends_on and the SQL. From
+          # metadata it reads only project_name and dbt_version
+          # (agent/dbt_context.py). The macros section is never read at all --
+          # `"macros"` appears nowhere in the codebase.
+          #
+          # `user_id` is dbt's anonymous per-installation identifier, and
+          # `created_at` is a wall-clock epoch stamped on every node and macro
+          # at parse time. Both change on every compile of unchanged source.
           VOLATILE_METADATA = ("generated_at", "invocation_id",
-                               "invocation_started_at")
+                               "invocation_started_at", "run_started_at",
+                               "user_id")
+
+          # Per-entry parse timestamp. Present on every node and every macro,
+          # so leaving it in guarantees a different hash on every compile --
+          # this, not the metadata block, is what still broke re-submission
+          # after the first normalisation attempt.
+          VOLATILE_ENTRY_FIELDS = ("created_at",)
+
+          # Only these sections are swept for per-entry timestamps. Named
+          # explicitly rather than walking the whole document, so the rule
+          # cannot silently start stripping fields somewhere unexamined.
+          ENTRY_SECTIONS = ("nodes", "macros")
+
+
+          def _without_entry_timestamps(section):
+              """One manifest section with per-entry parse stamps removed."""
+              cleaned = {}
+              for name, entry in section.items():
+                  if isinstance(entry, dict):
+                      entry = {key: value for key, value in entry.items()
+                               if key not in VOLATILE_ENTRY_FIELDS}
+                  cleaned[name] = entry
+              return cleaned
 
 
           def stable(manifest):
-              """The manifest with per-run metadata removed."""
+              """The manifest as a function of the commit, not of the run.
+
+              Removes exactly the fields listed above and nothing else. Every
+              semantic field -- models, sources, columns, depends_on, SQL --
+              is left untouched, so a real change to the project still changes
+              this document and the API still rejects it as a conflict.
+              """
+              manifest = dict(manifest)
+
               metadata = manifest.get("metadata")
               if isinstance(metadata, dict):
-                  manifest = dict(manifest)
                   manifest["metadata"] = {
                       key: value for key, value in metadata.items()
                       if key not in VOLATILE_METADATA
                   }
+
+              for name in ENTRY_SECTIONS:
+                  section = manifest.get(name)
+                  if isinstance(section, dict):
+                      manifest[name] = _without_entry_timestamps(section)
+
               return manifest
 
 

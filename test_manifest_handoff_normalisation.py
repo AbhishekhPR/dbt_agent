@@ -23,11 +23,60 @@ ORG = "AbhishekhPR"
 REPO = "dbt_agent"
 WORKFLOW = Path(".github/workflows/relium-pr-review.yml")
 
+# Two REAL dbt manifests, downloaded from GitHub Actions runs 32150083407 and
+# 32154337313. Both are compiles of the SAME base commit
+# (66f4daaa2e53f13fdded092bc0c3820d4d1f963a) forty-one minutes apart, so they
+# differ only in what dbt stamps per run. A synthetic manifest cannot stand in
+# for this: the first normalisation attempt passed against a synthetic fixture
+# and still failed in CI, because the fixture carried none of the per-node
+# `created_at` stamps that a real manifest has on every entry.
+FIXTURES = Path("tests/fixtures/manifests")
+REAL_A = FIXTURES / "base-compile-a.json"
+REAL_B = FIXTURES / "base-compile-b.json"
+
+
+def _real(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+#: Exactly what the workflow is allowed to strip. Pinned so that widening the
+#: rule fails here and has to be argued for.
+EXPECTED_VOLATILE_METADATA = {
+    "generated_at", "invocation_id", "invocation_started_at",
+    "run_started_at", "user_id",
+}
+EXPECTED_VOLATILE_ENTRY_FIELDS = {"created_at"}
+EXPECTED_ENTRY_SECTIONS = {"nodes", "macros"}
+
 _SEQUENCE = iter(range(20_000, 30_000))
 
 
 def _sha():
     return f"{next(_SEQUENCE):040x}".replace("x", "c")
+
+
+def _workflow_constants():
+    """The three tuples the workflow defines, loaded from the workflow."""
+    code = _workflow_code()
+    lines = code.splitlines()
+    start = next(i for i, line in enumerate(lines)
+                 if line.startswith("VOLATILE_METADATA"))
+    end = next(i for i, line in enumerate(lines)
+               if i > start and line.strip() == "return manifest")
+    namespace = {}
+    exec(compile("\n".join(lines[start:end + 1]), "workflow", "exec"), namespace)
+    return namespace
+
+
+def _workflow_code():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    blocks = [chunk.split("\n          PY", 1)[0]
+              for chunk in text.split("python - <<'PY'")[1:]]
+    matching = [chunk for chunk in blocks if "VOLATILE_METADATA" in chunk]
+    assert matching, "no embedded python step defines VOLATILE_METADATA"
+    return "\n".join(
+        line[10:] if line.startswith(" " * 10) else line
+        for line in matching[0].splitlines())
 
 
 def _workflow_normaliser():
@@ -136,6 +185,178 @@ class NormalisationUnitTests(unittest.TestCase):
         self.assertEqual(self.stable({"nodes": {}}), {"nodes": {}})
 
 
+class RealManifestNormalisationTests(unittest.TestCase):
+    """Against two genuine dbt manifests of the same commit.
+
+    This is the suite that would have caught the incomplete first fix.
+    """
+
+    def setUp(self):
+        self.stable = _workflow_normaliser()
+        self.a = _real(REAL_A)
+        self.b = _real(REAL_B)
+
+    def _hash(self, manifest):
+        import hashlib
+
+        return hashlib.sha256(json.dumps(
+            manifest, sort_keys=True, separators=(",", ":"),
+            default=str).encode()).hexdigest()
+
+    def test_the_fixtures_really_are_different_documents(self):
+        """Guards the test itself: if these ever became identical the suite
+        below would pass while proving nothing."""
+        self.assertNotEqual(self.a, self.b)
+        self.assertNotEqual(self._hash(self.a), self._hash(self.b))
+
+    def test_two_real_compiles_of_one_commit_normalise_to_one_document(self):
+        """REQUIREMENT 1 -- the whole point."""
+        self.assertEqual(self.stable(self.a), self.stable(self.b))
+        self.assertEqual(self._hash(self.stable(self.a)),
+                         self._hash(self.stable(self.b)))
+
+    def test_the_real_fixtures_differ_in_exactly_the_expected_fields(self):
+        """Documents WHY they differed, from the real artifacts."""
+        differing = {key for key in set(self.a["metadata"]) | set(self.b["metadata"])
+                     if self.a["metadata"].get(key) != self.b["metadata"].get(key)}
+        self.assertEqual(differing, EXPECTED_VOLATILE_METADATA)
+
+        for section in ("nodes", "macros"):
+            fields = set()
+            for name in set(self.a[section]) & set(self.b[section]):
+                first, second = self.a[section][name], self.b[section][name]
+                fields.update(key for key in set(first) | set(second)
+                              if first.get(key) != second.get(key))
+            self.assertEqual(fields, EXPECTED_VOLATILE_ENTRY_FIELDS, section)
+
+    def test_every_semantic_field_survives_normalisation(self):
+        """Nothing the review path reads is removed."""
+        normalised = self.stable(self.a)
+        for name, node in self.a["nodes"].items():
+            kept = normalised["nodes"][name]
+            for field in ("unique_id", "name", "resource_type", "database",
+                          "schema", "alias", "depends_on", "columns",
+                          "raw_code", "compiled_code", "config"):
+                if field in node:
+                    self.assertEqual(kept[field], node[field],
+                                     f"{name}.{field} was altered")
+        # And the metadata Relium actually reads.
+        for field in ("project_name", "dbt_version"):
+            self.assertEqual(normalised["metadata"].get(field),
+                             self.a["metadata"].get(field))
+
+    def test_the_node_and_macro_sets_are_unchanged(self):
+        normalised = self.stable(self.a)
+        self.assertEqual(set(normalised["nodes"]), set(self.a["nodes"]))
+        self.assertEqual(set(normalised["macros"]), set(self.a["macros"]))
+
+    # -- one requirement per volatile field, on the REAL document ----------
+
+    def _mutating(self, mutate):
+        import copy
+
+        changed = copy.deepcopy(self.a)
+        mutate(changed)
+        return self.stable(changed) == self.stable(self.a)
+
+    def test_generated_at_does_not_matter(self):
+        self.assertTrue(self._mutating(
+            lambda m: m["metadata"].__setitem__("generated_at", "2099-01-01T00:00:00Z")))
+
+    def test_invocation_id_does_not_matter(self):
+        self.assertTrue(self._mutating(
+            lambda m: m["metadata"].__setitem__("invocation_id", "different")))
+
+    def test_invocation_started_at_does_not_matter(self):
+        self.assertTrue(self._mutating(
+            lambda m: m["metadata"].__setitem__("invocation_started_at", "2099-01-01T00:00:00Z")))
+
+    def test_run_started_at_does_not_matter(self):
+        self.assertTrue(self._mutating(
+            lambda m: m["metadata"].__setitem__("run_started_at", "2099-01-01T00:00:00+00:00")))
+
+    def test_metadata_user_id_does_not_matter(self):
+        self.assertTrue(self._mutating(
+            lambda m: m["metadata"].__setitem__("user_id", "another-uuid")))
+
+    def test_node_created_at_does_not_matter(self):
+        def mutate(m):
+            for node in m["nodes"].values():
+                node["created_at"] = 1.0
+        self.assertTrue(self._mutating(mutate))
+
+    def test_macro_created_at_does_not_matter(self):
+        def mutate(m):
+            for macro in m["macros"].values():
+                macro["created_at"] = 1.0
+        self.assertTrue(self._mutating(mutate))
+
+    # -- and the changes that MUST still matter ----------------------------
+
+    def test_a_semantic_node_change_still_changes_the_document(self):
+        def mutate(m):
+            name = sorted(m["nodes"])[0]
+            m["nodes"][name]["raw_code"] = "select 999 as changed"
+        self.assertFalse(self._mutating(mutate))
+
+    def test_a_depends_on_change_still_changes_the_document(self):
+        def mutate(m):
+            for node in m["nodes"].values():
+                if isinstance(node.get("depends_on"), dict):
+                    node["depends_on"]["nodes"] = ["model.injected.dependency"]
+                    return
+            raise AssertionError("no node with depends_on in the fixture")
+        self.assertFalse(self._mutating(mutate))
+
+    def test_a_source_change_still_changes_the_document(self):
+        def mutate(m):
+            if m.get("sources"):
+                name = sorted(m["sources"])[0]
+                m["sources"][name]["identifier"] = "renamed_source_table"
+            else:
+                m["sources"] = {"source.injected": {"identifier": "x"}}
+        self.assertFalse(self._mutating(mutate))
+
+    def test_adding_or_removing_a_node_still_changes_the_document(self):
+        self.assertFalse(self._mutating(
+            lambda m: m["nodes"].pop(sorted(m["nodes"])[0])))
+
+    def test_a_column_change_still_changes_the_document(self):
+        def mutate(m):
+            for node in m["nodes"].values():
+                if isinstance(node.get("columns"), dict) and node["columns"]:
+                    key = sorted(node["columns"])[0]
+                    node["columns"][key] = {"name": "renamed_column"}
+                    return
+            raise AssertionError("no node with columns in the fixture")
+        self.assertFalse(self._mutating(mutate))
+
+
+class NormalisationFieldSetTests(unittest.TestCase):
+    """The field set is pinned. Widening it must fail here."""
+
+    def setUp(self):
+        self.constants = _workflow_constants()
+
+    def test_metadata_field_set_is_exactly_pinned(self):
+        self.assertEqual(set(self.constants["VOLATILE_METADATA"]),
+                         EXPECTED_VOLATILE_METADATA)
+
+    def test_entry_field_set_is_exactly_pinned(self):
+        self.assertEqual(set(self.constants["VOLATILE_ENTRY_FIELDS"]),
+                         EXPECTED_VOLATILE_ENTRY_FIELDS)
+
+    def test_only_nodes_and_macros_are_swept(self):
+        """Sources, exposures, metrics and the rest are never touched."""
+        self.assertEqual(set(self.constants["ENTRY_SECTIONS"]),
+                         EXPECTED_ENTRY_SECTIONS)
+
+    def test_sources_are_not_swept_for_timestamps(self):
+        stable = self.constants["stable"]
+        manifest = {"sources": {"source.a": {"created_at": 1.0, "name": "a"}}}
+        self.assertEqual(stable(manifest)["sources"]["source.a"]["created_at"], 1.0)
+
+
 class WorkflowSafetyTests(unittest.TestCase):
     """Static checks on the workflow. No database, no network.
 
@@ -164,19 +385,9 @@ class WorkflowSafetyTests(unittest.TestCase):
     def test_the_embedded_python_compiles(self):
         compile(self.code, "relium-pr-review", "exec")
 
-    def test_exactly_three_volatile_fields_are_removed(self):
-        """Scope discipline. Removing more than was proven volatile would be
-        stripping evidence, not noise."""
-        namespace = {}
-        lines = self.code.splitlines()
-        start = next(i for i, line in enumerate(lines)
-                     if line.startswith("VOLATILE_METADATA"))
-        end = next(i for i, line in enumerate(lines)
-                   if i > start and line.strip() == "return manifest")
-        exec(compile("\n".join(lines[start:end + 1]), "w", "exec"), namespace)
-        self.assertEqual(
-            set(namespace["VOLATILE_METADATA"]),
-            {"generated_at", "invocation_id", "invocation_started_at"})
+    # The field set is pinned in NormalisationFieldSetTests, which covers
+    # metadata, per-entry fields and the swept sections together. A second
+    # partial copy here would only drift.
 
     def test_the_diagnostics_print_only_safe_response_fields(self):
         """`describe` reads three keys and nothing else."""
