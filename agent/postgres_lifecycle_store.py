@@ -115,6 +115,94 @@ class PostgresLifecycleStore:
             (organization_id, repository_id),
         )
 
+    # -- Clerk-identified tenants and onboarding ---------------------------
+    #
+    # The workspace-level tenant, keyed by an immutable Clerk organization id.
+    # Distinct from the (organization_id, repository_id) pilot scope above,
+    # which is a repository, not a customer.
+
+    def tenant_by_clerk_organization(self, clerk_organization_id):
+        """The tenant for one Clerk organization, or None.
+
+        The lookup key is always the Clerk organization id from a verified
+        token. There is deliberately no lookup by tenant_id alone: a caller
+        naming a tenant is not evidence they belong to it, and offering that
+        query would make it easy to write a route that trusts one.
+        """
+        row = self.connection.execute(
+            "SELECT t.tenant_id, t.clerk_organization_id, t.organization_name, "
+            "       t.role, t.team_size, t.created_at, t.updated_at, "
+            "       s.current_step, s.completed_at "
+            "FROM tenants t "
+            "LEFT JOIN tenant_onboarding_state s ON s.tenant_id = t.tenant_id "
+            "WHERE t.clerk_organization_id = %s",
+            (clerk_organization_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_tenant_for_clerk_organization(self, clerk_organization_id, *,
+                                             organization_name, role=None,
+                                             team_size=None):
+        """Create the tenant for a Clerk organization, or update it in place.
+
+        IDEMPOTENT, AND SAFE UNDER CONCURRENCY. The idempotency is the UNIQUE
+        constraint on ``clerk_organization_id``, resolved by the database in
+        one statement — not a read-then-write, which two simultaneous
+        first-time requests would both pass before either inserted.
+
+        ``ON CONFLICT DO UPDATE`` rather than ``DO NOTHING`` because the losing
+        request must still receive the winning row: ``DO NOTHING`` returns no
+        rows on conflict, and the caller would have to re-read, which reopens
+        the race it just closed.
+
+        The generated ``tenant_id`` on the conflicting path is discarded by the
+        database. That is intentional: an identifier is cheap, and generating
+        it before the insert is what lets this be a single atomic statement.
+        """
+        candidate_id = f"ten_{uuid.uuid4().hex}"
+        with self.connection.transaction():
+            row = self.connection.execute(
+                "INSERT INTO tenants (tenant_id, clerk_organization_id, "
+                "                     organization_name, role, team_size) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON CONFLICT (clerk_organization_id) DO UPDATE SET "
+                "    organization_name = EXCLUDED.organization_name, "
+                "    role = EXCLUDED.role, "
+                "    team_size = EXCLUDED.team_size, "
+                "    updated_at = now() "
+                "RETURNING tenant_id, clerk_organization_id, organization_name, "
+                "          role, team_size, created_at, updated_at",
+                (candidate_id, clerk_organization_id, organization_name, role, team_size),
+            ).fetchone()
+            tenant = dict(row)
+            # The onboarding row is created with the tenant and never
+            # separately, so a tenant can never exist without state to read.
+            # DO NOTHING on replay: re-submitting the workspace step must not
+            # rewind progress made on a later step.
+            state = self.connection.execute(
+                "INSERT INTO tenant_onboarding_state (tenant_id) VALUES (%s) "
+                "ON CONFLICT (tenant_id) DO NOTHING "
+                "RETURNING current_step, completed_at",
+                (tenant["tenant_id"],),
+            ).fetchone()
+            if state is None:
+                state = self.connection.execute(
+                    "SELECT current_step, completed_at FROM tenant_onboarding_state "
+                    "WHERE tenant_id = %s",
+                    (tenant["tenant_id"],),
+                ).fetchone()
+        tenant.update(dict(state))
+        return tenant
+
+    def onboarding_state_for_tenant(self, tenant_id):
+        """Durable onboarding progress for one tenant, or None."""
+        row = self.connection.execute(
+            "SELECT tenant_id, current_step, completed_at, created_at, updated_at "
+            "FROM tenant_onboarding_state WHERE tenant_id = %s",
+            (tenant_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
     def delete_tenant(self, organization_id):
         now = datetime.now(timezone.utc)
         with self.connection.transaction():

@@ -43,6 +43,7 @@
     "GET /api/models/{model}/lineage",
     "GET /api/monitoring",
     "GET /api/monitoring/observations",
+    "GET /api/onboarding/state",
     "GET /api/repositories/{repository}/settings",
     "GET /api/reviews",
     "GET /api/reviews/{review_id}",
@@ -73,7 +74,8 @@
     "POST /api/reviews/{review_id}/exceptions/{exception_id}/revoke",
     "POST /api/reviews/{review_id}/request-changes",
     "POST /api/reviews/{review_id}/rerun",
-    "POST /github/webhook"
+    "POST /github/webhook",
+    "PUT /api/tenants"
   ],
   "routes": [
     {
@@ -202,6 +204,11 @@
       "path": "/api/monitoring/observations"
     },
     {
+      "authentication": "clerk-session",
+      "method": "GET",
+      "path": "/api/onboarding/state"
+    },
+    {
       "authentication": "service-token",
       "method": "GET",
       "path": "/api/repositories/{repository}/settings"
@@ -290,6 +297,11 @@
       "authentication": "service-token",
       "method": "GET",
       "path": "/api/reviews/{review_id}/snapshots"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "PUT",
+      "path": "/api/tenants"
     },
     {
       "authentication": "github-webhook-signature",

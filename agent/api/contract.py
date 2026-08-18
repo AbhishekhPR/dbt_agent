@@ -74,13 +74,28 @@ MANDATORY_ROUTES = {
     ("GET", "/api/reviews/{review_id}/collection-requests"),
     ("GET", "/api/reviews/{review_id}/snapshots"),
     ("GET", "/api/reviews/{review_id}/publications"),
+    # First-run onboarding. Authenticated by a server-verified Clerk session
+    # token rather than a service token — see ONBOARDING_AUTHENTICATED below.
+    ("GET", "/api/onboarding/state"),
+    ("PUT", "/api/tenants"),
 }
 
 AUTHENTICATION = {
     "/healthz": "none",
     "/readyz": "none",
     "/github/webhook": "github-webhook-signature",
+    # A Clerk session token, verified server-side against Clerk's JWKS. Named
+    # distinctly from "service-token" because it is a different principal with
+    # a different authorization model, and the contract should say so rather
+    # than blur two credentials into one label.
+    "/api/onboarding/state": "clerk-session",
+    "/api/tenants": "clerk-session",
 }
+
+#: Every authentication mode that counts as authenticated. An /api route whose
+#: mode is absent from this set is unauthenticated, which is the thing the
+#: contract test exists to prevent.
+AUTHENTICATED_MODES = frozenset({"service-token", "clerk-session"})
 
 
 def served_routes(app) -> list[dict]:

@@ -74,6 +74,12 @@ class HumanPrincipal:
 
     is_human = True
     scope = "human"
+    #: Authenticated by GitHub OAuth, and therefore carrying a real, live
+    #: repository permission in ``github_permission`` / ``may_govern``. Named
+    #: explicitly now that a second kind of human session exists — see
+    #: agent/api/authorization.py, where capabilities declare which identity
+    #: providers may hold them.
+    identity_provider = "github"
 
     @property
     def actor(self) -> str:

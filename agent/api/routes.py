@@ -334,7 +334,8 @@ def _governance_actor(body, principal) -> str:
 
 
 def create_api_routes(*, store_pool, authenticator_factory=None,
-                      session_manager=None, allowed_origins=()):
+                      session_manager=None, allowed_origins=(),
+                      clerk_verifier=None):
     """Build the /api route table. Registration stays explicit and inspectable.
 
     Every route declares the capability it needs. Authentication answers *who*
@@ -1428,6 +1429,15 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
             if name != "submit_manifest_evidence"
         ],
     ]
+
+    # First-run onboarding. A separate principal (Clerk, not a service token or
+    # a GitHub session) and therefore its own authentication path, kept in its
+    # own module rather than folded into `handler` above — merging them is how
+    # one credential ends up satisfying two different authorization models.
+    from agent.api.onboarding_routes import create_onboarding_routes
+
+    routes.extend(create_onboarding_routes(
+        store_pool=store_pool, clerk_verifier=clerk_verifier))
     return routes
 
 

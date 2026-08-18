@@ -27,6 +27,7 @@ def create_http_app(
     cors_allowed_origins=(),
     session_manager=None,
     auth_routes=(),
+    clerk_verifier=None,
 ):
     """Build the served application.
 
@@ -196,6 +197,7 @@ def create_http_app(
             store_pool=store_pool,
             session_manager=session_manager,
             allowed_origins=cors_allowed_origins,
+            clerk_verifier=clerk_verifier,
         ))
     # Dashboard sign-in. Registered only when the App's user-authorization
     # credentials are fully configured, so there is never a login route that
