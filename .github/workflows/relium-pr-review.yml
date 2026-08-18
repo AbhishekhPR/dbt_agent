@@ -182,6 +182,7 @@ jobs:
           import json
           import os
           from pathlib import Path
+          from urllib.error import HTTPError, URLError
           from urllib.request import Request, urlopen
 
           api_url = os.environ.get("RELIUM_API_URL", "").rstrip("/")
@@ -189,11 +190,56 @@ jobs:
           if not api_url or not token:
               raise SystemExit("RELIUM_API_URL and RELIUM_CI_TOKEN are required")
 
+
+          # Fields dbt stamps afresh on every compile. They describe the RUN,
+          # not the code, so two compiles of the same commit differ here and
+          # nowhere else -- which made an unchanged commit look like changed
+          # evidence and produced a 409 on re-submission.
+          #
+          # Nothing in Relium's review path reads them: it reads nodes,
+          # sources and depends_on. Dropping them makes the submitted document
+          # a function of the commit alone, so re-submitting the same commit is
+          # byte-identical and the API treats it as the idempotent retry it is.
+          VOLATILE_METADATA = ("generated_at", "invocation_id",
+                               "invocation_started_at")
+
+
+          def stable(manifest):
+              """The manifest with per-run metadata removed."""
+              metadata = manifest.get("metadata")
+              if isinstance(metadata, dict):
+                  manifest = dict(manifest)
+                  manifest["metadata"] = {
+                      key: value for key, value in metadata.items()
+                      if key not in VOLATILE_METADATA
+                  }
+              return manifest
+
+
+          def describe(error):
+              """The server's own reason, safe to print.
+
+              Reads only `status`, `code` and `detail` from the JSON body.
+              Never the request payload, never a header, never the token --
+              this runs in a public log.
+              """
+              try:
+                  document = json.loads(error.read().decode("utf-8") or "{}")
+              except Exception:
+                  return "<no JSON body>"
+              if not isinstance(document, dict):
+                  return "<unexpected body shape>"
+              parts = [f"{key}={document[key]!r}"
+                       for key in ("status", "code", "detail")
+                       if key in document]
+              return ", ".join(parts) or "<no recognised fields>"
+
+
           for side, sha in (("base", os.environ["BASE_SHA"]),
                             ("head", os.environ["HEAD_SHA"])):
-              manifest = json.loads(
+              manifest = stable(json.loads(
                   Path(f"evidence/{side}/manifest.json").read_text(encoding="utf-8")
-              )
+              ))
               body = json.dumps(
                   {"commit_sha": sha, "manifest": manifest}
               ).encode("utf-8")
@@ -210,7 +256,24 @@ jobs:
                       ),
                   },
               )
-              with urlopen(request, timeout=60) as response:
-                  if response.status not in (200, 202):
-                      raise SystemExit(f"Relium rejected {side} manifest")
+              try:
+                  with urlopen(request, timeout=60) as response:
+                      if response.status not in (200, 202):
+                          raise SystemExit(
+                              f"Relium rejected {side} manifest: "
+                              f"HTTP {response.status}"
+                          )
+                      print(f"Relium accepted {side} manifest: "
+                            f"HTTP {response.status}")
+              except HTTPError as error:
+                  # Without this the step reported only "HTTP Error 409:
+                  # Conflict" and discarded the one thing that says why.
+                  raise SystemExit(
+                      f"Relium rejected {side} manifest: "
+                      f"HTTP {error.code} ({describe(error)})"
+                  ) from None
+              except URLError as error:
+                  raise SystemExit(
+                      f"Relium unreachable for {side} manifest: {error.reason}"
+                  ) from None
           PY
