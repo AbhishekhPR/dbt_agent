@@ -428,14 +428,28 @@ class OnboardingRouteTests(unittest.TestCase):
         self.assertEqual(accepted.status_code, 200)
         self.assertEqual(accepted.json()["clerk_organization_id"], "org_2joined")
 
-    def test_phase_two_state_is_null_rather_than_invented(self):
-        """github/configuration are not implemented yet. Null says so;
-        {"installed": false} would be a claim nothing here has checked."""
+    def test_the_github_section_reports_only_verified_bindings(self):
+        """A fresh tenant has no installation, and says so factually.
+
+        `not_connected` here is a fact about stored bindings, not a guess:
+        nothing reaches this table without passing the three verifications in
+        agent/api/github_installation.py.
+        """
         self.client.put("/api/tenants", headers=self._auth(org_id="org_2acme"),
                         json={"organization_name": "Acme"})
         body = self.client.get("/api/onboarding/state",
                                headers=self._auth(org_id="org_2acme")).json()
-        self.assertIsNone(body["github"])
+        self.assertEqual(body["github"]["status"], "not_connected")
+        self.assertEqual(body["github"]["installations"], [])
+        self.assertIs(body["github"]["identity"]["linked"], False)
+
+    def test_phase_three_state_is_null_rather_than_invented(self):
+        """dbt configuration is not implemented yet. Null says so; a shape
+        would assert a configuration nothing has checked."""
+        self.client.put("/api/tenants", headers=self._auth(org_id="org_2acme"),
+                        json={"organization_name": "Acme"})
+        body = self.client.get("/api/onboarding/state",
+                               headers=self._auth(org_id="org_2acme")).json()
         self.assertIsNone(body["configuration"])
 
     def test_state_after_workspace_creation_advances_the_step(self):

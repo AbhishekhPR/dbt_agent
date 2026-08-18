@@ -297,6 +297,45 @@ class GitHubClient:
             route_template="/repos/{owner}/{repo}/installation",
         )
 
+    def get_app(self, app_jwt):
+        """The App's own identity, as GitHub reports it.
+
+        Returns GitHub's App object, whose ``slug`` is what the public
+        installation URL is built from. Read from GitHub rather than kept in
+        configuration so it cannot drift from the App the backend actually
+        authenticates as, and so no slug has to be hard-coded anywhere.
+
+        Requires an App JWT.
+        """
+        return self._request(
+            "GET",
+            "/app",
+            token=app_jwt,
+            operation="get_app",
+            route_template="/app",
+        )
+
+    def get_installation(self, installation_id, app_jwt):
+        """Authoritative facts about ONE installation of this App.
+
+        This is the call that makes a browser-supplied ``installation_id``
+        harmless. GitHub answers only for installations of the App the JWT
+        belongs to, so an id belonging to a different App — or to nothing —
+        raises GitHubNotFoundError instead of being taken at face value.
+
+        The account id, login and type in the response are GitHub's, not the
+        caller's. Nothing from the redirect is trusted.
+
+        Requires an App JWT.
+        """
+        return self._request(
+            "GET",
+            f"/app/installations/{installation_id}",
+            token=app_jwt,
+            operation="get_installation",
+            route_template="/app/installations/{installation_id}",
+        )
+
     def create_pull_request_review(self, owner, repository, pull_number, *,
                                    body, event="REQUEST_CHANGES"):
         """Submit a pull-request review.

@@ -175,6 +175,68 @@ def fetch_viewer(access_token, *, timeout=10.0, opener=None) -> dict:
             "name": document.get("name")}
 
 
+def fetch_user_installations(access_token, *, timeout=10.0, opener=None,
+                             max_pages=10) -> list:
+    """Which App installations the AUTHENTICATED USER can access.
+
+    ###################################################################
+    # THIS IS WHAT MAKES A SPOOFED installation_id USELESS.           #
+    ###################################################################
+
+    GitHub warns that the ``installation_id`` on the Setup URL redirect can be
+    forged, so it proves nothing on its own. ``GET /user/installations`` is the
+    other half: it is answered AS THE USER, and lists only installations that
+    user genuinely has access to. An attacker can name any installation id in a
+    URL; they cannot make this endpoint return one they have no access to,
+    because the answer is scoped to their own credential.
+
+    So the check is: the id from the redirect must appear in this list. That
+    joins a browser-supplied number to a human GitHub has independently
+    confirmed is associated with the installation.
+
+    Returns GitHub's installation objects verbatim. Paginated, because a user
+    in many organizations can have more than one page, and stopping at the
+    first would silently fail verification for exactly those customers.
+    """
+    installations = []
+    for page in range(1, max_pages + 1):
+        status, document = _get(
+            f"/user/installations?per_page=100&page={page}",
+            access_token, timeout=timeout, opener=opener)
+        if status != 200 or not isinstance(document, dict):
+            raise GitHubIdentityError(
+                "GitHub did not return the user's installations")
+        batch = document.get("installations")
+        if not isinstance(batch, list):
+            raise GitHubIdentityError(
+                "GitHub returned a malformed installation list")
+        installations.extend(item for item in batch if isinstance(item, dict))
+        # `total_count` is the whole set, not this page.
+        total = document.get("total_count")
+        if not isinstance(total, int) or len(installations) >= total or not batch:
+            break
+    return installations
+
+
+def user_can_access_installation(access_token, installation_id, *,
+                                 timeout=10.0, opener=None) -> bool:
+    """Whether this user is associated with this installation.
+
+    A narrow, boolean answer over :func:`fetch_user_installations`, compared on
+    the numeric id. Never on an account login: a login can be renamed and the
+    old name claimed by somebody else.
+    """
+    if isinstance(installation_id, bool) or not isinstance(installation_id, int):
+        return False
+    for installation in fetch_user_installations(
+            access_token, timeout=timeout, opener=opener):
+        candidate = installation.get("id")
+        if isinstance(candidate, int) and not isinstance(candidate, bool):
+            if candidate == installation_id:
+                return True
+    return False
+
+
 def fetch_repository_permissions(access_token, owner, repository, *,
                                  timeout=10.0, opener=None) -> dict | None:
     """The authenticated user's permissions on one repository.

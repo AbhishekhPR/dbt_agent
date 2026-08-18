@@ -36,6 +36,17 @@ class ManifestEvidenceConflict(ValueError):
     """A commit or idempotency key was replayed with different evidence."""
 
 
+class TenantInstallationConflict(ValueError):
+    """A GitHub App installation is already bound to a different tenant.
+
+    Store-level so the persistence layer does not depend on the API layer; the
+    HTTP boundary translates it to a non-disclosing 409. Never re-point a
+    binding to resolve this: doing so would hand one customer's repositories
+    to another, which is precisely what a spoofed installation id would be
+    trying to achieve.
+    """
+
+
 
 def _bounded_text(value, limit: int = 256):
     """Never persist an unbounded text value from a warehouse.
@@ -202,6 +213,298 @@ class PostgresLifecycleStore:
             (tenant_id,),
         ).fetchone()
         return dict(row) if row else None
+
+    # -- GitHub App installation binding -----------------------------------
+    #
+    # See migration 0015. The rule these methods exist to hold up: an
+    # installation is bound to a tenant only after three independent
+    # verifications, and never because a browser supplied an installation id.
+
+    def create_github_installation_state(self, *, state_hash, tenant_id,
+                                         clerk_user_id, expires_at,
+                                         purpose="github_app_install"):
+        """Mint one single-use installation-flow state.
+
+        Only the hash is stored. The value itself lives in the redirect URL and
+        in the customer's browser, and nowhere else, so a database disclosure
+        cannot be replayed as a live installation flow.
+        """
+        state_id = f"ist_{uuid.uuid4().hex}"
+        self.connection.execute(
+            "INSERT INTO github_installation_states "
+            "(installation_state_id, state_hash, tenant_id, clerk_user_id, "
+            " purpose, expires_at) VALUES (%s, %s, %s, %s, %s, %s)",
+            (state_id, state_hash, tenant_id, clerk_user_id, purpose, expires_at),
+        )
+        return state_id
+
+    def consume_github_installation_state(self, state_hash, *, now,
+                                          purpose="github_app_install"):
+        """Claim a state exactly once, or return None.
+
+        ###############################################################
+        # SINGLE-USE IS ENFORCED BY THIS ONE STATEMENT.               #
+        ###############################################################
+
+        The guard lives in the WHERE clause, so the check and the claim are the
+        same atomic operation. A read-then-write would let two concurrent
+        redirects — a double-click, a retried request, or a deliberate replay —
+        both observe an unconsumed state and both proceed. Here PostgreSQL
+        serialises the UPDATE on the row and exactly one caller gets a row
+        back; every other caller gets None and is refused.
+
+        Expiry is part of the same guard rather than a separate check, so an
+        expired state cannot be claimed by winning a race against a cleanup
+        job that has not run yet.
+
+        Returns the tenant and Clerk user recorded AT MINT TIME. Callers must
+        use these and never any equivalent value from the request.
+        """
+        row = self.connection.execute(
+            "UPDATE github_installation_states SET consumed_at = %s "
+            "WHERE state_hash = %s AND purpose = %s "
+            "  AND consumed_at IS NULL AND expires_at > %s "
+            "RETURNING installation_state_id, tenant_id, clerk_user_id, "
+            "          purpose, created_at, expires_at",
+            (now, state_hash, purpose, now),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def github_installation_state(self, state_hash):
+        """Read a state without consuming it. Tests and diagnostics only."""
+        row = self.connection.execute(
+            "SELECT installation_state_id, tenant_id, clerk_user_id, purpose, "
+            "       created_at, expires_at, consumed_at "
+            "FROM github_installation_states WHERE state_hash = %s",
+            (state_hash,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def delete_expired_github_installation_states(self, *, now):
+        """Housekeeping. Consumed and expired states carry no further value."""
+        return self.connection.execute(
+            "DELETE FROM github_installation_states "
+            "WHERE expires_at <= %s OR consumed_at IS NOT NULL",
+            (now,),
+        ).rowcount
+
+    # -- Clerk user to GitHub user links -----------------------------------
+
+    def upsert_clerk_github_identity(self, clerk_user_id, *, github_user_id,
+                                     github_login, access_token=None,
+                                     access_expires_at=None, refresh_token=None,
+                                     refresh_expires_at=None):
+        """Record that a Clerk user has proved control of a GitHub account.
+
+        Only ever called after a completed GitHub OAuth exchange. Re-linking
+        replaces the credential, which is what happens when a token is
+        refreshed or the customer re-authorises.
+        """
+        row = self.connection.execute(
+            "INSERT INTO clerk_github_identities "
+            "(clerk_user_id, github_user_id, github_login, access_token, "
+            " access_expires_at, refresh_token, refresh_expires_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (clerk_user_id) DO UPDATE SET "
+            "  github_user_id = EXCLUDED.github_user_id, "
+            "  github_login = EXCLUDED.github_login, "
+            "  access_token = EXCLUDED.access_token, "
+            "  access_expires_at = EXCLUDED.access_expires_at, "
+            "  refresh_token = EXCLUDED.refresh_token, "
+            "  refresh_expires_at = EXCLUDED.refresh_expires_at, "
+            "  revoked_at = NULL, updated_at = now() "
+            "RETURNING clerk_user_id, github_user_id, github_login, linked_at, "
+            "          updated_at",
+            (clerk_user_id, github_user_id, github_login, access_token,
+             access_expires_at, refresh_token, refresh_expires_at),
+        ).fetchone()
+        return dict(row)
+
+    def clerk_github_identity(self, clerk_user_id):
+        """The GitHub identity linked to a Clerk user, or None.
+
+        Returns the encrypted credential columns as stored. Decryption happens
+        in the application, never in SQL, and the plaintext never leaves the
+        server.
+        """
+        row = self.connection.execute(
+            "SELECT clerk_user_id, github_user_id, github_login, access_token, "
+            "       access_expires_at, refresh_token, refresh_expires_at, "
+            "       linked_at, updated_at, revoked_at "
+            "FROM clerk_github_identities "
+            "WHERE clerk_user_id = %s AND revoked_at IS NULL",
+            (clerk_user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def revoke_clerk_github_identity(self, clerk_user_id):
+        """Drop the stored credential and mark the link revoked."""
+        return self.connection.execute(
+            "UPDATE clerk_github_identities "
+            "SET revoked_at = now(), access_token = NULL, refresh_token = NULL, "
+            "    updated_at = now() "
+            "WHERE clerk_user_id = %s AND revoked_at IS NULL",
+            (clerk_user_id,),
+        ).rowcount
+
+    # -- installation facts -------------------------------------------------
+
+    def record_github_installation(self, github_installation_id, *,
+                                   github_account_id, github_account_login,
+                                   github_account_type, github_app_id=None,
+                                   repository_selection=None, status="active",
+                                   suspended_at=None, deleted_at=None):
+        """Record what GitHub says about an installation. Tenant-agnostic.
+
+        IDEMPOTENT, because webhook deliveries are retried and may arrive out
+        of order, and because the Setup redirect and the webhook both land
+        here. An upsert keyed on the installation id means a duplicate
+        delivery is a no-op rather than a second row or an error.
+
+        Says nothing about tenancy on purpose: a webhook payload contains
+        nothing that identifies a Relium tenant, and guessing one from the
+        account login would let anyone who can name a GitHub organization
+        attach themselves to another customer's workspace.
+        """
+        row = self.connection.execute(
+            "INSERT INTO github_installations "
+            "(github_installation_id, github_app_id, github_account_id, "
+            " github_account_login, github_account_type, repository_selection, "
+            " status, suspended_at, deleted_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (github_installation_id) DO UPDATE SET "
+            "  github_app_id = COALESCE(EXCLUDED.github_app_id, "
+            "                           github_installations.github_app_id), "
+            "  github_account_id = EXCLUDED.github_account_id, "
+            "  github_account_login = EXCLUDED.github_account_login, "
+            "  github_account_type = EXCLUDED.github_account_type, "
+            "  repository_selection = COALESCE(EXCLUDED.repository_selection, "
+            "                                  github_installations.repository_selection), "
+            "  status = EXCLUDED.status, "
+            "  suspended_at = EXCLUDED.suspended_at, "
+            "  deleted_at = EXCLUDED.deleted_at, "
+            "  updated_at = now() "
+            "RETURNING github_installation_id, github_app_id, github_account_id, "
+            "          github_account_login, github_account_type, "
+            "          repository_selection, status, suspended_at, deleted_at, "
+            "          first_seen_at, updated_at",
+            (github_installation_id, github_app_id, github_account_id,
+             github_account_login, github_account_type, repository_selection,
+             status, suspended_at, deleted_at),
+        ).fetchone()
+        return dict(row)
+
+    def github_installation(self, github_installation_id):
+        row = self.connection.execute(
+            "SELECT github_installation_id, github_app_id, github_account_id, "
+            "       github_account_login, github_account_type, "
+            "       repository_selection, status, suspended_at, deleted_at, "
+            "       first_seen_at, updated_at "
+            "FROM github_installations WHERE github_installation_id = %s",
+            (github_installation_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def set_github_installation_status(self, github_installation_id, status, *,
+                                       suspended_at=None, deleted_at=None):
+        """Lifecycle transition from a signature-verified webhook.
+
+        Writes nothing if the installation is unknown: a status update is not a
+        reason to invent a row, and doing so would let a delivery for another
+        App's installation create one here.
+        """
+        return self.connection.execute(
+            "UPDATE github_installations "
+            "SET status = %s, suspended_at = %s, deleted_at = %s, updated_at = now() "
+            "WHERE github_installation_id = %s",
+            (status, suspended_at, deleted_at, github_installation_id),
+        ).rowcount
+
+    # -- the binding --------------------------------------------------------
+
+    def bind_github_installation_to_tenant(self, github_installation_id, *,
+                                           tenant_id, bound_by_clerk_user_id,
+                                           verified_github_user_id,
+                                           bound_via_state_id=None):
+        """Attach a verified installation to a tenant, idempotently.
+
+        Returns ``(binding, created)``. Re-running the same binding is a
+        success with ``created=False`` — a customer who reloads the Setup
+        redirect must not see an error.
+
+        A DIFFERENT tenant claiming an already-bound installation is refused,
+        not silently re-pointed. Re-pointing would hand one customer's
+        repositories to another, and it is the exact outcome a spoofed
+        installation id would be aiming for. The refusal is a
+        ``TenantInstallationConflict``, which the HTTP layer renders as a
+        non-disclosing 409.
+        """
+        row = self.connection.execute(
+            "INSERT INTO tenant_github_installations "
+            "(github_installation_id, tenant_id, bound_by_clerk_user_id, "
+            " verified_github_user_id, bound_via_state_id) "
+            "VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (github_installation_id) DO UPDATE SET "
+            "  updated_at = now() "
+            # The guard is what makes a cross-tenant claim fail instead of
+            # overwriting. On conflict with the SAME tenant this updates and
+            # returns the row; with a different tenant the WHERE excludes it,
+            # no row is returned, and the caller raises.
+            "  WHERE tenant_github_installations.tenant_id = EXCLUDED.tenant_id "
+            "RETURNING github_installation_id, tenant_id, bound_by_clerk_user_id, "
+            "          verified_github_user_id, bound_via_state_id, bound_at, "
+            "          updated_at, (xmax = 0) AS inserted",
+            (github_installation_id, tenant_id, bound_by_clerk_user_id,
+             verified_github_user_id, bound_via_state_id),
+        ).fetchone()
+
+        if row is None:
+            existing = self.connection.execute(
+                "SELECT tenant_id FROM tenant_github_installations "
+                "WHERE github_installation_id = %s",
+                (github_installation_id,),
+            ).fetchone()
+            if existing is not None:
+                raise TenantInstallationConflict(
+                    "this GitHub App installation is already connected to a "
+                    "different Relium workspace")
+            raise TenantInstallationConflict(
+                "the installation binding could not be created")
+
+        binding = dict(row)
+        created = bool(binding.pop("inserted", False))
+        return binding, created
+
+    def tenant_github_installations(self, tenant_id, *, include_deleted=False):
+        """Every installation bound to one tenant, newest binding first.
+
+        Joined to the facts table so a caller gets account and status in one
+        read. No credential or token is selected, because none is stored.
+        """
+        clause = "" if include_deleted else " AND i.status <> 'deleted'"
+        rows = self.connection.execute(
+            "SELECT b.github_installation_id, b.tenant_id, b.bound_at, "
+            "       b.bound_by_clerk_user_id, b.verified_github_user_id, "
+            "       i.github_app_id, i.github_account_id, i.github_account_login, "
+            "       i.github_account_type, i.repository_selection, i.status, "
+            "       i.suspended_at, i.deleted_at "
+            "FROM tenant_github_installations b "
+            "JOIN github_installations i "
+            "  ON i.github_installation_id = b.github_installation_id "
+            f"WHERE b.tenant_id = %s{clause} "
+            "ORDER BY b.bound_at DESC, b.github_installation_id",
+            (tenant_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def tenant_for_github_installation(self, github_installation_id):
+        """Which tenant owns an installation, or None if it is unbound."""
+        row = self.connection.execute(
+            "SELECT tenant_id FROM tenant_github_installations "
+            "WHERE github_installation_id = %s",
+            (github_installation_id,),
+        ).fetchone()
+        return row["tenant_id"] if row else None
 
     def delete_tenant(self, organization_id):
         now = datetime.now(timezone.utc)

@@ -69,6 +69,8 @@
     "POST /api/metadata-snapshots",
     "POST /api/monitoring/baselines",
     "POST /api/monitoring/observations",
+    "POST /api/onboarding/github/identity",
+    "POST /api/onboarding/github/install",
     "POST /api/reviews",
     "POST /api/reviews/{review_id}/exceptions",
     "POST /api/reviews/{review_id}/exceptions/{exception_id}/revoke",
@@ -205,6 +207,16 @@
     },
     {
       "authentication": "clerk-session",
+      "method": "POST",
+      "path": "/api/onboarding/github/identity"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "POST",
+      "path": "/api/onboarding/github/install"
+    },
+    {
+      "authentication": "clerk-session",
       "method": "GET",
       "path": "/api/onboarding/state"
     },
@@ -302,6 +314,16 @@
       "authentication": "clerk-session",
       "method": "PUT",
       "path": "/api/tenants"
+    },
+    {
+      "authentication": "installation-state",
+      "method": "GET",
+      "path": "/auth/github/link/callback"
+    },
+    {
+      "authentication": "installation-state",
+      "method": "GET",
+      "path": "/github/setup"
     },
     {
       "authentication": "github-webhook-signature",

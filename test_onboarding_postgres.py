@@ -19,7 +19,10 @@ DSN = os.environ.get("RELIUM_TEST_POSTGRES_DSN")
 
 #: The schema version that existed before Clerk tenancy.
 PREVIOUS_LATEST = 13
-NEW_LATEST = 14
+#: Clerk tenants and onboarding state.
+CLERK_TENANCY = 14
+#: GitHub App installation binding.
+NEW_LATEST = 15
 
 
 def _reset_schema(dsn):
@@ -79,8 +82,10 @@ class ClerkTenantMigrationTests(unittest.TestCase):
                     "SELECT table_name FROM information_schema.tables "
                     "WHERE table_schema='public'").fetchall()
             }
-            self.assertIn("tenants", tables)
-            self.assertIn("tenant_onboarding_state", tables)
+            for table in ("tenants", "tenant_onboarding_state",
+                          "github_installation_states", "clerk_github_identities",
+                          "github_installations", "tenant_github_installations"):
+                self.assertIn(table, tables)
         finally:
             store.close()
 
@@ -92,9 +97,56 @@ class ClerkTenantMigrationTests(unittest.TestCase):
         store = self._store()
         try:
             versions = applied_versions(store.connection)
-            self.assertIn(NEW_LATEST, versions)
-            self.assertEqual(max(versions), NEW_LATEST)
+            # 0014 must be applied immediately after 13. Deliberately NOT
+            # "14 is the highest version": it was when this was written, and
+            # every later migration would otherwise break a test whose subject
+            # is 0014 and nothing else.
+            self.assertIn(CLERK_TENANCY, versions)
+            self.assertEqual(versions[versions.index(CLERK_TENANCY) - 1],
+                             PREVIOUS_LATEST)
             store.connection.execute("SELECT 1 FROM tenants LIMIT 1")
+        finally:
+            store.close()
+
+    def test_upgrade_from_clerk_tenancy_to_installation_binding(self):
+        """14 -> 15, the path a deployment already on Phase 1 will take."""
+        from agent.postgres_migrate import applied_versions
+
+        _apply_up_to(DSN, CLERK_TENANCY)
+        store = self._store()
+        try:
+            versions = applied_versions(store.connection)
+            self.assertIn(NEW_LATEST, versions)
+            self.assertEqual(versions[versions.index(NEW_LATEST) - 1],
+                             CLERK_TENANCY)
+            for table in ("github_installation_states", "clerk_github_identities",
+                          "github_installations", "tenant_github_installations"):
+                self.assertIsNotNone(
+                    store.connection.execute(
+                        "SELECT to_regclass(%s) AS n", (f"public.{table}",)
+                    ).fetchone()["n"], table)
+        finally:
+            store.close()
+
+    def test_upgrade_to_installation_binding_preserves_tenants(self):
+        """A migration that loses Phase 1 tenants is not a migration."""
+        _apply_up_to(DSN, CLERK_TENANCY)
+        import psycopg
+
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute(
+                "INSERT INTO tenants (tenant_id, clerk_organization_id, "
+                "organization_name) VALUES (%s, 'org_2kept', 'Kept')",
+                (f"ten_{'a' * 32}",))
+            conn.execute(
+                "INSERT INTO tenant_onboarding_state (tenant_id) VALUES (%s)",
+                (f"ten_{'a' * 32}",))
+
+        store = self._store()
+        try:
+            row = store.tenant_by_clerk_organization("org_2kept")
+            self.assertIsNotNone(row)
+            self.assertEqual(row["organization_name"], "Kept")
         finally:
             store.close()
 
@@ -343,6 +395,149 @@ class ClerkTenantStoreTests(unittest.TestCase):
         states = self.store.connection.execute(
             "SELECT COUNT(*) AS c FROM tenant_onboarding_state").fetchone()["c"]
         self.assertEqual(states, 1, "duplicate onboarding rows under concurrency")
+
+
+@unittest.skipUnless(DSN, "RELIUM_TEST_POSTGRES_DSN not set; PostgreSQL suite requires a real server")
+class GitHubInstallationConstraintTests(unittest.TestCase):
+    """Constraints the binding logic relies on, asserted directly."""
+
+    @classmethod
+    def setUpClass(cls):
+        _reset_schema(DSN)
+        from agent.postgres_lifecycle_store import PostgresLifecycleStore
+
+        cls.store = PostgresLifecycleStore(DSN)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.store.close()
+
+    def setUp(self):
+        self.store.connection.execute("DELETE FROM tenant_github_installations")
+        self.store.connection.execute("DELETE FROM github_installations")
+        self.store.connection.execute("DELETE FROM github_installation_states")
+        self.store.connection.execute("DELETE FROM tenants")
+        self.acme = self.store.upsert_tenant_for_clerk_organization(
+            "org_2acme", organization_name="Acme")["tenant_id"]
+        self.globex = self.store.upsert_tenant_for_clerk_organization(
+            "org_2globex", organization_name="Globex")["tenant_id"]
+
+    def _facts(self, installation_id):
+        self.store.record_github_installation(
+            installation_id, github_account_id=5001,
+            github_account_login="acme", github_account_type="Organization")
+
+    def test_an_installation_belongs_to_exactly_one_tenant(self):
+        """Enforced by PRIMARY KEY, not by application logic."""
+        self._facts(4001)
+        self.store.bind_github_installation_to_tenant(
+            4001, tenant_id=self.acme, bound_by_clerk_user_id="u",
+            verified_github_user_id=1)
+        with self.assertRaises(Exception):
+            self.store.connection.execute(
+                "INSERT INTO tenant_github_installations "
+                "(github_installation_id, tenant_id, bound_by_clerk_user_id, "
+                " verified_github_user_id) VALUES (4001, %s, 'u', 1)",
+                (self.globex,))
+
+    def test_a_tenant_may_hold_many_installations(self):
+        for installation_id in (4101, 4102, 4103):
+            self._facts(installation_id)
+            self.store.bind_github_installation_to_tenant(
+                installation_id, tenant_id=self.acme,
+                bound_by_clerk_user_id="u", verified_github_user_id=1)
+        self.assertEqual(len(self.store.tenant_github_installations(self.acme)), 3)
+
+    def test_a_cross_tenant_rebind_raises_rather_than_repointing(self):
+        from agent.postgres_lifecycle_store import TenantInstallationConflict
+
+        self._facts(4201)
+        self.store.bind_github_installation_to_tenant(
+            4201, tenant_id=self.acme, bound_by_clerk_user_id="u",
+            verified_github_user_id=1)
+        with self.assertRaises(TenantInstallationConflict):
+            self.store.bind_github_installation_to_tenant(
+                4201, tenant_id=self.globex, bound_by_clerk_user_id="v",
+                verified_github_user_id=2)
+        self.assertEqual(self.store.tenant_for_github_installation(4201),
+                         self.acme)
+
+    def test_an_account_login_is_not_unique(self):
+        """An account can uninstall and reinstall; both rows are legitimate."""
+        for installation_id in (4301, 4302):
+            self.store.record_github_installation(
+                installation_id, github_account_id=7001,
+                github_account_login="same-account",
+                github_account_type="Organization")
+        count = self.store.connection.execute(
+            "SELECT COUNT(*) AS c FROM github_installations "
+            "WHERE github_account_login = 'same-account'").fetchone()["c"]
+        self.assertEqual(count, 2)
+
+    def test_an_unknown_account_type_is_rejected(self):
+        with self.assertRaises(Exception):
+            self.store.record_github_installation(
+                4401, github_account_id=1, github_account_login="x",
+                github_account_type="Robot")
+
+    def test_a_binding_cannot_reference_an_unknown_installation(self):
+        from agent.postgres_lifecycle_store import TenantInstallationConflict
+
+        with self.assertRaises((Exception, TenantInstallationConflict)):
+            self.store.bind_github_installation_to_tenant(
+                999999, tenant_id=self.acme, bound_by_clerk_user_id="u",
+                verified_github_user_id=1)
+
+    def test_a_state_hash_is_unique(self):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        digest = "a" * 64
+        self.store.create_github_installation_state(
+            state_hash=digest, tenant_id=self.acme, clerk_user_id="u",
+            expires_at=now + timedelta(minutes=10))
+        with self.assertRaises(Exception):
+            self.store.create_github_installation_state(
+                state_hash=digest, tenant_id=self.globex, clerk_user_id="v",
+                expires_at=now + timedelta(minutes=10))
+
+    def test_a_state_hash_must_be_a_sha256_hex_digest(self):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        for bad in ("short", "z" * 64, "A" * 64, ""):
+            with self.assertRaises(Exception, msg=bad):
+                self.store.create_github_installation_state(
+                    state_hash=bad, tenant_id=self.acme, clerk_user_id="u",
+                    expires_at=now + timedelta(minutes=10))
+
+    def test_an_unknown_state_purpose_is_rejected(self):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        with self.assertRaises(Exception):
+            self.store.create_github_installation_state(
+                state_hash="b" * 64, tenant_id=self.acme, clerk_user_id="u",
+                expires_at=now + timedelta(minutes=10), purpose="something_else")
+
+    def test_deleting_a_tenant_removes_its_states_and_bindings(self):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        self._facts(4501)
+        self.store.bind_github_installation_to_tenant(
+            4501, tenant_id=self.acme, bound_by_clerk_user_id="u",
+            verified_github_user_id=1)
+        self.store.create_github_installation_state(
+            state_hash="c" * 64, tenant_id=self.acme, clerk_user_id="u",
+            expires_at=now + timedelta(minutes=10))
+
+        self.store.connection.execute("DELETE FROM tenants WHERE tenant_id = %s",
+                                      (self.acme,))
+        self.assertIsNone(self.store.tenant_for_github_installation(4501))
+        self.assertIsNone(self.store.github_installation_state("c" * 64))
+        # The installation FACTS survive: GitHub still has the App installed.
+        self.assertIsNotNone(self.store.github_installation(4501))
 
 
 if __name__ == "__main__":

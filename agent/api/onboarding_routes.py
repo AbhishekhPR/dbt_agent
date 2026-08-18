@@ -80,6 +80,11 @@ STEP_WORKSPACE = "workspace"
 #: sends the user to Clerk's organization selection/creation flow.
 CODE_CLERK_ORGANIZATION_REQUIRED = "clerk_organization_required"
 
+#: The Clerk organization is active but no Relium tenant exists yet, and the
+#: requested operation needs one. Distinct from the organization code because
+#: the fix is a different step, in a different system.
+CODE_WORKSPACE_REQUIRED = "workspace_required"
+
 
 class OnboardingAuthenticationError(Exception):
     """The Clerk credential is absent or not verifiable. Maps to 401."""
@@ -87,6 +92,99 @@ class OnboardingAuthenticationError(Exception):
 
 class OnboardingUnavailable(Exception):
     """Clerk cannot be reached, so no verdict is possible. Maps to 503."""
+
+
+class ClerkAuthenticator:
+    """Verifies a Clerk token and resolves it to a tenant-scoped principal.
+
+    Extracted so there is exactly ONE place a Clerk session token is verified
+    and exactly one place a tenant is resolved from it. The GitHub onboarding
+    routes need the same thing, and a second copy of this logic is how the two
+    drift until one of them forgets a check.
+    """
+
+    def __init__(self, verifier):
+        self._verifier = verifier
+
+    @property
+    def configured(self):
+        return self._verifier is not None
+
+    def identity(self, request):
+        """The verified Clerk identity behind this request, or raise."""
+        if self._verifier is None:
+            raise OnboardingUnavailable("Clerk authentication is not configured")
+
+        presented = bearer_token(request.headers.get("Authorization"))
+        try:
+            return self._verifier.verify(presented)
+        except ClerkVerificationError as exc:
+            # Recorded for an operator; the caller learns only that it failed.
+            # Naming the failed check would be an oracle for forging tokens.
+            # No token or claim is logged.
+            logger.info("onboarding_authentication_refused",
+                        extra={"operation": "clerk_verify", "reason": str(exc)})
+            raise OnboardingAuthenticationError(str(exc)) from None
+        except ClerkKeysUnavailable as exc:
+            # An outage is not a bad token. 401 here would sign every customer
+            # out for the duration.
+            logger.error("clerk_keys_unavailable",
+                         extra={"error_category": "identity_provider"})
+            raise OnboardingUnavailable(str(exc)) from None
+
+    def principal(self, request, store, *, write, require_tenant=False):
+        """Resolve to a ClerkPrincipal carrying the tenant, or raise.
+
+        The tenant comes from the organization id inside the VERIFIED token and
+        from nowhere else — never a path, query or body field.
+        """
+        identity = self.identity(request)
+        tenant = None
+        if identity.organization_id:
+            tenant = store.tenant_by_clerk_organization(identity.organization_id)
+
+        principal = ClerkPrincipal(
+            clerk_user_id=identity.user_id,
+            clerk_organization_id=identity.organization_id,
+            tenant_id=tenant["tenant_id"] if tenant else None,
+            clerk_session_id=identity.session_id,
+        )
+        capability = ONBOARDING_WRITE if write else ONBOARDING_READ
+        try:
+            authorize(principal, capability)
+        except CapabilityError as exc:
+            raise _Forbidden(str(exc)) from None
+
+        if not principal.clerk_organization_id:
+            raise _OrganizationRequired()
+        if require_tenant and principal.tenant_id is None:
+            raise _WorkspaceRequired()
+        return principal
+
+    def map_error(self, exc, request_id):
+        """Render the shared failure modes, or None if this is not one of them."""
+        if isinstance(exc, OnboardingAuthenticationError):
+            return _json({"status": "unauthorized"}, 401, request_id)
+        if isinstance(exc, OnboardingUnavailable):
+            return _json({"status": "unavailable"}, 503, request_id)
+        if isinstance(exc, _Forbidden):
+            return _json({"status": "forbidden", "detail": str(exc)}, 403,
+                         request_id)
+        if isinstance(exc, _OrganizationRequired):
+            return _json({"status": "conflict",
+                          "code": CODE_CLERK_ORGANIZATION_REQUIRED,
+                          "detail": "no active Clerk organization on this session"},
+                         409, request_id)
+        if isinstance(exc, _WorkspaceRequired):
+            return _json({"status": "conflict", "code": CODE_WORKSPACE_REQUIRED,
+                          "detail": "create the Relium workspace first"},
+                         409, request_id)
+        if isinstance(exc, ValidationError):
+            return _json(exc.as_dict(), 422, request_id)
+        if isinstance(exc, _BadRequest):
+            return _json({"status": "invalid_request", "detail": str(exc)}, 400,
+                         request_id)
+        return None
 
 
 def create_onboarding_routes(*, store_pool, clerk_verifier=None):
@@ -188,14 +286,28 @@ def create_onboarding_routes(*, store_pool, clerk_verifier=None):
                 "configuration": None,
             }
 
+        # The GitHub section is now factual: it reports bindings that survived
+        # the three verifications in agent/api/github_installation.py, and
+        # nothing else. An installation that only a browser has asserted does
+        # not appear here, because it was never written.
+        from agent.api.github_installation import (
+            github_identity_payload, installations_payload,
+        )
+
+        github = installations_payload(store, tenant["tenant_id"])
+        # Whether the human has proved a GitHub identity yet. Required before
+        # an installation can be bound, so the UI can ask for it first rather
+        # than after the customer has already installed the App.
+        github["identity"] = github_identity_payload(
+            store, identity.user_id)
+
         return 200, {
             "complete": tenant.get("completed_at") is not None,
             "current_step": tenant.get("current_step") or "github",
             "workspace": _workspace_payload(tenant),
-            # Not implemented in this phase. Null rather than a default,
-            # because {"installed": false} would assert something about GitHub
-            # that nothing here has checked.
-            "github": None,
+            "github": github,
+            # Phase 3. Null rather than a default, because a shape here would
+            # assert a dbt configuration that nothing has checked.
             "configuration": None,
         }
 
@@ -305,6 +417,10 @@ def create_onboarding_routes(*, store_pool, clerk_verifier=None):
 
 class _Forbidden(Exception):
     """Authenticated, but lacking the capability."""
+
+
+class _WorkspaceRequired(Exception):
+    """The tenant does not exist yet and this operation needs it."""
 
 
 class _OrganizationRequired(Exception):

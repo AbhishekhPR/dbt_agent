@@ -335,7 +335,8 @@ def _governance_actor(body, principal) -> str:
 
 def create_api_routes(*, store_pool, authenticator_factory=None,
                       session_manager=None, allowed_origins=(),
-                      clerk_verifier=None):
+                      clerk_verifier=None, installation_binder=None,
+                      identity_linker=None, app_url=""):
     """Build the /api route table. Registration stays explicit and inspectable.
 
     Every route declares the capability it needs. Authentication answers *who*
@@ -1434,10 +1435,28 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
     # a GitHub session) and therefore its own authentication path, kept in its
     # own module rather than folded into `handler` above — merging them is how
     # one credential ends up satisfying two different authorization models.
-    from agent.api.onboarding_routes import create_onboarding_routes
+    from agent.api.onboarding_routes import (
+        ClerkAuthenticator, create_onboarding_routes,
+    )
 
+    clerk_authenticator = ClerkAuthenticator(clerk_verifier)
     routes.extend(create_onboarding_routes(
         store_pool=store_pool, clerk_verifier=clerk_verifier))
+
+    # The GitHub half of onboarding: linking a human identity, and binding an
+    # installation. Registered unconditionally and answering 503 when the
+    # GitHub App or its user-authorization credentials are not configured — a
+    # route that vanishes on misconfiguration is indistinguishable from one
+    # that was never deployed, and the contract test requires a stable table.
+    from agent.api.onboarding_github_routes import create_onboarding_github_routes
+
+    routes.extend(create_onboarding_github_routes(
+        store_pool=store_pool,
+        clerk_authenticator=clerk_authenticator,
+        binder=installation_binder,
+        identity_linker=identity_linker,
+        app_url=app_url,
+    ))
     return routes
 
 

@@ -124,7 +124,9 @@ class RouteContractTests(unittest.TestCase):
         """The pre-existing API surface keeps the credential it always had."""
         from agent.api.contract import served_routes
 
-        clerk_paths = {"/api/onboarding/state", "/api/tenants"}
+        clerk_paths = {"/api/onboarding/state", "/api/tenants",
+                       "/api/onboarding/github/identity",
+                       "/api/onboarding/github/install"}
         for entry in served_routes(self.app):
             if entry["path"].startswith("/api/") and entry["path"] not in clerk_paths:
                 self.assertEqual(

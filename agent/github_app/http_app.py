@@ -9,6 +9,7 @@ from starlette.routing import Route
 
 from agent.api.routes import create_api_routes
 from agent.github_app.jobs import WebhookJob
+from agent.github_app.models import InstallationEvent
 from agent.github_app.signatures import verify_webhook_signature
 from agent.github_app.webhooks import WebhookPayloadError, parse_webhook
 
@@ -28,6 +29,9 @@ def create_http_app(
     session_manager=None,
     auth_routes=(),
     clerk_verifier=None,
+    installation_binder=None,
+    identity_linker=None,
+    app_url="",
 ):
     """Build the served application.
 
@@ -163,6 +167,42 @@ def create_http_app(
             return JSONResponse(
                 {"status": "ignored", "delivery_id": delivery_id}, status_code=202
             )
+
+        # Installation lifecycle. Recorded directly rather than queued: it is a
+        # small idempotent write with no analysis behind it, and it must land
+        # even when the review worker is busy or stopped.
+        #
+        # ###########################################################
+        # # THIS RECORDS FACTS. IT NEVER BINDS A TENANT.            #
+        # ###########################################################
+        #
+        # A signature-verified delivery proves GitHub sent it. It does not say
+        # which Relium customer installed the App — nothing in the payload
+        # identifies a tenant, and the fields that look like they might (the
+        # account login, the sender) are names anyone can choose. Tenancy is
+        # established only by the verified Setup flow in
+        # agent/api/github_installation.py.
+        if isinstance(event, InstallationEvent):
+            if store_pool is None:
+                return JSONResponse(
+                    {"status": "ignored", "delivery_id": delivery_id},
+                    status_code=202,
+                )
+            try:
+                await run_in_threadpool(_record_installation, store_pool, event)
+            except Exception:
+                logger.error(
+                    "installation_event_persist_failed",
+                    extra={"error_category": "database"},
+                )
+                # 503 so GitHub retries. The write is idempotent, so a retry
+                # after a partial failure converges rather than duplicating.
+                return JSONResponse({"status": "unavailable"}, status_code=503)
+            return JSONResponse(
+                {"status": "accepted", "delivery_id": delivery_id},
+                status_code=202,
+            )
+
         job = WebhookJob(
             delivery_id=delivery_id,
             event_name=event_name,
@@ -198,6 +238,9 @@ def create_http_app(
             session_manager=session_manager,
             allowed_origins=cors_allowed_origins,
             clerk_verifier=clerk_verifier,
+            installation_binder=installation_binder,
+            identity_linker=identity_linker,
+            app_url=app_url,
         ))
     # Dashboard sign-in. Registered only when the App's user-authorization
     # credentials are fully configured, so there is never a login route that
@@ -247,6 +290,68 @@ def create_http_app(
     app.state.store_pool = store_pool
     app.state.cors_allowed_origins = list(cors_allowed_origins or ())
     return app
+
+
+#: How an installation action maps to stored status. `deleted` is a soft
+#: delete: uninstalling stops reviews, it does not erase what Relium did while
+#: the App was installed.
+_INSTALLATION_STATUS = {
+    "created": "active",
+    "deleted": "deleted",
+    "suspend": "suspended",
+    "unsuspend": "active",
+    # installation_repositories deliveries do not change status; they refresh
+    # repository_selection on a live installation.
+    "added": None,
+    "removed": None,
+}
+
+
+def _record_installation(store_pool, event):
+    """Persist installation facts. Idempotent, so replays are harmless.
+
+    GitHub retries deliveries and can reorder them, so this must converge
+    rather than accumulate. The upsert is keyed on the installation id, which
+    makes a duplicate delivery a no-op instead of a second row.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    status = _INSTALLATION_STATUS.get(event.action)
+
+    with store_pool.acquire() as store:
+        if status is None:
+            # A repository-selection change on an installation we do not know
+            # about is not a reason to create one: we would be recording an
+            # installation nobody has verified. Ignore it; the Setup flow or a
+            # `created` delivery is what brings it into existence.
+            if store.github_installation(event.installation_id) is None:
+                return
+            existing = store.github_installation(event.installation_id)
+            store.record_github_installation(
+                event.installation_id,
+                github_app_id=event.app_id,
+                github_account_id=event.account_id,
+                github_account_login=event.account_login,
+                github_account_type=event.account_type,
+                repository_selection=event.repository_selection,
+                status=existing["status"],
+                suspended_at=existing.get("suspended_at"),
+                deleted_at=existing.get("deleted_at"),
+            )
+            return
+
+        store.record_github_installation(
+            event.installation_id,
+            github_app_id=event.app_id,
+            github_account_id=event.account_id,
+            github_account_login=event.account_login,
+            github_account_type=event.account_type,
+            repository_selection=event.repository_selection,
+            status=status,
+            suspended_at=now if status == "suspended" else None,
+            deleted_at=now if status == "deleted" else None,
+        )
 
 
 async def _read_bounded_body(request: Request, limit: int) -> bytes | None:

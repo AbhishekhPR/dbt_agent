@@ -78,6 +78,8 @@ MANDATORY_ROUTES = {
     # token rather than a service token — see ONBOARDING_AUTHENTICATED below.
     ("GET", "/api/onboarding/state"),
     ("PUT", "/api/tenants"),
+    ("POST", "/api/onboarding/github/identity"),
+    ("POST", "/api/onboarding/github/install"),
 }
 
 AUTHENTICATION = {
@@ -90,6 +92,15 @@ AUTHENTICATION = {
     # than blur two credentials into one label.
     "/api/onboarding/state": "clerk-session",
     "/api/tenants": "clerk-session",
+    "/api/onboarding/github/identity": "clerk-session",
+    "/api/onboarding/github/install": "clerk-session",
+    # Browser redirects arriving from github.com. They cannot carry a header,
+    # and a cookie would be sent cross-site, so the credential is the
+    # single-use installation state itself. Named distinctly because it is a
+    # weaker claim than a session: it says which flow this is, not what was
+    # installed — every other value on the request is verified against GitHub.
+    "/auth/github/link/callback": "installation-state",
+    "/github/setup": "installation-state",
 }
 
 #: Every authentication mode that counts as authenticated. An /api route whose
