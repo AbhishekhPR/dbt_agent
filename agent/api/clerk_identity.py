@@ -210,6 +210,15 @@ class ClerkSettings:
         without the API at all), and it should start normally with the
         onboarding routes answering "not configured" instead of failing to boot.
         """
+        # None means "the process environment", matching load_settings in
+        # agent/github_app/settings.py. Without this the production bootstrap
+        # -- which passes environ through from main() and normally has None --
+        # would raise on a None lookup instead of reading the environment.
+        if environ is None:
+            import os as _os
+
+            environ = _os.environ
+
         issuer = (environ.get("RELIUM_CLERK_ISSUER") or "").strip().rstrip("/")
         if not issuer:
             return None

@@ -80,6 +80,12 @@ MANDATORY_ROUTES = {
     ("PUT", "/api/tenants"),
     ("POST", "/api/onboarding/github/identity"),
     ("POST", "/api/onboarding/github/install"),
+    ("GET", "/api/onboarding/repositories"),
+    ("PUT", "/api/onboarding/repositories/{repository_id}"),
+    ("PUT", "/api/onboarding/dbt"),
+    ("POST", "/api/onboarding/ci-token"),
+    ("POST", "/api/onboarding/complete"),
+    ("POST", "/api/onboarding/dashboard-session"),
 }
 
 AUTHENTICATION = {
@@ -94,6 +100,14 @@ AUTHENTICATION = {
     "/api/tenants": "clerk-session",
     "/api/onboarding/github/identity": "clerk-session",
     "/api/onboarding/github/install": "clerk-session",
+    "/api/onboarding/repositories": "clerk-session",
+    "/api/onboarding/repositories/{repository_id}": "clerk-session",
+    "/api/onboarding/dbt": "clerk-session",
+    "/api/onboarding/ci-token": "clerk-session",
+    "/api/onboarding/complete": "clerk-session",
+    # Authenticated by the Clerk bearer; SETS the GitHub dashboard session
+    # cookie. The two credentials meet here and nowhere else.
+    "/api/onboarding/dashboard-session": "clerk-session",
     # Browser redirects arriving from github.com. They cannot carry a header,
     # and a cookie would be sent cross-site, so the credential is the
     # single-use installation state itself. Named distinctly because it is a

@@ -336,7 +336,9 @@ def _governance_actor(body, principal) -> str:
 def create_api_routes(*, store_pool, authenticator_factory=None,
                       session_manager=None, allowed_origins=(),
                       clerk_verifier=None, installation_binder=None,
-                      identity_linker=None, app_url=""):
+                      identity_linker=None, app_url="",
+                      repository_service=None, api_url="",
+                      dashboard_bridge=None, secure_cookies=True):
     """Build the /api route table. Registration stays explicit and inspectable.
 
     Every route declares the capability it needs. Authentication answers *who*
@@ -1441,7 +1443,7 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
 
     clerk_authenticator = ClerkAuthenticator(clerk_verifier)
     routes.extend(create_onboarding_routes(
-        store_pool=store_pool, clerk_verifier=clerk_verifier))
+        store_pool=store_pool, clerk_verifier=clerk_verifier, api_url=api_url))
 
     # The GitHub half of onboarding: linking a human identity, and binding an
     # installation. Registered unconditionally and answering 503 when the
@@ -1456,6 +1458,21 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
         binder=installation_binder,
         identity_linker=identity_linker,
         app_url=app_url,
+    ))
+
+    # Repository selection, dbt configuration, CI credential and completion.
+    # Same registration rule: always served, 503 when GitHub is not configured.
+    from agent.api.onboarding_repository_routes import (
+        create_onboarding_repository_routes,
+    )
+
+    routes.extend(create_onboarding_repository_routes(
+        store_pool=store_pool,
+        clerk_authenticator=clerk_authenticator,
+        service=repository_service,
+        api_url=api_url,
+        dashboard_bridge=dashboard_bridge,
+        secure_cookies=secure_cookies,
     ))
     return routes
 

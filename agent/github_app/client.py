@@ -127,6 +127,25 @@ class GitHubClient:
             route_template="/app/installations/{installation_id}/access_tokens",
         )
 
+    def list_installation_repositories(self, installation_token, *, page=1,
+                                       per_page=100):
+        """Repositories THIS installation grants access to.
+
+        The authoritative answer to "what may Relium touch for this customer".
+        It is scoped to the installation token, so it cannot return a
+        repository the customer did not select when installing -- which is what
+        makes it usable as an authorization source rather than a convenience.
+
+        Requires an INSTALLATION token, not an App JWT.
+        """
+        return self._request(
+            "GET",
+            f"/installation/repositories?per_page={int(per_page)}&page={int(page)}",
+            token=installation_token,
+            operation="list_installation_repositories",
+            route_template="/installation/repositories",
+        )
+
     def get_file(self, owner, repository, path, ref):
         quoted = urllib.parse.quote(path, safe="/")
         return self._request_raw(

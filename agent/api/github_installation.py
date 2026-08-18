@@ -217,6 +217,9 @@ class InstallationBinder:
             state_hash=hash_state(state),
             tenant_id=tenant_id,
             clerk_user_id=clerk_user_id,
+            # Both timestamps from this clock, so the stored lifetime is
+            # exactly INSTALLATION_STATE_LIFETIME regardless of database skew.
+            created_at=now,
             expires_at=now + INSTALLATION_STATE_LIFETIME,
         )
         return {

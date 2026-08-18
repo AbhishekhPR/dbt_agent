@@ -193,6 +193,94 @@ class SessionManager:
             "login": viewer["login"],
         }
 
+    def establish_from_verified_identity(self, store, *, access_token,
+                                         organization_id, repository_id,
+                                         environment, refresh_token=None,
+                                         access_expires_at=None,
+                                         refresh_expires_at=None):
+        """Mint a dashboard session from an ALREADY-VERIFIED GitHub credential.
+
+        ###############################################################
+        # THIS IS THE SAME SESSION, NOT A SECOND SESSION SYSTEM.      #
+        ###############################################################
+
+        It writes the same row, with the same columns, that
+        ``complete_authorization`` writes. Everything downstream is therefore
+        unchanged: the cookie is HttpOnly, CSRF is the same double-submit,
+        ``authenticate`` re-verifies with GitHub on the same schedule, and
+        revocation works the same way. The ONLY difference is where the
+        credential came from — an existing verified link rather than a fresh
+        OAuth code exchange.
+
+        WHAT IS STILL CHECKED, EVERY TIME
+        ---------------------------------
+        The repository permission is fetched LIVE from GitHub, as the user,
+        before the session exists. Nothing is inherited from onboarding and
+        nothing is assumed from the fact that a tenant is set up:
+
+          * a user GitHub does not recognise gets no session;
+          * a user with no access to the repository gets no session, even
+            though their tenant owns it;
+          * a read-only user gets a session whose ``may_govern`` is False, so
+            they can read the dashboard and cannot approve an exception.
+
+        ``may_govern`` comes from ``may_govern(permissions)`` — the same
+        function, on the same GitHub response — so a Clerk-originated session
+        can never carry authority a GitHub-originated one would not.
+
+        The scope is passed in by the caller and must be derived server-side
+        from the tenant. This method does not resolve it, and deliberately has
+        no idea a Clerk organization exists.
+        """
+        now = self._clock()
+
+        viewer = self._identity.fetch_viewer(access_token)
+        permissions = self._identity.fetch_repository_permissions(
+            access_token, organization_id, repository_id)
+
+        if not may_read(permissions):
+            # GitHub reports no access. Onboarding having configured this
+            # repository does not change that: the tenant may own it and this
+            # particular person may still have been removed.
+            raise SessionError(
+                f"{viewer['login']} does not have access to "
+                f"{organization_id}/{repository_id}")
+
+        session_id = new_secret()
+        session_hash = digest(session_id)
+        csrf_token = new_secret()
+        store.ensure_tenant(organization_id, repository_id, environment)
+        store.create_dashboard_session(
+            session_hash,
+            organization_id=organization_id,
+            repository_id=repository_id,
+            environment=environment,
+            github_login=viewer["login"],
+            github_user_id=viewer.get("user_id"),
+            github_permission=highest_permission(permissions),
+            may_govern=may_govern(permissions),
+            permission_checked_at=now,
+            csrf_token=csrf_token,
+            expires_at=now + SESSION_LIFETIME,
+            # Re-encrypted under THIS session hash. The onboarding copy is
+            # bound to the Clerk user id and cannot be decrypted here, and this
+            # copy cannot be decrypted there — so a disclosure of one row does
+            # not yield a credential usable against the other.
+            github_access_token=encrypt(
+                self._key, access_token, associated=session_hash),
+            github_access_expires_at=access_expires_at,
+            github_refresh_token=encrypt(
+                self._key, refresh_token, associated=session_hash),
+            github_refresh_expires_at=refresh_expires_at,
+        )
+        return {
+            "session_id": session_id,
+            "csrf_token": csrf_token,
+            "login": viewer["login"],
+            "may_govern": may_govern(permissions),
+            "github_permission": highest_permission(permissions),
+        }
+
     # -- authentication ----------------------------------------------------
 
     def authenticate(self, store, session_id, *, require_fresh_permission=False):

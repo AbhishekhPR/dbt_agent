@@ -373,7 +373,7 @@ class InstallationBindingTests(unittest.TestCase):
         state = new_state()
         self.store.create_github_installation_state(
             state_hash=hash_state(state), tenant_id=self.acme,
-            clerk_user_id="user_alice", expires_at=NOW + timedelta(minutes=10),
+            clerk_user_id="user_alice", created_at=NOW, expires_at=NOW + timedelta(minutes=10),
             purpose="github_identity_link")
         with self._refused("installation_state_invalid"):
             self.binder.complete(self.store, presented_state=state,
@@ -661,7 +661,7 @@ class GitHubIdentityLinkTests(unittest.TestCase):
         state = new_state()
         self.store.create_github_installation_state(
             state_hash=hash_state(state), tenant_id=self.tenant,
-            clerk_user_id=clerk_user_id, expires_at=NOW + timedelta(minutes=10),
+            clerk_user_id=clerk_user_id, created_at=NOW, expires_at=NOW + timedelta(minutes=10),
             purpose=purpose)
         return state
 

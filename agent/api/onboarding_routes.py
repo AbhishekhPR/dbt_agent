@@ -187,7 +187,7 @@ class ClerkAuthenticator:
         return None
 
 
-def create_onboarding_routes(*, store_pool, clerk_verifier=None):
+def create_onboarding_routes(*, store_pool, clerk_verifier=None, api_url=""):
     """Build the onboarding route table.
 
     ``clerk_verifier`` is None when this deployment has no Clerk configuration.
@@ -301,14 +301,19 @@ def create_onboarding_routes(*, store_pool, clerk_verifier=None):
         github["identity"] = github_identity_payload(
             store, identity.user_id)
 
+        # Phase 3: the dbt configuration section is now factual too. Null
+        # still means "not configured", never a plausible-looking default.
+        from agent.api.repository_onboarding import configuration_payload
+
+        configuration = configuration_payload(store, tenant["tenant_id"],
+                                              api_url=api_url)
+
         return 200, {
             "complete": tenant.get("completed_at") is not None,
             "current_step": tenant.get("current_step") or "github",
             "workspace": _workspace_payload(tenant),
             "github": github,
-            # Phase 3. Null rather than a default, because a shape here would
-            # assert a dbt configuration that nothing has checked.
-            "configuration": None,
+            "configuration": configuration,
         }
 
     def put_tenant(request, body, store):

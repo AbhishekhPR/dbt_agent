@@ -126,7 +126,13 @@ class RouteContractTests(unittest.TestCase):
 
         clerk_paths = {"/api/onboarding/state", "/api/tenants",
                        "/api/onboarding/github/identity",
-                       "/api/onboarding/github/install"}
+                       "/api/onboarding/github/install",
+                       "/api/onboarding/repositories",
+                       "/api/onboarding/repositories/{repository_id}",
+                       "/api/onboarding/dbt",
+                       "/api/onboarding/ci-token",
+                       "/api/onboarding/complete",
+                       "/api/onboarding/dashboard-session"}
         for entry in served_routes(self.app):
             if entry["path"].startswith("/api/") and entry["path"] not in clerk_paths:
                 self.assertEqual(

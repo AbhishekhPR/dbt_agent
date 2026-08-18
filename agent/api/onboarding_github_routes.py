@@ -108,11 +108,15 @@ def create_onboarding_github_routes(*, store_pool, clerk_authenticator,
                 "create the Relium workspace before connecting GitHub")
 
         state = new_state()
+        expires_at = identity_linker.expires_at()
         store.create_github_installation_state(
             state_hash=hash_state(state),
             tenant_id=principal.tenant_id,
             clerk_user_id=principal.clerk_user_id,
-            expires_at=identity_linker.expires_at(),
+            # Same clock as the expiry it is paired with. See
+            # create_github_installation_state.
+            created_at=expires_at - INSTALLATION_STATE_LIFETIME,
+            expires_at=expires_at,
             purpose="github_identity_link",
         )
         return 200, {

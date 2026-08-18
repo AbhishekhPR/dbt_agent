@@ -22,7 +22,9 @@ PREVIOUS_LATEST = 13
 #: Clerk tenants and onboarding state.
 CLERK_TENANCY = 14
 #: GitHub App installation binding.
-NEW_LATEST = 15
+INSTALLATION_BINDING = 15
+#: Repository selection, dbt configuration and CI state.
+NEW_LATEST = 16
 
 
 def _reset_schema(dsn):
@@ -84,7 +86,8 @@ class ClerkTenantMigrationTests(unittest.TestCase):
             }
             for table in ("tenants", "tenant_onboarding_state",
                           "github_installation_states", "clerk_github_identities",
-                          "github_installations", "tenant_github_installations"):
+                          "github_installations", "tenant_github_installations",
+                          "tenant_repositories"):
                 self.assertIn(table, tables)
         finally:
             store.close()
@@ -116,9 +119,10 @@ class ClerkTenantMigrationTests(unittest.TestCase):
         store = self._store()
         try:
             versions = applied_versions(store.connection)
-            self.assertIn(NEW_LATEST, versions)
-            self.assertEqual(versions[versions.index(NEW_LATEST) - 1],
-                             CLERK_TENANCY)
+            self.assertIn(INSTALLATION_BINDING, versions)
+            self.assertEqual(
+                versions[versions.index(INSTALLATION_BINDING) - 1],
+                CLERK_TENANCY)
             for table in ("github_installation_states", "clerk_github_identities",
                           "github_installations", "tenant_github_installations"):
                 self.assertIsNotNone(
@@ -495,11 +499,11 @@ class GitHubInstallationConstraintTests(unittest.TestCase):
         digest = "a" * 64
         self.store.create_github_installation_state(
             state_hash=digest, tenant_id=self.acme, clerk_user_id="u",
-            expires_at=now + timedelta(minutes=10))
+            created_at=now, expires_at=now + timedelta(minutes=10))
         with self.assertRaises(Exception):
             self.store.create_github_installation_state(
                 state_hash=digest, tenant_id=self.globex, clerk_user_id="v",
-                expires_at=now + timedelta(minutes=10))
+                created_at=now, expires_at=now + timedelta(minutes=10))
 
     def test_a_state_hash_must_be_a_sha256_hex_digest(self):
         from datetime import datetime, timedelta, timezone
@@ -509,7 +513,7 @@ class GitHubInstallationConstraintTests(unittest.TestCase):
             with self.assertRaises(Exception, msg=bad):
                 self.store.create_github_installation_state(
                     state_hash=bad, tenant_id=self.acme, clerk_user_id="u",
-                    expires_at=now + timedelta(minutes=10))
+                    created_at=now, expires_at=now + timedelta(minutes=10))
 
     def test_an_unknown_state_purpose_is_rejected(self):
         from datetime import datetime, timedelta, timezone
@@ -518,7 +522,7 @@ class GitHubInstallationConstraintTests(unittest.TestCase):
         with self.assertRaises(Exception):
             self.store.create_github_installation_state(
                 state_hash="b" * 64, tenant_id=self.acme, clerk_user_id="u",
-                expires_at=now + timedelta(minutes=10), purpose="something_else")
+                created_at=now, expires_at=now + timedelta(minutes=10), purpose="something_else")
 
     def test_deleting_a_tenant_removes_its_states_and_bindings(self):
         from datetime import datetime, timedelta, timezone
@@ -530,7 +534,7 @@ class GitHubInstallationConstraintTests(unittest.TestCase):
             verified_github_user_id=1)
         self.store.create_github_installation_state(
             state_hash="c" * 64, tenant_id=self.acme, clerk_user_id="u",
-            expires_at=now + timedelta(minutes=10))
+            created_at=now, expires_at=now + timedelta(minutes=10))
 
         self.store.connection.execute("DELETE FROM tenants WHERE tenant_id = %s",
                                       (self.acme,))
@@ -538,6 +542,151 @@ class GitHubInstallationConstraintTests(unittest.TestCase):
         self.assertIsNone(self.store.github_installation_state("c" * 64))
         # The installation FACTS survive: GitHub still has the App installed.
         self.assertIsNotNone(self.store.github_installation(4501))
+
+
+@unittest.skipUnless(DSN, "RELIUM_TEST_POSTGRES_DSN not set; PostgreSQL suite requires a real server")
+class RepositoryOnboardingMigrationTests(unittest.TestCase):
+    """Migration 0016, from empty and from the Phase 2 schema."""
+
+    def setUp(self):
+        _reset_schema(DSN)
+
+    def _store(self):
+        from agent.postgres_lifecycle_store import PostgresLifecycleStore
+
+        return PostgresLifecycleStore(DSN)
+
+    def test_upgrade_from_installation_binding_to_repository_onboarding(self):
+        """15 -> 16, the path a deployment already on Phase 2 will take."""
+        from agent.postgres_migrate import applied_versions
+
+        _apply_up_to(DSN, INSTALLATION_BINDING)
+        store = self._store()
+        try:
+            versions = applied_versions(store.connection)
+            self.assertIn(NEW_LATEST, versions)
+            self.assertEqual(versions[versions.index(NEW_LATEST) - 1],
+                             INSTALLATION_BINDING)
+            self.assertIsNotNone(store.connection.execute(
+                "SELECT to_regclass('public.tenant_repositories') AS n"
+            ).fetchone()["n"])
+            # Completion columns are added to the existing table rather than
+            # duplicating tenant_onboarding_state.completed_at.
+            columns = {row["column_name"] for row in store.connection.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'tenant_onboarding_state'").fetchall()}
+            self.assertIn("completed_repository_id", columns)
+            self.assertIn("completed_by_clerk_user_id", columns)
+        finally:
+            store.close()
+
+    def test_upgrade_preserves_phase_two_bindings(self):
+        """A migration that loses verified installation bindings is broken."""
+        import psycopg
+
+        _apply_up_to(DSN, INSTALLATION_BINDING)
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute(
+                "INSERT INTO tenants (tenant_id, clerk_organization_id, "
+                "organization_name) VALUES (%s, 'org_2kept', 'Kept')",
+                (f"ten_{'b' * 32}",))
+            conn.execute(
+                "INSERT INTO github_installations (github_installation_id, "
+                "github_account_id, github_account_login, github_account_type) "
+                "VALUES (5150, 1, 'kept', 'Organization')")
+            conn.execute(
+                "INSERT INTO tenant_github_installations "
+                "(github_installation_id, tenant_id, bound_by_clerk_user_id, "
+                " verified_github_user_id) VALUES (5150, %s, 'u', 1)",
+                (f"ten_{'b' * 32}",))
+
+        store = self._store()
+        try:
+            self.assertEqual(
+                store.tenant_for_github_installation(5150), f"ten_{'b' * 32}")
+        finally:
+            store.close()
+
+    def test_a_repository_belongs_to_exactly_one_tenant(self):
+        from agent.postgres_lifecycle_store import TenantRepositoryConflict
+
+        store = self._store()
+        try:
+            first = store.upsert_tenant_for_clerk_organization(
+                "org_2a", organization_name="A")["tenant_id"]
+            second = store.upsert_tenant_for_clerk_organization(
+                "org_2b", organization_name="B")["tenant_id"]
+            store.record_github_installation(
+                7001, github_account_id=1, github_account_login="a",
+                github_account_type="Organization")
+            store.select_tenant_repository(
+                8001, tenant_id=first, github_installation_id=7001,
+                owner_login="a", name="repo")
+            with self.assertRaises(TenantRepositoryConflict):
+                store.select_tenant_repository(
+                    8001, tenant_id=second, github_installation_id=7001,
+                    owner_login="a", name="repo")
+        finally:
+            store.close()
+
+    def test_removing_an_installation_removes_its_repositories(self):
+        """A repository reachable only through an installation that is gone
+        must not stay configured."""
+        store = self._store()
+        try:
+            tenant = store.upsert_tenant_for_clerk_organization(
+                "org_2c", organization_name="C")["tenant_id"]
+            store.record_github_installation(
+                7002, github_account_id=1, github_account_login="c",
+                github_account_type="Organization")
+            store.select_tenant_repository(
+                8002, tenant_id=tenant, github_installation_id=7002,
+                owner_login="c", name="repo")
+            store.connection.execute(
+                "DELETE FROM github_installations "
+                "WHERE github_installation_id = 7002")
+            self.assertIsNone(store.tenant_repository(tenant, 8002))
+        finally:
+            store.close()
+
+    def test_the_database_refuses_an_escaping_manifest_path(self):
+        """Defence in depth: the API validates, and so does the schema."""
+        store = self._store()
+        try:
+            tenant = store.upsert_tenant_for_clerk_organization(
+                "org_2d", organization_name="D")["tenant_id"]
+            store.record_github_installation(
+                7003, github_account_id=1, github_account_login="d",
+                github_account_type="Organization")
+            store.select_tenant_repository(
+                8003, tenant_id=tenant, github_installation_id=7003,
+                owner_login="d", name="repo")
+            for bad in ("/etc/passwd", "C:/win/m.json", "../escape.json",
+                        "a/../b.json", "a//b.json", "a/"):
+                with self.assertRaises(Exception, msg=bad):
+                    store.connection.execute(
+                        "UPDATE tenant_repositories SET manifest_path = %s "
+                        "WHERE github_repository_id = 8003", (bad,))
+        finally:
+            store.close()
+
+    def test_an_unknown_enforcement_mode_is_refused_by_the_database(self):
+        store = self._store()
+        try:
+            tenant = store.upsert_tenant_for_clerk_organization(
+                "org_2e", organization_name="E")["tenant_id"]
+            store.record_github_installation(
+                7004, github_account_id=1, github_account_login="e",
+                github_account_type="Organization")
+            store.select_tenant_repository(
+                8004, tenant_id=tenant, github_installation_id=7004,
+                owner_login="e", name="repo")
+            with self.assertRaises(Exception):
+                store.connection.execute(
+                    "UPDATE tenant_repositories SET enforcement_mode = 'block' "
+                    "WHERE github_repository_id = 8004")
+        finally:
+            store.close()
 
 
 if __name__ == "__main__":

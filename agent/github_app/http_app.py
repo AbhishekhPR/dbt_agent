@@ -32,6 +32,10 @@ def create_http_app(
     installation_binder=None,
     identity_linker=None,
     app_url="",
+    repository_service=None,
+    api_url="",
+    dashboard_bridge=None,
+    secure_cookies=True,
 ):
     """Build the served application.
 
@@ -241,6 +245,10 @@ def create_http_app(
             installation_binder=installation_binder,
             identity_linker=identity_linker,
             app_url=app_url,
+            repository_service=repository_service,
+            api_url=api_url,
+            dashboard_bridge=dashboard_bridge,
+            secure_cookies=secure_cookies,
         ))
     # Dashboard sign-in. Registered only when the App's user-authorization
     # credentials are fully configured, so there is never a login route that

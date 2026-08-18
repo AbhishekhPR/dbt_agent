@@ -61,7 +61,8 @@ def configure_logging(level=logging.INFO) -> None:
     root.setLevel(level)
 
 
-def build_application(settings, *, client_factory=None, logger=None, sleep=time.sleep):
+def build_application(settings, *, client_factory=None, logger=None,
+                      sleep=time.sleep, environ=None):
     logger = logger or logging.getLogger("relium.github_app")
     storage = RepositoryStorage(settings.storage_root)
     slack_publisher = None
@@ -160,6 +161,111 @@ def build_application(settings, *, client_factory=None, logger=None, sleep=time.
     elif store_pool is not None:
         logger.warning("dashboard login is NOT configured; /auth routes are absent")
 
+    # ------------------------------------------------------------------
+    # First-run onboarding: Clerk identity, installation binding, repository
+    # and dbt configuration.
+    #
+    # Assembled here rather than inside create_http_app because every part of
+    # it is optional configuration, and a deployment that has not configured
+    # Clerk or the GitHub App must still start and serve reviews. What it must
+    # NOT do is start and quietly authenticate people anyway, so each component
+    # is built only when the credentials it needs are actually present, and the
+    # routes answer 503 rather than vanishing when one is absent.
+    clerk_verifier = None
+    installation_binder = None
+    identity_linker = None
+    repository_service = None
+    dashboard_bridge = None
+
+    if store_pool is not None:
+        from agent.api.clerk_identity import (
+            ClerkConfigurationError, ClerkSettings, ClerkVerifier,
+        )
+
+        try:
+            clerk_settings = ClerkSettings.from_environ(environ)
+        except ClerkConfigurationError as exc:
+            # Misconfiguration is fatal at boot rather than at the first
+            # request: an https-only issuer that is not https would otherwise
+            # fail on a customer, not on us.
+            raise SettingsError(str(exc)) from None
+        if clerk_settings is not None:
+            clerk_verifier = ClerkVerifier(clerk_settings)
+            logger.info("clerk authentication enabled")
+        else:
+            logger.warning(
+                "RELIUM_CLERK_ISSUER is not set; onboarding routes are served "
+                "but authenticate nobody")
+
+        from agent.api.github_installation import (
+            GitHubAppIdentity, GitHubIdentityLinker, InstallationBinder,
+        )
+        from agent.api.repository_onboarding import RepositoryOnboardingService
+        from agent.github_app.auth import create_app_jwt
+
+        # The App JWT is minted per call and lives for ten minutes. The private
+        # key stays in settings and never leaves this closure.
+        def app_jwt():
+            return create_app_jwt(settings.app_id, settings.private_key)
+
+        onboarding_client = client_factory() if client_factory else GitHubClient(
+            timeout=settings.request_timeout_seconds)
+        app_identity = GitHubAppIdentity(onboarding_client, app_jwt)
+
+        # The installation binder needs the session encryption key: it decrypts
+        # the stored GitHub user credential to ask GitHub, as that human,
+        # whether they can really see the installation being claimed.
+        if settings.session_encryption_key:
+            installation_binder = InstallationBinder(
+                app_identity=app_identity,
+                client=onboarding_client,
+                jwt_factory=app_jwt,
+                session_key=settings.session_encryption_key,
+            )
+            repository_service = RepositoryOnboardingService(
+                client=onboarding_client, jwt_factory=app_jwt)
+        else:
+            logger.warning(
+                "RELIUM_SESSION_ENCRYPTION_KEY is not set; GitHub installation "
+                "binding is disabled and onboarding cannot be completed")
+
+        # Linking a Clerk user to a verified GitHub identity reuses the App's
+        # user-authorization credentials -- the same client id and secret the
+        # dashboard login uses, on a separate callback.
+        if (settings.github_client_id and settings.github_client_secret
+                and settings.session_encryption_key and settings.public_url):
+            identity_linker = GitHubIdentityLinker(
+                client_id=settings.github_client_id,
+                client_secret=settings.github_client_secret,
+                redirect_uri=f"{settings.public_url}/auth/github/link/callback",
+                session_key=settings.session_encryption_key,
+            )
+        else:
+            logger.warning(
+                "GitHub user-authorization is not fully configured; a Clerk "
+                "user cannot prove a GitHub identity and no installation can "
+                "be bound")
+
+    # The bridge from a completed Clerk onboarding into the EXISTING GitHub
+    # dashboard session. Built after the session manager, and only when there
+    # is one -- without it there is no dashboard session to establish, and
+    # inventing a second session system would be the wrong answer.
+    if (session_manager is not None and repository_service is not None
+            and settings.session_encryption_key):
+        from agent.api.dashboard_bridge import DashboardSessionBridge
+
+        dashboard_bridge = DashboardSessionBridge(
+            session_manager=session_manager,
+            session_key=settings.session_encryption_key,
+            repository_service=repository_service,
+            environment=settings.metadata_review_environment,
+        )
+        logger.info("dashboard session bridge enabled")
+    elif store_pool is not None:
+        logger.warning(
+            "the dashboard session bridge is NOT configured; an onboarded "
+            "tenant cannot enter the dashboard")
+
     app = create_http_app(
         webhook_secret=settings.webhook_secret,
         job_queue=jobs,
@@ -173,6 +279,17 @@ def build_application(settings, *, client_factory=None, logger=None, sleep=time.
         cors_allowed_origins=settings.cors_allowed_origins,
         session_manager=session_manager,
         auth_routes=auth_routes,
+        clerk_verifier=clerk_verifier,
+        installation_binder=installation_binder,
+        identity_linker=identity_linker,
+        repository_service=repository_service,
+        dashboard_bridge=dashboard_bridge,
+        secure_cookies=settings.secure_cookies,
+        # Where a GitHub round trip returns the browser to, and the API origin
+        # the customer's CI will submit manifests to. Both come from
+        # configuration; neither is derived from a request.
+        app_url=settings.dashboard_url or "",
+        api_url=settings.public_url or "",
     )
     app.state.job_queue = jobs
     return app
@@ -182,7 +299,7 @@ def main(environ=None, *, run_server=None) -> None:
     configure_logging()
     try:
         settings = load_settings(environ)
-        app = build_application(settings)
+        app = build_application(settings, environ=environ)
     except SettingsError as exc:
         print(f"Relium GitHub App server configuration error: {exc}", file=sys.stderr)
         raise SystemExit(2) from None

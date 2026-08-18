@@ -43,6 +43,7 @@
     "GET /api/models/{model}/lineage",
     "GET /api/monitoring",
     "GET /api/monitoring/observations",
+    "GET /api/onboarding/repositories",
     "GET /api/onboarding/state",
     "GET /api/repositories/{repository}/settings",
     "GET /api/reviews",
@@ -69,6 +70,9 @@
     "POST /api/metadata-snapshots",
     "POST /api/monitoring/baselines",
     "POST /api/monitoring/observations",
+    "POST /api/onboarding/ci-token",
+    "POST /api/onboarding/complete",
+    "POST /api/onboarding/dashboard-session",
     "POST /api/onboarding/github/identity",
     "POST /api/onboarding/github/install",
     "POST /api/reviews",
@@ -77,6 +81,8 @@
     "POST /api/reviews/{review_id}/request-changes",
     "POST /api/reviews/{review_id}/rerun",
     "POST /github/webhook",
+    "PUT /api/onboarding/dbt",
+    "PUT /api/onboarding/repositories/{repository_id}",
     "PUT /api/tenants"
   ],
   "routes": [
@@ -208,12 +214,42 @@
     {
       "authentication": "clerk-session",
       "method": "POST",
+      "path": "/api/onboarding/ci-token"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "POST",
+      "path": "/api/onboarding/complete"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "POST",
+      "path": "/api/onboarding/dashboard-session"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "PUT",
+      "path": "/api/onboarding/dbt"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "POST",
       "path": "/api/onboarding/github/identity"
     },
     {
       "authentication": "clerk-session",
       "method": "POST",
       "path": "/api/onboarding/github/install"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "GET",
+      "path": "/api/onboarding/repositories"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "PUT",
+      "path": "/api/onboarding/repositories/{repository_id}"
     },
     {
       "authentication": "clerk-session",
