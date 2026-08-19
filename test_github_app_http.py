@@ -102,6 +102,50 @@ class GitHubAppHttpTests(unittest.TestCase):
             raise_server_exceptions=options.get("raise_server_exceptions", True),
         ), queue
 
+    def test_put_tenant_preflight_allows_clerk_headers_without_authentication(self):
+        from agent.github_app.http_app import create_http_app
+
+        verifier = Mock()
+        app = create_http_app(
+            webhook_secret=SECRET,
+            job_queue=FakeQueue(),
+            max_body_bytes=1024,
+            shutdown_timeout_seconds=0.5,
+            clock=lambda: 20.0,
+            logger=Mock(),
+            store_pool=Mock(),
+            clerk_verifier=verifier,
+            cors_allowed_origins=("https://app.relium.dev",),
+        )
+
+        with TestClient(app) as client:
+            response = client.options(
+                "/api/tenants",
+                headers={
+                    "Origin": "https://app.relium.dev",
+                    "Access-Control-Request-Method": "PUT",
+                    "Access-Control-Request-Headers": "Authorization, Content-Type",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.headers["Access-Control-Allow-Origin"],
+            "https://app.relium.dev",
+        )
+        allowed_methods = {
+            method.strip()
+            for method in response.headers["Access-Control-Allow-Methods"].split(",")
+        }
+        self.assertIn("PUT", allowed_methods)
+        allowed_headers = {
+            header.strip().lower()
+            for header in response.headers["Access-Control-Allow-Headers"].split(",")
+        }
+        self.assertIn("authorization", allowed_headers)
+        self.assertIn("content-type", allowed_headers)
+        verifier.verify.assert_not_called()
+
     def test_valid_signature_preserves_raw_body_and_returns_202(self):
         body = _body()
         client, jobs = self._client()

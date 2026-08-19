@@ -274,7 +274,7 @@ def create_http_app(
         middleware.append(Middleware(
             CORSMiddleware,
             allow_origins=list(cors_allowed_origins),
-            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_methods=["GET", "POST", "PUT", "OPTIONS"],
             allow_headers=["Authorization", "Content-Type", "Idempotency-Key",
                            "X-Request-Id", "X-Relium-CSRF"],
             expose_headers=["X-Request-Id"],
