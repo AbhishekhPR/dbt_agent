@@ -611,6 +611,43 @@ class PostgresLifecycleStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def tenant_repository_detections(self, tenant_id):
+        rows = self.connection.execute(
+            "SELECT github_repository_id, tenant_id, github_installation_id, "
+            "owner_login, name, default_branch, private, dbt_detected, "
+            "dbt_project_dir, dbt_checked_at, dbt_checked_commit_sha "
+            "FROM tenant_repository_dbt_detection WHERE tenant_id = %s",
+            (tenant_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_tenant_repository_detection(self, *, tenant_id,
+                                           github_repository_id,
+                                           github_installation_id, owner_login,
+                                           name, default_branch, private,
+                                           dbt_detected, dbt_project_dir,
+                                           dbt_checked_at,
+                                           dbt_checked_commit_sha):
+        self.connection.execute(
+            "INSERT INTO tenant_repository_dbt_detection "
+            "(tenant_id, github_repository_id, github_installation_id, "
+            " owner_login, name, default_branch, private, dbt_detected, "
+            " dbt_project_dir, dbt_checked_at, dbt_checked_commit_sha) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (tenant_id, github_repository_id) DO UPDATE SET "
+            " github_installation_id = EXCLUDED.github_installation_id, "
+            " owner_login = EXCLUDED.owner_login, name = EXCLUDED.name, "
+            " default_branch = EXCLUDED.default_branch, private = EXCLUDED.private, "
+            " dbt_detected = EXCLUDED.dbt_detected, "
+            " dbt_project_dir = EXCLUDED.dbt_project_dir, "
+            " dbt_checked_at = EXCLUDED.dbt_checked_at, "
+            " dbt_checked_commit_sha = EXCLUDED.dbt_checked_commit_sha",
+            (tenant_id, github_repository_id, github_installation_id,
+             owner_login, name, default_branch, private, dbt_detected,
+             dbt_project_dir, dbt_checked_at, dbt_checked_commit_sha),
+        )
+        self.connection.commit()
+
     def configured_tenant_repository(self, tenant_id):
         """The tenant's configured repository, if there is one.
 

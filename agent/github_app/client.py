@@ -146,6 +146,14 @@ class GitHubClient:
             route_template="/installation/repositories",
         )
 
+    def get_branch(self, owner, repository, branch):
+        return self._request(
+            "GET",
+            f"/repos/{owner}/{repository}/branches/{urllib.parse.quote(branch, safe='')}",
+            operation="get_repository_branch",
+            route_template="/repos/{owner}/{repo}/branches/{branch}",
+        )
+
     def get_file(self, owner, repository, path, ref):
         quoted = urllib.parse.quote(path, safe="/")
         return self._request_raw(

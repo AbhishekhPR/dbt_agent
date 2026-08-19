@@ -40,7 +40,7 @@ REUSED, NOT REINVENTED
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from datetime import datetime, timezone
 
 from agent.github_app.config import (
@@ -160,6 +160,7 @@ class AuthorizedRepository:
     default_branch: str
     private: bool
     installation_id: int
+    head_sha: str | None = None
 
 
 class RepositoryOnboardingService:
@@ -205,12 +206,37 @@ class RepositoryOnboardingService:
                 continue
             repositories.extend(
                 self._installation_repositories(binding["github_installation_id"]))
+        cached = ({row["github_repository_id"]: row
+                   for row in store.tenant_repository_detections(tenant_id)}
+                  if hasattr(store, "tenant_repository_detections") else {})
+        for repository in repositories:
+            current = cached.get(repository.github_repository_id)
+            if (current and current.get("dbt_detected") is not None
+                    and current.get("default_branch") == repository.default_branch
+                    and current.get("dbt_checked_commit_sha") == repository.head_sha):
+                continue
+            detection = self.detect_dbt_project(repository)
+            if hasattr(store, "upsert_tenant_repository_detection"):
+                store.upsert_tenant_repository_detection(
+                    tenant_id=tenant_id,
+                    github_repository_id=repository.github_repository_id,
+                    github_installation_id=repository.installation_id,
+                    owner_login=repository.owner_login,
+                    name=repository.name,
+                    default_branch=repository.default_branch,
+                    private=repository.private,
+                    dbt_detected=detection["detected"],
+                    dbt_project_dir=detection["project_dir"],
+                    dbt_checked_at=self._clock(),
+                    dbt_checked_commit_sha=repository.head_sha,
+                )
         return repositories
 
     def _installation_repositories(self, installation_id):
         from agent.github_app.client import GitHubAPIError
 
         token = self._installation_token(installation_id)
+        client = self._client.with_token(token)
         found = []
         seen_total = None
         for page in range(1, 11):
@@ -231,7 +257,25 @@ class RepositoryOnboardingService:
             seen_total = document.get("total_count")
             if not batch or (isinstance(seen_total, int) and len(found) >= seen_total):
                 break
-        return found
+        enriched = []
+        for repository in found:
+            if not hasattr(self._client, "get_branch"):
+                enriched.append(repository)
+                continue
+            try:
+                branch = client.get_branch(
+                    repository.owner_login, repository.name,
+                    repository.default_branch)
+            except GitHubAPIError:
+                raise RepositoryOnboardingError(CODE_GITHUB_UNAVAILABLE) from None
+            try:
+                sha = branch["commit"]["sha"]
+            except (KeyError, TypeError):
+                raise RepositoryOnboardingError(CODE_GITHUB_UNAVAILABLE) from None
+            if not isinstance(sha, str) or not sha:
+                raise RepositoryOnboardingError(CODE_GITHUB_UNAVAILABLE)
+            enriched.append(dataclass_replace(repository, head_sha=sha))
+        return enriched
 
     # -- authorization ------------------------------------------------------
 
@@ -582,9 +626,13 @@ def repositories_payload(store, tenant_id, repositories):
     """The listing as the API exposes it, merged with what is stored."""
     stored = {row["github_repository_id"]: row
               for row in store.tenant_repositories(tenant_id)}
+    detections = ({row["github_repository_id"]: row
+                  for row in store.tenant_repository_detections(tenant_id)}
+                 if hasattr(store, "tenant_repository_detections") else {})
     payload = []
     for repository in repositories:
         record = stored.get(repository.github_repository_id, {})
+        detection = detections.get(repository.github_repository_id, record)
         payload.append({
             "repository_id": repository.github_repository_id,
             "full_name": repository.full_name,
@@ -592,8 +640,8 @@ def repositories_payload(store, tenant_id, repositories):
             "name": repository.name,
             "default_branch": repository.default_branch,
             "private": repository.private,
-            "dbt_detected": record.get("dbt_detected"),
-            "dbt_project_dir": record.get("dbt_project_dir"),
+            "dbt_detected": detection.get("dbt_detected"),
+            "dbt_project_dir": detection.get("dbt_project_dir"),
             "selected": bool(record),
             "configured": bool(record.get("manifest_path")),
         })
