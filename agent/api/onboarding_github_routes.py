@@ -29,21 +29,33 @@ from __future__ import annotations
 
 import logging
 import urllib.parse
+from contextlib import contextmanager
 
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import RedirectResponse
 from starlette.routing import Route
 
 from agent.api.github_installation import (
-    CODE_APP_NOT_CONFIGURED, CODE_GITHUB_IDENTITY_REQUIRED, CODE_STATE_INVALID,
-    INSTALLATION_STATE_LIFETIME, InstallationBindingError, hash_state, new_state,
+    CODE_APP_NOT_CONFIGURED, CODE_GITHUB_IDENTITY_REQUIRED,
+    CODE_GITHUB_UNAVAILABLE, CODE_STATE_INVALID, INSTALLATION_STATE_LIFETIME,
+    InstallationBindingError, hash_state, new_state,
 )
-from agent.api.validation import isoformat
+from agent.api.validation import ValidationError, isoformat
 
 logger = logging.getLogger(__name__)
 
 #: Where a completed or failed GitHub round trip sends the browser back to.
 DEFAULT_RETURN_PATH = "/onboarding"
+
+
+@contextmanager
+def _store_transaction(store):
+    """Use a real store transaction while keeping test stores lightweight."""
+    transaction = getattr(store, "transaction", None)
+    if not callable(transaction):
+        transaction = store.connection.transaction
+    with transaction():
+        yield
 
 
 def safe_return_path(value, default=DEFAULT_RETURN_PATH):
@@ -75,7 +87,7 @@ def _redirect_back(app_url, path, params):
 
 def create_onboarding_github_routes(*, store_pool, clerk_authenticator,
                                     binder=None, identity_linker=None,
-                                    app_url=""):
+                                    app_url="", api_url=""):
     """Build the GitHub onboarding routes.
 
     ``binder`` and ``identity_linker`` are None when this deployment has no
@@ -152,6 +164,47 @@ def create_onboarding_github_routes(*, store_pool, clerk_authenticator,
             "install_url": started["install_url"],
             "expires_at": isoformat(started["expires_at"]),
         }
+
+    # -- POST /api/onboarding/github/reconcile ----------------------------
+
+    def reconcile_installation(request, body):
+        """Discover without a pooled store, then bind and read state atomically."""
+        selected = body.get("installation_id")
+        if selected is not None:
+            if (isinstance(selected, bool) or not isinstance(selected, int)
+                    or selected <= 0):
+                raise ValidationError(
+                    "'installation_id' must be a positive integer",
+                    field="installation_id")
+
+        with store_pool.acquire() as store:
+            principal = clerk_authenticator.principal(
+                request, store, write=True, require_tenant=True)
+            access_token, github_user_id = binder.reconciliation_identity(
+                store, clerk_user_id=principal.clerk_user_id)
+
+        discovery = binder.discover_reconciliation(
+            access_token, selected_installation_id=selected)
+
+        with store_pool.acquire() as store:
+            with _store_transaction(store):
+                tenant = store.tenant_by_clerk_organization(
+                    principal.clerk_organization_id)
+                if (tenant is None
+                        or tenant["tenant_id"] != principal.tenant_id):
+                    raise InstallationBindingError(
+                        "workspace_required",
+                        "the Relium workspace is no longer available")
+                result = binder.complete_reconciliation(
+                    store, discovery=discovery,
+                    tenant_id=tenant["tenant_id"],
+                    clerk_user_id=principal.clerk_user_id,
+                    github_user_id=github_user_id)
+                result["state"] = onboarding_state_payload(
+                    store, clerk_user_id=principal.clerk_user_id,
+                    clerk_organization_id=principal.clerk_organization_id,
+                    tenant=tenant, api_url=api_url)
+        return 200, result
 
     # -- GET /auth/github/link/callback ------------------------------------
 
@@ -250,6 +303,21 @@ def create_onboarding_github_routes(*, store_pool, clerk_authenticator,
 
     # -- plumbing ----------------------------------------------------------
 
+    def error_response(exc, request, request_id):
+        if isinstance(exc, InstallationBindingError):
+            if exc.code == CODE_GITHUB_UNAVAILABLE:
+                return _json({"status": "unavailable", "code": exc.code},
+                             503, request_id)
+            return _json({"status": "conflict", "code": exc.code},
+                         409, request_id)
+        mapped = clerk_authenticator.map_error(exc, request_id)
+        if mapped is not None:
+            return mapped
+        logger.error("onboarding_github_request_failed",
+                     extra={"error_category": "internal",
+                            "route_template": request.url.path})
+        return _json({"status": "unavailable"}, 500, request_id)
+
     def clerk_handler(fn, *, write):
         """A Clerk-authenticated JSON handler, using the shared authenticator."""
         async def wrapped(request):
@@ -260,36 +328,39 @@ def create_onboarding_github_routes(*, store_pool, clerk_authenticator,
                 return unavailable
 
             try:
-                principal_holder = {}
-
                 def work():
                     with store_pool.acquire() as store:
                         principal = clerk_authenticator.principal(
                             request, store, write=write)
-                        principal_holder["p"] = principal
                         return fn(request, None, store, principal)
 
                 status, payload = await run_in_threadpool(work)
                 return _json(payload, status, request_id)
-            except InstallationBindingError as exc:
-                return _json({"status": "conflict", "code": exc.code}, 409,
-                             request_id)
             except Exception as exc:
-                mapped = clerk_authenticator.map_error(exc, request_id)
-                if mapped is not None:
-                    return mapped
-                logger.error("onboarding_github_request_failed",
-                             extra={"error_category": "internal",
-                                    "route_template": request.url.path})
-                return _json({"status": "unavailable"}, 500, request_id)
+                return error_response(exc, request, request_id)
 
         return wrapped
+
+    async def reconcile_handler(request):
+        request_id = _request_id(request)
+        unavailable = _require(binder, request_id, _json)
+        if unavailable is not None:
+            return unavailable
+        try:
+            body = await _read_json(request)
+            status, payload = await run_in_threadpool(
+                reconcile_installation, request, body)
+            return _json(payload, status, request_id)
+        except Exception as exc:
+            return error_response(exc, request, request_id)
 
     return [
         Route("/api/onboarding/github/identity",
               clerk_handler(start_identity_link, write=True), methods=["POST"]),
         Route("/api/onboarding/github/install",
               clerk_handler(start_installation, write=True), methods=["POST"]),
+        Route("/api/onboarding/github/reconcile",
+              reconcile_handler, methods=["POST"]),
         Route("/auth/github/link/callback", complete_identity_link,
               methods=["GET"]),
         Route("/github/setup", setup_redirect, methods=["GET"]),
@@ -298,4 +369,6 @@ def create_onboarding_github_routes(*, store_pool, clerk_authenticator,
 
 # Imported late to avoid a cycle: onboarding_routes owns the JSON plumbing and
 # the Clerk authenticator, and imports nothing from here.
-from agent.api.onboarding_routes import _json, _request_id  # noqa: E402
+from agent.api.onboarding_routes import (  # noqa: E402
+    _json, _read_json, _request_id, onboarding_state_payload,
+)

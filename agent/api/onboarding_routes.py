@@ -187,6 +187,46 @@ class ClerkAuthenticator:
         return None
 
 
+def onboarding_state_payload(store, *, clerk_user_id, clerk_organization_id,
+                             tenant, api_url=""):
+    """Build the authoritative onboarding document without side effects."""
+    if clerk_organization_id is None:
+        return {
+            "complete": False,
+            "current_step": STEP_ORGANIZATION,
+            "code": CODE_CLERK_ORGANIZATION_REQUIRED,
+            "workspace": None,
+            "github": None,
+            "configuration": None,
+        }
+
+    if tenant is None:
+        return {
+            "complete": False,
+            "current_step": STEP_WORKSPACE,
+            "workspace": None,
+            "github": None,
+            "configuration": None,
+        }
+
+    from agent.api.github_installation import (
+        github_identity_payload, installations_payload,
+    )
+    from agent.api.repository_onboarding import configuration_payload
+
+    github = installations_payload(store, tenant["tenant_id"])
+    github["identity"] = github_identity_payload(store, clerk_user_id)
+    configuration = configuration_payload(
+        store, tenant["tenant_id"], api_url=api_url)
+    return {
+        "complete": tenant.get("completed_at") is not None,
+        "current_step": tenant.get("current_step") or "github",
+        "workspace": _workspace_payload(tenant),
+        "github": github,
+        "configuration": configuration,
+    }
+
+
 def create_onboarding_routes(*, store_pool, clerk_verifier=None, api_url=""):
     """Build the onboarding route table.
 
@@ -255,66 +295,10 @@ def create_onboarding_routes(*, store_pool, clerk_verifier=None, api_url=""):
     def get_state(request, body, store):
         identity = request.state.clerk_identity
         _, tenant = _principal_for(store, identity, capability=ONBOARDING_READ)
-
-        if identity.organization_id is None:
-            # Signed in to Clerk, but no organization is active on the session.
-            #
-            # Clerk owns this. The application uses Organizations, so a new
-            # user may still need to create, join or select one as part of
-            # Clerk's own flow — and Relium must not paper over that by
-            # inventing an organization on their behalf. The frontend sends
-            # them to Clerk, and returns here with a refreshed token.
-            return 200, {
-                "complete": False,
-                "current_step": STEP_ORGANIZATION,
-                "code": CODE_CLERK_ORGANIZATION_REQUIRED,
-                "workspace": None,
-                "github": None,
-                "configuration": None,
-            }
-
-        if tenant is None:
-            # There IS an active Clerk organization; Relium has no tenant for
-            # it yet. This is the genuine first-run workspace state, and the
-            # only legitimate way to hold a verified identity with an
-            # organization and still have no tenant.
-            return 200, {
-                "complete": False,
-                "current_step": STEP_WORKSPACE,
-                "workspace": None,
-                "github": None,
-                "configuration": None,
-            }
-
-        # The GitHub section is now factual: it reports bindings that survived
-        # the three verifications in agent/api/github_installation.py, and
-        # nothing else. An installation that only a browser has asserted does
-        # not appear here, because it was never written.
-        from agent.api.github_installation import (
-            github_identity_payload, installations_payload,
-        )
-
-        github = installations_payload(store, tenant["tenant_id"])
-        # Whether the human has proved a GitHub identity yet. Required before
-        # an installation can be bound, so the UI can ask for it first rather
-        # than after the customer has already installed the App.
-        github["identity"] = github_identity_payload(
-            store, identity.user_id)
-
-        # Phase 3: the dbt configuration section is now factual too. Null
-        # still means "not configured", never a plausible-looking default.
-        from agent.api.repository_onboarding import configuration_payload
-
-        configuration = configuration_payload(store, tenant["tenant_id"],
-                                              api_url=api_url)
-
-        return 200, {
-            "complete": tenant.get("completed_at") is not None,
-            "current_step": tenant.get("current_step") or "github",
-            "workspace": _workspace_payload(tenant),
-            "github": github,
-            "configuration": configuration,
-        }
+        return 200, onboarding_state_payload(
+            store, clerk_user_id=identity.user_id,
+            clerk_organization_id=identity.organization_id,
+            tenant=tenant, api_url=api_url)
 
     def put_tenant(request, body, store):
         identity = request.state.clerk_identity

@@ -210,12 +210,22 @@ def fetch_user_installations(access_token, *, timeout=10.0, opener=None,
         if not isinstance(batch, list):
             raise GitHubIdentityError(
                 "GitHub returned a malformed installation list")
-        installations.extend(item for item in batch if isinstance(item, dict))
+        if any(not isinstance(item, dict) for item in batch):
+            raise GitHubIdentityError(
+                "GitHub returned a malformed installation list")
+        installations.extend(batch)
         # `total_count` is the whole set, not this page.
         total = document.get("total_count")
-        if not isinstance(total, int) or len(installations) >= total or not batch:
-            break
-    return installations
+        if (isinstance(total, bool) or not isinstance(total, int) or total < 0
+                or len(installations) > total):
+            raise GitHubIdentityError(
+                "GitHub returned a malformed installation count")
+        if len(installations) == total:
+            return installations
+        if not batch:
+            raise GitHubIdentityError(
+                "GitHub returned an incomplete installation list")
+    raise GitHubIdentityError("GitHub installation pagination was incomplete")
 
 
 def user_can_access_installation(access_token, installation_id, *,

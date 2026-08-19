@@ -1458,6 +1458,7 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
         binder=installation_binder,
         identity_linker=identity_linker,
         app_url=app_url,
+        api_url=api_url,
     ))
 
     # Repository selection, dbt configuration, CI credential and completion.

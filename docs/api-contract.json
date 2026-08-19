@@ -75,6 +75,7 @@
     "POST /api/onboarding/dashboard-session",
     "POST /api/onboarding/github/identity",
     "POST /api/onboarding/github/install",
+    "POST /api/onboarding/github/reconcile",
     "POST /api/reviews",
     "POST /api/reviews/{review_id}/exceptions",
     "POST /api/reviews/{review_id}/exceptions/{exception_id}/revoke",
@@ -240,6 +241,11 @@
       "authentication": "clerk-session",
       "method": "POST",
       "path": "/api/onboarding/github/install"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "POST",
+      "path": "/api/onboarding/github/reconcile"
     },
     {
       "authentication": "clerk-session",

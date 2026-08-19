@@ -273,6 +273,206 @@ class InstallationBinder:
             store, clerk_user_id=state_owner, installation_id=installation_id)
 
         # ---- persist -----------------------------------------------------
+        created = self._persist_binding(
+            store, installation_id=installation_id, facts=facts,
+            tenant_id=tenant_id, clerk_user_id=state_owner,
+            verified_github_user_id=verified_github_user_id,
+            bound_via_state_id=claimed["installation_state_id"])
+
+        logger.info("github_installation_bound", extra={
+            "operation": "install_setup",
+            # Ids only. No token, no state, no account name.
+            "installation_id": installation_id,
+        })
+        return InstallationBinding(
+            installation_id=installation_id,
+            tenant_id=tenant_id,
+            account_login=facts["account_login"],
+            account_type=facts["account_type"],
+            account_id=facts["account_id"],
+            created=created,
+        )
+
+    def reconcile(self, store, *, tenant_id, clerk_user_id,
+                  selected_installation_id=None):
+        """Discover and bind an installation that predates onboarding.
+
+        The optional id is a browser preference, never evidence.  A candidate
+        is eligible only after it appears in a fresh user-scoped installation
+        list and the App, authenticated with its own JWT, independently returns
+        the same installation.  All candidates are verified before any write so
+        ambiguity and verification failures leave tenant bindings untouched.
+        """
+        access_token, github_user_id = self.reconciliation_identity(
+            store, clerk_user_id=clerk_user_id)
+        discovery = self.discover_reconciliation(
+            access_token,
+            selected_installation_id=selected_installation_id)
+        return self.complete_reconciliation(
+            store, discovery=discovery, tenant_id=tenant_id,
+            clerk_user_id=clerk_user_id, github_user_id=github_user_id)
+
+    def reconciliation_identity(self, store, *, clerk_user_id):
+        """Load the linked-user credential before releasing the store."""
+        return self._linked_human(store, clerk_user_id=clerk_user_id)
+
+    def discover_reconciliation(self, access_token, *,
+                                selected_installation_id=None):
+        """Fetch and App-verify candidates without holding a store connection.
+
+        The returned evidence is process-local and must be passed directly to
+        :meth:`complete_reconciliation`; it is never an API payload.
+        """
+        from agent.api.github_identity import (
+            GitHubCredentialExpired, GitHubIdentityError,
+        )
+
+        if selected_installation_id is not None:
+            if (isinstance(selected_installation_id, bool)
+                    or not isinstance(selected_installation_id, int)
+                    or selected_installation_id <= 0):
+                raise InstallationBindingError(CODE_INSTALLATION_UNKNOWN)
+
+        try:
+            documents = self._identity.fetch_user_installations(access_token)
+        except GitHubCredentialExpired:
+            raise InstallationBindingError(CODE_GITHUB_IDENTITY_UNUSABLE) from None
+        except GitHubIdentityError:
+            raise InstallationBindingError(CODE_GITHUB_UNAVAILABLE) from None
+
+        if not isinstance(documents, list):
+            raise InstallationBindingError(CODE_GITHUB_UNAVAILABLE)
+
+        installation_ids = []
+        seen = set()
+        for document in documents:
+            if not isinstance(document, dict):
+                raise InstallationBindingError(CODE_GITHUB_UNAVAILABLE)
+            installation_id = document.get("id")
+            if (isinstance(installation_id, bool)
+                    or not isinstance(installation_id, int)
+                    or installation_id <= 0):
+                raise InstallationBindingError(CODE_GITHUB_UNAVAILABLE)
+            if installation_id not in seen:
+                seen.add(installation_id)
+                installation_ids.append(installation_id)
+
+        if selected_installation_id is not None:
+            if selected_installation_id not in seen:
+                raise InstallationBindingError(CODE_INSTALLATION_NOT_AUTHORIZED)
+        elif not installation_ids:
+            return {"status": "not_found", "verified_candidates": []}
+
+        from agent.github_app.client import GitHubAPIError
+
+        try:
+            expected_app_id = self._app.app_id()
+        except InstallationBindingError:
+            raise
+        except GitHubAPIError:
+            raise InstallationBindingError(CODE_GITHUB_UNAVAILABLE) from None
+        if (isinstance(expected_app_id, bool)
+                or not isinstance(expected_app_id, int)
+                or expected_app_id <= 0):
+            raise InstallationBindingError(CODE_APP_NOT_CONFIGURED)
+
+        candidates = []
+        for installation_id in installation_ids:
+            facts = self._installation_facts(
+                installation_id, allow_not_found=True)
+            # /user/installations lists every App visible to the linked user.
+            # A 404 from this App-scoped endpoint means this entry belongs to
+            # another App, so it is not a candidate during discovery.
+            if facts is None:
+                continue
+            app_id = facts["app_id"]
+            if (isinstance(app_id, bool) or not isinstance(app_id, int)
+                    or app_id <= 0 or app_id != expected_app_id
+                    or facts["repository_selection"] not in ("all", "selected")):
+                raise InstallationBindingError(CODE_INSTALLATION_UNKNOWN)
+            candidates.append({
+                "installation_id": installation_id,
+                "account_id": facts["account_id"],
+                "account_login": facts["account_login"],
+                "account_type": facts["account_type"],
+                "repository_selection": facts["repository_selection"],
+                "facts": facts,
+            })
+
+        if selected_installation_id is not None:
+            chosen = next(
+                (candidate for candidate in candidates
+                 if candidate["installation_id"] == selected_installation_id),
+                None)
+            if chosen is None:
+                raise InstallationBindingError(CODE_INSTALLATION_UNKNOWN)
+            return {
+                "status": "ready",
+                "verified_candidates": candidates,
+                "chosen_installation_id": selected_installation_id,
+            }
+
+        if not candidates:
+            return {"status": "not_found", "verified_candidates": []}
+
+        if len(candidates) > 1:
+            return {
+                "status": "selection_required",
+                "verified_candidates": candidates,
+            }
+
+        return {
+            "status": "ready",
+            "verified_candidates": candidates,
+            "chosen_installation_id": candidates[0]["installation_id"],
+        }
+
+    def complete_reconciliation(self, store, *, discovery, tenant_id,
+                                clerk_user_id, github_user_id):
+        """Apply verified evidence inside the caller's transaction."""
+        candidates = discovery["verified_candidates"]
+        for candidate in candidates:
+            owner = store.tenant_for_github_installation(
+                candidate["installation_id"])
+            if owner is not None and owner != tenant_id:
+                raise InstallationBindingError(CODE_INSTALLATION_CLAIMED)
+
+        if discovery["status"] == "not_found":
+            return {"status": "not_found", "candidates": []}
+        if discovery["status"] == "selection_required":
+            return {
+                "status": "selection_required",
+                "candidates": [self._public_candidate(c) for c in candidates],
+            }
+
+        chosen = next(
+            candidate for candidate in candidates
+            if candidate["installation_id"] == discovery["chosen_installation_id"])
+        self._persist_binding(
+            store, installation_id=chosen["installation_id"],
+            facts=chosen["facts"], tenant_id=tenant_id,
+            clerk_user_id=clerk_user_id,
+            verified_github_user_id=github_user_id,
+            bound_via_state_id=None)
+        logger.info("github_installation_bound", extra={
+            "operation": "install_reconcile",
+            "installation_id": chosen["installation_id"],
+        })
+        return {
+            "status": "connected",
+            "candidates": [],
+            "installation_id": chosen["installation_id"],
+        }
+
+    @staticmethod
+    def _public_candidate(candidate):
+        return {key: candidate[key] for key in (
+            "installation_id", "account_id", "account_login", "account_type",
+            "repository_selection")}
+
+    def _persist_binding(self, store, *, installation_id, facts, tenant_id,
+                         clerk_user_id, verified_github_user_id,
+                         bound_via_state_id):
         store.record_github_installation(
             installation_id,
             github_app_id=facts["app_id"],
@@ -289,31 +489,18 @@ class InstallationBinder:
             _, created = store.bind_github_installation_to_tenant(
                 installation_id,
                 tenant_id=tenant_id,
-                bound_by_clerk_user_id=state_owner,
+                bound_by_clerk_user_id=clerk_user_id,
                 verified_github_user_id=verified_github_user_id,
-                bound_via_state_id=claimed["installation_state_id"],
+                bound_via_state_id=bound_via_state_id,
             )
         except TenantInstallationConflict as exc:
             raise InstallationBindingError(CODE_INSTALLATION_CLAIMED,
                                            str(exc)) from None
-
-        logger.info("github_installation_bound", extra={
-            "operation": "install_setup",
-            # Ids only. No token, no state, no account name.
-            "installation_id": installation_id,
-        })
-        return InstallationBinding(
-            installation_id=installation_id,
-            tenant_id=tenant_id,
-            account_login=facts["account_login"],
-            account_type=facts["account_type"],
-            account_id=facts["account_id"],
-            created=created,
-        )
+        return created
 
     # -- the individual verifications --------------------------------------
 
-    def _installation_facts(self, installation_id):
+    def _installation_facts(self, installation_id, *, allow_not_found=False):
         """Ask GitHub, as the App, what this installation is.
 
         A 404 here is the answer for both "no such installation" and
@@ -326,6 +513,8 @@ class InstallationBinder:
             document = self._client.get_installation(
                 installation_id, self._jwt_factory())
         except GitHubNotFoundError:
+            if allow_not_found:
+                return None
             raise InstallationBindingError(CODE_INSTALLATION_UNKNOWN) from None
         except GitHubAPIError:
             raise InstallationBindingError(CODE_GITHUB_UNAVAILABLE) from None
@@ -378,26 +567,9 @@ class InstallationBinder:
         from agent.api.github_identity import (
             GitHubCredentialExpired, GitHubIdentityError,
         )
-        from agent.api.session_crypto import CredentialEncryptionError, decrypt
 
-        link = store.clerk_github_identity(clerk_user_id)
-        if link is None:
-            raise InstallationBindingError(CODE_GITHUB_IDENTITY_REQUIRED)
-
-        try:
-            access_token = decrypt(self._session_key, link.get("access_token"),
-                                   associated=clerk_user_id)
-        except CredentialEncryptionError:
-            raise InstallationBindingError(CODE_GITHUB_IDENTITY_UNUSABLE) from None
-        if not access_token:
-            raise InstallationBindingError(CODE_GITHUB_IDENTITY_REQUIRED)
-
-        expires_at = link.get("access_expires_at")
-        if expires_at is not None and expires_at <= self._clock():
-            # Refreshing belongs to the linking flow, which owns the client
-            # secret. Here the honest answer is "re-authorise", not a silently
-            # skipped check.
-            raise InstallationBindingError(CODE_GITHUB_IDENTITY_UNUSABLE)
+        access_token, github_user_id = self._linked_human(
+            store, clerk_user_id=clerk_user_id)
 
         try:
             authorized = self._identity.user_can_access_installation(
@@ -417,10 +589,31 @@ class InstallationBinder:
             })
             raise InstallationBindingError(CODE_INSTALLATION_NOT_AUTHORIZED)
 
-        github_user_id = link.get("github_user_id")
-        if not isinstance(github_user_id, int) or github_user_id <= 0:
-            raise InstallationBindingError(CODE_GITHUB_IDENTITY_UNUSABLE)
         return github_user_id
+
+    def _linked_human(self, store, *, clerk_user_id):
+        """Return the decrypted linked-user token and immutable GitHub id."""
+        from agent.api.session_crypto import CredentialEncryptionError, decrypt
+
+        link = store.clerk_github_identity(clerk_user_id)
+        if link is None:
+            raise InstallationBindingError(CODE_GITHUB_IDENTITY_REQUIRED)
+        try:
+            access_token = decrypt(self._session_key, link.get("access_token"),
+                                   associated=clerk_user_id)
+        except CredentialEncryptionError:
+            raise InstallationBindingError(CODE_GITHUB_IDENTITY_UNUSABLE) from None
+        if not access_token:
+            raise InstallationBindingError(CODE_GITHUB_IDENTITY_REQUIRED)
+        expires_at = link.get("access_expires_at")
+        if expires_at is not None and expires_at <= self._clock():
+            raise InstallationBindingError(CODE_GITHUB_IDENTITY_UNUSABLE)
+        github_user_id = link.get("github_user_id")
+        if (isinstance(github_user_id, bool)
+                or not isinstance(github_user_id, int)
+                or github_user_id <= 0):
+            raise InstallationBindingError(CODE_GITHUB_IDENTITY_UNUSABLE)
+        return access_token, github_user_id
 
 
 class GitHubIdentityLinker:

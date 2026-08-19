@@ -127,6 +127,7 @@ class RouteContractTests(unittest.TestCase):
         clerk_paths = {"/api/onboarding/state", "/api/tenants",
                        "/api/onboarding/github/identity",
                        "/api/onboarding/github/install",
+                       "/api/onboarding/github/reconcile",
                        "/api/onboarding/repositories",
                        "/api/onboarding/repositories/{repository_id}",
                        "/api/onboarding/dbt",
