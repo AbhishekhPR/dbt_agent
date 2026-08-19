@@ -24,7 +24,7 @@ CLERK_TENANCY = 14
 #: GitHub App installation binding.
 INSTALLATION_BINDING = 15
 #: Repository selection, dbt configuration and CI state.
-NEW_LATEST = 16
+NEW_LATEST = 17
 
 
 def _reset_schema(dsn):
@@ -87,7 +87,8 @@ class ClerkTenantMigrationTests(unittest.TestCase):
             for table in ("tenants", "tenant_onboarding_state",
                           "github_installation_states", "clerk_github_identities",
                           "github_installations", "tenant_github_installations",
-                          "tenant_repositories"):
+                          "tenant_repositories",
+                          "tenant_repository_dbt_detection"):
                 self.assertIn(table, tables)
         finally:
             store.close()

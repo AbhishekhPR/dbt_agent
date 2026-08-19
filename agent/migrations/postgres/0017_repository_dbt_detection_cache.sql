@@ -1,6 +1,6 @@
 -- Durable, non-selection dbt detection cache for onboarding listings.
 CREATE TABLE IF NOT EXISTS tenant_repository_dbt_detection (
-    tenant_id UUID NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
     github_repository_id BIGINT NOT NULL,
     github_installation_id BIGINT NOT NULL,
     owner_login TEXT NOT NULL,

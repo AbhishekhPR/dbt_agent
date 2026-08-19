@@ -66,6 +66,25 @@ class PostgresMigrationTests(unittest.TestCase):
         self.assertEqual(first, second)
         store.close()
 
+    def test_dbt_detection_cache_uses_text_tenant_foreign_key(self):
+        from agent.postgres_lifecycle_store import PostgresLifecycleStore
+
+        store = PostgresLifecycleStore(DSN)
+        try:
+            referenced = store.connection.execute(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name='tenants' "
+                "AND column_name='tenant_id'").fetchone()["data_type"]
+            cache_type = store.connection.execute(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_schema='public' AND "
+                "table_name='tenant_repository_dbt_detection' "
+                "AND column_name='tenant_id'").fetchone()["data_type"]
+            self.assertEqual(referenced, "text")
+            self.assertEqual(cache_type, referenced)
+        finally:
+            store.close()
+
     def test_invalid_migration_rolls_back_atomically(self):
         from agent.postgres_lifecycle_store import PostgresLifecycleStore
 
