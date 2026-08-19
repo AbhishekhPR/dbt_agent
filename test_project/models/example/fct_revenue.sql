@@ -7,3 +7,4 @@ SELECT
 FROM raw_orders
 WHERE order_status != 'cancelled'
 GROUP BY customer_id, order_status
+-- Relium hosted manifest E2E test
