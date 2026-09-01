@@ -13,7 +13,37 @@ from starlette.routing import Route
 
 from agent.dashboard_contracts import DASHBOARD_RESOURCES
 
-CONTRACT_VERSION = "1.0.0"
+CONTRACT_VERSION = "1.1.0"
+
+# Request bodies whose shape is part of the public contract. This remains
+# separate from route registration metadata so the served route table stays a
+# compact method/path/authentication inventory.
+REQUEST_BODIES = {
+    # The ENTIRE billing checkout contract: one field, two permitted values.
+    # Declared here so the absence of a product id, an amount and a customer id
+    # is a published fact rather than an implementation detail -- there is no
+    # request shape in which a browser names what it is buying.
+    ("POST", "/api/billing/checkout"): {
+        "content_type": "application/json",
+        "required": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "plan": {
+                    "type": "string",
+                    "enum": ["starter", "pro"],
+                    "description": (
+                        "Which configured plan to purchase. The Polar product "
+                        "is resolved from deployment configuration; product "
+                        "ids and prices are never accepted from a caller"
+                    ),
+                },
+            },
+            "required": ["plan"],
+            "additionalProperties": True,
+        },
+    },
+}
 
 # Routes the public API release must serve. Kept explicit so an accidental
 # deletion fails a test rather than silently shrinking the surface.
@@ -87,6 +117,14 @@ MANDATORY_ROUTES = {
     ("POST", "/api/onboarding/ci-token"),
     ("POST", "/api/onboarding/complete"),
     ("POST", "/api/onboarding/dashboard-session"),
+    # Billing. The first three are the same Clerk principal as onboarding,
+    # scoped to the tenant in the verified token. The webhook is Polar's
+    # callback and is authenticated by a Standard Webhooks signature over the
+    # raw body -- declared distinctly below, never as "none".
+    ("POST", "/api/billing/checkout"),
+    ("GET", "/api/billing/subscription"),
+    ("POST", "/api/billing/portal"),
+    ("POST", "/api/billing/webhooks/polar"),
 }
 
 AUTHENTICATION = {
@@ -110,6 +148,16 @@ AUTHENTICATION = {
     # Authenticated by the Clerk bearer; SETS the GitHub dashboard session
     # cookie. The two credentials meet here and nowhere else.
     "/api/onboarding/dashboard-session": "clerk-session",
+    "/api/billing/checkout": "clerk-session",
+    "/api/billing/subscription": "clerk-session",
+    "/api/billing/portal": "clerk-session",
+    # Polar -> Relium. No session and no bearer token: a payment provider's
+    # callback carries neither. The credential is an HMAC-SHA256 signature over
+    # the exact request body, verified against POLAR_WEBHOOK_SECRET before the
+    # body is parsed. Named distinctly from the GitHub webhook because it is a
+    # different scheme (Standard Webhooks, with a replay window) and a different
+    # secret.
+    "/api/billing/webhooks/polar": "polar-webhook-signature",
     # Browser redirects arriving from github.com. They cannot carry a header,
     # and a cookie would be sent cross-site, so the credential is the
     # single-use installation state itself. Named distinctly because it is a
@@ -122,7 +170,9 @@ AUTHENTICATION = {
 #: Every authentication mode that counts as authenticated. An /api route whose
 #: mode is absent from this set is unauthenticated, which is the thing the
 #: contract test exists to prevent.
-AUTHENTICATED_MODES = frozenset({"service-token", "clerk-session"})
+AUTHENTICATED_MODES = frozenset({
+    "service-token", "clerk-session", "polar-webhook-signature",
+})
 
 
 def served_routes(app) -> list[dict]:
@@ -145,9 +195,15 @@ def served_routes(app) -> list[dict]:
 
 def build_contract(app) -> dict:
     entries = served_routes(app)
+    served = {(entry["method"], entry["path"]) for entry in entries}
     return {
         "contract_version": CONTRACT_VERSION,
         "routes": entries,
+        "request_bodies": {
+            f"{method} {path}": body
+            for (method, path), body in sorted(REQUEST_BODIES.items())
+            if (method, path) in served
+        },
         "dashboard_resources": dict(sorted(DASHBOARD_RESOURCES.items())),
         "mandatory_routes": sorted(f"{m} {p}" for m, p in MANDATORY_ROUTES),
     }

@@ -1,5 +1,5 @@
 {
-  "contract_version": "1.0.0",
+  "contract_version": "1.1.0",
   "dashboard_resources": {
     "anomaly_list": "/api/anomalies",
     "collection_request_detail": "/api/collection-requests/{request_id}",
@@ -29,6 +29,7 @@
   },
   "mandatory_routes": [
     "GET /api/anomalies",
+    "GET /api/billing/subscription",
     "GET /api/collection-requests",
     "GET /api/collection-requests/{request_id}",
     "GET /api/delivery-status",
@@ -61,6 +62,9 @@
     "GET /healthz",
     "GET /readyz",
     "POST /api/anomalies",
+    "POST /api/billing/checkout",
+    "POST /api/billing/portal",
+    "POST /api/billing/webhooks/polar",
     "POST /api/collection-requests/{request_id}/acknowledge",
     "POST /api/collection-requests/{request_id}/failure",
     "POST /api/collectors",
@@ -86,6 +90,29 @@
     "PUT /api/onboarding/repositories/{repository_id}",
     "PUT /api/tenants"
   ],
+  "request_bodies": {
+    "POST /api/billing/checkout": {
+      "content_type": "application/json",
+      "required": true,
+      "schema": {
+        "additionalProperties": true,
+        "properties": {
+          "plan": {
+            "description": "Which configured plan to purchase. The Polar product is resolved from deployment configuration; product ids and prices are never accepted from a caller",
+            "enum": [
+              "starter",
+              "pro"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "plan"
+        ],
+        "type": "object"
+      }
+    }
+  },
   "routes": [
     {
       "authentication": "service-token",
@@ -96,6 +123,26 @@
       "authentication": "service-token",
       "method": "POST",
       "path": "/api/anomalies"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "POST",
+      "path": "/api/billing/checkout"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "POST",
+      "path": "/api/billing/portal"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "GET",
+      "path": "/api/billing/subscription"
+    },
+    {
+      "authentication": "polar-webhook-signature",
+      "method": "POST",
+      "path": "/api/billing/webhooks/polar"
     },
     {
       "authentication": "service-token",

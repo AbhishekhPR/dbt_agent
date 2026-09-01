@@ -79,7 +79,7 @@ class RouteContractTests(unittest.TestCase):
         self.assertTrue(drift["drift_free"], drift)
 
     def test_checked_in_contract_matches_the_served_route_table(self):
-        from agent.api.contract import served_routes
+        from agent.api.contract import build_contract, served_routes
 
         self.assertTrue(
             CONTRACT_PATH.is_file(),
@@ -89,6 +89,11 @@ class RouteContractTests(unittest.TestCase):
         self.assertEqual(
             checked_in["routes"], served_routes(self.app),
             "docs/api-contract.json has drifted from the served route table",
+        )
+        self.assertEqual(
+            checked_in.get("request_bodies"),
+            build_contract(self.app)["request_bodies"],
+            "docs/api-contract.json has drifted from request-body declarations",
         )
 
     def test_every_api_route_is_authenticated(self):
@@ -121,21 +126,30 @@ class RouteContractTests(unittest.TestCase):
         self.assertEqual(modes[("PUT", "/api/tenants")], "clerk-session")
 
     def test_service_token_routes_did_not_become_clerk_routes(self):
-        """The pre-existing API surface keeps the credential it always had."""
+        """The pre-existing API surface keeps the credential it always had.
+
+        The exempt set is every route that was deliberately built on a
+        different principal: onboarding and billing on a Clerk session, and the
+        Polar webhook on a signature. Adding to it is an explicit edit, which is
+        the point — a new route cannot quietly change what credential the
+        established surface accepts.
+        """
         from agent.api.contract import served_routes
 
-        clerk_paths = {"/api/onboarding/state", "/api/tenants",
-                       "/api/onboarding/github/identity",
-                       "/api/onboarding/github/install",
-                       "/api/onboarding/github/reconcile",
-                       "/api/onboarding/repositories",
-                       "/api/onboarding/repositories/{repository_id}",
-                       "/api/onboarding/dbt",
-                       "/api/onboarding/ci-token",
-                       "/api/onboarding/complete",
-                       "/api/onboarding/dashboard-session"}
+        exempt = {"/api/billing/checkout", "/api/billing/subscription",
+                  "/api/billing/portal", "/api/billing/webhooks/polar",
+                  "/api/onboarding/state", "/api/tenants",
+                  "/api/onboarding/github/identity",
+                  "/api/onboarding/github/install",
+                  "/api/onboarding/github/reconcile",
+                  "/api/onboarding/repositories",
+                  "/api/onboarding/repositories/{repository_id}",
+                  "/api/onboarding/dbt",
+                  "/api/onboarding/ci-token",
+                  "/api/onboarding/complete",
+                  "/api/onboarding/dashboard-session"}
         for entry in served_routes(self.app):
-            if entry["path"].startswith("/api/") and entry["path"] not in clerk_paths:
+            if entry["path"].startswith("/api/") and entry["path"] not in exempt:
                 self.assertEqual(
                     entry["authentication"], "service-token",
                     f"{entry['method']} {entry['path']} changed authentication mode",

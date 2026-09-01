@@ -46,6 +46,16 @@ class TenantRepositoryConflict(ValueError):
     """
 
 
+class TenantBillingConflict(ValueError):
+    """A Polar customer or subscription is already bound to another workspace.
+
+    Store-level so the persistence layer stays independent of the API layer. The
+    binding is never re-pointed to resolve this: moving a subscription between
+    tenants is the one operation that would hand a paying customer's plan to
+    somebody else, and no webhook payload is evidence that it should happen.
+    """
+
+
 class TenantInstallationConflict(ValueError):
     """A GitHub App installation is already bound to a different tenant.
 
@@ -223,6 +233,137 @@ class PostgresLifecycleStore:
             (tenant_id,),
         ).fetchone()
         return dict(row) if row else None
+
+    # -- Polar billing, per tenant -----------------------------------------
+    #
+    # See migration 0018. The rules these methods exist to hold up: a
+    # subscription belongs to exactly one workspace, an older webhook delivery
+    # never overwrites a newer one, and a replayed delivery is a no-op.
+
+    def billing_for_tenant(self, tenant_id):
+        """This workspace's billing row, or None when it has never bought.
+
+        None means the free plan. It is not an error and callers must not treat
+        it as one — a tenant that has never reached checkout legitimately has no
+        row, and creating an empty one to avoid the None would make "has a Polar
+        customer" unanswerable.
+        """
+        row = self.connection.execute(
+            "SELECT tenant_id, polar_customer_id, polar_subscription_id, "
+            "       polar_product_id, plan, subscription_status, "
+            "       current_period_end, cancel_at_period_end, past_due_at, "
+            "       subscription_modified_at, created_at, updated_at "
+            "FROM tenant_billing WHERE tenant_id = %s",
+            (tenant_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def tenant_for_polar_customer(self, polar_customer_id):
+        """The tenant already bound to one Polar customer id, or None.
+
+        The webhook path's last-resort attribution, used only after the
+        server-set external id and metadata on the payload came up empty. It
+        reads a mapping RELIUM wrote; it never creates one.
+        """
+        row = self.connection.execute(
+            "SELECT tenant_id FROM tenant_billing WHERE polar_customer_id = %s",
+            (polar_customer_id,),
+        ).fetchone()
+        return row["tenant_id"] if row else None
+
+    def upsert_billing_from_subscription(self, *, tenant_id, polar_customer_id,
+                                         polar_subscription_id, polar_product_id,
+                                         plan, subscription_status,
+                                         current_period_end, cancel_at_period_end,
+                                         past_due_at, subscription_modified_at):
+        """Record one Polar subscription against one workspace.
+
+        Returns ``applied``, ``stale`` or ``ignored``.
+
+        ``ignored``  the tenant does not exist. A webhook naming a workspace
+                     this deployment does not have is acknowledged, not created:
+                     a tenant is minted by a verified Clerk session and by
+                     nothing else, least of all by a payment provider's payload.
+
+        ``stale``    a subscription object older than the one already stored.
+                     Deliveries can arrive out of order, and without this guard
+                     a retried `subscription.created` landing after
+                     `subscription.revoked` would restore a plan Polar has
+                     already ended. Enforced in the ON CONFLICT predicate rather
+                     than by reading first and comparing in Python, which two
+                     concurrent deliveries would both pass.
+
+        ``applied``  the row now reflects this object.
+
+        A subscription already recorded against a DIFFERENT tenant raises
+        ``TenantBillingConflict``. The UNIQUE constraints are what detect it;
+        the response is to refuse, never to re-point the row, because re-pointing
+        is precisely what handing one customer's paid plan to another looks
+        like.
+        """
+        with self.connection.transaction():
+            exists = self.connection.execute(
+                "SELECT 1 FROM tenants WHERE tenant_id = %s", (tenant_id,)
+            ).fetchone()
+            if exists is None:
+                return "ignored"
+
+            try:
+                row = self.connection.execute(
+                    "INSERT INTO tenant_billing ("
+                    "    tenant_id, polar_customer_id, polar_subscription_id, "
+                    "    polar_product_id, plan, subscription_status, "
+                    "    current_period_end, cancel_at_period_end, past_due_at, "
+                    "    subscription_modified_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT (tenant_id) DO UPDATE SET "
+                    "    polar_customer_id = COALESCE(EXCLUDED.polar_customer_id, "
+                    "                                 tenant_billing.polar_customer_id), "
+                    "    polar_subscription_id = EXCLUDED.polar_subscription_id, "
+                    "    polar_product_id = EXCLUDED.polar_product_id, "
+                    "    plan = EXCLUDED.plan, "
+                    "    subscription_status = EXCLUDED.subscription_status, "
+                    "    current_period_end = EXCLUDED.current_period_end, "
+                    "    cancel_at_period_end = EXCLUDED.cancel_at_period_end, "
+                    "    past_due_at = EXCLUDED.past_due_at, "
+                    "    subscription_modified_at = EXCLUDED.subscription_modified_at, "
+                    "    updated_at = now() "
+                    "WHERE tenant_billing.subscription_modified_at IS NULL "
+                    "   OR EXCLUDED.subscription_modified_at IS NULL "
+                    "   OR EXCLUDED.subscription_modified_at "
+                    "      >= tenant_billing.subscription_modified_at "
+                    "RETURNING tenant_id",
+                    (tenant_id, polar_customer_id, polar_subscription_id,
+                     polar_product_id, plan, subscription_status,
+                     current_period_end, bool(cancel_at_period_end), past_due_at,
+                     subscription_modified_at),
+                ).fetchone()
+            except Exception as exc:
+                if type(exc).__name__ == "UniqueViolation":
+                    raise TenantBillingConflict(
+                        "this Polar subscription belongs to another workspace"
+                    ) from None
+                raise
+            # No row means the ON CONFLICT predicate refused the update, which
+            # can only be the ordering guard.
+            return "applied" if row is not None else "stale"
+
+    def record_billing_webhook_delivery(self, *, delivery_id, event_type,
+                                        tenant_id=None):
+        """Claim one webhook delivery. False when it has already been seen.
+
+        The de-duplication is the PRIMARY KEY on the delivery id, resolved by
+        the database in one statement. A read-then-write would let two
+        simultaneous retries of the same delivery both pass the read.
+        """
+        row = self.connection.execute(
+            "INSERT INTO billing_webhook_deliveries "
+            "(delivery_id, event_type, tenant_id) VALUES (%s, %s, %s) "
+            "ON CONFLICT (delivery_id) DO NOTHING "
+            "RETURNING delivery_id",
+            (delivery_id, event_type, tenant_id),
+        ).fetchone()
+        return row is not None
 
     # -- GitHub App installation binding -----------------------------------
     #

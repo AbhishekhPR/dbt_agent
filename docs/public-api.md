@@ -7,8 +7,11 @@ an endpoint cannot be documented without being served.
 
 ## Boundaries
 
-- Every `/api/*` route authenticates a service token. The GitHub webhook keeps
-  its own HMAC signature authentication and never accepts a service token.
+- Every `/api/*` route authenticates either a service token; a server-verified
+  Clerk session, for onboarding and billing; or, for the single Polar billing
+  callback, a Standard Webhooks signature over the raw request body. The GitHub
+  webhook keeps its own HMAC signature authentication and never accepts any of
+  the others.
 - Handlers call a service layer, which calls `PostgresLifecycleStore`. No
   handler touches a connection, cursor or SQL string.
 - The API has no SQLite, in-memory, filesystem or fake persistence fallback.
@@ -29,6 +32,36 @@ Tokens are presented as `Authorization: Bearer rlm_<token_id>.<secret>`.
   environment. An environment-scoped token pins every request to it.
 - Tokens support expiry (`expires_at`) and revocation (`revoked_at`).
 - Token values never appear in logs, responses, evidence or error bodies.
+
+## Billing
+
+Four routes, and one rule: **the backend is authoritative, and the browser
+names nothing.**
+
+| Route | Credential | Notes |
+|---|---|---|
+| `POST /api/billing/checkout` | Clerk session | Body is `{"plan": "starter"|"pro"}` and nothing else is read. The Polar product is resolved from deployment configuration. |
+| `GET /api/billing/subscription` | Clerk session | The workspace's entitlement, as the webhook last recorded it. |
+| `POST /api/billing/portal` | Clerk session | A session on Polar's hosted customer portal for this workspace's own Polar customer. |
+| `POST /api/billing/webhooks/polar` | Polar signature | The only path that changes a plan. |
+
+- The workspace is resolved from the Clerk token. It appears in no path, query
+  or body, so there is no request shape that bills another workspace.
+- A product id, price, amount, customer id or subscription id from a caller is
+  never read. The plan is one of two configured products.
+- The checkout return URL grants nothing. `?billing=success` causes the
+  dashboard to re-read `GET /api/billing/subscription` for a bounded period; the
+  answer still comes from the database the webhook writes.
+- A workspace that already has a live subscription is refused a second checkout
+  (`409 subscription_exists`). Polar's checkout creates a NEW subscription, so a
+  second one would bill the customer twice; plan changes go through the portal.
+- The webhook verifies its signature over the raw body before parsing,
+  de-duplicates on the Standard Webhooks `webhook-id`, and refuses a
+  subscription object older than the one already stored. A subscription to a
+  product this deployment was not configured with is recorded and grants `free`.
+- `plan` is one of `free`, `starter`, `pro`. Entitlement is decided in
+  `agent/billing/plans.py` and read through `agent/billing/access.py`; nothing
+  else in the codebase inspects a subscription status.
 
 ## Tenant non-disclosure
 

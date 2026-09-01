@@ -266,6 +266,38 @@ def build_application(settings, *, client_factory=None, logger=None,
             "the dashboard session bridge is NOT configured; an onboarded "
             "tenant cannot enter the dashboard")
 
+    # Polar billing. Built on the same rule as Clerk above: absent
+    # configuration is a supported deployment and leaves the routes answering
+    # 503, but BROKEN configuration stops the process here rather than failing
+    # on the first customer who reaches checkout.
+    billing_service = None
+    if store_pool is not None:
+        from agent.billing.config import PolarConfigurationError, PolarSettings
+
+        try:
+            polar_settings = PolarSettings.from_environ(environ)
+        except PolarConfigurationError as exc:
+            raise SettingsError(str(exc)) from None
+        if polar_settings is None:
+            logger.warning(
+                "Polar billing is not configured; /api/billing routes are "
+                "served but answer 503")
+        else:
+            from agent.billing.client import PolarClient
+            from agent.billing.service import BillingService
+
+            if polar_settings.is_sandbox:
+                # Said out loud at boot. A production deployment pointed at the
+                # sandbox takes real sign-ups and charges nobody, and the only
+                # visible symptom is that money never arrives.
+                logger.warning("polar billing is using the SANDBOX environment")
+            billing_service = BillingService(
+                polar_settings,
+                PolarClient(polar_settings,
+                            timeout=settings.request_timeout_seconds),
+                app_url=settings.dashboard_url or "")
+            logger.info("polar billing enabled (%s)", polar_settings.server)
+
     app = create_http_app(
         webhook_secret=settings.webhook_secret,
         job_queue=jobs,
@@ -284,6 +316,7 @@ def build_application(settings, *, client_factory=None, logger=None,
         identity_linker=identity_linker,
         repository_service=repository_service,
         dashboard_bridge=dashboard_bridge,
+        billing_service=billing_service,
         secure_cookies=settings.secure_cookies,
         # Where a GitHub round trip returns the browser to, and the API origin
         # the customer's CI will submit manifests to. Both come from
