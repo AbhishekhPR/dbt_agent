@@ -56,6 +56,17 @@ class TenantBillingConflict(ValueError):
     """
 
 
+class TenantRepositoryLimitReached(ValueError):
+    """Connecting another repository would exceed the workspace's plan.
+
+    Store-level because the limit has to be enforced in the same transaction
+    that does the insert. Checking the count in the API layer and inserting
+    afterwards leaves a window in which two concurrent selections both pass a
+    check that neither of them then re-tests, and a Free workspace ends up with
+    two repositories it cannot be charged for.
+    """
+
+
 class TenantInstallationConflict(ValueError):
     """A GitHub App installation is already bound to a different tenant.
 
@@ -673,11 +684,32 @@ class PostgresLifecycleStore:
     # in the WHERE clause, so an id that belongs to another tenant matches no
     # row rather than being corrected after the fact.
 
+    def tenant_for_repository_slug(self, organization_id, repository_id):
+        """The tenant that connected one GitHub owner/name pair, or None.
+
+        The join between a service token's scope — which names a repository by
+        owner login and name — and billing, which is keyed by tenant. Reads a
+        mapping onboarding wrote; never creates one.
+        """
+        row = self.connection.execute(
+            "SELECT tenant_id FROM tenant_repositories "
+            "WHERE owner_login = %s AND name = %s LIMIT 1",
+            (organization_id, repository_id),
+        ).fetchone()
+        return row["tenant_id"] if row else None
+
+    def count_tenant_repositories(self, tenant_id):
+        row = self.connection.execute(
+            "SELECT count(*) AS n FROM tenant_repositories WHERE tenant_id = %s",
+            (tenant_id,),
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
     def select_tenant_repository(self, github_repository_id, *, tenant_id,
                                  github_installation_id, owner_login, name,
                                  default_branch=None, private=None,
                                  dbt_detected=None, dbt_project_dir=None,
-                                 dbt_checked_at=None):
+                                 dbt_checked_at=None, repository_limit=None):
         """Record the tenant's chosen repository, idempotently.
 
         Re-selecting the same repository refreshes the display metadata and the
@@ -687,7 +719,54 @@ class PostgresLifecycleStore:
         A repository already claimed by a DIFFERENT tenant raises rather than
         being re-pointed. Re-pointing would move a configured repository
         between customers, which is exactly what a spoofed id would attempt.
+
+        ``repository_limit`` is the plan's allowance; None means unlimited.
+        It is enforced HERE, inside the transaction that inserts, and only
+        against repositories that are not already this tenant's — re-selecting
+        one they already have is never a new connection and must keep working
+        for a workspace that is over its allowance after a downgrade.
         """
+        if repository_limit is None:
+            return self._upsert_tenant_repository(
+                github_repository_id, tenant_id=tenant_id,
+                github_installation_id=github_installation_id,
+                owner_login=owner_login, name=name,
+                default_branch=default_branch, private=private,
+                dbt_detected=dbt_detected, dbt_project_dir=dbt_project_dir,
+                dbt_checked_at=dbt_checked_at)
+
+        with self.connection.transaction():
+            # Serialises concurrent selections for THIS tenant against each
+            # other, so the count below cannot be read by two transactions that
+            # then both insert. Other tenants are unaffected: the lock is one
+            # row in `tenants`.
+            self.connection.execute(
+                "SELECT 1 FROM tenants WHERE tenant_id = %s FOR UPDATE",
+                (tenant_id,),
+            ).fetchone()
+            already_theirs = self.connection.execute(
+                "SELECT 1 FROM tenant_repositories "
+                "WHERE tenant_id = %s AND github_repository_id = %s",
+                (tenant_id, github_repository_id),
+            ).fetchone()
+            if already_theirs is None:
+                connected = self.count_tenant_repositories(tenant_id)
+                if connected + 1 > repository_limit:
+                    raise TenantRepositoryLimitReached(
+                        "this workspace has reached the number of repositories "
+                        "its plan includes")
+            return self._upsert_tenant_repository(
+                github_repository_id, tenant_id=tenant_id,
+                github_installation_id=github_installation_id,
+                owner_login=owner_login, name=name,
+                default_branch=default_branch, private=private,
+                dbt_detected=dbt_detected, dbt_project_dir=dbt_project_dir,
+                dbt_checked_at=dbt_checked_at)
+
+    def _upsert_tenant_repository(self, github_repository_id, *, tenant_id,
+                                  github_installation_id, owner_login, name,
+                                  default_branch, private, dbt_detected,
+                                  dbt_project_dir, dbt_checked_at):
         row = self.connection.execute(
             "INSERT INTO tenant_repositories "
             "(github_repository_id, tenant_id, github_installation_id, "
@@ -1672,10 +1751,23 @@ class PostgresLifecycleStore:
         ).fetchone()
         return dict(row) if row else None
 
-    def list_reviews(self, organization_id, repository_id, *, environment=None, limit=25, offset=0):
+    def list_reviews(self, organization_id, repository_id, *, environment=None,
+                     limit=25, offset=0, since=None):
+        """Reviews, newest first.
+
+        ``since`` is the plan's history window — a VISIBILITY bound, never a
+        deletion. Rows outside it stay exactly where they are and come back the
+        moment the workspace upgrades; a downgrade must not destroy a
+        customer's history, and a retention policy that deletes is a separate
+        decision from one that hides.
+        """
+        extra_sql, extra_params = "", ()
+        if since is not None:
+            extra_sql, extra_params = " AND created_at >= %s", (since,)
         return self._paged(
             "reviews", "review_id", organization_id, repository_id,
             environment=environment, limit=limit, offset=offset,
+            extra_sql=extra_sql, extra_params=extra_params,
         )
 
     # -- tenant-scoped paginated reads ----------------------------------------

@@ -37,6 +37,7 @@ def create_http_app(
     dashboard_bridge=None,
     secure_cookies=True,
     billing_service=None,
+    billing_settings=None,
 ):
     """Build the served application.
 
@@ -251,6 +252,7 @@ def create_http_app(
             dashboard_bridge=dashboard_bridge,
             secure_cookies=secure_cookies,
             billing_service=billing_service,
+            billing_settings=billing_settings,
         ))
     # Dashboard sign-in. Registered only when the App's user-authorization
     # credentials are fully configured, so there is never a login route that

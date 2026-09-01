@@ -53,8 +53,21 @@ NOT_FOUND_CODES = frozenset({CODE_REPOSITORY_NOT_FOUND})
 def create_onboarding_repository_routes(*, store_pool, clerk_authenticator,
                                         service=None, api_url="",
                                         dashboard_bridge=None,
-                                        secure_cookies=True):
-    """Build the routes. ``service`` is None when GitHub is not configured."""
+                                        secure_cookies=True,
+                                        billing_settings=None):
+    """Build the routes. ``service`` is None when GitHub is not configured.
+
+    ``billing_settings`` is the Polar configuration, or None on a deployment
+    that has none. It is passed to the entitlement resolver rather than read
+    from the environment here, so what a workspace may do is a function of the
+    configuration this application was built with — see
+    ``agent.billing.access.get_workspace_entitlements``.
+    """
+    from agent.billing.access import get_workspace_entitlements
+
+    def _entitlements(store, principal):
+        return get_workspace_entitlements(
+            store, principal.tenant_id, billing_settings)
 
     def _repository_id(request):
         """Read the path parameter as an integer, or refuse.
@@ -79,7 +92,8 @@ def create_onboarding_repository_routes(*, store_pool, clerk_authenticator,
 
     def select_repository(request, body, store, principal):
         record = service.select_repository(
-            store, principal.tenant_id, _repository_id(request))
+            store, principal.tenant_id, _repository_id(request),
+            repository_limit=_entitlements(store, principal).repository_limit)
         return 200, {
             "repository_id": record["github_repository_id"],
             "full_name": f"{record['owner_login']}/{record['name']}",
@@ -98,7 +112,8 @@ def create_onboarding_repository_routes(*, store_pool, clerk_authenticator,
             store, principal.tenant_id, repository_id,
             project_dir=body.get("project_dir"),
             manifest_path=body.get("manifest_path"),
-            enforcement_mode=body.get("enforcement_mode"))
+            enforcement_mode=body.get("enforcement_mode"),
+            merge_blocking=_entitlements(store, principal).merge_blocking)
         # Re-read through the payload builder so the response is exactly what
         # a later GET /api/onboarding/state will report, rather than a
         # separately-assembled view that could drift from it.

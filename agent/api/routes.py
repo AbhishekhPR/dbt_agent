@@ -17,6 +17,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from agent.api.collector_routes import COLLECTOR_ROUTES, build_handlers
+from agent.billing.entitlements import RUNTIME_EVIDENCE, WAREHOUSE_EVIDENCE
 from agent.api.auth import AuthenticationError, AuthorizationError, ServiceTokenAuthenticator, bearer_token
 from agent.api.authorization import (
     CI_MANIFEST_INGEST, COLLECTION_REQUEST_READ, COLLECTOR_INGEST, DASHBOARD_READ,
@@ -133,6 +134,30 @@ _COLLECTOR_CAPABILITY = {
     # Read by the dashboard only; the collector never asks for these.
     "get_snapshot_status": DASHBOARD_READ,
     "get_review_evidence_coverage": DASHBOARD_READ,
+}
+
+# Which collector routes are a PAID capability, and which are core.
+#
+# ###################################################################
+# # THE dbt MANIFEST IS CORE. THE WAREHOUSE SNAPSHOT IS PAID.       #
+# ###################################################################
+#
+# `submit_manifest_evidence` is deliberately absent. The manifest is the input
+# to the SQL/dbt analysis, the downstream blast radius and the semantic diff —
+# everything Free includes. Metering it would not withhold a paid feature, it
+# would make the free product's own analysis worse, which is the one thing
+# entitlements here may never do.
+#
+# `submit_snapshot` is warehouse evidence: what the collector observed in the
+# customer's warehouse. That is the paid input, and this is where it is
+# refused.
+#
+# Registration and the collection-request lifecycle are also absent on purpose.
+# Refusing an acknowledgement or a failure report would strand a collector in a
+# retry loop over a request it can never settle; the evidence itself is the
+# boundary worth holding, and it is held one line below.
+_COLLECTOR_PLAN_CAPABILITY = {
+    "submit_snapshot": WAREHOUSE_EVIDENCE,
 }
 
 
@@ -339,7 +364,7 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
                       identity_linker=None, app_url="",
                       repository_service=None, api_url="",
                       dashboard_bridge=None, secure_cookies=True,
-                      billing_service=None):
+                      billing_service=None, billing_settings=None):
     """Build the /api route table. Registration stays explicit and inspectable.
 
     Every route declares the capability it needs. Authentication answers *who*
@@ -380,6 +405,56 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
             raise _HttpError(403, {"status": "forbidden", "detail": str(exc)}) from None
         return principal
 
+    def _require_entitlement(store, scope, plan_capability):
+        """Refuse a request for a capability this workspace's plan excludes.
+
+        ###################################################################
+        # THIS IS THE SECURITY BOUNDARY FOR PAID EVIDENCE.                #
+        ###################################################################
+
+        The dashboard hides what a plan does not include, but hiding is UX. A
+        Free workspace holding a valid CI token can call these endpoints
+        directly, and this is what answers. The plan is read from Relium's own
+        billing row — written only by a signature-verified Polar webhook — and
+        never from anything in the request.
+
+        402 rather than 403: the caller is authenticated and authorized for
+        this repository, and the only thing standing between them and the
+        endpoint is the plan. The code and the capability are both in the body
+        so a client can render the right upgrade prompt without parsing prose.
+        """
+        from agent.billing.entitlements import (
+            CODE_PLAN_UPGRADE_REQUIRED, plan_including)
+
+        entitlements = _entitlements_for_scope(store, scope)
+        if entitlements.allows(plan_capability):
+            return
+        raise _HttpError(402, {
+            "status": "payment_required",
+            "code": CODE_PLAN_UPGRADE_REQUIRED,
+            "capability": plan_capability,
+            "required_plan": plan_including(plan_capability),
+        })
+
+    def _entitlements_for_scope(store, scope):
+        from agent.billing.access import entitlements_for_scope
+
+        return entitlements_for_scope(store, scope, billing_settings)
+
+    def _history_window(store, scope):
+        """The oldest review this workspace's plan shows, and the window size.
+
+        ``since`` None means unlimited — Pro, and any deployment with no Polar
+        configuration.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        days = _entitlements_for_scope(store, scope).history_retention_days
+        if days is None:
+            return {"since": None, "days": None}
+        return {"since": datetime.now(timezone.utc) - timedelta(days=days),
+                "days": days}
+
     def _require_csrf(request, store, session_id):
         """Cookie-authenticated mutations need an origin and a bound token.
 
@@ -400,7 +475,7 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
                                    "detail": "missing or invalid CSRF token"})
 
     def handler(fn, *, write: bool, capability=None, download=False,
-                max_body_bytes=MAX_API_BODY_BYTES):
+                max_body_bytes=MAX_API_BODY_BYTES, plan_capability=None):
         """Wrap one route function with authentication, scoping and error mapping.
 
         ``download`` changes only how a SUCCESSFUL response is built: the
@@ -409,6 +484,12 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
         Content-Disposition attachment header. Errors still travel the ordinary
         JSON path, so a failed download is a normal API error rather than a
         file containing an error.
+
+        ``plan_capability`` names a billing entitlement this route requires. It
+        is checked AFTER authentication and scoping, so the answer never
+        depends on an unverified caller, and it is checked HERE rather than in
+        each handler — a paid surface that has to remember to call a helper is
+        a paid surface one route will forget.
         """
         capability = capability or (GOVERNANCE_WRITE if write else DASHBOARD_READ)
 
@@ -424,6 +505,8 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
                     with store_pool.acquire() as store:
                         scope = _authenticate(request, store, capability,
                                               mutating=write)
+                        if plan_capability is not None:
+                            _require_entitlement(store, scope, plan_capability)
                         service = LifecycleService(store)
                         return fn(request, body, scope, service)
 
@@ -596,12 +679,20 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
 
     def list_reviews(request, body, scope, service):
         limit, offset = _page(request)
+        # The plan's history window. A bound on what is SHOWN, never on what is
+        # stored: an upgrade brings the older reviews straight back, and a
+        # downgrade destroys nothing. `history_window_days` is reported so the
+        # dashboard can say why a list stops where it does rather than leaving
+        # it looking like the workspace has no older reviews.
+        window = _history_window(service.store, scope)
         page = service.store.list_reviews(
             scope.organization_id, scope.repository_id,
             environment=_env_filter(request, scope), limit=limit, offset=offset,
+            since=window["since"],
         )
         return 200, {
             "total": page["total"], "limit": limit, "offset": offset,
+            "history_window_days": window["days"],
             "items": [_review_view(r) for r in page["items"]],
         }
 
@@ -1357,10 +1448,10 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
 
     routes = [
         Route("/api/deployments/events", handler(post_deployment_event, write=True, capability=PIPELINE_INGEST), methods=["POST"]),
-        Route("/api/monitoring/baselines", handler(post_baseline, write=True, capability=PIPELINE_INGEST), methods=["POST"]),
-        Route("/api/monitoring/observations", handler(post_observation, write=True, capability=PIPELINE_INGEST), methods=["POST"]),
+        Route("/api/monitoring/baselines", handler(post_baseline, write=True, capability=PIPELINE_INGEST, plan_capability=RUNTIME_EVIDENCE), methods=["POST"]),
+        Route("/api/monitoring/observations", handler(post_observation, write=True, capability=PIPELINE_INGEST, plan_capability=RUNTIME_EVIDENCE), methods=["POST"]),
         Route("/api/anomalies", handler(list_anomalies, write=False), methods=["GET"]),
-        Route("/api/anomalies", handler(post_anomaly, write=True, capability=PIPELINE_INGEST), methods=["POST"]),
+        Route("/api/anomalies", handler(post_anomaly, write=True, capability=PIPELINE_INGEST, plan_capability=RUNTIME_EVIDENCE), methods=["POST"]),
         Route("/api/incidents", handler(list_incidents, write=False), methods=["GET"]),
         Route("/api/incidents", handler(post_incident_rca, write=True, capability=PIPELINE_INGEST), methods=["POST"]),
         Route("/api/reviews", handler(list_reviews, write=False), methods=["GET"]),
@@ -1427,7 +1518,8 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
         *[
             Route(path,
                   handler(_collector[name], write=write,
-                          capability=_COLLECTOR_CAPABILITY[name]),
+                          capability=_COLLECTOR_CAPABILITY[name],
+                          plan_capability=_COLLECTOR_PLAN_CAPABILITY.get(name)),
                   methods=[method])
             for method, path, name, write in COLLECTOR_ROUTES
             if name != "submit_manifest_evidence"
@@ -1475,6 +1567,7 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
         api_url=api_url,
         dashboard_bridge=dashboard_bridge,
         secure_cookies=secure_cookies,
+        billing_settings=billing_settings,
     ))
 
     # Billing. Three Clerk-authenticated routes scoped to the tenant in the

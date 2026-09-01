@@ -80,6 +80,12 @@ CODE_INVALID_CONFIG = "invalid_configuration"
 CODE_GITHUB_UNAVAILABLE = "github_unavailable"
 CODE_CONFIGURATION_REQUIRED = "configuration_required"
 CODE_CI_TOKEN_REQUIRED = "ci_token_required"
+#: The workspace's plan does not include another connected repository. A
+#: conflict with current state, never an authorization failure: the caller may
+#: have this repository, they simply may not have one MORE.
+CODE_REPOSITORY_LIMIT_REACHED = "repository_limit_reached"
+#: The workspace's plan does not include the requested enforcement mode.
+CODE_ENFORCEMENT_NOT_INCLUDED = "merge_blocking_not_included"
 
 
 @dataclass(frozen=True)
@@ -302,9 +308,17 @@ class RepositoryOnboardingService:
 
     # -- selection ----------------------------------------------------------
 
-    def select_repository(self, store, tenant_id, github_repository_id):
-        """Record the tenant's chosen repository, after authorizing it."""
-        from agent.postgres_lifecycle_store import TenantRepositoryConflict
+    def select_repository(self, store, tenant_id, github_repository_id, *,
+                          repository_limit=None):
+        """Record the tenant's chosen repository, after authorizing it.
+
+        ``repository_limit`` is the plan allowance, resolved by the caller from
+        the workspace's billing state and passed straight through to the store,
+        which enforces it in the same transaction that inserts. None is
+        unlimited.
+        """
+        from agent.postgres_lifecycle_store import (
+            TenantRepositoryConflict, TenantRepositoryLimitReached)
 
         repository = self.authorized_repository(
             store, tenant_id, github_repository_id)
@@ -321,7 +335,15 @@ class RepositoryOnboardingService:
                 dbt_detected=detection["detected"],
                 dbt_project_dir=detection["project_dir"],
                 dbt_checked_at=self._clock(),
+                repository_limit=repository_limit,
             )
+        except TenantRepositoryLimitReached as exc:
+            # Not an authorization failure and not a not-found: the caller may
+            # have this repository, their plan simply does not include another
+            # connection. Named distinctly so the dashboard can offer an
+            # upgrade instead of an error.
+            raise RepositoryOnboardingError(
+                CODE_REPOSITORY_LIMIT_REACHED, str(exc)) from None
         except TenantRepositoryConflict as exc:
             # Claimed by another tenant. Non-disclosing: the caller learns that
             # they cannot have it, not who does.
@@ -365,19 +387,30 @@ class RepositoryOnboardingService:
     # -- configuration ------------------------------------------------------
 
     def configure_repository(self, store, tenant_id, github_repository_id, *,
-                             project_dir, manifest_path, enforcement_mode):
+                             project_dir, manifest_path, enforcement_mode,
+                             merge_blocking=True):
         """Validate and persist the dbt configuration.
 
         Validation is the backend's own, not a second implementation of it:
         paths go through validate_repository_relative_path, and the rendered
         relium.yml is parsed back through load_repository_config. A file this
         produces therefore cannot be one the GitHub App would later reject.
+
+        ``merge_blocking`` is the workspace's entitlement. False refuses
+        ``enforce`` rather than silently writing ``shadow``: a customer who
+        asked for a release gate and was quietly given a comment is worse off
+        than one who was told which plan includes it. This is only the
+        DASHBOARD's copy of the gate — the authoritative one is in the runner,
+        because enforcement_mode also arrives from relium.yml in the customer's
+        own repository, which they can edit.
         """
         self.authorized_repository(store, tenant_id, github_repository_id)
 
         project_dir = _validate_project_dir(project_dir)
         manifest_path = _validate_manifest_path(manifest_path)
         enforcement_mode = _validate_enforcement_mode(enforcement_mode)
+        if enforcement_mode == "enforce" and not merge_blocking:
+            raise RepositoryOnboardingError(CODE_ENFORCEMENT_NOT_INCLUDED)
 
         rendered = render_relium_yml(manifest_path=manifest_path,
                                      enforcement_mode=enforcement_mode)
