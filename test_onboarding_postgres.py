@@ -24,6 +24,8 @@ CLERK_TENANCY = 14
 #: GitHub App installation binding.
 INSTALLATION_BINDING = 15
 #: Repository selection, dbt configuration and CI state.
+REPOSITORY_ONBOARDING = 16
+#: Cached dbt project detection per repository.
 NEW_LATEST = 17
 
 
@@ -558,7 +560,7 @@ class RepositoryOnboardingMigrationTests(unittest.TestCase):
         return PostgresLifecycleStore(DSN)
 
     def test_upgrade_from_installation_binding_to_repository_onboarding(self):
-        """15 -> 16, the path a deployment already on Phase 2 will take."""
+        """15 -> 17, the path a deployment already on Phase 2 will take."""
         from agent.postgres_migrate import applied_versions
 
         _apply_up_to(DSN, INSTALLATION_BINDING)
@@ -567,7 +569,7 @@ class RepositoryOnboardingMigrationTests(unittest.TestCase):
             versions = applied_versions(store.connection)
             self.assertIn(NEW_LATEST, versions)
             self.assertEqual(versions[versions.index(NEW_LATEST) - 1],
-                             INSTALLATION_BINDING)
+                             REPOSITORY_ONBOARDING)
             self.assertIsNotNone(store.connection.execute(
                 "SELECT to_regclass('public.tenant_repositories') AS n"
             ).fetchone()["n"])
