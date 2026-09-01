@@ -215,6 +215,8 @@ class BillingService:
         return self.view_for_record(store.billing_for_tenant(tenant_id))
 
     def view_for_record(self, record):
+        from agent.billing.entitlements import entitlements_for
+
         if not record:
             return {
                 "plan": PLAN_FREE,
@@ -223,6 +225,11 @@ class BillingService:
                 "cancel_at_period_end": False,
                 "current_period_end": None,
                 "has_billing_account": False,
+                # A workspace that has never bought is on Free, and Free has
+                # entitlements like any other plan. Omitting them here would
+                # make the dashboard guess, and a dashboard that guesses at
+                # capabilities is a dashboard that eventually guesses wrong.
+                "entitlements": entitlements_for(PLAN_FREE).as_payload(),
             }
         effective_plan, is_active = access_state(
             plan=record.get("plan") or PLAN_FREE,
@@ -245,6 +252,10 @@ class BillingService:
             # no use for it, and an identifier that appears in a response is one
             # that will eventually be sent back in a request.
             "has_billing_account": bool(record.get("polar_customer_id")),
+            # Derived from the EFFECTIVE plan, never from the stored one. A
+            # workspace whose Pro subscription Polar revoked is told it has
+            # Free's entitlements, because that is what it has.
+            "entitlements": entitlements_for(effective_plan).as_payload(),
         }
 
     # -- webhook -----------------------------------------------------------

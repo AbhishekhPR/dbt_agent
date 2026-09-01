@@ -26,10 +26,26 @@ class PullRequestReviewRunner:
         reviewer=review_manifest_change,
         slack_publisher=None,
         lifecycle=None,
+        merge_blocking_allowed=None,
     ):
         self.storage = storage
         self.reviewer = reviewer
         self.slack_publisher = slack_publisher
+        # ###############################################################
+        # # relium.yml BELONGS TO THE CUSTOMER. THIS DOES NOT.          #
+        # ###############################################################
+        #
+        # `enforcement_mode` is read out of relium.yml in the repository being
+        # reviewed, so a Free workspace can write `enforcement_mode: enforce`
+        # and, without this, would get Pro's release gate for nothing. The
+        # dashboard refuses to SET enforce below Pro, but the dashboard is not
+        # the only way that value arrives.
+        #
+        # A callable `(owner, repository) -> bool`, or None on a deployment
+        # with no Polar configuration, where nothing is metered and the
+        # customer's own file is the only authority — which is the behavior
+        # every existing deployment already has.
+        self._merge_blocking_allowed = merge_blocking_allowed
         # The review lifecycle is an explicit dependency. The runner never
         # opens a database connection itself; it holds this or it holds the
         # inert compatibility object.
@@ -49,6 +65,35 @@ class PullRequestReviewRunner:
             self.storage.complete_delivery(event.repository.id, event.delivery_id)
         return response
 
+    def _apply_entitlements(self, config, owner, repository):
+        """Cap the repository's configuration by what its workspace bought.
+
+        Today that is one field. `enforce` becomes `shadow` below Pro, which
+        changes the GitHub check CONCLUSION from failure to neutral — and
+        nothing else. The review still runs, the decision is still computed the
+        same way, and a BLOCK is still reported as a BLOCK: Free and Starter
+        get the analysis and the recommendation, Pro gets the gate. Degrading
+        the decision itself, rather than its enforcement, is the line this must
+        never cross.
+        """
+        import dataclasses
+
+        if self._merge_blocking_allowed is None:
+            return config
+        if config.enforcement_mode != "enforce":
+            return config
+        try:
+            allowed = self._merge_blocking_allowed(owner, repository)
+        except Exception:
+            # A billing lookup that fails must not fail the review. Falling
+            # back to `shadow` withholds a paid gate for one delivery; falling
+            # back to `enforce` would hand out the paid gate to everyone the
+            # moment the database hiccups.
+            allowed = False
+        if allowed:
+            return config
+        return dataclasses.replace(config, enforcement_mode="shadow")
+
     def _run_claimed(self, event, client, *, expected_app_id):
         owner = event.repository.owner
         repository = event.repository.name
@@ -59,6 +104,7 @@ class PullRequestReviewRunner:
         config = load_repository_config(config_content)
         if not config.enabled:
             return {"status": "disabled", "delivery_id": event.delivery_id}
+        config = self._apply_entitlements(config, owner, repository)
 
         manifest = None
         try:

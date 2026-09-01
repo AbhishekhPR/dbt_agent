@@ -1169,10 +1169,21 @@ class BillingRouteTests(unittest.TestCase):
                                headers=self._auth("org_0")).json()
         self.assertEqual(set(body) - {"request_id"}, {
             "plan", "status", "is_active", "cancel_at_period_end",
-            "current_period_end", "has_billing_account"})
+            "current_period_end", "has_billing_account", "entitlements",
+            "repository_count"})
         text = json.dumps(body)
         for secret in ("cus_a", "sub_a", PRO_PRODUCT):
             self.assertNotIn(secret, text)
+
+        # The entitlement object is capabilities and nothing else. It is the
+        # newest thing in this response and therefore the likeliest place for
+        # an identifier to be added by accident later.
+        self.assertEqual(set(body["entitlements"]), {
+            "repository_limit", "member_limit", "history_retention_days",
+            "warehouse_evidence", "runtime_evidence", "custom_review_policies",
+            "merge_blocking", "governance_controls"})
+        for value in body["entitlements"].values():
+            self.assertIsInstance(value, (bool, int, type(None)))
 
     # -- the return URL grants nothing ------------------------------------
 

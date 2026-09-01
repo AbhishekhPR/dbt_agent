@@ -97,10 +97,43 @@ def build_application(settings, *, client_factory=None, logger=None,
     )
     logger.info("review lifecycle mode: %s", lifecycle.mode)
 
+    # Polar configuration is resolved HERE, before the runner, because the
+    # runner needs it: enforcement_mode arrives from the customer's own
+    # relium.yml, and whether `enforce` is honoured is a billing question. A
+    # deployment with no Polar configuration resolves to None and meters
+    # nothing, which is what every deployment did before entitlements existed.
+    polar_settings = None
+    if store_pool is not None:
+        from agent.billing.config import PolarConfigurationError, PolarSettings
+
+        try:
+            polar_settings = PolarSettings.from_environ(environ)
+        except PolarConfigurationError as exc:
+            raise SettingsError(str(exc)) from None
+
+    merge_blocking_allowed = None
+    if polar_settings is not None and store_pool is not None:
+        def merge_blocking_allowed(owner, repository):
+            """Is this repository's workspace entitled to a real release gate?
+
+            Opens its own short-lived store connection from the pool: the
+            runner is on the webhook path and holds no connection of its own.
+            """
+            from agent.billing.access import entitlements_for_scope
+
+            class _Scope:
+                organization_id = str(owner)
+                repository_id = str(repository)
+
+            with store_pool.acquire() as store:
+                return entitlements_for_scope(
+                    store, _Scope(), polar_settings).merge_blocking
+
     runner = PullRequestReviewRunner(
         storage=storage,
         slack_publisher=slack_publisher,
         lifecycle=lifecycle,
+        merge_blocking_allowed=merge_blocking_allowed,
     )
     if client_factory is None:
         client_factory = partial(
@@ -272,16 +305,10 @@ def build_application(settings, *, client_factory=None, logger=None,
     # on the first customer who reaches checkout.
     billing_service = None
     if store_pool is not None:
-        from agent.billing.config import PolarConfigurationError, PolarSettings
-
-        try:
-            polar_settings = PolarSettings.from_environ(environ)
-        except PolarConfigurationError as exc:
-            raise SettingsError(str(exc)) from None
         if polar_settings is None:
             logger.warning(
                 "Polar billing is not configured; /api/billing routes are "
-                "served but answer 503")
+                "served but answer 503; NO PLAN LIMIT IS ENFORCED")
         else:
             from agent.billing.client import PolarClient
             from agent.billing.service import BillingService
@@ -317,6 +344,7 @@ def build_application(settings, *, client_factory=None, logger=None,
         repository_service=repository_service,
         dashboard_bridge=dashboard_bridge,
         billing_service=billing_service,
+        billing_settings=polar_settings,
         secure_cookies=settings.secure_cookies,
         # Where a GitHub round trip returns the browser to, and the API origin
         # the customer's CI will submit manifests to. Both come from

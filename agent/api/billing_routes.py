@@ -106,6 +106,18 @@ def create_billing_routes(*, store_pool, clerk_authenticator, service=None):
             "cancel_at_period_end": view["cancel_at_period_end"],
             "current_period_end": _isoformat(view["current_period_end"]),
             "has_billing_account": view["has_billing_account"],
+            # Capabilities only. The dashboard uses these to show what is
+            # locked and which plan unlocks it; every one of them is ALSO
+            # enforced server-side, because this response travels to a browser
+            # and a browser is not a boundary.
+            "entitlements": view["entitlements"],
+            # How many repositories this workspace actually has, so the screen
+            # can say "you have 4 and Free includes 1" after a downgrade.
+            # Relium never deletes one to fit a smaller plan, so being over the
+            # allowance is a real, supported state and the dashboard has to be
+            # able to name it. A count, not a list: this response is about
+            # billing.
+            "repository_count": _repository_count(store, principal.tenant_id),
         }
 
     def create_portal(request, body, store, principal):
@@ -258,6 +270,22 @@ def create_billing_routes(*, store_pool, clerk_authenticator, service=None):
               methods=["POST"]),
         Route("/api/billing/webhooks/polar", polar_webhook, methods=["POST"]),
     ]
+
+
+def _repository_count(store, tenant_id):
+    """Connected repositories, or None when the store cannot say.
+
+    None rather than 0: a deployment whose store predates this method has an
+    unknown count, and reporting zero would make the dashboard tell a customer
+    with four repositories that they have none.
+    """
+    reader = getattr(store, "count_tenant_repositories", None)
+    if reader is None:
+        return None
+    try:
+        return reader(tenant_id)
+    except Exception:
+        return None
 
 
 def _status_word(status):

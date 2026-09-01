@@ -100,6 +100,10 @@ class GitHubAppServerTests(unittest.TestCase):
             storage=ANY,
             slack_publisher=sink_type.return_value,
             lifecycle=ANY,
+            # None on a deployment with no Polar configuration: relium.yml is
+            # then the only authority on enforcement_mode, exactly as before
+            # entitlements existed.
+            merge_blocking_allowed=None,
         )
         lifecycle = runner_type.call_args.kwargs["lifecycle"]
         self.assertTrue(hasattr(lifecycle, "begin"))
