@@ -73,6 +73,12 @@ horizontally. Out of scope for this pilot.
 | `RELIUM_PORT` | yes | `${{PORT}}`. |
 | `RELIUM_HOST` | no | Defaults to `0.0.0.0`. |
 | `RELIUM_SLACK_WEBHOOK_URL` | no | Optional secondary output. |
+| `POLAR_ACCESS_TOKEN` | yes\*\* | Polar **Organization Access Token** (`polar_oat_…`). Server-side only. |
+| `POLAR_WEBHOOK_SECRET` | yes\*\* | The secret configured on the Polar webhook endpoint. Must match exactly. |
+| `POLAR_STARTER_PRODUCT_ID` | yes\*\* | Product id of **Relium Starter** ($149/month) in the Polar organization this token belongs to. |
+| `POLAR_PRO_PRODUCT_ID` | yes\*\* | Product id of **Relium Pro** ($250/month). Must differ from Starter. |
+| `POLAR_SERVER` | no | `production` (default) or `sandbox`. Sandbox is a fully separate Polar environment with its own token, secret and product ids. |
+| `POLAR_PAST_DUE_GRACE_DAYS` | no | `0`–`21`, default `0`. Mirrors Polar's own "Grace period for benefit revocation"; keep the two equal. |
 
 \* Exactly one key source is required. **The inline value wins** when both are
 set — a stale path in configuration must not outrank the secret an operator
@@ -83,6 +89,51 @@ All seven sign-in variables (`CLIENT_ID`, `CLIENT_SECRET`,
 `DASHBOARD_ORGANIZATION`, `DASHBOARD_REPOSITORY`) must be present together, or
 the `/auth` routes are not registered and the dashboard has no way in. A
 half-configured login looks like a boundary and is not one.
+
+\*\* The four Polar variables are required **together** to enable billing. With
+none of them set the deployment starts normally and `/api/billing/*` answers
+`503 billing_not_configured`; with some of them set it **refuses to start**,
+because a deployment that can send a customer to checkout but cannot verify the
+webhook that grants their plan is the worst of the three states.
+
+`POLAR_STARTER_PRODUCT_ID` and `POLAR_PRO_PRODUCT_ID` are the ONLY things that
+decide which internal plan a subscription grants. A price is never consulted,
+and a subscription to any other product grants `free` — including a product
+created in the Polar dashboard and not added here. Sandbox and production
+product ids are different values; swapping the environment without swapping all
+four variables leaves customers on a plan nobody is paying for.
+
+### Polar webhook registration
+
+One endpoint, in the Polar dashboard under **Settings → Webhooks**:
+
+| Setting | Value |
+|---|---|
+| **URL** | `${RELIUM_PUBLIC_URL}/api/billing/webhooks/polar` |
+| **Format** | Raw (Polar's own Standard Webhooks payload) |
+| **Secret** | The value of `POLAR_WEBHOOK_SECRET`, byte for byte |
+| **Events** | Every `subscription.*` event: `subscription.created`, `subscription.active`, `subscription.updated`, `subscription.canceled`, `subscription.uncanceled`, `subscription.past_due`, `subscription.revoked` — plus `subscription.paused`, `subscription.resumed` and `subscription.cycled` where offered |
+
+Register the endpoint separately in **sandbox** and in **production**; the two
+environments have independent webhook configuration and independent secrets.
+
+Relium subscribes to no order, refund or benefit event: entitlement is derived
+from the subscription object alone, and a second source of truth for the same
+fact is a second thing that can disagree.
+
+Without the webhook, a customer completes payment, is charged, and stays on the
+free plan in Relium — the checkout return grants nothing on its own, which is
+deliberate.
+
+### Polar customer portal settings
+
+Under **Settings → Customer portal** in the Polar dashboard:
+
+| Setting | Value | Without it |
+|---|---|---|
+| **Enable subscription plan changes** | **on** | A Starter customer has no way to reach Pro. Relium deliberately refuses a second checkout for a workspace that already subscribes — Polar's checkout creates a NEW subscription, so the customer would be billed for both — and sends every plan change to the portal instead. |
+
+Cancellation is always available in the portal and needs no setting.
 
 Set the App's **Callback URL** to `${RELIUM_PUBLIC_URL}/auth/github/callback`
 and its **Webhook URL** to `${RELIUM_PUBLIC_URL}/github/webhook`.

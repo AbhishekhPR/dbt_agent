@@ -338,7 +338,8 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
                       clerk_verifier=None, installation_binder=None,
                       identity_linker=None, app_url="",
                       repository_service=None, api_url="",
-                      dashboard_bridge=None, secure_cookies=True):
+                      dashboard_bridge=None, secure_cookies=True,
+                      billing_service=None):
     """Build the /api route table. Registration stays explicit and inspectable.
 
     Every route declares the capability it needs. Authentication answers *who*
@@ -1474,6 +1475,18 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
         api_url=api_url,
         dashboard_bridge=dashboard_bridge,
         secure_cookies=secure_cookies,
+    ))
+
+    # Billing. Three Clerk-authenticated routes scoped to the tenant in the
+    # verified token, plus the Polar webhook — which is public by necessity and
+    # authenticated by a signature over its raw body. Registered on the same
+    # rule as everything above: always served, 503 when Polar is not configured.
+    from agent.api.billing_routes import create_billing_routes
+
+    routes.extend(create_billing_routes(
+        store_pool=store_pool,
+        clerk_authenticator=clerk_authenticator,
+        service=billing_service,
     ))
     return routes
 
