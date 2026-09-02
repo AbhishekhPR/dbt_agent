@@ -115,6 +115,10 @@ MANDATORY_ROUTES = {
     ("PUT", "/api/onboarding/repositories/{repository_id}"),
     ("PUT", "/api/onboarding/dbt"),
     ("POST", "/api/onboarding/ci-token"),
+    # The customer's GitHub Actions workflow, served verbatim. Declared here
+    # because setup cannot be completed without it, so an accidental removal
+    # should fail the contract test rather than surface as a dead step.
+    ("GET", "/api/onboarding/ci-workflow"),
     ("POST", "/api/onboarding/complete"),
     ("POST", "/api/onboarding/dashboard-session"),
     # Billing. The first three are the same Clerk principal as onboarding,
@@ -144,6 +148,10 @@ AUTHENTICATION = {
     "/api/onboarding/repositories/{repository_id}": "clerk-session",
     "/api/onboarding/dbt": "clerk-session",
     "/api/onboarding/ci-token": "clerk-session",
+    # The workflow itself carries no credential, but the variables served
+    # beside it describe a tenant's configured repository, so this is
+    # authenticated and tenant-scoped like everything else here.
+    "/api/onboarding/ci-workflow": "clerk-session",
     "/api/onboarding/complete": "clerk-session",
     # Authenticated by the Clerk bearer; SETS the GitHub dashboard session
     # cookie. The two credentials meet here and nowhere else.

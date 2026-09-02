@@ -395,16 +395,17 @@ class RepositoryOnboardingTests(unittest.TestCase):
                                      enforcement_mode="shadow")
         self.assertNotIn("project_dir", rendered)
 
-    def test_ci_variables_separate_the_two_manifest_paths(self):
+    def test_ci_variables_keep_the_manifest_path_repository_relative(self):
         from agent.api.repository_onboarding import ci_variables_for
 
         variables = ci_variables_for(
             project_dir="analytics",
             manifest_path="analytics/target/manifest.json", api_url=API_URL)
         self.assertEqual(variables["RELIUM_DBT_PROJECT_DIR"], "analytics")
-        # Relative to the project dir, because the workflow has already
-        # changed into it.
-        self.assertEqual(variables["RELIUM_MANIFEST_PATH"], "target/manifest.json")
+        # The workflow resolves this from the checkout root. Stripping the
+        # project directory would point a nested dbt project at the wrong file.
+        self.assertEqual(variables["RELIUM_MANIFEST_PATH"],
+                         "analytics/target/manifest.json")
         self.assertNotIn("RELIUM_CI_TOKEN", variables)
 
     # -- CI token -----------------------------------------------------------

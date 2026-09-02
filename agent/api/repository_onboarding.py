@@ -598,19 +598,43 @@ def render_relium_yml(*, manifest_path, enforcement_mode):
 def ci_variables_for(*, project_dir, manifest_path, api_url):
     """The repository VARIABLES the workflow needs. Never the secret.
 
-    RELIUM_MANIFEST_PATH is relative to RELIUM_DBT_PROJECT_DIR, because the
-    workflow has already changed into the project directory. relium.yml's
-    manifest_path is repository-relative. The two differ and both are correct;
-    conflating them breaks the handoff.
+    ###################################################################
+    # BOTH PATHS ARE REPOSITORY-RELATIVE. THIS USED TO SAY OTHERWISE. #
+    ###################################################################
+
+    This function previously stripped the project directory from
+    RELIUM_MANIFEST_PATH, on the stated reasoning that "the workflow has
+    already changed into the project directory". The workflow does not. Its
+    resolution step runs with ``working-directory: source`` -- the checkout
+    root -- and resolves::
+
+        manifest = ((root / configured_manifest).resolve()
+                    if configured_manifest else (project / "target/manifest.json"))
+
+    ``root`` is the repository root, not the project. The same line also
+    resolves the fallback read out of ``relium.yml``, whose ``manifest_path``
+    is repository-relative and is written that way by ``render_relium_yml``.
+    One expression, one base: whatever reaches ``configured_manifest`` is
+    interpreted from the repository root.
+
+    So for a project in ``analytics/`` the old value was
+    ``target/manifest.json``, the workflow looked for
+    ``<root>/target/manifest.json``, dbt had written
+    ``<root>/analytics/target/manifest.json``, and the ``test -f`` guard failed
+    the job. Every customer whose dbt project is not at the repository root got
+    a red workflow on their first pull request, following setup exactly as
+    instructed.
+
+    The value is now the configured path as-is. The project directory is a
+    separate variable and stays one -- it tells the workflow which project to
+    compile, not where the artifact lands.
+
+    See test_ci_workflow_handoff.py, which derives the expectation from the
+    workflow file itself rather than restating it here.
     """
-    within_project = manifest_path
-    if project_dir and project_dir != ".":
-        prefix = f"{project_dir}/"
-        if manifest_path.startswith(prefix):
-            within_project = manifest_path[len(prefix):]
     return {
         "RELIUM_DBT_PROJECT_DIR": project_dir or ".",
-        "RELIUM_MANIFEST_PATH": within_project,
+        "RELIUM_MANIFEST_PATH": manifest_path,
         "RELIUM_API_URL": api_url,
     }
 

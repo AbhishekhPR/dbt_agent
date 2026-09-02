@@ -1,0 +1,321 @@
+name: Relium manifest handoff
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  compile-manifests:
+    name: Compile ${{ matrix.side }} manifest
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - side: base
+            sha: ${{ github.event.pull_request.base.sha }}
+          - side: head
+            sha: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Check out repository-provided build configuration
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: configuration
+          persist-credentials: false
+
+      - name: Check out exact ${{ matrix.side }} revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
+          path: source
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Resolve dbt project and manifest paths
+        id: paths
+        working-directory: source
+        env:
+          RELIUM_DBT_PROJECT_DIR: ${{ vars.RELIUM_DBT_PROJECT_DIR }}
+          RELIUM_MANIFEST_PATH: ${{ vars.RELIUM_MANIFEST_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          root = Path.cwd().resolve()
+          configured_project = os.environ.get("RELIUM_DBT_PROJECT_DIR", "").strip()
+          if configured_project:
+              project = (root / configured_project).resolve()
+          else:
+              candidates = [
+                  path.parent for path in root.rglob("dbt_project.yml")
+                  if not {"dbt_packages", "target", ".venv"}.intersection(path.parts)
+              ]
+              if root in candidates:
+                  project = root
+              elif len(candidates) == 1:
+                  project = candidates[0]
+              else:
+                  raise SystemExit(
+                      "Set repository variable RELIUM_DBT_PROJECT_DIR when the "
+                      "dbt project is not unique."
+                  )
+          if root != project and root not in project.parents:
+              raise SystemExit("RELIUM_DBT_PROJECT_DIR must stay inside the checkout")
+          if not (project / "dbt_project.yml").is_file():
+              raise SystemExit(f"No dbt_project.yml found in {project.relative_to(root)}")
+
+          configured_manifest = os.environ.get("RELIUM_MANIFEST_PATH", "").strip()
+          if not configured_manifest:
+              config = root / "relium.yml"
+              if config.is_file():
+                  match = re.search(
+                      r"(?m)^\s*manifest_path\s*:\s*['\"]?([^'\"#\r\n]+)",
+                      config.read_text(encoding="utf-8"),
+                  )
+                  if match:
+                      configured_manifest = match.group(1).strip()
+          manifest = ((root / configured_manifest).resolve()
+                      if configured_manifest else (project / "target/manifest.json"))
+          if root != manifest and root not in manifest.parents:
+              raise SystemExit("RELIUM_MANIFEST_PATH must stay inside the checkout")
+
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as stream:
+              stream.write(f"project_dir={project.relative_to(root).as_posix() or '.'}\n")
+              stream.write(f"manifest_path={manifest}\n")
+          PY
+
+      - name: Install repository dbt dependencies
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          project_dir="${{ steps.paths.outputs.project_dir }}"
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          elif [ -f ../configuration/requirements.txt ]; then
+            python -m pip install -r ../configuration/requirements.txt
+          fi
+          if [ "$project_dir" != "." ] && [ -f "$project_dir/requirements.txt" ]; then
+            python -m pip install -r "$project_dir/requirements.txt"
+          elif [ "$project_dir" != "." ] && [ -f "../configuration/$project_dir/requirements.txt" ]; then
+            python -m pip install -r "../configuration/$project_dir/requirements.txt"
+          fi
+          command -v dbt >/dev/null
+
+      - name: Compile exact ${{ matrix.side }} dbt manifest
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          project_dir="${{ steps.paths.outputs.project_dir }}"
+          profiles_dir=""
+          if [ -f "$project_dir/profiles.yml" ]; then
+            profiles_dir="$project_dir"
+          elif [ -f "../configuration/$project_dir/profiles.yml" ]; then
+            profiles_dir="../configuration/$project_dir"
+          fi
+          dbt_args=(--project-dir "$project_dir")
+          if [ -n "$profiles_dir" ]; then
+            dbt_args+=(--profiles-dir "$profiles_dir")
+          fi
+          if [ -f "$project_dir/packages.yml" ] || [ -f "$project_dir/dependencies.yml" ]; then
+            dbt deps "${dbt_args[@]}"
+          fi
+          dbt compile "${dbt_args[@]}"
+          test -f "${{ steps.paths.outputs.manifest_path }}"
+
+      - name: Stage manifest only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir staged
+          cp "${{ steps.paths.outputs.manifest_path }}" staged/manifest.json
+
+      - name: Upload exact ${{ matrix.side }} manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: relium-manifest-${{ matrix.side }}
+          path: staged/manifest.json
+          if-no-files-found: error
+          retention-days: 1
+
+  submit-manifests:
+    name: Submit exact manifests to Relium
+    needs: compile-manifests
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download BASE manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: relium-manifest-base
+          path: evidence/base
+
+      - name: Download HEAD manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: relium-manifest-head
+          path: evidence/head
+
+      - name: POST both exact manifests
+        env:
+          RELIUM_API_URL: ${{ vars.RELIUM_API_URL }}
+          RELIUM_CI_TOKEN: ${{ secrets.RELIUM_CI_TOKEN }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+
+          api_url = os.environ.get("RELIUM_API_URL", "").rstrip("/")
+          token = os.environ.get("RELIUM_CI_TOKEN", "")
+          if not api_url or not token:
+              raise SystemExit("RELIUM_API_URL and RELIUM_CI_TOKEN are required")
+
+
+          # Fields dbt stamps afresh on every compile. They describe the RUN,
+          # not the code, so two compiles of the same commit differ here and
+          # nowhere else -- which made an unchanged commit look like changed
+          # evidence and produced a 409 on re-submission.
+          #
+          # VERIFIED UNUSED BY THE REVIEW PATH before removal. What Relium
+          # actually reads from a node is: unique_id, name, resource_type,
+          # database, schema, alias, identifier, depends_on and the SQL. From
+          # metadata it reads only project_name and dbt_version
+          # (agent/dbt_context.py). The macros section is never read at all --
+          # `"macros"` appears nowhere in the codebase.
+          #
+          # `user_id` is dbt's anonymous per-installation identifier, and
+          # `created_at` is a wall-clock epoch stamped on every node and macro
+          # at parse time. Both change on every compile of unchanged source.
+          VOLATILE_METADATA = ("generated_at", "invocation_id",
+                               "invocation_started_at", "run_started_at",
+                               "user_id")
+
+          # Per-entry parse timestamp. Present on every node and every macro,
+          # so leaving it in guarantees a different hash on every compile --
+          # this, not the metadata block, is what still broke re-submission
+          # after the first normalisation attempt.
+          VOLATILE_ENTRY_FIELDS = ("created_at",)
+
+          # Only these sections are swept for per-entry timestamps. Named
+          # explicitly rather than walking the whole document, so the rule
+          # cannot silently start stripping fields somewhere unexamined.
+          ENTRY_SECTIONS = ("nodes", "macros")
+
+
+          def _without_entry_timestamps(section):
+              """One manifest section with per-entry parse stamps removed."""
+              cleaned = {}
+              for name, entry in section.items():
+                  if isinstance(entry, dict):
+                      entry = {key: value for key, value in entry.items()
+                               if key not in VOLATILE_ENTRY_FIELDS}
+                  cleaned[name] = entry
+              return cleaned
+
+
+          def stable(manifest):
+              """The manifest as a function of the commit, not of the run.
+
+              Removes exactly the fields listed above and nothing else. Every
+              semantic field -- models, sources, columns, depends_on, SQL --
+              is left untouched, so a real change to the project still changes
+              this document and the API still rejects it as a conflict.
+              """
+              manifest = dict(manifest)
+
+              metadata = manifest.get("metadata")
+              if isinstance(metadata, dict):
+                  manifest["metadata"] = {
+                      key: value for key, value in metadata.items()
+                      if key not in VOLATILE_METADATA
+                  }
+
+              for name in ENTRY_SECTIONS:
+                  section = manifest.get(name)
+                  if isinstance(section, dict):
+                      manifest[name] = _without_entry_timestamps(section)
+
+              return manifest
+
+
+          def describe(error):
+              """The server's own reason, safe to print.
+
+              Reads only `status`, `code` and `detail` from the JSON body.
+              Never the request payload, never a header, never the token --
+              this runs in a public log.
+              """
+              try:
+                  document = json.loads(error.read().decode("utf-8") or "{}")
+              except Exception:
+                  return "<no JSON body>"
+              if not isinstance(document, dict):
+                  return "<unexpected body shape>"
+              parts = [f"{key}={document[key]!r}"
+                       for key in ("status", "code", "detail")
+                       if key in document]
+              return ", ".join(parts) or "<no recognised fields>"
+
+
+          for side, sha in (("base", os.environ["BASE_SHA"]),
+                            ("head", os.environ["HEAD_SHA"])):
+              manifest = stable(json.loads(
+                  Path(f"evidence/{side}/manifest.json").read_text(encoding="utf-8")
+              ))
+              body = json.dumps(
+                  {"commit_sha": sha, "manifest": manifest}
+              ).encode("utf-8")
+              print(f"Relium {side} manifest payload bytes: {len(body)}")
+              request = Request(
+                  f"{api_url}/api/manifest-evidence",
+                  data=body,
+                  method="POST",
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Content-Type": "application/json",
+                      "Idempotency-Key": (
+                          f"github-actions:{os.environ['REPOSITORY_ID']}:{sha}"
+                      ),
+                  },
+              )
+              try:
+                  with urlopen(request, timeout=60) as response:
+                      if response.status not in (200, 202):
+                          raise SystemExit(
+                              f"Relium rejected {side} manifest: "
+                              f"HTTP {response.status}"
+                          )
+                      print(f"Relium accepted {side} manifest: "
+                            f"HTTP {response.status}")
+              except HTTPError as error:
+                  # Without this the step reported only "HTTP Error 409:
+                  # Conflict" and discarded the one thing that says why.
+                  raise SystemExit(
+                      f"Relium rejected {side} manifest: "
+                      f"HTTP {error.code} ({describe(error)})"
+                  ) from None
+              except URLError as error:
+                  raise SystemExit(
+                      f"Relium unreachable for {side} manifest: {error.reason}"
+                  ) from None
+          PY

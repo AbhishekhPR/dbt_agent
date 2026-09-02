@@ -39,3 +39,11 @@ include = ["agent*"]
 
 [tool.setuptools]
 include-package-data = false
+
+# The customer's GitHub Actions workflow is a data file inside the package
+# because it has to SHIP: the Docker image copies `agent/` and nothing else,
+# and GET /api/onboarding/ci-workflow serves this file. Named explicitly
+# rather than by turning on include-package-data, which would sweep in
+# whatever else happens to be tracked.
+[tool.setuptools.package-data]
+"agent.ci_workflow" = ["*.yml"]
