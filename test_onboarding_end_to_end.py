@@ -306,7 +306,7 @@ class _FlowHarness(unittest.TestCase):
         self.assertEqual(body["ci_variables"]["RELIUM_DBT_PROJECT_DIR"],
                          "analytics")
         self.assertEqual(body["ci_variables"]["RELIUM_MANIFEST_PATH"],
-                         "target/manifest.json")
+                         "analytics/target/manifest.json")
         self.assertIs(body["ci_token_issued"], False)
 
         # 7. Issue the CI credential.
