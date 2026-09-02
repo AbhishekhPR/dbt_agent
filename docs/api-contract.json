@@ -44,6 +44,7 @@
     "GET /api/models/{model}/lineage",
     "GET /api/monitoring",
     "GET /api/monitoring/observations",
+    "GET /api/onboarding/ci-workflow",
     "GET /api/onboarding/repositories",
     "GET /api/onboarding/state",
     "GET /api/repositories/{repository}/settings",
@@ -263,6 +264,11 @@
       "authentication": "clerk-session",
       "method": "POST",
       "path": "/api/onboarding/ci-token"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "GET",
+      "path": "/api/onboarding/ci-workflow"
     },
     {
       "authentication": "clerk-session",

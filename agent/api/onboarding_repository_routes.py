@@ -6,6 +6,7 @@ Phase 3. Five Clerk-authenticated routes:
     PUT  /api/onboarding/repositories/{repository_id} select one
     PUT  /api/onboarding/dbt                          project_dir + manifest_path
     POST /api/onboarding/ci-token                     issue the CI credential
+    GET  /api/onboarding/ci-workflow                  the workflow to commit
     POST /api/onboarding/complete                     finish, idempotently
 
 ###################################################################
@@ -35,9 +36,11 @@ from starlette.routing import Route
 
 from agent.api.dashboard_bridge import DashboardBridgeError
 from agent.api.repository_onboarding import (
-    CODE_REPOSITORY_NOT_FOUND, RepositoryOnboardingError, configuration_payload,
+    CODE_NO_REPOSITORY_SELECTED, CODE_REPOSITORY_NOT_FOUND,
+    RepositoryOnboardingError, ci_variables_for, configuration_payload,
     repositories_payload,
 )
+from agent.ci_workflow import workflow_payload
 from agent.api.validation import isoformat
 
 logger = logging.getLogger(__name__)
@@ -146,6 +149,59 @@ def create_onboarding_repository_routes(*, store_pool, clerk_authenticator,
                 f"Create a repository secret named {credential.secret_name} "
                 "with this value. It is shown once and cannot be recovered.")
         return 200, payload
+
+    def get_ci_workflow(request, body, store, principal):
+        """The GitHub Actions workflow this tenant should commit.
+
+        ###################################################################
+        # THE SAME FILE FOR EVERYONE. THE VARIABLES ARE WHAT DIFFER.      #
+        ###################################################################
+
+        The workflow is a static asset served verbatim -- there is no
+        substitution step and no place to inject anything. What is
+        tenant-specific travels beside it as repository VARIABLES (the API
+        URL, the dbt project directory, the manifest path), which are not
+        secrets. The one secret the workflow needs, RELIUM_CI_TOKEN, is issued
+        by a different route, shown once, and never appears in this response --
+        only the boolean saying whether it exists yet.
+
+        That split is why this can be a static asset. A rendered workflow is a
+        workflow that could one day render a credential into itself.
+
+        SCOPE. `repository_id` is optional. Supplied, it is resolved through
+        `authorized_repository`, so an id belonging to another tenant is a 404
+        exactly as it is everywhere else in this module. Omitted, the tenant's
+        own configured repository is used. The workflow content does not
+        depend on either -- but the variables do, and a caller must not be
+        able to read another tenant's configured paths by guessing an id.
+        """
+        raw = request.query_params.get("repository_id")
+        repository_id = None
+        if raw is not None:
+            if not raw.isdigit() or len(raw) > 20 or int(raw) <= 0:
+                raise RepositoryOnboardingError(CODE_REPOSITORY_NOT_FOUND)
+            repository_id = int(raw)
+            # Raises CODE_REPOSITORY_NOT_FOUND for anything outside this
+            # tenant's installation. Called for its authorization effect.
+            service.authorized_repository(store, principal.tenant_id,
+                                          repository_id)
+
+        record = store.configured_tenant_repository(principal.tenant_id)
+        if record is None or (repository_id is not None
+                              and record["github_repository_id"] != repository_id):
+            # Nothing configured for this tenant, or the caller asked about a
+            # repository they may have but have not configured. Either way
+            # there are no variables to report, and inventing defaults would
+            # be fabricating configuration.
+            raise RepositoryOnboardingError(CODE_NO_REPOSITORY_SELECTED)
+
+        variables = ci_variables_for(
+            project_dir=record.get("project_dir") or ".",
+            manifest_path=record.get("manifest_path"),
+            api_url=api_url)
+        return 200, workflow_payload(
+            ci_variables=variables,
+            ci_token_issued=bool(record.get("ci_token_id")))
 
     def establish_dashboard_session(request, body, store, principal):
         """Exchange a verified Clerk session for the ordinary dashboard session.
@@ -260,6 +316,8 @@ def create_onboarding_repository_routes(*, store_pool, clerk_authenticator,
               methods=["PUT"]),
         Route("/api/onboarding/ci-token", handler(issue_ci_token, write=True),
               methods=["POST"]),
+        Route("/api/onboarding/ci-workflow",
+              handler(get_ci_workflow, write=False), methods=["GET"]),
         Route("/api/onboarding/complete",
               handler(complete_onboarding, write=True), methods=["POST"]),
         Route("/api/onboarding/dashboard-session",

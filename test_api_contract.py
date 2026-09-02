@@ -146,6 +146,7 @@ class RouteContractTests(unittest.TestCase):
                   "/api/onboarding/repositories/{repository_id}",
                   "/api/onboarding/dbt",
                   "/api/onboarding/ci-token",
+                  "/api/onboarding/ci-workflow",
                   "/api/onboarding/complete",
                   "/api/onboarding/dashboard-session"}
         for entry in served_routes(self.app):
