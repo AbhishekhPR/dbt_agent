@@ -114,6 +114,13 @@ class PublicApiTestCase(unittest.TestCase):
         cls.sessions = SessionManager(
             client_id="test-client", client_secret="test-secret",
             encryption_key=load_key(generate_key()), identity=cls.identity)
+        # The /auth routes are mounted too, because the browser's whole path
+        # runs through them: it learns its CSRF token from GET /auth/session,
+        # not from a cookie it can read. Without them the suite could only
+        # exercise a token handed to it out of band, which is exactly the
+        # shortcut that let the production failure through.
+        from agent.api.auth_routes import create_auth_routes
+
         cls.app = create_http_app(
             webhook_secret="test-webhook-secret",
             job_queue=_StubQueue(),
@@ -123,6 +130,12 @@ class PublicApiTestCase(unittest.TestCase):
             store_pool=cls.pool,
             session_manager=cls.sessions,
             cors_allowed_origins=("https://app.relium.test",),
+            auth_routes=create_auth_routes(
+                store_pool=cls.pool, session_manager=cls.sessions,
+                dashboard_url="https://app.relium.test",
+                callback_url="https://api.relium.test/auth/github/callback",
+                organization_id="org-api", repository_id="repo-api",
+                environment="prod", secure_cookies=False),
         )
         cls.client = TestClient(cls.app)
         cls.client.__enter__()
@@ -1745,6 +1758,190 @@ class BrowserAuthorizationBoundaryTests(PublicApiTestCase):
                                  login="intruder")
         self.assertEqual(
             self._session_get(f"/api/reviews/{review_id}", intruder).status_code, 404)
+
+
+class CrossOriginCsrfTests(PublicApiTestCase):
+    """The re-run path, walked exactly the way a browser walks it.
+
+    ###################################################################
+    # WHY THIS SUITE EXISTS.                                          #
+    ###################################################################
+
+    In production the dashboard is ``app.relium.dev`` and the API is
+    ``api.relium.dev``. The API sets ``relium_csrf`` with no Domain, so it is
+    host-only; ``document.cookie`` is scoped by HOST rather than by site, so
+    the dashboard could not read it. The session cookie was unaffected -- the
+    browser only has to SEND that one, and ``app`` and ``api`` are same-site
+    under ``relium.dev``, so it went out on every request.
+
+    Reads therefore worked and every cookie-authenticated mutation was refused
+    with "missing or invalid CSRF token". Re-run was simply the first one a
+    production run exercised.
+
+    Every test written before this one took ``csrf_token`` from the value
+    ``complete_authorization`` returned, or from a TestClient cookie jar that
+    is one origin by construction. Both are the token handed over out of band.
+    These tests refuse that shortcut: the token is obtained the way the
+    dashboard obtains it, from ``GET /auth/session``, carrying nothing but the
+    session cookie.
+    """
+
+    _csrf_pulls = itertools.count(9400)
+
+    def _review_id(self):
+        return self._review(pull_number=next(self._csrf_pulls)).review_id
+
+    def _browser_csrf(self, session):
+        """The token a dashboard on another host can actually get hold of.
+
+        Only the session cookie goes out, because that is the only thing the
+        browser has: the CSRF cookie exists, but on a host this origin cannot
+        read.
+        """
+        response = self.client.get("/auth/session",
+                                   cookies=self._session_cookies(session),
+                                   headers={"Origin": "https://app.relium.test"})
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()["csrf_token"]
+
+    def _rerun(self, review_id, session, csrf, origin="https://app.relium.test"):
+        headers = {"Idempotency-Key": uuid.uuid4().hex}
+        if origin is not None:
+            headers["Origin"] = origin
+        if csrf is not None:
+            headers["X-Relium-CSRF"] = csrf
+        return self.client.post(f"/api/reviews/{review_id}/rerun", json={},
+                                headers=headers,
+                                cookies=self._session_cookies(session))
+
+    # -- the token is reachable, and it is the right one --------------------
+
+    def test_the_session_endpoint_reports_the_token_for_this_session(self):
+        session = self._sign_in(WRITE_PERMISSIONS)
+        self.assertEqual(self._browser_csrf(session), session["csrf_token"])
+
+    def test_an_unauthenticated_browser_is_told_nothing(self):
+        """No session, no token. The endpoint is not a token dispenser."""
+        response = self.client.get("/auth/session")
+        self.assertEqual(response.status_code, 401)
+        self.assertNotIn("csrf_token", response.json())
+        self.assertNotIn("csrf", response.text.lower())
+
+    def test_the_session_endpoint_still_returns_no_credential(self):
+        session = self._sign_in(WRITE_PERMISSIONS)
+        body = self.client.get("/auth/session",
+                               cookies=self._session_cookies(session)).json()
+        # The CSRF token is expected here. A GitHub credential never is.
+        self.assertEqual(body.pop("csrf_token"), session["csrf_token"])
+        self.assertNotRegex(json.dumps(body),
+                            r"(?i)access_token|refresh|secret|gho_")
+
+    def test_a_revoked_session_reports_no_token(self):
+        session = self._sign_in(WRITE_PERMISSIONS)
+        logout = self.client.post("/auth/logout",
+                                  cookies=self._session_cookies(session))
+        self.assertEqual(logout.status_code, 200)
+        self.assertEqual(
+            self.client.get("/auth/session",
+                            cookies=self._session_cookies(session)).status_code,
+            401)
+
+    # -- and the re-run works ----------------------------------------------
+
+    def test_a_dashboard_on_another_host_can_re_run(self):
+        """The end-to-end assertion. This is what production could not do.
+
+        Nothing here is read out of a cookie jar: the token comes from the
+        session endpoint, and the only cookie sent is the HttpOnly session id.
+        """
+        review_id = self._review_id()
+        session = self._sign_in(WRITE_PERMISSIONS)
+
+        response = self._rerun(review_id, session, self._browser_csrf(session))
+
+        self.assertEqual(response.status_code, 202, response.text)
+        body = response.json()
+        self.assertEqual(body["status"], "accepted")
+        self.assertTrue(body["rerun_id"])
+
+    def test_the_re_run_actually_requested_the_collection(self):
+        """Accepted has to mean a collection request exists, not just a 202."""
+        review_id = self._review_id()
+        session = self._sign_in(WRITE_PERMISSIONS)
+        body = self._rerun(review_id, session, self._browser_csrf(session)).json()
+
+        with self.pool.acquire() as store:
+            requests = store.collection_requests_for_review(
+                self.org, self.repo, review_id)
+        self.assertIn(body["rerun_id"], [r["request_id"] for r in requests])
+
+    # -- and the protection is intact --------------------------------------
+
+    def test_a_re_run_with_no_token_is_still_refused(self):
+        review_id = self._review_id()
+        session = self._sign_in(WRITE_PERMISSIONS)
+        response = self._rerun(review_id, session, None)
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["code"], "csrf_token_invalid")
+
+    def test_a_re_run_with_an_empty_token_is_still_refused(self):
+        """The empty string is what the broken client actually sent."""
+        review_id = self._review_id()
+        session = self._sign_in(WRITE_PERMISSIONS)
+        response = self._rerun(review_id, session, "")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["code"], "csrf_token_invalid")
+
+    def test_a_re_run_with_a_wrong_token_is_still_refused(self):
+        review_id = self._review_id()
+        session = self._sign_in(WRITE_PERMISSIONS)
+        for wrong in ("wrong", self._browser_csrf(session) + "x"):
+            response = self._rerun(review_id, session, wrong)
+            self.assertEqual(response.status_code, 403, wrong)
+            self.assertEqual(response.json()["code"], "csrf_token_invalid")
+
+    def test_another_sessions_token_cannot_re_run_this_one(self):
+        """The token is bound to a session, and reading it does not unbind it."""
+        review_id = self._review_id()
+        session = self._sign_in(WRITE_PERMISSIONS)
+        other = self._sign_in(WRITE_PERMISSIONS, login="someone-else")
+
+        response = self._rerun(review_id, session, self._browser_csrf(other))
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["code"], "csrf_token_invalid")
+
+    def test_a_valid_token_from_a_disallowed_origin_is_refused(self):
+        """A sibling subdomain is same-site, so the origin is checked as well."""
+        review_id = self._review_id()
+        session = self._sign_in(WRITE_PERMISSIONS)
+        csrf = self._browser_csrf(session)
+
+        forged = self._rerun(review_id, session, csrf,
+                             origin="https://evil.relium.test")
+        self.assertEqual(forged.status_code, 403)
+        self.assertEqual(forged.json()["code"], "origin_not_allowed")
+
+        missing = self._rerun(review_id, session, csrf, origin=None)
+        self.assertEqual(missing.status_code, 403)
+        self.assertEqual(missing.json()["code"], "origin_required")
+
+    def test_a_revoked_sessions_token_cannot_re_run(self):
+        review_id = self._review_id()
+        session = self._sign_in(WRITE_PERMISSIONS)
+        csrf = self._browser_csrf(session)
+        self.client.post("/auth/logout", cookies=self._session_cookies(session))
+
+        response = self._rerun(review_id, session, csrf)
+        self.assertEqual(response.status_code, 403)
+
+    def test_a_read_only_collaborator_is_still_refused_with_a_valid_token(self):
+        """CSRF is not authorization, and passing it grants no authority."""
+        review_id = self._review_id()
+        reader = self._sign_in(READ_PERMISSIONS)
+        response = self._rerun(review_id, reader, self._browser_csrf(reader))
+        self.assertEqual(response.status_code, 403)
+        self.assertNotEqual(response.json().get("code"), "csrf_token_invalid")
 
 
 if __name__ == "__main__":

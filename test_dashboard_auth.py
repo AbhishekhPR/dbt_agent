@@ -462,6 +462,68 @@ class SessionLifecycleTests(unittest.TestCase):
         self.assertFalse(self.manager.verify_csrf(
             self.store, result["session_id"], result["csrf_token"]))
 
+    # -- handing the token to a dashboard on another host ------------------
+    #
+    # The CSRF token is also written as a script-readable cookie, and that is
+    # enough only when the dashboard and the API share a host. Production does
+    # not: app.relium.dev cannot read a cookie api.relium.dev set, because
+    # document.cookie is scoped by host rather than by site. So the token has
+    # to be readable from the session itself. Everything below is about that
+    # read being exactly as narrow as the session it belongs to.
+
+    def test_the_session_reports_the_token_bound_to_it(self):
+        result = self._sign_in()
+        self.assertEqual(
+            self.manager.csrf_token(self.store, result["session_id"]),
+            result["csrf_token"])
+        # And it is the value verify_csrf will actually accept -- one source,
+        # not two that could drift.
+        self.assertTrue(self.manager.verify_csrf(
+            self.store, result["session_id"],
+            self.manager.csrf_token(self.store, result["session_id"])))
+
+    def test_each_session_reports_only_its_own_token(self):
+        first = self._sign_in()
+        self.store.states.clear()
+        second = self._sign_in()
+        self.assertNotEqual(first["csrf_token"], second["csrf_token"])
+        self.assertEqual(self.manager.csrf_token(self.store, second["session_id"]),
+                         second["csrf_token"])
+        self.assertFalse(self.manager.verify_csrf(
+            self.store, first["session_id"],
+            self.manager.csrf_token(self.store, second["session_id"])))
+
+    def test_there_is_no_token_without_a_live_session(self):
+        """Absent, unknown, revoked and expired all yield nothing.
+
+        A caller who is not signed in must not be able to collect a token and
+        then go looking for a session cookie to pair it with.
+        """
+        result = self._sign_in()
+        self.assertIsNone(self.manager.csrf_token(self.store, None))
+        self.assertIsNone(self.manager.csrf_token(self.store, ""))
+        self.assertIsNone(self.manager.csrf_token(self.store, "not-a-session"))
+
+        self.now = T0 + timedelta(hours=13)
+        self.assertIsNone(self.manager.csrf_token(self.store, result["session_id"]))
+
+        self.now = T0
+        self.manager.revoke(self.store, result["session_id"])
+        self.assertIsNone(self.manager.csrf_token(self.store, result["session_id"]))
+
+    def test_reading_the_token_does_not_grant_anything_on_its_own(self):
+        """The token is not a credential, and this is why returning it is safe.
+
+        Presenting it against a session that is over -- or with no session at
+        all -- still fails, because verify_csrf looks the session up first.
+        """
+        result = self._sign_in()
+        token = self.manager.csrf_token(self.store, result["session_id"])
+        self.manager.revoke(self.store, result["session_id"])
+        self.assertFalse(self.manager.verify_csrf(
+            self.store, result["session_id"], token))
+        self.assertFalse(self.manager.verify_csrf(self.store, None, token))
+
 
 if __name__ == "__main__":
     unittest.main()

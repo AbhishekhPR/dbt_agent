@@ -375,6 +375,44 @@ class SessionManager:
 
     # -- csrf and revocation ----------------------------------------------
 
+    def csrf_token(self, store, session_id):
+        """The CSRF token bound to a live session, or None.
+
+        ###################################################################
+        # THIS IS HOW THE DASHBOARD LEARNS THE TOKEN CROSS-ORIGIN.        #
+        ###################################################################
+
+        The token is also written as a script-readable cookie, and for a
+        deployment that serves the dashboard and the API from the SAME host
+        that is enough. Production does not: the dashboard is
+        ``app.relium.dev`` and the API is ``api.relium.dev``. A cookie the API
+        sets carries no ``Domain``, so it is host-only, and ``document.cookie``
+        is scoped by host rather than by site — the dashboard cannot read it,
+        even though the browser happily *sends* it back to the API. That is
+        exactly why reads worked and every cookie-authenticated mutation was
+        refused: the session cookie only has to be sent, the CSRF cookie has to
+        be read.
+
+        Widening the cookie to ``Domain=.relium.dev`` would fix the symptom by
+        handing the token to every sibling subdomain — the precise attacker
+        ``_require_csrf`` says it is defending against. So the token is served
+        here instead, over a request that is authenticated by the session
+        cookie and readable only from an allow-listed origin. Nothing about the
+        check changes: ``verify_csrf`` still compares against the value stored
+        on the session row.
+
+        An absent, unknown, revoked or expired session yields None. There is no
+        token for a caller who is not signed in.
+        """
+        if not session_id:
+            return None
+        record = store.get_dashboard_session(digest(session_id))
+        if record is None or record.get("revoked_at") is not None:
+            return None
+        if record["expires_at"] <= self._clock():
+            return None
+        return record["csrf_token"]
+
     def verify_csrf(self, store, session_id, presented):
         """Double-submit check, bound to the session and compared in constant time."""
         record = store.get_dashboard_session(digest(session_id or ""))
