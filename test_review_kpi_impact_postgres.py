@@ -68,9 +68,11 @@ class ReviewKpiImpactMigrationTests(unittest.TestCase):
         _reset_schema(DSN)
         cls.store = PostgresLifecycleStore(DSN)
         cls.store.ensure_tenant(ORG, REPO, ENV)
-        for review_id in (REVIEW, LEGACY_REVIEW):
+        # Distinct pull numbers: reviews are unique on (pull number, head SHA),
+        # so two rows sharing both would collide before any of this is tested.
+        for pull_number, review_id in enumerate((REVIEW, LEGACY_REVIEW), start=1):
             cls.store.upsert_pr_review(
-                ORG, REPO, ENV, review_id=review_id, pull_number=1,
+                ORG, REPO, ENV, review_id=review_id, pull_number=pull_number,
                 base_sha=BASE_SHA, head_sha=HEAD_SHA,
                 base_manifest_hash="base", head_manifest_hash="head",
                 enforcement_mode="enforce", policy_version="default-v1",

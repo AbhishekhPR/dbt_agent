@@ -1187,7 +1187,7 @@ class ReviewDetailSurfaceTests(PublicApiTestCase):
             store.record_review_decision(
                 self.org, self.repo, outcome.review_id,
                 decision="ALLOW", evidence_coverage="COMPLETE", health=100,
-                attempt=outcome.attempt + 1, trigger="recompute",
+                attempt=outcome.attempt + 1, trigger="metadata_snapshot",
                 payload={"findings": []}, kpi_impact=document)
 
         body = self._get(f"/api/reviews/{outcome.review_id}/attempts")
