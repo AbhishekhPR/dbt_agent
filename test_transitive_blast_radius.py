@@ -230,6 +230,34 @@ class TheDashboardProjectionCarriesIt(unittest.TestCase):
         # The flat list stays usable for such a review.
         self.assertEqual(view["downstream_models"], ["model.a.fct_customer_mrr"])
 
+    def test_a_malformed_persisted_payload_projects_every_field_as_absent(self):
+        """The shapes test_public_api pins against real PostgreSQL, covered here
+        too so the contract is not only provable where a database exists."""
+        for malformed in (42, {"plan": 42}, {"plan": {"targets": 42}}):
+            with self.subTest(malformed=malformed):
+                view = _change_plan_view({"payload": malformed})
+                self.assertEqual(view, {
+                    "changed_models": [],
+                    "added_dependencies": [],
+                    "removed_dependencies": [],
+                    "downstream_models": [],
+                    "direct_edges": None,
+                    "downstream_edges": None,
+                    "collected_downstream_models": None,
+                    "max_downstream_depth": None,
+                    "targets": [],
+                })
+
+    def test_the_projection_exposes_exactly_the_allowlisted_fields(self):
+        plan = _plan(REVENUE_CHAIN, ["int_subscription_revenue"]).as_dict()
+        # `notes` and `required_evidence_level` are planner internals and must
+        # not cross the boundary just because the plan grew new fields.
+        self.assertEqual(set(self._view(plan)), {
+            "changed_models", "added_dependencies", "removed_dependencies",
+            "downstream_models", "direct_edges", "downstream_edges",
+            "collected_downstream_models", "max_downstream_depth", "targets",
+        })
+
     def test_a_change_with_no_downstream_projects_an_empty_list(self):
         view = self._view({"downstream_edges": []})
         self.assertEqual(view["downstream_edges"], [])

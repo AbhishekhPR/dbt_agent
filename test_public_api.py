@@ -1080,12 +1080,22 @@ class ReviewDetailSurfaceTests(PublicApiTestCase):
 
         self.assertEqual(set(body["change_plan"]), {
             "changed_models", "added_dependencies", "removed_dependencies",
-            "downstream_models", "direct_edges", "targets",
+            "downstream_models", "direct_edges", "downstream_edges",
+            "collected_downstream_models", "max_downstream_depth", "targets",
         })
         self.assertEqual(body["change_plan"]["changed_models"], ["fct_orders"])
         self.assertIsInstance(body["change_plan"]["added_dependencies"], list)
         self.assertIsInstance(body["change_plan"]["removed_dependencies"], list)
         self.assertIsInstance(body["change_plan"]["downstream_models"], list)
+        # The transitive walk and the bounded collection scope are both
+        # allowlisted, and both are lists on a plan the planner produced.
+        self.assertIsInstance(body["change_plan"]["downstream_edges"], list)
+        self.assertIsInstance(
+            body["change_plan"]["collected_downstream_models"], list)
+        self.assertIsInstance(body["change_plan"]["max_downstream_depth"], int)
+        for edge in body["change_plan"]["downstream_edges"]:
+            self.assertEqual(set(edge), {"source_model_unique_id",
+                                         "target_model_unique_id", "depth"})
         self.assertTrue(body["change_plan"]["targets"])
         for target in body["change_plan"]["targets"]:
             self.assertEqual(set(target), {
@@ -1099,12 +1109,18 @@ class ReviewDetailSurfaceTests(PublicApiTestCase):
         self.assertNotIn("internal planner note", serialized)
 
     def test_review_detail_tolerates_malformed_persisted_change_plan_shapes(self):
+        # Every edge/depth field is None rather than empty: a payload this
+        # malformed recorded no walk at all, and "[]" would claim the analysis
+        # ran and found nothing downstream.
         empty_plan = {
             "changed_models": [],
             "added_dependencies": [],
             "removed_dependencies": [],
             "downstream_models": [],
             "direct_edges": None,
+            "downstream_edges": None,
+            "collected_downstream_models": None,
+            "max_downstream_depth": None,
             "targets": [],
         }
         malformed_payloads = (
