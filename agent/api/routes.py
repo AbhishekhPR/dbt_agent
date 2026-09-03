@@ -1626,10 +1626,12 @@ def _change_plan_view(record):
     # review predates the evidence and a graph cannot be drawn for it, while
     # [] means the analysis ran and found no direct downstream. Reconstructing
     # edges from the flat lists would be inference, so it is not done here.
-    edge_values = plan.get("direct_edges")
-    if isinstance(edge_values, list):
-        direct_edges = []
-        for edge in edge_values:
+    def edge_list(field, *, with_depth=False):
+        values = plan.get(field)
+        if not isinstance(values, list):
+            return None
+        edges = []
+        for edge in values:
             if not isinstance(edge, dict):
                 continue
             source = edge.get("source_model_unique_id")
@@ -1638,12 +1640,25 @@ def _change_plan_view(record):
                 continue
             if not source or not target:
                 continue
-            direct_edges.append({
-                "source_model_unique_id": source,
-                "target_model_unique_id": target,
-            })
-    else:
-        direct_edges = None
+            projected = {"source_model_unique_id": source,
+                         "target_model_unique_id": target}
+            if with_depth:
+                depth = edge.get("depth")
+                # A depth-carrying edge with no readable depth is dropped
+                # rather than defaulted: "one hop" is a claim, and guessing it
+                # would put a grandchild on the graph as a direct consumer.
+                if not isinstance(depth, int) or isinstance(depth, bool) or depth < 1:
+                    continue
+                projected["depth"] = depth
+            edges.append(projected)
+        return edges
+
+    direct_edges = edge_list("direct_edges")
+    # The transitive closure, each edge carrying the hop count at which the
+    # traversal reached it. Same null-versus-empty rule as above: null means
+    # this review predates the evidence, [] means the walk ran and the change
+    # has no downstream at all.
+    downstream_edges = edge_list("downstream_edges", with_depth=True)
 
     return {
         "changed_models": string_list("changed_models"),
@@ -1651,6 +1666,17 @@ def _change_plan_view(record):
         "removed_dependencies": string_list("removed_dependencies"),
         "downstream_models": string_list("downstream_models"),
         "direct_edges": direct_edges,
+        "downstream_edges": downstream_edges,
+        # What a collector was asked to observe, which is deliberately narrower
+        # than the blast radius above. Null on a review that predates the
+        # distinction rather than silently equal to the blast radius.
+        "collected_downstream_models": (
+            string_list("collected_downstream_models")
+            if isinstance(plan.get("collected_downstream_models"), list) else None),
+        "max_downstream_depth": (
+            plan.get("max_downstream_depth")
+            if isinstance(plan.get("max_downstream_depth"), int)
+            and not isinstance(plan.get("max_downstream_depth"), bool) else None),
         "targets": targets,
     }
 

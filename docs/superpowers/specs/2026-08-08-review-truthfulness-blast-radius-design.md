@@ -77,3 +77,44 @@ Final verification runs the complete backend unit/integration suite, the complet
 ## Safety
 
 No Relium Pilot credential or resource is used. The fixture PR is never merged. Cleanup closes the fixture PR, removes only the fixture branch, restores and verifies the exact webhook configuration through GitHub, stops tunnel/listener processes, and scans evidence for secrets.
+
+## Addendum, 2026-09-03: transitive downstream and unentitled evidence
+
+Two statements above described the engine as it was, not a boundary the product
+wanted, and both have been superseded.
+
+### Blast radius is no longer depth-1
+
+Phase 2 said "the current engine reads direct downstream models only" and
+disabled Graph view "because the backend does not expose sufficient path/edge
+geometry". The geometry now exists. `build_collection_plan` walks the head
+manifest's `depends_on` breadth-first from the changed models and records:
+
+- `downstream_models` — the full transitive closure
+- `downstream_edges` — every edge in that closure, each carrying the depth at
+  which the walk reached its target
+- `direct_edges` — unchanged, still depth-1, still the answer to "which changed
+  model does this node actually read"
+- `collected_downstream_models` — the DIRECT downstream, and the only
+  downstream models a collector is asked to observe
+
+The collection request is deliberately unchanged. Describing the blast radius
+and scanning a customer warehouse for all of it are different decisions, and
+only the first may grow with the depth of their project.
+
+Every edge is one relationship dbt itself declared, walked one hop at a time.
+Exposures are still not propagated, and no path is inferred between
+non-adjacent models.
+
+Consumers must read `depth` from `downstream_edges` rather than assuming every
+entry in `downstream_models` is a direct, depth-1 consumer.
+
+### Evidence a plan does not include
+
+`change_plan` additionally exposes `metadata_not_required_reason` and
+`warehouse_evidence_entitled`, and the evidence coverage rows may now carry the
+state `NOT ENTITLED` (migration 0019). A workspace whose plan excludes
+warehouse evidence cannot submit a snapshot at all, so its reviews do not
+require one, do not wait for one, and say so explicitly through the
+`metadata.not_entitled` finding rather than claiming no external production
+dependency exists.

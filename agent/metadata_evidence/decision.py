@@ -32,6 +32,7 @@ from agent.evidence_policy import (
 from agent.metadata_evidence.collection_plan import (
     CRITICAL_TTL_MINUTES,
     DEFAULT_TTL_MINUTES,
+    NOT_REQUIRED_NOT_ENTITLED,
 )
 
 PRODUCTION_METADATA = "production_metadata"
@@ -215,6 +216,7 @@ def evaluate_metadata_decision(*, plan, snapshot, enforcement_mode,
     plan_dict = plan.as_dict() if hasattr(plan, "as_dict") else dict(plan)
     targets = plan_dict.get("targets", [])
     metadata_required = bool(plan_dict.get("metadata_required"))
+    not_required_reason = plan_dict.get("metadata_not_required_reason")
 
     available = {
         "base_code": True,
@@ -231,7 +233,33 @@ def evaluate_metadata_decision(*, plan, snapshot, enforcement_mode,
 
     # ---- no production evidence yet -----------------------------------
     if snapshot is None:
-        if not metadata_required:
+        if not metadata_required and not_required_reason == NOT_REQUIRED_NOT_ENTITLED:
+            # ###########################################################
+            # # THE LIMITATION IS STATED, NOT SIMULATED.                #
+            # ###########################################################
+            #
+            # This change DOES depend on external production state. What is
+            # absent is the entitlement to observe it, and that is what this
+            # says. It must never be reported as ``metadata.not_required``,
+            # which claims no external dependency was introduced, and it must
+            # never be reported as PENDING, which claims something is still
+            # coming. Nothing here pretends production evidence was evaluated:
+            # the finding names the capability, and the evidence state is a
+            # terminal NOT ENTITLED rather than an open request.
+            evidence[PRODUCTION_METADATA] = EvidenceState.NOT_ENTITLED
+            findings.append(Finding(
+                code="metadata.not_entitled", severity="info", category="evidence",
+                message=("Production warehouse evidence is not included on this "
+                         "workspace's plan, so the production state of the "
+                         "relations below was not collected and was not "
+                         "evaluated. The code, manifest and lineage analysis in "
+                         "this review is unaffected."),
+                detail={"capability": "warehouse_evidence",
+                        "requested_relations": [t["relation_name"] for t in targets
+                                                if t.get("dependency_kind") == "external"]},
+            ))
+            lifecycle = "METADATA_NOT_REQUIRED"
+        elif not metadata_required:
             evidence[PRODUCTION_METADATA] = EvidenceState.NOT_EVALUATED
             findings.append(Finding(
                 code="metadata.not_required", severity="info", category="evidence",
