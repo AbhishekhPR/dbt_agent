@@ -124,7 +124,7 @@ def begin_review(store, *, organization_id, repository_id, environment,
                  changed_models, enforcement_mode, delivery_id=None,
                  code_health=100, code_findings=(), critical_models=(),
                  evidence_level="profile", now=None, semantic_evidence=None,
-                 entitlements=None):
+                 kpi_impact=None, entitlements=None):
     """Persist a genuine GitHub review and decide what to publish.
 
     Returns a LifecycleOutcome. When production evidence is required and not
@@ -259,6 +259,10 @@ def begin_review(store, *, organization_id, repository_id, environment,
         # recomputed for storage.
         semantic_evidence=semantic_evidence,
         metadata_comparison=metadata_comparison,
+        # Same rule, same reason: the KPI inference ran during analysis
+        # and its result is carried here rather than re-derived, so the
+        # attempt records what the decision was actually taken against.
+        kpi_impact=kpi_impact,
     )
     store.record_evidence_states(organization_id, repository_id, review_id, attempt,
                                  _evidence_rows(decision))

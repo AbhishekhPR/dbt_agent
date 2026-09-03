@@ -464,6 +464,74 @@ def _semantic_signals(semantic_context) -> list[Signal]:
     return signals
 
 
+def _kpi_impact_document(signal, report) -> dict:
+    """The KPI impact of one review, in the form that is persisted.
+
+    ###################################################################
+    # THIS IS A LINEAGE CLAIM, NOT A BUSINESS FORECAST.               #
+    ###################################################################
+
+    Every field is something ``infer_impacted_kpis`` actually established: which
+    discovered KPIs a changed model reaches, the models and paths it reaches
+    them through, and how confident the inference is. There is no monetary
+    figure, because nothing upstream observes revenue or volume — a currency
+    amount here would be fabricated, and a reader could not tell it from a
+    measured one.
+
+    ``status`` is what makes the stored column meaningful. Reaching this
+    function at all means the inference RAN, so the document says ``evaluated``
+    even when it impacted nothing; a review where it never ran stores SQL NULL
+    instead. See agent/metadata_evidence/kpi_impact.py.
+
+    ``changed_models``, ``impacted_kpis`` and ``impact_paths`` keep exactly the
+    shapes and types they have always had — ``impacted_kpis`` is still a list of
+    names — because existing readers depend on them. The per-KPI detail is added
+    beside them under a new key rather than by changing one.
+    """
+    signal_metadata = dict(signal.metadata or {})
+    impacted = sorted(getattr(report, "impacted_kpis", None) or [],
+                      key=lambda impact: impact.name)
+    return {
+        "status": "evaluated",
+        "changed_models": list(signal_metadata.get("changed_models", [])),
+        "impacted_kpis": list(signal_metadata.get("impacted_kpis", [])),
+        "impact_paths": [
+            list(path) for path in signal_metadata.get("impact_paths", [])
+        ],
+        "unaffected_kpis": list(signal_metadata.get("unaffected_kpis", [])),
+        # The report's own aggregate, not an average recomputed here.
+        "confidence": getattr(report, "confidence", None),
+        # Per KPI, so the dashboard can say WHY a KPI is listed rather than
+        # only that it is. `impacted_by_models` names the models the impact
+        # travels through; `reasons` is the inference's own explanation.
+        "impacted_kpi_details": [
+            {
+                "name": impact.name,
+                "confidence": impact.confidence,
+                "impacted_by_models": list(impact.impacted_by_models or []),
+                "related_columns": list(impact.related_columns or []),
+                "reasons": list(impact.reasons or []),
+                "impact_paths": [
+                    list(path)
+                    for path in (impact.metadata or {}).get("impact_paths", [])
+                ],
+                # "related" / "unrelated" / "fallback". Says whether column
+                # lineage could sharpen the model-level claim, or not.
+                "column_impact": (impact.metadata or {}).get("column_impact"),
+            }
+            for impact in impacted
+        ],
+        # Column lineage is often unavailable, and the inference says so rather
+        # than pretending to a precision it does not have. Persisting the
+        # reason means the dashboard can be honest about it too.
+        "column_level_evidence": list(
+            signal_metadata.get("column_level_evidence", [])),
+        "fallback_reason": signal_metadata.get("fallback_reason"),
+        "impacted_count": len(impacted),
+        "unaffected_count": len(signal_metadata.get("unaffected_kpis", [])),
+    }
+
+
 def _current_snapshot(
     deployment_id,
     affected_models: list[str],
@@ -511,14 +579,8 @@ def _add_semantic_metadata(
             None,
         )
         if kpi_impact_signal is not None:
-            metadata["kpi_impact"] = {
-                "changed_models": list(kpi_impact_signal.metadata.get("changed_models", [])),
-                "impacted_kpis": list(kpi_impact_signal.metadata.get("impacted_kpis", [])),
-                "impact_paths": [
-                    list(path)
-                    for path in kpi_impact_signal.metadata.get("impact_paths", [])
-                ],
-            }
+            metadata["kpi_impact"] = _kpi_impact_document(
+                kpi_impact_signal, semantic_context.kpi_impact_report)
 
     if current_snapshot is not None:
         current_snapshot_dict = current_snapshot.to_dict()

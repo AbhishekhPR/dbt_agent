@@ -115,7 +115,8 @@ class InMemoryLifecycleStore:
                                decision, evidence_coverage, health, attempt,
                                trigger, enforcement_mode=None, snapshot_id=None,
                                policy_version=None, policy_hash=None, payload=None,
-                               semantic_evidence=None, metadata_comparison=None):
+                               semantic_evidence=None, metadata_comparison=None,
+                               kpi_impact=None):
         review = self.reviews[(organization_id, repository_id, review_id)]
         review.update({"decision": decision, "evidence_coverage": evidence_coverage,
                        "health": health, "attempt": attempt})
@@ -124,6 +125,7 @@ class InMemoryLifecycleStore:
                "trigger": trigger, "snapshot_id": snapshot_id,
                "payload": dict(payload or {}),
                "semantic_evidence": semantic_evidence,
+               "kpi_impact": kpi_impact,
                "metadata_comparison": metadata_comparison}
         self.decisions.append(row)
         return dict(row)

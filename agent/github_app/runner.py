@@ -7,6 +7,7 @@ from agent.github_app.client import GitHubNotFoundError
 from agent.github_app.comments import upsert_review_comment
 from agent.github_app.config import DEFAULT_MANIFEST_PATH, load_repository_config
 from agent.github_app.review_comment import render_review_comment
+from agent.metadata_evidence.kpi_impact import kpi_impact_from_incident
 from agent.metadata_evidence.semantic_evidence import (
     semantic_evidence_from_incident,
 )
@@ -335,6 +336,10 @@ class PullRequestReviewRunner:
         health = incident.get("health")
         return self.lifecycle.begin(
             semantic_evidence=_semantic_evidence(incident),
+            # The same analysis that produced the semantic comparison also
+            # inferred KPI impact. Both are lifted out here so the CI
+            # handoff path and this one persist identical evidence.
+            kpi_impact=kpi_impact_from_incident(incident),
             organization_id=str(event.repository.owner),
             repository_id=str(event.repository.name),
             pull_number=event.pull_number,

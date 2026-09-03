@@ -1,0 +1,41 @@
+-- KPI impact, bound to the exact attempt that inferred it.
+--
+-- `infer_impacted_kpis` already runs on every review that has a project
+-- context: it walks the semantic graph and the model lineage and reports which
+-- discovered KPIs a changed model reaches. That result went into the incident's
+-- `metadata.kpi_impact`, was used to derive a root cause, and was then dropped
+-- on the floor. Nothing persisted it against the review, so the dashboard had
+-- no per-review KPI impact to show and the adapter documented the absence as
+-- "KPI impact exists per deployment, not per pre-merge review".
+--
+-- The existing `kpi_impact` TABLE is a different fact and stays as it is: it
+-- records the observed impact of a DEPLOYMENT, after the fact. This column is
+-- the inferred impact of a PROPOSED change, before merge. Storing the second
+-- in the first would conflate a measurement with a prediction.
+--
+-- On review_attempts rather than reviews, for the same reason semantic
+-- evidence is (migration 0010): the primary key is
+-- (organization_id, repository_id, review_id, attempt), so an attempt can
+-- never be shown KPI impact inferred for a different head SHA. The binding is
+-- structural rather than something every read path has to remember.
+--
+-- A dedicated column rather than a key inside the generic `payload`, because
+-- "the inference did not run" and "it ran and found no impacted KPI" are
+-- different answers and both must be representable:
+--
+--   NULL                                        -> inference did not run
+--                                                  (no project context, no
+--                                                   discovered KPIs to test)
+--   {"status":"evaluated","impacted_kpis":[]}   -> ran, nothing impacted
+--   {"status":"evaluated","impacted_kpis":[..]} -> ran, impact found
+--
+-- SQL NULL carries the first state, so an absent row can never be read back as
+-- "analysed, no KPI affected".
+--
+-- Additive and nullable: every existing review_attempts row keeps its meaning
+-- and reads back as "not computed", which is exactly what those attempts did.
+-- No backfill is possible or attempted — the manifests an old attempt was
+-- computed from are not re-analysed, and inventing a result for them would be
+-- fabricating evidence for a decision that has already been published.
+ALTER TABLE review_attempts
+    ADD COLUMN IF NOT EXISTS kpi_impact JSONB;

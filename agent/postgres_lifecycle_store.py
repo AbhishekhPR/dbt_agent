@@ -2255,7 +2255,8 @@ class PostgresLifecycleStore:
                                trigger="initial", snapshot_id=None,
                                enforcement_mode=None, policy_version=None,
                                policy_hash=None, payload=None,
-                               semantic_evidence=None, metadata_comparison=None):
+                               semantic_evidence=None, metadata_comparison=None,
+                               kpi_impact=None):
         """Record a decision and preserve it as an immutable attempt.
 
         Coverage, health, decision and lifecycle state are stored separately;
@@ -2275,8 +2276,8 @@ class PostgresLifecycleStore:
                 "INSERT INTO review_attempts (organization_id, repository_id, review_id, "
                 "attempt, lifecycle_state, decision, evidence_coverage, health, "
                 "enforcement_mode, policy_version, policy_hash, trigger, snapshot_id, "
-                "payload, semantic_evidence, metadata_comparison) "
-                "SELECT %s, %s, %s, %s, lifecycle_state, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s "
+                "payload, semantic_evidence, metadata_comparison, kpi_impact) "
+                "SELECT %s, %s, %s, %s, lifecycle_state, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s "
                 "FROM reviews WHERE organization_id=%s AND repository_id=%s AND review_id=%s "
                 "ON CONFLICT (organization_id, repository_id, review_id, attempt) DO NOTHING",
                 (organization_id, repository_id, review_id, attempt, decision,
@@ -2289,6 +2290,10 @@ class PostgresLifecycleStore:
                  # "never computed"; status=no_baseline is "computed, and there
                  # was no prior observation to compare against".
                  self._Jsonb(metadata_comparison) if metadata_comparison is not None else None,
+                 # And again for KPI impact. NULL is "the inference did
+                 # not run"; status=evaluated with an empty list is "it
+                 # ran and no KPI is reached". See migration 0020.
+                 self._Jsonb(kpi_impact) if kpi_impact is not None else None,
                  organization_id, repository_id, review_id),
             )
         return self.get_review(organization_id, repository_id, review_id)

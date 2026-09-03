@@ -282,6 +282,89 @@ def _metadata_coverage_view(stored):
     }
 
 
+#: Statuses a stored KPI impact document may carry. Mirrors
+#: agent/metadata_evidence/kpi_impact.py; an unrecognised status is projected
+#: as None rather than passed through, so a document written by a newer
+#: version cannot be rendered by a dashboard that does not understand it.
+_KPI_IMPACT_STATUSES = {"evaluated"}
+
+
+def _kpi_impact_view(stored):
+    """Project stored KPI impact for the dashboard.
+
+    ``None`` is preserved as ``None``. The inference not having run is a
+    different fact from it running and finding no impacted KPI, and a
+    dashboard that cannot tell them apart will report "no KPI affected" for a
+    review nobody ever asked the question about.
+
+    ###################################################################
+    # WHAT THIS IS NOT.                                               #
+    ###################################################################
+
+    A lineage claim, projected as one. There is no monetary field to project,
+    because nothing upstream measures money — see
+    agent/metadata_evidence/kpi_impact.py. Fields are copied through
+    explicitly rather than by passing the stored document along, so a key that
+    appears in storage never reaches the API without someone deciding it
+    should.
+    """
+    if not isinstance(stored, dict):
+        return None
+    if stored.get("status") not in _KPI_IMPACT_STATUSES:
+        return None
+
+    details = []
+    for impact in stored.get("impacted_kpi_details") or []:
+        if not isinstance(impact, dict) or not impact.get("name"):
+            continue
+        details.append({
+            "name": impact.get("name"),
+            "confidence": impact.get("confidence"),
+            "impacted_by_models": _kpi_string_list(impact, "impacted_by_models"),
+            "related_columns": _kpi_string_list(impact, "related_columns"),
+            "reasons": _kpi_string_list(impact, "reasons"),
+            "impact_paths": _path_list(impact.get("impact_paths")),
+            "column_impact": impact.get("column_impact"),
+        })
+
+    return {
+        "status": stored.get("status"),
+        "changed_models": _kpi_string_list(stored, "changed_models"),
+        "impacted_kpis": _kpi_string_list(stored, "impacted_kpis"),
+        "unaffected_kpis": _kpi_string_list(stored, "unaffected_kpis"),
+        "impact_paths": _path_list(stored.get("impact_paths")),
+        "confidence": stored.get("confidence"),
+        "impacted_kpi_details": details,
+        # Says whether column lineage could sharpen the model-level claim.
+        # Surfaced so the dashboard can show the limit of the evidence rather
+        # than presenting a lineage-only inference as a column-level one.
+        "column_level_evidence": _kpi_string_list(stored, "column_level_evidence"),
+        "fallback_reason": stored.get("fallback_reason"),
+        # Counted from what is actually being returned, never read back from a
+        # stored count that could disagree with the list beside it.
+        "impacted_count": len(_kpi_string_list(stored, "impacted_kpis")),
+        "unaffected_count": len(_kpi_string_list(stored, "unaffected_kpis")),
+    }
+
+
+def _kpi_string_list(document, key):
+    """Non-empty strings under ``key``, in order, or an empty list."""
+    return [value for value in (document.get(key) or [])
+            if isinstance(value, str) and value]
+
+
+def _path_list(paths):
+    """Impact paths, each a list of node names. Anything else is dropped."""
+    projected = []
+    for path in paths or []:
+        if not isinstance(path, (list, tuple)):
+            continue
+        nodes = [node for node in path if isinstance(node, str) and node]
+        if nodes:
+            projected.append(nodes)
+    return projected
+
+
 def _metadata_comparison_view(stored):
     """Project stored production metadata comparison evidence for the dashboard.
 
@@ -1094,6 +1177,11 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
                  # from whatever the newest snapshot happens to be now.
                  "metadata_comparison": _metadata_comparison_view(
                      a.get("metadata_comparison")),
+                 # Bound to THIS attempt for the same reason: KPI impact is
+                 # inferred from the manifests of one head SHA, and showing
+                 # attempt 1's inference beside attempt 2's decision would
+                 # describe code that is no longer under review.
+                 "kpi_impact": _kpi_impact_view(a.get("kpi_impact")),
                  "created_at": isoformat(a.get("created_at"))}
                 for a in attempts
             ],
