@@ -1804,6 +1804,21 @@ class CrossOriginCsrfTests(PublicApiTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()["csrf_token"]
 
+    def _settle_requests(self, review_id):
+        """Close every actionable request, so a re-run is a real re-run.
+
+        The review fixture leaves one collection request in flight, and re-run
+        answers already_running for that - correctly, and with a 200. These
+        tests are about CSRF, so the 202 path is the one they need to reach.
+        """
+        with self.pool.acquire() as store:
+            for request in store.collection_requests_for_review(
+                    self.org, self.repo, review_id):
+                if request["state"] in ("PENDING", "ACKNOWLEDGED"):
+                    store.close_collection_request(
+                        self.org, self.repo, request["request_id"],
+                        state="COMPLETED")
+
     def _rerun(self, review_id, session, csrf, origin="https://app.relium.test"):
         headers = {"Idempotency-Key": uuid.uuid4().hex}
         if origin is not None:
@@ -1856,6 +1871,7 @@ class CrossOriginCsrfTests(PublicApiTestCase):
         """
         review_id = self._review_id()
         session = self._sign_in(WRITE_PERMISSIONS)
+        self._settle_requests(review_id)
 
         response = self._rerun(review_id, session, self._browser_csrf(session))
 
@@ -1868,6 +1884,7 @@ class CrossOriginCsrfTests(PublicApiTestCase):
         """Accepted has to mean a collection request exists, not just a 202."""
         review_id = self._review_id()
         session = self._sign_in(WRITE_PERMISSIONS)
+        self._settle_requests(review_id)
         body = self._rerun(review_id, session, self._browser_csrf(session)).json()
 
         with self.pool.acquire() as store:

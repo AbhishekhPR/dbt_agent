@@ -233,14 +233,6 @@ def create_onboarding_repository_routes(*, store_pool, clerk_authenticator,
             "login": established["login"],
             "may_govern": established["may_govern"],
             "github_permission": established["github_permission"],
-            # The CSRF token for the session this call just minted. The cookie
-            # below carries it too, but only usefully to a dashboard served
-            # from THIS host; in production it is a different one, so the
-            # dashboard would have no readable token until its next
-            # /auth/session. Returning it here closes that window without a
-            # second round-trip. It is not a credential: a mutation still needs
-            # the HttpOnly session cookie. See SessionManager.csrf_token.
-            "csrf_token": established["csrf_token"],
             "_session": established,   # stripped before the response is sent
         }
 
@@ -344,10 +336,10 @@ def _set_session_cookies(response, established, *, secure):
     useless without the session cookie.
 
     SameSite=lax matches the existing model. Neither cookie carries a Domain,
-    so both stay host-only to the API. The session id, and anything that could
-    reconstruct it, appears in no response body and no redirect URL; the CSRF
-    token is returned in the body deliberately, because a host-only cookie is
-    not readable by a dashboard on another host.
+    so both stay host-only to the API - and neither, nor anything that could
+    reconstruct one, appears in a response body or a redirect URL. A dashboard
+    on another host cannot read the CSRF cookie, and reads its token from
+    GET /auth/session instead; see SessionManager.csrf_token.
     """
     from agent.api.sessions import CSRF_COOKIE, SESSION_COOKIE, SESSION_LIFETIME
 
