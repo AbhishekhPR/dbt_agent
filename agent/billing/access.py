@@ -30,6 +30,8 @@ from agent.billing.plans import PAID_PLANS, PLAN_FREE, access_state, at_least
 __all__ = [
     "get_workspace_plan", "workspace_has_paid_access", "at_least",
     "get_workspace_entitlements", "entitlements_for_scope", "tenant_for_scope",
+    "tenant_for_repository", "entitlements_for_repository",
+    "review_entitlements",
 ]
 
 
@@ -81,13 +83,12 @@ def get_workspace_entitlements(store, tenant_id, settings=None, *, now=None):
     return entitlements_for(get_workspace_plan(store, tenant_id, settings, now=now))
 
 
-def tenant_for_scope(store, scope):
-    """The tenant that owns the repository a service-token scope points at.
+def tenant_for_repository(store, organization_id, repository_id):
+    """The tenant that owns a repository, by GitHub owner login and name.
 
-    Service tokens are scoped to an organization and a repository -- the GitHub
-    owner login and repository name -- while billing is keyed by tenant. This
-    is the join, and it reads a mapping Relium wrote during onboarding; it
-    never creates one.
+    Billing is keyed by tenant while the review lifecycle knows only the
+    repository coordinates a webhook carried. This is the join, and it reads a
+    mapping Relium wrote during onboarding; it never creates one.
 
     Returns None when the repository was never onboarded through a tenant,
     which is the case for a deployment that predates Clerk tenancy. Callers
@@ -95,8 +96,6 @@ def tenant_for_scope(store, scope):
     workspace would break an install that was working before entitlements
     existed, and there is no subscription to enforce against anyway.
     """
-    organization_id = getattr(scope, "organization_id", None)
-    repository_id = getattr(scope, "repository_id", None)
     if not organization_id or not repository_id:
         return None
     reader = getattr(store, "tenant_for_repository_slug", None)
@@ -105,14 +104,74 @@ def tenant_for_scope(store, scope):
     return reader(str(organization_id), str(repository_id))
 
 
+def tenant_for_scope(store, scope):
+    """The tenant that owns the repository a service-token scope points at.
+
+    Service tokens are scoped to an organization and a repository -- the GitHub
+    owner login and repository name -- which is exactly the pair
+    ``tenant_for_repository`` resolves.
+    """
+    return tenant_for_repository(
+        store,
+        getattr(scope, "organization_id", None),
+        getattr(scope, "repository_id", None),
+    )
+
+
 def entitlements_for_scope(store, scope, settings=None, *, now=None):
     """Entitlements for a service-token caller. See ``tenant_for_scope``."""
+    return entitlements_for_repository(
+        store,
+        getattr(scope, "organization_id", None),
+        getattr(scope, "repository_id", None),
+        settings, now=now)
+
+
+def entitlements_for_repository(store, organization_id, repository_id,
+                                settings=None, *, now=None):
+    """Entitlements for the workspace that owns a repository.
+
+    The same question ``entitlements_for_scope`` answers, asked with the plain
+    coordinates the review lifecycle holds instead of a token scope.
+    """
     if settings is None:
         return UNMETERED
-    tenant_id = tenant_for_scope(store, scope)
+    tenant_id = tenant_for_repository(store, organization_id, repository_id)
     if tenant_id is None:
         return UNMETERED
     return get_workspace_entitlements(store, tenant_id, settings, now=now)
+
+
+def review_entitlements(store, organization_id, repository_id, *,
+                        environ=None, now=None):
+    """Entitlements for a review, resolved outside any request path.
+
+    ###################################################################
+    # THE ONE ENTITLEMENT ANSWER THE REVIEW LIFECYCLE USES.           #
+    ###################################################################
+
+    The webhook runner and the durable lifecycle worker are separate processes
+    that both begin reviews, and neither of them is handed built billing
+    configuration the way an API route is. Reading the environment here is
+    what makes the two agree: a review resumed by the worker must reach the
+    same answer as the same review begun by the runner, and it cannot do that
+    from configuration only one of them was given.
+
+    ``environ`` is a parameter rather than an implicit read so a test can vary
+    it. A deployment with no Polar configuration resolves to UNMETERED, which
+    is exactly what every deployment did before entitlements existed.
+
+    A PolarConfigurationError is deliberately NOT swallowed. Both composition
+    roots validate this configuration at boot, so reaching this function with
+    broken configuration means it changed under a running process; failing the
+    job leaves it on the outbox to retry rather than silently deciding the
+    workspace is unmetered and collecting paid evidence for free.
+    """
+    from agent.billing.config import PolarSettings
+
+    settings = PolarSettings.from_environ(environ)
+    return entitlements_for_repository(
+        store, organization_id, repository_id, settings, now=now)
 
 
 def _grace(settings):

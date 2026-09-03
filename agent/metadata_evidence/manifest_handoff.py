@@ -15,6 +15,10 @@ from agent.metadata_evidence.review_lifecycle import (
     review_id_for,
 )
 from agent.metadata_evidence.collection_plan import manifest_hash
+from agent.metadata_evidence.kpi_impact import kpi_impact_from_incident
+from agent.metadata_evidence.semantic_evidence import (
+    semantic_evidence_from_incident,
+)
 
 EVENT_TYPE = "review.manifest_resume_requested"
 
@@ -138,6 +142,12 @@ def resume_manifest_review(store, *, organization_id, repository_id,
         enforcement_mode=review.get("enforcement_mode") or "shadow",
         delivery_id=review.get("github_delivery_id"),
         code_health=int(health) if isinstance(health, int) else 100,
+        # The analysis above compared the exact base and head SQL. Dropping the
+        # result here is what made a hosted-manifest review report that no SQL
+        # semantic comparison was available for it: the comparison had run, and
+        # nothing carried it to storage.
+        semantic_evidence=semantic_evidence_from_incident(incident),
+        kpi_impact=kpi_impact_from_incident(incident),
     )
     store.enqueue_review_recomputation(
         organization_id, repository_id, environment, review_id=review_id,

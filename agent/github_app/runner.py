@@ -7,6 +7,10 @@ from agent.github_app.client import GitHubNotFoundError
 from agent.github_app.comments import upsert_review_comment
 from agent.github_app.config import DEFAULT_MANIFEST_PATH, load_repository_config
 from agent.github_app.review_comment import render_review_comment
+from agent.metadata_evidence.kpi_impact import kpi_impact_from_incident
+from agent.metadata_evidence.semantic_evidence import (
+    semantic_evidence_from_incident,
+)
 from agent.metadata_evidence.service import DisabledReviewLifecycle
 from agent.metadata_evidence.waiting_publication import (
     render_manifest_waiting_result,
@@ -332,6 +336,10 @@ class PullRequestReviewRunner:
         health = incident.get("health")
         return self.lifecycle.begin(
             semantic_evidence=_semantic_evidence(incident),
+            # The same analysis that produced the semantic comparison also
+            # inferred KPI impact. Both are lifted out here so the CI
+            # handoff path and this one persist identical evidence.
+            kpi_impact=kpi_impact_from_incident(incident),
             organization_id=str(event.repository.owner),
             repository_id=str(event.repository.name),
             pull_number=event.pull_number,
@@ -678,13 +686,8 @@ def _semantic_evidence(incident) -> dict | None:
     exactly once, during the review, and this is that same object on its way
     to storage.
 
-    Returns None when no comparison ran at all — for example when the base
-    manifest could not be fetched — so an absent comparison is stored as SQL
-    NULL and can never be read back as "compared, nothing changed".
+    The extraction itself lives in ``agent.metadata_evidence.semantic_evidence``
+    so the CI manifest handoff path, which runs the same analysis in the
+    lifecycle worker, persists the same evidence instead of NULL.
     """
-    metadata = incident.get("metadata") if isinstance(incident, dict) else None
-    comparison = (metadata or {}).get("manifest_comparison") or {}
-    evidence = comparison.get("sql_semantic_comparison")
-    if not isinstance(evidence, dict) or not evidence.get("models"):
-        return None
-    return evidence
+    return semantic_evidence_from_incident(incident)

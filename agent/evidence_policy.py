@@ -31,6 +31,15 @@ class EvidenceState(str, Enum):
     # Required evidence that has been requested and is still outstanding. A
     # review in this state has not failed; it has not finished.
     PENDING = "PENDING"
+    # Evidence this workspace's plan does not include, so it was never
+    # requested and never will be. Deliberately distinct from PENDING and from
+    # MISSING: PENDING says "asked for, still coming", MISSING says "should
+    # have been there and was not", and both imply the review is incomplete
+    # pending something a collector could still do. NOT ENTITLED says the
+    # input is out of scope for this workspace, which is a finished answer.
+    # Reporting it as PENDING is what left a Free review waiting forever for
+    # evidence it is structurally incapable of supplying.
+    NOT_ENTITLED = "NOT ENTITLED"
 
 
 class EvidenceRequirement(str, Enum):

@@ -95,8 +95,15 @@ class DirectEdgeEvidence(unittest.TestCase):
             _edges(plan),
             [("model.a.stg_orders", "model.a.dim_customers")])
 
-    def test_transitive_downstream_is_not_an_edge(self):
-        """Graph v0 is DIRECT only: a grandchild is not a direct edge."""
+    def test_transitive_downstream_is_not_a_DIRECT_edge(self):
+        """``direct_edges`` stays depth-1: a grandchild is not a direct edge.
+
+        It IS downstream, though, and the blast radius says so. The two lists
+        answer different questions - what reads a changed model, and what a
+        change reaches - and this pins the first without re-asserting the
+        truncation the second used to carry. The transitive walk is covered in
+        test_transitive_blast_radius.py.
+        """
         plan = _plan({
             "model.a.stg_orders": _model("stg_orders"),
             "model.a.int_orders": _model("int_orders", ["model.a.stg_orders"]),
@@ -106,7 +113,11 @@ class DirectEdgeEvidence(unittest.TestCase):
         self.assertEqual(
             _edges(plan),
             [("model.a.stg_orders", "model.a.int_orders")])
-        self.assertNotIn("model.a.mart_orders", plan.downstream_models)
+        # Not a direct edge, and not a collection target...
+        self.assertEqual(plan.collected_downstream_models,
+                         ["model.a.int_orders"])
+        # ...but genuinely downstream of the change.
+        self.assertIn("model.a.mart_orders", plan.downstream_models)
 
     def test_a_changed_model_reading_another_changed_model_is_not_an_edge(self):
         """Both ends changed in this PR, so the target is head-derived state

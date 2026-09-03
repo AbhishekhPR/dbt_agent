@@ -1080,12 +1080,22 @@ class ReviewDetailSurfaceTests(PublicApiTestCase):
 
         self.assertEqual(set(body["change_plan"]), {
             "changed_models", "added_dependencies", "removed_dependencies",
-            "downstream_models", "direct_edges", "targets",
+            "downstream_models", "direct_edges", "downstream_edges",
+            "collected_downstream_models", "max_downstream_depth", "targets",
         })
         self.assertEqual(body["change_plan"]["changed_models"], ["fct_orders"])
         self.assertIsInstance(body["change_plan"]["added_dependencies"], list)
         self.assertIsInstance(body["change_plan"]["removed_dependencies"], list)
         self.assertIsInstance(body["change_plan"]["downstream_models"], list)
+        # The transitive walk and the bounded collection scope are both
+        # allowlisted, and both are lists on a plan the planner produced.
+        self.assertIsInstance(body["change_plan"]["downstream_edges"], list)
+        self.assertIsInstance(
+            body["change_plan"]["collected_downstream_models"], list)
+        self.assertIsInstance(body["change_plan"]["max_downstream_depth"], int)
+        for edge in body["change_plan"]["downstream_edges"]:
+            self.assertEqual(set(edge), {"source_model_unique_id",
+                                         "target_model_unique_id", "depth"})
         self.assertTrue(body["change_plan"]["targets"])
         for target in body["change_plan"]["targets"]:
             self.assertEqual(set(target), {
@@ -1099,12 +1109,18 @@ class ReviewDetailSurfaceTests(PublicApiTestCase):
         self.assertNotIn("internal planner note", serialized)
 
     def test_review_detail_tolerates_malformed_persisted_change_plan_shapes(self):
+        # Every edge/depth field is None rather than empty: a payload this
+        # malformed recorded no walk at all, and "[]" would claim the analysis
+        # ran and found nothing downstream.
         empty_plan = {
             "changed_models": [],
             "added_dependencies": [],
             "removed_dependencies": [],
             "downstream_models": [],
             "direct_edges": None,
+            "downstream_edges": None,
+            "collected_downstream_models": None,
+            "max_downstream_depth": None,
             "targets": [],
         }
         malformed_payloads = (
@@ -1136,6 +1152,69 @@ class ReviewDetailSurfaceTests(PublicApiTestCase):
         for finding in findings:
             for field in ("code", "severity", "category", "message", "detail"):
                 self.assertIn(field, finding)
+
+    def test_attempts_expose_the_kpi_impact_that_was_inferred(self):
+        """The review API must return KPI impact bound to the attempt.
+
+        Basic KPI impact is part of the Free product contract. The inference
+        ran on every review with a project context and was then discarded, so
+        there was nothing for this endpoint to return -- see migration 0020.
+
+        The document is recorded through the store here rather than by driving
+        a whole analysis, because what is under test is the persistence and the
+        projection; that the analysis produces it, and that both review paths
+        hand it over, is proven in test_review_kpi_impact.py.
+        """
+        outcome = self._review(pull_number=4271)
+        document = {
+            "status": "evaluated",
+            "changed_models": ["int_subscription_revenue"],
+            "impacted_kpis": ["Revenue / GMV"],
+            "unaffected_kpis": [],
+            "impact_paths": [],
+            "confidence": 90,
+            "impacted_kpi_details": [{
+                "name": "Revenue / GMV", "confidence": 90,
+                "impacted_by_models": ["int_subscription_revenue"],
+                "related_columns": ["revenue"],
+                "reasons": ["Direct model match: int_subscription_revenue"],
+                "impact_paths": [], "column_impact": "fallback"}],
+            "column_level_evidence": [],
+            "fallback_reason": "changed columns unavailable",
+            "impacted_count": 1, "unaffected_count": 0,
+        }
+        with self.pool.acquire() as store:
+            store.record_review_decision(
+                self.org, self.repo, outcome.review_id,
+                decision="ALLOW", evidence_coverage="COMPLETE", health=100,
+                attempt=outcome.attempt + 1, trigger="metadata_snapshot",
+                payload={"findings": []}, kpi_impact=document)
+
+        body = self._get(f"/api/reviews/{outcome.review_id}/attempts")
+        attempts = {a["attempt"]: a for a in body["attempts"]}
+
+        carried = attempts[outcome.attempt + 1]["kpi_impact"]
+        self.assertIsNotNone(carried, "KPI impact did not reach the API")
+        self.assertEqual(carried["status"], "evaluated")
+        self.assertEqual(carried["impacted_kpis"], ["Revenue / GMV"])
+        self.assertEqual(carried["impacted_count"], 1)
+        detail = carried["impacted_kpi_details"][0]
+        self.assertEqual(detail["impacted_by_models"], ["int_subscription_revenue"])
+        self.assertTrue(detail["reasons"])
+
+    def test_an_attempt_with_no_inference_reports_null_not_empty(self):
+        """"Never inferred" and "inferred, nothing impacted" must stay apart.
+
+        Every attempt written before migration 0020 is the first case, and a
+        dashboard shown an empty document for one of those would state that no
+        KPI is affected by a change nobody ever asked the question about.
+        """
+        outcome = self._review(pull_number=4272)
+        body = self._get(f"/api/reviews/{outcome.review_id}/attempts")
+
+        first = body["attempts"][0]
+        self.assertIn("kpi_impact", first, "the field must always be present")
+        self.assertIsNone(first["kpi_impact"])
 
     def test_attempts_expose_the_lifecycle_transitions(self):
         outcome = self._review()

@@ -99,6 +99,12 @@ def recompute_review(store, *, organization_id, repository_id, environment,
     # the schema ever admits that, this must become a provenance check rather
     # than an unconditional carry-forward.
     semantic_evidence = previous.get("semantic_evidence") if previous else None
+    # Carried forward for the same reason as the semantic comparison: a
+    # recomputation re-evaluates PRODUCTION evidence against manifests that
+    # have not moved, so the KPI inference for this head SHA is unchanged.
+    # Dropping it would make attempt 2 report "not computed" for something
+    # attempt 1 established about the very same code.
+    kpi_impact = previous.get("kpi_impact") if previous else None
 
     # Computed exactly once, here, where the current snapshot is already known
     # to be durably stored and accepted - and then written down. The read path
@@ -125,6 +131,7 @@ def recompute_review(store, *, organization_id, repository_id, environment,
         payload={"findings": [f.as_dict() for f in decision.findings],
                  "snapshot_id": snapshot["snapshot_id"]},
         semantic_evidence=semantic_evidence,
+        kpi_impact=kpi_impact,
         metadata_comparison=metadata_comparison,
     )
     store.record_evidence_states(organization_id, repository_id, review_id,

@@ -96,13 +96,25 @@ def _evidence_rows(decision):
         requirement = policy.requirements.get(source, EvidenceRequirement.OPTIONAL)
         requirement = getattr(requirement, "value", str(requirement))
         if source == PRODUCTION_METADATA:
+            # NOT ENTITLED is deliberately absent from the promoting set. A
+            # source this workspace's plan excludes is not a requirement that
+            # happens to be unmet — it is out of scope — and recording it as
+            # `required` would render on the dashboard as an outstanding
+            # obligation the customer has no way to discharge.
             requirement = "required" if decision.evidence_states_available.get(
                 "production") or state in ("PENDING", "MISSING", "STALE") else "optional"
+        # Every evidence-category finding the decision engine emits is about
+        # production metadata - pending, expired, stale, partial, unsupported,
+        # not required, not entitled. Stamping that message onto every source
+        # put an explanation of the warehouse snapshot next to the base
+        # manifest row, which now reads as "the base manifest is not included
+        # on your plan". The detail belongs to the source it describes.
         detail = None
-        for finding in decision.findings:
-            if finding.category == "evidence":
-                detail = finding.message
-                break
+        if source == PRODUCTION_METADATA:
+            for finding in decision.findings:
+                if finding.category == "evidence":
+                    detail = finding.message
+                    break
         rows[source] = (requirement, state, EVIDENCE_GROUPS.get(source), detail)
     return rows
 
@@ -111,14 +123,36 @@ def begin_review(store, *, organization_id, repository_id, environment,
                  pull_number, base_sha, head_sha, base_manifest, head_manifest,
                  changed_models, enforcement_mode, delivery_id=None,
                  code_health=100, code_findings=(), critical_models=(),
-                 evidence_level="profile", now=None, semantic_evidence=None):
+                 evidence_level="profile", now=None, semantic_evidence=None,
+                 kpi_impact=None, entitlements=None):
     """Persist a genuine GitHub review and decide what to publish.
 
     Returns a LifecycleOutcome. When production evidence is required and not
     yet available the outcome carries ``waiting=True`` and ``decision=None`` -
     the review has not failed, it has not finished.
+
+    ###################################################################
+    # WAITING IS ONLY LEGITIMATE WHEN SOMETHING CAN STILL ARRIVE.     #
+    ###################################################################
+
+    ``entitlements`` says what this workspace's plan includes, and it is
+    resolved here rather than by the caller because the two callers are
+    different processes - the webhook runner and the lifecycle worker - and a
+    review must reach the same answer whichever one begins it. Passing it
+    explicitly is for tests, which must be able to vary a plan without varying
+    the environment.
+
+    A workspace whose plan excludes warehouse evidence cannot submit a
+    snapshot at all: the collector endpoint refuses it with 402 before the
+    store ever sees it. So no collection request is created, no
+    acknowledgement is expected, and the review proceeds to a decision on the
+    evidence it actually has.
     """
     now = now or datetime.now(timezone.utc)
+    if entitlements is None:
+        from agent.billing.access import review_entitlements
+
+        entitlements = review_entitlements(store, organization_id, repository_id)
     review_id = review_id_for(repository_id, pull_number, head_sha)
     base_hash = manifest_hash(base_manifest)
     head_hash = manifest_hash(head_manifest)
@@ -130,6 +164,8 @@ def begin_review(store, *, organization_id, repository_id, environment,
         changed_models=changed_models,
         evidence_level=evidence_level,
         critical_models=critical_models,
+        warehouse_evidence_entitled=bool(
+            getattr(entitlements, "warehouse_evidence", True)),
     )
     plan_dict = plan.as_dict()
 
@@ -179,7 +215,10 @@ def begin_review(store, *, organization_id, repository_id, environment,
                       "policy_version": policy.version,
                       "policy_hash": policy.content_hash,
                       "ttl_minutes": ttl_minutes_for(criticality),
-                      "downstream_models": plan_dict["downstream_models"],
+                      # The bounded set the collector is asked about, which is
+                      # narrower than the blast radius the review reports.
+                      "downstream_models": plan_dict["collected_downstream_models"],
+                      "impacted_downstream_models": plan_dict["downstream_models"],
                       "added_dependencies": plan_dict["added_dependencies"],
                       "removed_dependencies": plan_dict["removed_dependencies"]},
             )
@@ -220,6 +259,10 @@ def begin_review(store, *, organization_id, repository_id, environment,
         # recomputed for storage.
         semantic_evidence=semantic_evidence,
         metadata_comparison=metadata_comparison,
+        # Same rule, same reason: the KPI inference ran during analysis
+        # and its result is carried here rather than re-derived, so the
+        # attempt records what the decision was actually taken against.
+        kpi_impact=kpi_impact,
     )
     store.record_evidence_states(organization_id, repository_id, review_id, attempt,
                                  _evidence_rows(decision))
