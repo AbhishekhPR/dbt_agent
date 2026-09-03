@@ -7,7 +7,9 @@ identity that lets it call /api at all.
 No route here returns a GitHub token, a refresh token or the client secret,
 and none of those values is written to a log. What the browser gets is an
 opaque session id in an HttpOnly cookie and a CSRF token it must echo back on
-mutations.
+mutations. The CSRF token is returned by /auth/session as well as set as a
+cookie, because in production the dashboard and the API are different hosts
+and a host-only cookie is not readable across them.
 """
 from __future__ import annotations
 
@@ -127,17 +129,30 @@ def create_auth_routes(*, store_pool, session_manager, dashboard_url,
     async def session(request):
         """Who the browser currently is, if anyone.
 
-        The dashboard calls this on load. It returns identity and authority
-        only — never a credential.
+        The dashboard calls this on load. It returns identity, authority and
+        the session's CSRF token — never a credential.
+
+        ``csrf_token`` is here because the dashboard and the API are different
+        hosts in production, so the script-readable CSRF cookie the API sets on
+        ``api.relium.dev`` is invisible to ``document.cookie`` on
+        ``app.relium.dev``. See ``SessionManager.csrf_token``. It is safe to
+        return: this response is reachable only with the session cookie
+        attached, and CORS lists the dashboard origin exactly, so no other page
+        can read the body. It is also useless alone — a mutation still needs
+        the HttpOnly session cookie, which script cannot touch.
         """
         session_id = request.cookies.get(SESSION_COOKIE)
 
         def work():
             with store_pool.acquire() as store:
-                return session_manager.authenticate(store, session_id)
+                principal = session_manager.authenticate(store, session_id)
+                # Read inside the same acquisition: a second one could observe
+                # a session revoked in between and report no token for an
+                # identity it just confirmed.
+                return principal, session_manager.csrf_token(store, session_id)
 
         try:
-            principal = await run_in_threadpool(work)
+            principal, csrf_token = await run_in_threadpool(work)
         except SessionError:
             return JSONResponse({"authenticated": False}, status_code=401)
 
@@ -149,6 +164,7 @@ def create_auth_routes(*, store_pool, session_manager, dashboard_url,
             "environment": principal.environment,
             "github_permission": principal.github_permission,
             "may_govern": principal.may_govern,
+            "csrf_token": csrf_token,
         })
 
     async def logout(request):

@@ -70,6 +70,14 @@ DEPLOYMENT_EVENT_TYPES = {"created"} | set(ALLOWED_TRANSITIONS) | {
 }
 SEVERITIES = {"low", "medium", "high", "critical"}
 COVERAGE_STATES = {"COMPLETE", "INCOMPLETE", "UNKNOWN"}
+
+#: Machine-readable reasons a cookie-authenticated mutation was refused before
+#: it reached a handler. The dashboard branches on these; the prose beside them
+#: is for a human reading a log, and must never be what code matches on.
+CODE_ORIGIN_REQUIRED = "origin_required"
+CODE_ORIGIN_NOT_ALLOWED = "origin_not_allowed"
+CODE_CSRF_TOKEN_INVALID = "csrf_token_invalid"
+
 SUPPORTED_METRICS = {
     "row_count", "null_rate", "duplicate_rate", "freshness",
     "cardinality", "schema", "kpi_value",
@@ -460,18 +468,26 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
 
         SameSite is not relied on alone: the dashboard and the API share a
         registrable domain, so a sibling subdomain would be same-site.
+
+        Each refusal carries a ``code`` as well as prose. The dashboard has to
+        tell "your token is stale, re-read it and retry" apart from "you may
+        not do this", and it must not do that by matching on an English
+        sentence.
         """
         origin = request.headers.get("Origin")
         if allowed_origins:
             if not origin:
                 raise _HttpError(403, {"status": "forbidden",
+                                       "code": CODE_ORIGIN_REQUIRED,
                                        "detail": "Origin header is required"})
             if origin not in allowed_origins:
                 raise _HttpError(403, {"status": "forbidden",
+                                       "code": CODE_ORIGIN_NOT_ALLOWED,
                                        "detail": "origin is not allowed"})
         if not session_manager.verify_csrf(
                 store, session_id, request.headers.get(CSRF_HEADER)):
             raise _HttpError(403, {"status": "forbidden",
+                                   "code": CODE_CSRF_TOKEN_INVALID,
                                    "detail": "missing or invalid CSRF token"})
 
     def handler(fn, *, write: bool, capability=None, download=False,

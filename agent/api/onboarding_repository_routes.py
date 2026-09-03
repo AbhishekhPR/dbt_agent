@@ -335,8 +335,11 @@ def _set_session_cookies(response, established, *, secure):
     readable because the dashboard has to echo it on mutations, and it is
     useless without the session cookie.
 
-    SameSite=lax matches the existing model. Neither cookie, nor anything that
-    could reconstruct one, appears in the response body or a redirect URL.
+    SameSite=lax matches the existing model. Neither cookie carries a Domain,
+    so both stay host-only to the API - and neither, nor anything that could
+    reconstruct one, appears in a response body or a redirect URL. A dashboard
+    on another host cannot read the CSRF cookie, and reads its token from
+    GET /auth/session instead; see SessionManager.csrf_token.
     """
     from agent.api.sessions import CSRF_COOKIE, SESSION_COOKIE, SESSION_LIFETIME
 
