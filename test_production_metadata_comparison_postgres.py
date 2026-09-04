@@ -97,7 +97,7 @@ class ProductionComparisonPostgresTests(unittest.TestCase):
 
     def submit(self, *, observed_at, relations=(), organization_id=ORG,
                repository_id=REPO, environment=ENV, completeness="COMPLETE",
-               review_id=None, snapshot_id=None):
+               freshness_state="CURRENT", review_id=None, snapshot_id=None):
         """Persist a snapshot through the real storage path."""
         snapshot_id = snapshot_id or f"snap-{uuid.uuid4().hex[:16]}"
         snapshot, created = self.store.submit_metadata_snapshot(
@@ -107,7 +107,8 @@ class ProductionComparisonPostgresTests(unittest.TestCase):
             payload_hash=f"ph-{snapshot_id}",
             evidence_hash=f"eh-{snapshot_id}",
             observed_at=observed_at, collected_at=observed_at,
-            completeness=completeness, review_id=review_id,
+            completeness=completeness, freshness_state=freshness_state,
+            review_id=review_id,
             relations=list(relations),
         )
         self.assertTrue(created)
@@ -233,6 +234,42 @@ class ProductionComparisonPostgresTests(unittest.TestCase):
         current = self.submit(observed_at=at(112), relations=[orders()])
         self.assertEqual(self.baseline_of(current)["snapshot_id"],
                          eligible["snapshot_id"])
+
+    def test_a_stale_snapshot_is_not_an_eligible_baseline(self):
+        environment = f"stale-baseline-{uuid.uuid4().hex[:8]}"
+        self.store.ensure_tenant(ORG, REPO, environment)
+        eligible = self.submit(
+            observed_at=at(113), relations=[orders(row_count=1000)],
+            environment=environment,
+        )
+        self.submit(
+            observed_at=at(114), relations=[orders(row_count=10)],
+            environment=environment, freshness_state="STALE",
+        )
+        current = self.submit(
+            observed_at=at(115), relations=[orders(row_count=900)],
+            environment=environment,
+        )
+
+        baseline = self.baseline_of(current)
+        self.assertEqual(baseline["snapshot_id"], eligible["snapshot_id"])
+        comparison = self.compare(current)
+        self.assertEqual(comparison["baseline_snapshot_id"], eligible["snapshot_id"])
+        self.assertEqual(comparison["changes"][0]["absolute_delta"], -100)
+
+    def test_stale_only_history_produces_no_baseline(self):
+        environment = f"stale-only-{uuid.uuid4().hex[:8]}"
+        self.store.ensure_tenant(ORG, REPO, environment)
+        self.submit(
+            observed_at=at(116), relations=[orders()],
+            environment=environment, freshness_state="PARTIALLY_STALE",
+        )
+        current = self.submit(
+            observed_at=at(117), relations=[orders()], environment=environment,
+        )
+
+        self.assertIsNone(self.baseline_of(current))
+        self.assertEqual(self.compare(current)["status"], "no_baseline")
 
     def test_a_tie_on_observed_at_is_broken_deterministically(self):
         moment = at(120)

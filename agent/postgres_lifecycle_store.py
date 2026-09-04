@@ -18,7 +18,10 @@ from datetime import datetime, timedelta, timezone
 
 from agent.lifecycle_models import ALLOWED_TRANSITIONS
 from agent.metadata_evidence.change_request import normalize_remote_review_id
-from agent.metadata_evidence.production_comparison import ELIGIBLE_COMPLETENESS
+from agent.metadata_evidence.production_comparison import (
+    ELIGIBLE_COMPLETENESS,
+    ELIGIBLE_FRESHNESS,
+)
 from agent.postgres_migrate import apply_migrations
 
 OUTBOX_LEASE_SECONDS = 300
@@ -2979,8 +2982,9 @@ class PostgresLifecycleStore:
         never the current snapshot, is never from another repository or
         organization, and is never from another environment.
 
-        A snapshot whose collection FAILED is excluded: it is a record that
-        collection did not work, not an observation of production.
+        A snapshot whose collection FAILED or whose freshness is not CURRENT
+        is excluded: both remain audit records, but neither is an eligible
+        baseline description of production.
         """
         if received_at is None:
             # Only reachable for a snapshot that has not been read back from
@@ -2993,11 +2997,12 @@ class PostgresLifecycleStore:
             "SELECT snapshot_id FROM metadata_snapshots "
             "WHERE organization_id=%s AND repository_id=%s AND environment=%s "
             "AND completeness = ANY(%s) "
+            "AND freshness_state = ANY(%s) "
             "AND snapshot_id <> %s "
             "AND (observed_at, received_at, snapshot_id) < (%s, %s, %s) "
             "ORDER BY observed_at DESC, received_at DESC, snapshot_id DESC LIMIT 1",
             (organization_id, repository_id, environment,
-             list(ELIGIBLE_COMPLETENESS), snapshot_id,
+             list(ELIGIBLE_COMPLETENESS), list(ELIGIBLE_FRESHNESS), snapshot_id,
              observed_at, received_at, snapshot_id),
         ).fetchone()
         if row is None:
