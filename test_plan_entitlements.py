@@ -769,10 +769,12 @@ class HistoryWindowTests(unittest.TestCase):
         from agent.postgres_lifecycle_store import PostgresLifecycleStore
 
         source = inspect.getsource(PostgresLifecycleStore.list_reviews)
-        # The docstring says "deletion" precisely because there is none, so
-        # strip it before looking for the statement.
-        code = source.replace(PostgresLifecycleStore.list_reviews.__doc__ or "", "")
-        self.assertNotIn("DELETE", code.upper())
+        # Match an executable SQL statement, not prose in the function's
+        # docstring. ``inspect`` preserves source indentation while ``__doc__``
+        # is dedented, so string replacement was interpreter-dependent and
+        # produced a false failure on Python 3.14.
+        self.assertNotRegex(source.upper(), r"\bDELETE\s+FROM\b")
+        code = source
         self.assertIn("created_at >=", code)
 
 
