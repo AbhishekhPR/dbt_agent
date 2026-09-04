@@ -256,6 +256,20 @@ class CollectorArtifactTests(unittest.TestCase):
             "779efed43584ebd2eaffd60c4893468046259dc35047ca588d59205e96708343",
             guide)
 
+    def test_install_guide_uses_supported_commands_for_every_launch_os(self):
+        guide = (ROOT / "docs" / "collector-install.md").read_text(
+            encoding="utf-8")
+        for expected in (
+            "Windows PowerShell", "macOS", "Linux", "Expand-Archive",
+            "Get-FileHash", "shasum -a 256 -c SHA256SUMS",
+            "sha256sum --check SHA256SUMS",
+            r".venv\Scripts\relium.exe collect --test",
+            ".venv/bin/relium collect --test",
+        ):
+            self.assertIn(expected, guide)
+        self.assertNotIn("python -m relium", guide)
+        self.assertNotIn("python -m agent", guide)
+
     def test_package_workflow_builds_tests_and_checksums_the_same_wheel(self):
         workflow = (ROOT / ".github" / "workflows" /
                     "collector-package.yml").read_text(encoding="utf-8")
@@ -266,6 +280,44 @@ class CollectorArtifactTests(unittest.TestCase):
         self.assertIn("sha256sum --check SHA256SUMS", workflow)
         self.assertIn("path: |", workflow)
         self.assertIn("dist/SHA256SUMS", workflow)
+
+    def test_production_image_builds_one_versioned_collector_bundle(self):
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("AS collector-builder", dockerfile)
+        self.assertEqual(dockerfile.count("python -m build --wheel"), 1)
+        for pin in ('"build==1.2.2.post1"', '"setuptools==80.9.0"',
+                    '"wheel==0.45.1"'):
+            self.assertIn(pin, dockerfile)
+        self.assertIn("python -m build --wheel --no-isolation", dockerfile)
+        self.assertIn("relium-0.1.0-py3-none-any.whl", dockerfile)
+        self.assertIn("sha256sum relium-0.1.0-py3-none-any.whl > SHA256SUMS",
+                      dockerfile)
+        self.assertIn("sha256sum --check SHA256SUMS", dockerfile)
+        self.assertIn("relium-collector-0.1.0.zip", dockerfile)
+
+    def test_runtime_copies_the_finished_bundle_without_rebuilding_it(self):
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        runtime = dockerfile.split("FROM python:3.10-slim-bookworm", 2)[-1]
+        self.assertIn("COPY --from=collector-builder", runtime)
+        self.assertIn("/app/artifacts/relium-collector-0.1.0.zip", runtime)
+        self.assertNotIn("python -m build", runtime)
+
+    def test_bundle_creation_names_only_the_wheel_and_checksum(self):
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        zip_line = next(
+            line.strip() for line in dockerfile.splitlines()
+            if "zipfile -c" in line
+        )
+        self.assertTrue(zip_line.endswith(
+            "relium-0.1.0-py3-none-any.whl SHA256SUMS"), zip_line)
+        for forbidden in ("RELIUM_API_TOKEN", "RELIUM_WAREHOUSE_DSN",
+                          "workspace_id", "repository_id"):
+            self.assertNotIn(forbidden, zip_line)
+
+    def test_docker_context_includes_the_package_metadata_inputs(self):
+        dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
+        self.assertIn("!pyproject.toml", dockerignore)
+        self.assertIn("!README.md", dockerignore)
 
 
 # ------------------------------------------------------ token lifecycle

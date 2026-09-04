@@ -8,10 +8,10 @@ an endpoint cannot be documented without being served.
 ## Boundaries
 
 - Every `/api/*` route authenticates either a service token; a server-verified
-  Clerk session, for onboarding and billing; or, for the single Polar billing
-  callback, a Standard Webhooks signature over the raw request body. The GitHub
-  webhook keeps its own HMAC signature authentication and never accepts any of
-  the others.
+  Clerk session, for onboarding and billing; a GitHub dashboard session, for
+  the collector package; or, for the single Polar billing callback, a Standard
+  Webhooks signature over the raw request body. The GitHub webhook keeps its
+  own HMAC signature authentication and never accepts any of the others.
 - Handlers call a service layer, which calls `PostgresLifecycleStore`. No
   handler touches a connection, cursor or SQL string.
 - The API has no SQLite, in-memory, filesystem or fake persistence fallback.
@@ -124,3 +124,13 @@ rejected with `422`.
 `GET /readyz` reports PostgreSQL reachability, whether migrations are current,
 configuration presence, and outbox counts by state. It performs reads only and
 never mutates lifecycle data. It discloses no configuration values.
+# Collector package download
+
+`GET /api/collector-package` returns the immutable, production-image-built
+`relium-collector-0.1.0.zip` attachment. It requires an authenticated GitHub
+dashboard session and the workspace's `warehouse_evidence` entitlement;
+service tokens, including collector and operator-read tokens, are refused.
+Successful responses are `application/zip`, use `Cache-Control: private,
+no-store`, and contain exactly `relium-0.1.0-py3-none-any.whl` plus
+`SHA256SUMS`. The archive is built once with the image and is never generated
+per request.

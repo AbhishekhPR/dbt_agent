@@ -1,5 +1,5 @@
 {
-  "contract_version": "1.1.0",
+  "contract_version": "1.2.0",
   "dashboard_resources": {
     "anomaly_list": "/api/anomalies",
     "collection_request_detail": "/api/collection-requests/{request_id}",
@@ -32,6 +32,7 @@
     "GET /api/billing/subscription",
     "GET /api/collection-requests",
     "GET /api/collection-requests/{request_id}",
+    "GET /api/collector-package",
     "GET /api/collector-setup",
     "GET /api/delivery-status",
     "GET /api/deployments",
@@ -168,6 +169,11 @@
       "authentication": "service-token",
       "method": "POST",
       "path": "/api/collection-requests/{request_id}/failure"
+    },
+    {
+      "authentication": "github-dashboard-session",
+      "method": "GET",
+      "path": "/api/collector-package"
     },
     {
       "authentication": "service-token",

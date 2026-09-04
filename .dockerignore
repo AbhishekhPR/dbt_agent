@@ -3,6 +3,8 @@
 **
 !Dockerfile
 !requirements.lock
+!pyproject.toml
+!README.md
 !agent/
 !agent/**
 

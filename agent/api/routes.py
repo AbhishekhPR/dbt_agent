@@ -11,18 +11,25 @@ import json
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import JSONResponse, Response
+from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
 from agent.api.collector_routes import COLLECTOR_ROUTES, build_handlers
+from agent.api.collector_package import (
+    COLLECTOR_BUNDLE_FILENAME,
+    CollectorPackageUnavailable,
+    resolve_collector_package,
+)
 from agent.billing.entitlements import RUNTIME_EVIDENCE, WAREHOUSE_EVIDENCE
 from agent.collector.adapters import POSTGRES_ADAPTER, SUPPORTED_ADAPTERS
 from agent.api.auth import AuthenticationError, AuthorizationError, ServiceTokenAuthenticator, bearer_token
 from agent.api.authorization import (
-    CI_MANIFEST_INGEST, COLLECTION_REQUEST_READ, COLLECTOR_INGEST, DASHBOARD_READ,
-    GOVERNANCE_WRITE, PIPELINE_INGEST, CapabilityError, authorize,
+    CI_MANIFEST_INGEST, COLLECTION_REQUEST_READ, COLLECTOR_INGEST,
+    COLLECTOR_PACKAGE_DOWNLOAD, DASHBOARD_READ, GOVERNANCE_WRITE,
+    PIPELINE_INGEST, CapabilityError, authorize,
 )
 from agent.api.sessions import CSRF_HEADER, SESSION_COOKIE, SessionError
 from agent.metadata_evidence.evidence_export import (
@@ -375,7 +382,8 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
                       identity_linker=None, app_url="",
                       repository_service=None, api_url="",
                       dashboard_bridge=None, secure_cookies=True,
-                      billing_service=None, billing_settings=None):
+                      billing_service=None, billing_settings=None,
+                      collector_package_path=None):
     """Build the /api route table. Registration stays explicit and inspectable.
 
     Every route declares the capability it needs. Authentication answers *who*
@@ -532,6 +540,17 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
                 result = await run_in_threadpool(work)
                 if download:
                     status, payload, filename = result
+                    if isinstance(payload, Path):
+                        return FileResponse(
+                            payload,
+                            status_code=status,
+                            media_type="application/zip",
+                            filename=filename,
+                            headers={
+                                "X-Request-Id": request_id,
+                                "Cache-Control": "private, no-store",
+                            },
+                        )
                     # A str payload is already the artifact and is written
                     # verbatim: re-encoding Markdown as JSON would change the
                     # bytes the caller asked for. Anything else is a JSON
@@ -1584,6 +1603,16 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
             entries.sort(key=lambda e: e["event_key"])
         return 200, {"environment": environment, "channels": channels}
 
+    def collector_package(request, body, scope, service):
+        try:
+            package = resolve_collector_package(collector_package_path)
+        except CollectorPackageUnavailable:
+            raise _HttpError(503, {
+                "status": "unavailable",
+                "detail": "collector package is not available in this build",
+            }) from None
+        return 200, package, COLLECTOR_BUNDLE_FILENAME
+
     _collector = build_handlers()
 
     routes = [
@@ -1644,6 +1673,10 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
         Route("/api/delivery-status", handler(delivery_status, write=False), methods=["GET"]),
         Route("/api/collector-setup",
               handler(collector_setup, write=False,
+                      plan_capability=WAREHOUSE_EVIDENCE), methods=["GET"]),
+        Route("/api/collector-package",
+              handler(collector_package, write=False, download=True,
+                      capability=COLLECTOR_PACKAGE_DOWNLOAD,
                       plan_capability=WAREHOUSE_EVIDENCE), methods=["GET"]),
         Route("/api/collector-tokens",
               handler(issue_dashboard_collector_token, write=True,

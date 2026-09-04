@@ -33,7 +33,7 @@
 - [ ] Create failing tests in `test_collector_package.py` that build a two-file ZIP fixture and assert `GET /api/collector-package` is present, returns its exact bytes as `application/zip`, names `relium-collector-0.1.0.zip`, sets `Cache-Control: private, no-store`, rejects an unauthenticated caller, rejects a dashboard user without `warehouse_evidence`, and cannot be authorized by a collector token.
 - [ ] Run `python -m pytest test_collector_package.py test_api_contract.py -q`; expect failures for the absent module and route.
 - [ ] Add `agent/api/collector_package.py` with constants `COLLECTOR_VERSION = "0.1.0"`, `COLLECTOR_WHEEL_FILENAME = "relium-0.1.0-py3-none-any.whl"`, `COLLECTOR_BUNDLE_FILENAME = "relium-collector-0.1.0.zip"`, a default `/app/artifacts/...` path, and a resolver that accepts a deployment/test path but fails closed unless it is a regular file.
-- [ ] Extend the existing authenticated download wrapper in `agent/api/routes.py` to serve a validated `Path` with `FileResponse`, explicit `application/zip`, attachment disposition, request id, and private no-store caching. Register `GET /api/collector-package` with `DASHBOARD_READ` and `plan_capability=WAREHOUSE_EVIDENCE`.
+- [ ] Extend the existing authenticated download wrapper in `agent/api/routes.py` to serve a validated `Path` with `FileResponse`, explicit `application/zip`, attachment disposition, request id, and private no-store caching. Register `GET /api/collector-package` with the human-only `COLLECTOR_PACKAGE_DOWNLOAD` capability and `plan_capability=WAREHOUSE_EVIDENCE`.
 - [ ] Add the route to `MANDATORY_ROUTES`, regenerate `docs/api-contract.json`, and document the endpoint in `docs/public-api.md`.
 - [ ] Re-run the focused backend tests; expect PASS.
 

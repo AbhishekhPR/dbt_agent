@@ -13,7 +13,7 @@ from starlette.routing import Route
 
 from agent.dashboard_contracts import DASHBOARD_RESOURCES
 
-CONTRACT_VERSION = "1.1.0"
+CONTRACT_VERSION = "1.2.0"
 
 # Request bodies whose shape is part of the public contract. This remains
 # separate from route registration metadata so the served route table stays a
@@ -84,6 +84,7 @@ MANDATORY_ROUTES = {
     ("POST", "/api/collectors"),
     ("POST", "/api/collectors/verification"),
     ("GET", "/api/collector-setup"),
+    ("GET", "/api/collector-package"),
     ("POST", "/api/collector-tokens"),
     ("POST", "/api/collector-tokens/{token_id}/revoke"),
     # Review detail surface. These expose evidence the store already held but
@@ -160,6 +161,7 @@ AUTHENTICATION = {
     # Authenticated by the Clerk bearer; SETS the GitHub dashboard session
     # cookie. The two credentials meet here and nowhere else.
     "/api/onboarding/dashboard-session": "clerk-session",
+    "/api/collector-package": "github-dashboard-session",
     "/api/billing/checkout": "clerk-session",
     "/api/billing/subscription": "clerk-session",
     "/api/billing/portal": "clerk-session",
@@ -183,7 +185,8 @@ AUTHENTICATION = {
 #: mode is absent from this set is unauthenticated, which is the thing the
 #: contract test exists to prevent.
 AUTHENTICATED_MODES = frozenset({
-    "service-token", "clerk-session", "polar-webhook-signature",
+    "service-token", "clerk-session", "github-dashboard-session",
+    "polar-webhook-signature",
 })
 
 

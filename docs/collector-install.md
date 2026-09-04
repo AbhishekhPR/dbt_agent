@@ -71,31 +71,47 @@ will show only the non-secret token id.
 
 ---
 
-## 5. Install the collector
+## 5. Download, verify, and install the collector
 
-Check the artifact before installing it. You are about to run this code
-against your warehouse, and the checksum is how you confirm the file you
-received is the file we built.
+In **Integrations → Warehouse evidence**, select **Download collector**. The
+authenticated response saves `relium-collector-0.1.0.zip`. It contains exactly
+`relium-0.1.0-py3-none-any.whl` and `SHA256SUMS`; the checksum was generated
+from that exact wheel during the production image build.
+
+Run the commands for your operating system from the directory where the browser
+saved the ZIP. If verification fails, stop and contact Relium. Do not install
+the wheel.
+
+### Windows PowerShell
+
+```powershell
+Expand-Archive -LiteralPath .\relium-collector-0.1.0.zip -DestinationPath .\relium-collector-0.1.0
+Set-Location .\relium-collector-0.1.0
+$expected = ((Get-Content -LiteralPath .\SHA256SUMS -Raw).Trim() -split '\s+')[0].ToLower()
+$actual = (Get-FileHash -LiteralPath .\relium-0.1.0-py3-none-any.whl -Algorithm SHA256).Hash.ToLower()
+if ($actual -ne $expected) { throw 'SHA-256 verification failed' }
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install .\relium-0.1.0-py3-none-any.whl
+```
+
+### macOS
 
 ```bash
+unzip relium-collector-0.1.0.zip -d relium-collector-0.1.0
+cd relium-collector-0.1.0
+shasum -a 256 -c SHA256SUMS
+python3 -m venv .venv
+.venv/bin/python -m pip install ./relium-0.1.0-py3-none-any.whl
+```
+
+### Linux
+
+```bash
+unzip relium-collector-0.1.0.zip -d relium-collector-0.1.0
+cd relium-collector-0.1.0
 sha256sum --check SHA256SUMS
-```
-
-Every supported collector bundle contains the wheel and the `SHA256SUMS` file
-generated from that exact wheel in the same packaging job. If verification
-fails, stop and contact your Relium contact. Do not install it. A checksum
-copied into documentation is intentionally not used because it can drift from
-the artifact it describes.
-
-```bash
-python -m venv /opt/relium/venv
-/opt/relium/venv/bin/pip install relium-0.1.0-py3-none-any.whl
-```
-
-Verify:
-
-```bash
-/opt/relium/venv/bin/relium collect --help
+python3 -m venv .venv
+.venv/bin/python -m pip install ./relium-0.1.0-py3-none-any.whl
 ```
 
 The wheel depends only on `click` and `psycopg`. If `pip` pulls anything
@@ -116,7 +132,18 @@ beyond those and their own dependencies, you have the wrong artifact.
 | `RELIUM_API_TIMEOUT_SECONDS` | no | API call timeout. Default `30`. |
 | `RELIUM_API_CA_BUNDLE` | no | PEM bundle for a private or inspecting CA. |
 
-Example:
+Windows PowerShell:
+
+```powershell
+$env:RELIUM_API_URL = "https://api.relium.example.com"
+$env:RELIUM_API_TOKEN = "rlm_...."
+$env:RELIUM_WAREHOUSE_DSN = "postgresql://relium_collector:PASSWORD@warehouse.internal:5432/analytics?sslmode=require"
+$env:RELIUM_ENVIRONMENT = "production"
+$env:RELIUM_COLLECTOR_ID = "acme-prod-collector"
+.\.venv\Scripts\relium.exe collect --test
+```
+
+macOS and Linux:
 
 ```bash
 export RELIUM_API_URL="https://api.relium.example.com"
@@ -124,6 +151,7 @@ export RELIUM_API_TOKEN="rlm_...."
 export RELIUM_WAREHOUSE_DSN="postgresql://relium_collector:PASSWORD@warehouse.internal:5432/analytics?sslmode=require"
 export RELIUM_ENVIRONMENT="production"
 export RELIUM_COLLECTOR_ID="acme-prod-collector"
+.venv/bin/relium collect --test
 ```
 
 Store these in a secrets manager or a `0600` environment file owned by the
@@ -138,9 +166,8 @@ Use `sslmode=require` (or stricter) in the warehouse DSN.
 
 ## 7. Verify connectivity
 
-```bash
-relium collect --test
-```
+The supported installed entry point is `relium`. The connectivity command is
+`relium collect --test` (using the virtual-environment paths shown above).
 
 This registers the collector, opens the same server-enforced read-only
 PostgreSQL session used for collection, runs `SELECT 1`, records the verified
