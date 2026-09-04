@@ -57,6 +57,22 @@ class PostgresMetadataReader:
 
     __str__ = __repr__
 
+    def verify_connection(self):
+        """Prove the configured credentials can open a read-only session.
+
+        Registration proves only that the collector can reach Relium. This
+        deliberately opens the same server-enforced read-only connection used
+        for collection and executes a constant query, so dashboard health is
+        never inferred from token or tenant activity.
+        """
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                row = cursor.fetchone()
+        if not row or row[0] != 1:
+            raise WarehouseUnavailable("warehouse verification returned no result")
+        return True
+
     def _connect(self):
         try:
             import psycopg

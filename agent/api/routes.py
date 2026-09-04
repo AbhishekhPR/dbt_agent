@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse, Response
@@ -140,6 +140,7 @@ _COLLECTOR_CAPABILITY = {
     "submit_manifest_evidence": CI_MANIFEST_INGEST,
     "submit_snapshot": COLLECTOR_INGEST,
     "register_collector": COLLECTOR_INGEST,
+    "report_collector_verification": COLLECTOR_INGEST,
     # Read by the dashboard only; the collector never asks for these.
     "get_snapshot_status": DASHBOARD_READ,
     "get_review_evidence_coverage": DASHBOARD_READ,
@@ -603,6 +604,113 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
             event_type=event_type, idempotency_key=key, payload=payload,
         )
         return (202 if created else 200), {"status": "accepted", **response}
+
+    def issue_dashboard_collector_token(request, body, scope, service):
+        """Mint one environment-scoped secret for an authenticated maintainer."""
+        from agent.collector.provisioning import issue_collector_token
+
+        environment = scope.require_environment(optional_str(body, "environment"))
+        token_id, presented = issue_collector_token(
+            service.store,
+            organization_id=scope.organization_id,
+            repository_id=scope.repository_id,
+            environment=environment,
+            description=optional_str(body, "description"),
+        )
+        return 201, {
+            "status": "issued", "token_id": token_id,
+            "token": presented, "environment": environment,
+            "one_time_secret": True,
+        }
+
+    def revoke_dashboard_collector_token(request, body, scope, service):
+        token_id = request.path_params["token_id"]
+        revoked = service.store.revoke_service_token_for_scope(
+            scope.organization_id, scope.repository_id, token_id,
+            scope="collector")
+        if not revoked:
+            raise NotFoundError("collector token not found")
+        return 200, {"status": "revoked", "token_id": token_id}
+
+    def collector_setup(request, body, scope, service):
+        """One truthful dashboard projection for setup and current health."""
+        environment = scope.require_environment(
+            request.query_params.get("environment"))
+        now = _utcnow()
+        tokens = service.store.list_service_tokens(
+            scope.organization_id, scope.repository_id,
+            environment=environment, scope="collector")
+        active_tokens = [
+            row for row in tokens
+            if row.get("revoked_at") is None
+            and (row.get("expires_at") is None or row["expires_at"] > now)
+        ]
+        collectors = service.store.list_collectors(
+            scope.organization_id, scope.repository_id,
+            environment=environment)
+        collector = collectors[0] if collectors else None
+        stale_after = timedelta(minutes=5)
+
+        if collector is None and not active_tokens:
+            connection_status = "not_configured"
+        elif collector is None:
+            connection_status = "configured_never_seen"
+        elif (collector.get("verification_status") == "verified"
+              and collector.get("last_verified_at") is not None
+              and collector["last_verified_at"] >= now - stale_after):
+            connection_status = "connected"
+        else:
+            connection_status = "stale"
+
+        waiting = service.store.waiting_metadata_reviews(
+            scope.organization_id, scope.repository_id,
+            environment=environment)
+
+        def iso(value):
+            return value.isoformat() if hasattr(value, "isoformat") else value
+
+        collector_view = None
+        if collector is not None:
+            collector_view = {
+                "collector_id": collector["collector_id"],
+                "collector_version": collector.get("collector_version"),
+                "adapter_type": collector.get("adapter_type"),
+                "description": collector.get("description"),
+                "last_seen_at": iso(collector.get("last_seen_at")),
+                "last_verified_at": iso(collector.get("last_verified_at")),
+                "last_failed_at": iso(collector.get("last_failed_at")),
+                "verification_status": collector.get("verification_status"),
+                "verification_error_category":
+                    collector.get("verification_error_category"),
+            }
+        return 200, {
+            "status": "ok",
+            "environment": environment,
+            "connection_status": connection_status,
+            "supported_adapters": ["postgresql"],
+            "request_ttl_minutes": 30,
+            "stale_after_seconds": int(stale_after.total_seconds()),
+            "collector": collector_view,
+            "tokens": [
+                {"token_id": row["token_id"],
+                 "description": row.get("description"),
+                 "created_at": iso(row.get("created_at")),
+                 "expires_at": iso(row.get("expires_at")),
+                 "revoked_at": iso(row.get("revoked_at"))}
+                for row in tokens
+            ],
+            "waiting_reviews": [
+                {"review_id": row["review_id"],
+                 "pull_number": row.get("pull_number"),
+                 "lifecycle_state": row["lifecycle_state"],
+                 "request_id": row.get("request_id"),
+                 "expires_at": iso(row.get("expires_at"))}
+                for row in waiting
+            ],
+            "action_required": (
+                "Run `relium collect --test`, then schedule `relium collect`."
+                if waiting and connection_status != "connected" else None),
+        }
 
     def post_baseline(request, body, scope, service):
         key = require_idempotency_key(body, request.headers)
@@ -1521,6 +1629,15 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
         Route("/api/repositories/{repository}/settings", handler(repository_settings, write=False), methods=["GET"]),
         Route("/api/evidence-coverage", handler(evidence_coverage, write=False), methods=["GET"]),
         Route("/api/delivery-status", handler(delivery_status, write=False), methods=["GET"]),
+        Route("/api/collector-setup",
+              handler(collector_setup, write=False,
+                      plan_capability=WAREHOUSE_EVIDENCE), methods=["GET"]),
+        Route("/api/collector-tokens",
+              handler(issue_dashboard_collector_token, write=True,
+                      plan_capability=WAREHOUSE_EVIDENCE), methods=["POST"]),
+        Route("/api/collector-tokens/{token_id}/revoke",
+              handler(revoke_dashboard_collector_token, write=True,
+                      plan_capability=WAREHOUSE_EVIDENCE), methods=["POST"]),
 
         # Collector control and metadata snapshot surface. Registered on the
         # same application, behind the same authentication and tenant scoping.

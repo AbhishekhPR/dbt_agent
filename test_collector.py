@@ -102,12 +102,16 @@ class _RecordingReader:
     def missing_relation(relation_name):
         return PostgresMetadataReader.missing_relation(relation_name)
 
+    def verify_connection(self):
+        return True
+
 
 class _FakeClient:
     def __init__(self, submit_status=202, requests=None):
         self.submitted = []
         self.failures = []
         self.acknowledged = []
+        self.verifications = []
         self._submit_status = submit_status
         self.registered = False
         self._requests = requests if requests is not None else [_request()]
@@ -131,6 +135,11 @@ class _FakeClient:
 
     def report_failure(self, request_id, reason):
         self.failures.append((request_id, reason))
+        return {"status": "recorded"}
+
+    def report_verification(self, *, status, error_category=None):
+        self.verifications.append({"status": status,
+                                   "error_category": error_category})
         return {"status": "recorded"}
 
     def submit_snapshot(self, snapshot, idempotency_key):
@@ -334,6 +343,40 @@ class RequestValidationTests(unittest.TestCase):
 # --------------------------------------------------------- identity + replay
 
 class IdentityAndReplayTests(unittest.TestCase):
+    def test_idle_run_registers_a_heartbeat_but_does_not_claim_connectivity(self):
+        client = _FakeClient(requests=[])
+        reader = _RecordingReader()
+        outcome = run_collection(_config(), client=client, reader=reader)
+        self.assertTrue(outcome.ok)
+        self.assertTrue(client.registered)
+        self.assertEqual(client.verifications, [])
+        self.assertEqual(reader.calls, [])
+
+    def test_explicit_verification_reaches_the_warehouse_and_reports_success(self):
+        client = _FakeClient(requests=[])
+        reader = _RecordingReader()
+        outcome = run_collection(
+            _config(), client=client, reader=reader, verify_only=True)
+        self.assertTrue(outcome.ok)
+        self.assertTrue(client.registered)
+        self.assertEqual(client.verifications, [
+            {"status": "verified", "error_category": None}])
+
+    def test_failed_verification_reports_only_a_safe_error_category(self):
+        from agent.collector.warehouse import WarehouseUnavailable
+
+        class _BrokenVerificationReader(_RecordingReader):
+            def verify_connection(self):
+                raise WarehouseUnavailable(
+                    "could not connect to the warehouse (OperationalError)")
+
+        client = _FakeClient(requests=[])
+        outcome = run_collection(
+            _config(), client=client, reader=_BrokenVerificationReader(),
+            verify_only=True)
+        self.assertFalse(outcome.ok)
+        self.assertEqual(client.verifications, [
+            {"status": "failed", "error_category": "warehouse_unavailable"}])
     def test_collector_preserves_review_and_attempt_identity(self):
         client = _FakeClient()
         request = _request(attempt=3)

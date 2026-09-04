@@ -1664,7 +1664,8 @@ class PostgresLifecycleStore:
         self.connection.execute(
             "DELETE FROM oauth_authorization_states WHERE expires_at < %s", (before,))
 
-    def list_service_tokens(self, organization_id=None, repository_id=None):
+    def list_service_tokens(self, organization_id=None, repository_id=None,
+                            *, environment=None, scope=None):
         """Tokens for an operator to identify later. The hash is never returned.
 
         A token has to be findable after issuance - to audit it, or to revoke
@@ -1672,7 +1673,7 @@ class PostgresLifecycleStore:
         is unrecoverable by design.
         """
         sql = ("SELECT token_id, organization_id, repository_id, environment, "
-               "description, created_at, expires_at, revoked_at "
+               "scope, description, created_at, expires_at, revoked_at "
                "FROM api_service_tokens")
         clauses, args = [], []
         if organization_id is not None:
@@ -1681,6 +1682,12 @@ class PostgresLifecycleStore:
         if repository_id is not None:
             clauses.append("repository_id=%s")
             args.append(repository_id)
+        if environment is not None:
+            clauses.append("environment=%s")
+            args.append(environment)
+        if scope is not None:
+            clauses.append("scope=%s")
+            args.append(scope)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY created_at DESC"
@@ -1697,6 +1704,17 @@ class PostgresLifecycleStore:
             "UPDATE api_service_tokens SET revoked_at=now() "
             "WHERE token_id=%s AND revoked_at IS NULL RETURNING token_id",
             (token_id,),
+        ).fetchone()
+        return row is not None
+
+    def revoke_service_token_for_scope(self, organization_id, repository_id,
+                                       token_id, *, scope):
+        """Revoke only when the named token belongs to this exact tenant."""
+        row = self.connection.execute(
+            "UPDATE api_service_tokens SET revoked_at=now() "
+            "WHERE token_id=%s AND organization_id=%s AND repository_id=%s "
+            "AND scope=%s AND revoked_at IS NULL RETURNING token_id",
+            (token_id, organization_id, repository_id, scope),
         ).fetchone()
         return row is not None
 
@@ -2536,12 +2554,61 @@ class PostgresLifecycleStore:
             "environment, token_id, collector_version, adapter_type, description) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (organization_id, repository_id, collector_id) DO UPDATE SET "
+            "token_id=EXCLUDED.token_id, "
             "collector_version=EXCLUDED.collector_version, "
-            "adapter_type=EXCLUDED.adapter_type, last_seen_at=now() RETURNING *",
+            "adapter_type=EXCLUDED.adapter_type, description=COALESCE("
+            "EXCLUDED.description, collector_identities.description), "
+            "last_seen_at=now(), revoked=FALSE, revoked_at=NULL, "
+            "revoked_reason=NULL RETURNING *",
             (organization_id, repository_id, collector_id, environment, token_id,
              collector_version, adapter_type, description),
         ).fetchone()
         return dict(row)
+
+    def list_collectors(self, organization_id, repository_id, *, environment=None):
+        sql = ("SELECT * FROM collector_identities WHERE organization_id=%s "
+               "AND repository_id=%s AND revoked=FALSE")
+        args = [organization_id, repository_id]
+        if environment is not None:
+            sql += " AND environment=%s"
+            args.append(environment)
+        sql += " ORDER BY last_seen_at DESC NULLS LAST, created_at DESC"
+        return [dict(row) for row in self.connection.execute(sql, tuple(args)).fetchall()]
+
+    def record_collector_verification(self, organization_id, repository_id,
+                                      environment, *, collector_id, token_id,
+                                      status, error_category=None):
+        if status not in ("verified", "failed"):
+            raise ValueError("invalid collector verification status")
+        timestamp_column = ("last_verified_at" if status == "verified"
+                            else "last_failed_at")
+        row = self.connection.execute(
+            f"UPDATE collector_identities SET verification_status=%s, "
+            f"verification_error_category=%s, {timestamp_column}=now(), "
+            "last_seen_at=now() WHERE organization_id=%s AND repository_id=%s "
+            "AND environment=%s AND collector_id=%s AND token_id=%s "
+            "AND revoked=FALSE RETURNING *",
+            (status, error_category, organization_id, repository_id,
+             environment, collector_id, token_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def waiting_metadata_reviews(self, organization_id, repository_id, *,
+                                 environment):
+        rows = self.connection.execute(
+            "SELECT r.review_id, r.pull_number, r.lifecycle_state, "
+            "cr.request_id, cr.expires_at FROM reviews r "
+            "LEFT JOIN LATERAL (SELECT request_id, expires_at FROM "
+            "collection_requests WHERE organization_id=r.organization_id "
+            "AND repository_id=r.repository_id AND review_id=r.review_id "
+            "AND state IN ('PENDING','ACKNOWLEDGED') ORDER BY created_at DESC "
+            "LIMIT 1) cr ON TRUE WHERE r.organization_id=%s "
+            "AND r.repository_id=%s AND r.environment=%s "
+            "AND r.lifecycle_state IN ('METADATA_REQUESTED','WAITING_FOR_METADATA') "
+            "ORDER BY r.updated_at DESC",
+            (organization_id, repository_id, environment),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def revoke_collector(self, organization_id, repository_id, collector_id, *, reason=None):
         self.connection.execute(

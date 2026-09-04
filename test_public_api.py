@@ -1673,6 +1673,107 @@ class BrowserAuthorizationBoundaryTests(PublicApiTestCase):
         self.assertEqual(
             self._session_get("/api/collection-requests", session).status_code, 403)
 
+    # -- warehouse evidence setup ---------------------------------------
+
+    def test_warehouse_setup_is_not_configured_when_only_tenant_exists(self):
+        environment = f"warehouse-{uuid.uuid4().hex[:8]}"
+        with self.pool.acquire() as store:
+            store.ensure_tenant(self.org, self.repo, environment)
+        session = self._sign_in(WRITE_PERMISSIONS, env=environment)
+
+        response = self._session_get(
+            f"/api/collector-setup?environment={environment}", session)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["connection_status"], "not_configured")
+        self.assertEqual(payload["supported_adapters"], ["postgresql"])
+        self.assertEqual(payload["request_ttl_minutes"], 30)
+        self.assertIsNone(payload["collector"])
+
+    def test_collector_token_is_shown_once_then_never_projected(self):
+        environment = f"warehouse-{uuid.uuid4().hex[:8]}"
+        with self.pool.acquire() as store:
+            store.ensure_tenant(self.org, self.repo, environment)
+        session = self._sign_in(WRITE_PERMISSIONS, env=environment)
+
+        issued = self._session_post(
+            "/api/collector-tokens",
+            {"environment": environment, "description": "Production collector"},
+            session)
+        self.assertEqual(issued.status_code, 201, issued.text)
+        secret = issued.json()["token"]
+        token_id = issued.json()["token_id"]
+        self.assertTrue(secret.startswith("rlm_"))
+        self.assertTrue(issued.json()["one_time_secret"])
+
+        setup = self._session_get(
+            f"/api/collector-setup?environment={environment}", session)
+        self.assertEqual(setup.status_code, 200, setup.text)
+        payload = setup.json()
+        self.assertEqual(payload["connection_status"], "configured_never_seen")
+        self.assertEqual(payload["tokens"][0]["token_id"], token_id)
+        self.assertNotIn(secret, json.dumps(payload, default=str))
+        self.assertNotIn("secret_hash", json.dumps(payload, default=str))
+
+    def test_recent_verification_is_connected_and_old_verification_is_stale(self):
+        environment = f"warehouse-{uuid.uuid4().hex[:8]}"
+        with self.pool.acquire() as store:
+            store.ensure_tenant(self.org, self.repo, environment)
+        session = self._sign_in(WRITE_PERMISSIONS, env=environment)
+        issued = self._session_post(
+            "/api/collector-tokens", {"environment": environment}, session)
+        self.assertEqual(issued.status_code, 201, issued.text)
+        token = issued.json()["token"]
+        collector_id = f"collector-{uuid.uuid4().hex[:8]}"
+        auth = {"Authorization": f"Bearer {token}",
+                "Idempotency-Key": uuid.uuid4().hex}
+
+        registered = self.client.post(
+            "/api/collectors",
+            json={"collector_id": collector_id, "environment": environment,
+                  "collector_version": "0.1.0", "adapter_type": "postgresql"},
+            headers=auth)
+        self.assertEqual(registered.status_code, 200, registered.text)
+
+        verified = self.client.post(
+            "/api/collectors/verification",
+            json={"collector_id": collector_id, "environment": environment,
+                  "status": "verified"},
+            headers={**auth, "Idempotency-Key": uuid.uuid4().hex})
+        self.assertEqual(verified.status_code, 200, verified.text)
+
+        setup = self._session_get(
+            f"/api/collector-setup?environment={environment}", session)
+        self.assertEqual(setup.status_code, 200, setup.text)
+        self.assertEqual(setup.json()["connection_status"], "connected")
+        self.assertEqual(setup.json()["collector"]["collector_id"], collector_id)
+        self.assertIsNotNone(setup.json()["collector"]["last_seen_at"])
+        self.assertIsNotNone(setup.json()["collector"]["last_verified_at"])
+
+        with self.pool.acquire() as store:
+            store.connection.execute(
+                "UPDATE collector_identities SET last_verified_at=now() - "
+                "interval '10 minutes' WHERE organization_id=%s AND "
+                "repository_id=%s AND collector_id=%s",
+                (self.org, self.repo, collector_id))
+        stale = self._session_get(
+            f"/api/collector-setup?environment={environment}", session)
+        self.assertEqual(stale.status_code, 200, stale.text)
+        self.assertEqual(stale.json()["connection_status"], "stale")
+
+    def test_collector_token_cannot_issue_or_list_collector_tokens(self):
+        self.assertEqual(
+            self.client.post(
+                "/api/collector-tokens", json={"environment": self.env},
+                headers=self.ingest_auth).status_code,
+            403)
+        self.assertEqual(
+            self.client.get(
+                f"/api/collector-setup?environment={self.env}",
+                headers=self.ingest_auth).status_code,
+            403)
+
     # -- actor -------------------------------------------------------------
 
     def test_body_supplied_actor_is_rejected(self):

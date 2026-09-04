@@ -82,6 +82,10 @@ MANDATORY_ROUTES = {
     ("GET", "/api/metadata-snapshots/{snapshot_id}"),
     ("GET", "/api/reviews/{review_id}/evidence-coverage"),
     ("POST", "/api/collectors"),
+    ("POST", "/api/collectors/verification"),
+    ("GET", "/api/collector-setup"),
+    ("POST", "/api/collector-tokens"),
+    ("POST", "/api/collector-tokens/{token_id}/revoke"),
     # Review detail surface. These expose evidence the store already held but
     # nothing could read: findings, attempt history, what was requested from
     # the collector, which snapshots answered it, and where it was published.

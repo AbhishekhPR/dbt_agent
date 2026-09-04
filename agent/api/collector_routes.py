@@ -52,6 +52,7 @@ MAX_TEXT_VALUE = 256
 
 COLLECTION_STATUSES = {"COLLECTED", "PARTIAL", "UNSUPPORTED", "FAILED", "SKIPPED"}
 COMPLETENESS = {"COMPLETE", "PARTIAL", "FAILED"}
+VERIFICATION_STATUSES = {"verified", "failed"}
 
 # Anything matching these must never arrive in, or be persisted from, a
 # snapshot payload.
@@ -544,6 +545,7 @@ def build_handlers():
         row = service.store.register_collector(
             scope.organization_id, scope.repository_id, environment,
             collector_id=collector_id,
+            token_id=scope.token_id,
             collector_version=optional_str(body, "collector_version"),
             adapter_type=optional_str(body, "adapter_type"),
             description=optional_str(body, "description"))
@@ -551,6 +553,29 @@ def build_handlers():
             "collector_id": row["collector_id"], "environment": row["environment"],
             "collector_version": row["collector_version"],
             "adapter_type": row["adapter_type"], "revoked": row["revoked"]}}
+
+    def report_collector_verification(request, body, scope, service):
+        collector_id = require_str(body, "collector_id")
+        environment = scope.require_environment(optional_str(body, "environment"))
+        status = optional_choice(body, "status", VERIFICATION_STATUSES)
+        if status is None:
+            raise ValidationError("status is required")
+        error_category = optional_str(body, "error_category")
+        if status == "verified":
+            error_category = None
+        row = service.store.record_collector_verification(
+            scope.organization_id, scope.repository_id, environment,
+            collector_id=collector_id, token_id=scope.token_id,
+            status=status, error_category=_bounded(error_category))
+        if row is None:
+            raise NotFoundError("collector not found")
+        return 200, {"status": "recorded", "collector": {
+            "collector_id": row["collector_id"],
+            "environment": row["environment"],
+            "verification_status": row["verification_status"],
+            "last_seen_at": row["last_seen_at"].isoformat(),
+            "last_verified_at": (row["last_verified_at"].isoformat()
+                                 if row.get("last_verified_at") else None)}}
 
     return {
         "list_collection_requests": list_collection_requests,
@@ -562,6 +587,7 @@ def build_handlers():
         "get_snapshot_status": get_snapshot_status,
         "get_review_evidence_coverage": get_review_evidence_coverage,
         "register_collector": register_collector,
+        "report_collector_verification": report_collector_verification,
     }
 
 
@@ -578,4 +604,6 @@ COLLECTOR_ROUTES = (
     ("GET", "/api/reviews/{review_id}/evidence-coverage",
      "get_review_evidence_coverage", False),
     ("POST", "/api/collectors", "register_collector", True),
+    ("POST", "/api/collectors/verification",
+     "report_collector_verification", True),
 )
