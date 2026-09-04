@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 from agent.github_app.checks import CHECK_NAME, build_check_run_payload
 from agent.github_app.review_comment import render_review_comment
+from agent.metadata_evidence.decision_explanation import explanation_for_attempt
 
 EVENT_TYPE = "review.publication_reconcile_requested"
 
@@ -44,6 +45,7 @@ def build_review_result(review, attempt):
     """
     findings = list((attempt.get("payload") or {}).get("findings") or [])
     decision = attempt.get("decision") or review.get("decision")
+    explanation = explanation_for_attempt({**attempt, "decision": decision})
 
     if decision is None:
         from agent.metadata_evidence.waiting_publication import render_waiting_result
@@ -76,12 +78,17 @@ def build_review_result(review, attempt):
         measured = ", ".join(f"{k}={v}" for k, v in sorted(detail.items()))
         target = ".".join(p for p in (finding.get("relation"),
                                       finding.get("column")) if p)
+        is_code = finding.get("category") == "code"
         material.append({
             "rule": finding.get("code"),
-            "title": f"{finding.get('code')}{f' — {target}' if target else ''}",
+            "title": (
+                detail.get("title") if is_code and detail.get("title")
+                else f"{finding.get('code')}{f' — {target}' if target else ''}"
+            ),
             "impact": finding.get("message"),
             "recommended_fix": (
-                f"Measured: {measured}." if measured
+                detail.get("recommended_fix") if is_code and detail.get("recommended_fix")
+                else f"Measured: {measured}." if measured
                 else "Review the production evidence for this relation."),
         })
 
@@ -106,7 +113,15 @@ def build_review_result(review, attempt):
                 f["relation"] for f in findings
                 if isinstance(f, dict) and f.get("relation")
             }),
+            "top_reasons": ([explanation["primary_reason"]]
+                            if explanation["primary_reason"] else []),
+            "recommendation": (
+                material[0]["recommended_fix"] if material
+                else "Review the recorded decision reason before merging."
+            ) if decision in {"WARN", "BLOCK"} else "Proceed with deployment.",
         },
+        "primary_reason": explanation["primary_reason"],
+        "health_explanation": explanation["health_explanation"],
     }
 
 

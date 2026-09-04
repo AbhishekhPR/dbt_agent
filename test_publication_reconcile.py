@@ -145,6 +145,29 @@ class ResultShapeTests(unittest.TestCase):
                                          _attempt(decision=decision))
             self.assertEqual(result["incident"]["severity"], severity)
 
+    def test_block_uses_the_persisted_primary_reason(self):
+        reason = "The LEFT JOIN filter drops rows without succeeded payments."
+        attempt = _attempt(
+            decision="BLOCK",
+            payload={"findings": [], "primary_reason": reason},
+        )
+        result = build_review_result(_review(decision="BLOCK"), attempt)
+        self.assertEqual(result["incident"]["top_reasons"], [reason])
+
+    def test_legacy_block_without_findings_gets_an_explicit_health_reason(self):
+        attempt = _attempt(decision="BLOCK", health=65, payload={"findings": []})
+        result = build_review_result(_review(decision="BLOCK"), attempt)
+        self.assertEqual(
+            result["incident"]["top_reasons"],
+            ["Code review health is 65/100, below the 70-point merge threshold."],
+        )
+
+    def test_allow_with_no_findings_does_not_invent_a_primary_reason(self):
+        result = build_review_result(
+            _review(decision="ALLOW"), _attempt(decision="ALLOW", findings=[])
+        )
+        self.assertEqual(result["incident"]["top_reasons"], [])
+
 
 class ReconciliationTests(unittest.TestCase):
     def _run(self, store, publisher, **kwargs):

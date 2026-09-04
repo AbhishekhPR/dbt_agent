@@ -32,6 +32,7 @@ from agent.metadata_evidence.impact_report import (
     impact_report_filename,
     render_review_impact_report,
 )
+from agent.metadata_evidence.decision_explanation import explanation_for_attempt
 from agent.api.service import (
     ConflictError,
     LifecycleService,
@@ -1070,8 +1071,9 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
                     "trigger": a.get("trigger"),
                     "snapshot_id": a.get("snapshot_id"),
                     "created_at": isoformat(a.get("created_at")),
-                    "findings": [_finding_view(f)
-                                 for f in (a.get("payload") or {}).get("findings", [])],
+                     "findings": [_finding_view(f)
+                                  for f in (a.get("payload") or {}).get("findings", [])],
+                     **explanation_for_attempt(a),
                 }
                 for a in attempts
             ],
@@ -1108,9 +1110,10 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
                  # Same binding rule: this describes the two production
                  # observations THIS attempt compared, and is never re-derived
                  # from whatever the newest snapshot happens to be now.
-                 "metadata_comparison": _metadata_comparison_view(
-                     a.get("metadata_comparison")),
-                 "created_at": isoformat(a.get("created_at"))}
+                  "metadata_comparison": _metadata_comparison_view(
+                      a.get("metadata_comparison")),
+                  **explanation_for_attempt(a),
+                  "created_at": isoformat(a.get("created_at"))}
                 for a in attempts
             ],
             "transitions": [

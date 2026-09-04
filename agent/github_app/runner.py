@@ -337,6 +337,7 @@ class PullRequestReviewRunner:
         return self.lifecycle.begin(
             semantic_evidence=_semantic_evidence(incident),
             code_findings=lifecycle_code_findings(result),
+            health_explanation=result.get("health_explanation"),
             organization_id=str(event.repository.owner),
             repository_id=str(event.repository.name),
             pull_number=event.pull_number,

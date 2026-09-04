@@ -128,6 +128,7 @@ def _review_project_context_change(
 
     lifecycle = _deployment_lifecycle_metadata(review)
     material_findings = _material_ast_findings(review.incident)
+    health_explanation = _health_explanation(review.incident)
     incident = render_json(review.incident)
     cli_text = render_cli(review.incident)
     markdown = render_markdown(review.incident)
@@ -141,6 +142,7 @@ def _review_project_context_change(
         "changed_files": _ordered_unique(list(changed_files or [])),
         "changed_models": [spec["name"] for spec in model_specs],
         "material_findings": material_findings,
+        "health_explanation": health_explanation,
         "sql_sources": sql_sources,
         "semantic_comparison": {
             "evaluated": bool((metadata or {}).get("semantic_comparison_evaluated")),
@@ -154,6 +156,28 @@ def _review_project_context_change(
             "cli": f"{cli_text}\n\nDeployment History\n" + "\n".join(cli_status),
             "markdown": f"{markdown}\n\n## Deployment History\n" + "\n".join(markdown_status),
         },
+    }
+
+
+def _health_explanation(incident) -> dict:
+    deductions = []
+    for signal in incident.signals:
+        if signal.score >= 0:
+            continue
+        reason = next((str(value).strip() for value in signal.reasons or []
+                       if str(value).strip()), None)
+        if not reason:
+            reason = f"{signal.component} reduced code review health"
+        deductions.append({
+            "component": str(signal.component),
+            "points": abs(int(signal.score)),
+            "reason": reason,
+        })
+    return {
+        "score": int(incident.health),
+        "label": "Code review health",
+        "basis": "static_code_and_manifest_analysis",
+        "deductions": deductions,
     }
 
 

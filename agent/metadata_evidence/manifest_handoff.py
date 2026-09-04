@@ -143,6 +143,7 @@ def resume_manifest_review(store, *, organization_id, repository_id,
         delivery_id=review.get("github_delivery_id"),
         code_health=int(health) if isinstance(health, int) else 100,
         code_findings=lifecycle_code_findings(result),
+        health_explanation=result.get("health_explanation"),
         semantic_evidence=semantic_evidence_from_incident(incident),
     )
     store.enqueue_review_recomputation(
