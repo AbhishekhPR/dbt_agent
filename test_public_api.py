@@ -1687,7 +1687,7 @@ class BrowserAuthorizationBoundaryTests(PublicApiTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
         self.assertEqual(payload["connection_status"], "not_configured")
-        self.assertEqual(payload["supported_adapters"], ["postgresql"])
+        self.assertEqual(payload["supported_adapters"], ["postgres"])
         self.assertEqual(payload["request_ttl_minutes"], 30)
         self.assertIsNone(payload["collector"])
 
@@ -1732,7 +1732,7 @@ class BrowserAuthorizationBoundaryTests(PublicApiTestCase):
         registered = self.client.post(
             "/api/collectors",
             json={"collector_id": collector_id, "environment": environment,
-                  "collector_version": "0.1.0", "adapter_type": "postgresql"},
+                  "collector_version": "0.1.0", "adapter_type": "postgres"},
             headers=auth)
         self.assertEqual(registered.status_code, 200, registered.text)
 
@@ -1761,6 +1761,70 @@ class BrowserAuthorizationBoundaryTests(PublicApiTestCase):
             f"/api/collector-setup?environment={environment}", session)
         self.assertEqual(stale.status_code, 200, stale.text)
         self.assertEqual(stale.json()["connection_status"], "stale")
+
+    def test_revoked_verification_cannot_remain_connected_or_attach_to_a_new_token(self):
+        environment = f"warehouse-{uuid.uuid4().hex[:8]}"
+        with self.pool.acquire() as store:
+            store.ensure_tenant(self.org, self.repo, environment)
+        session = self._sign_in(WRITE_PERMISSIONS, env=environment)
+        issued = self._session_post(
+            "/api/collector-tokens", {"environment": environment}, session)
+        token_id = issued.json()["token_id"]
+        token = issued.json()["token"]
+        collector_id = f"collector-{uuid.uuid4().hex[:8]}"
+        auth = {"Authorization": f"Bearer {token}"}
+        registered = self.client.post(
+            "/api/collectors",
+            json={"collector_id": collector_id, "environment": environment,
+                  "adapter_type": "postgres"}, headers=auth)
+        self.assertEqual(registered.status_code, 200, registered.text)
+        verified = self.client.post(
+            "/api/collectors/verification",
+            json={"collector_id": collector_id, "environment": environment,
+                  "status": "verified"}, headers=auth)
+        self.assertEqual(verified.status_code, 200, verified.text)
+
+        revoked = self._session_post(
+            f"/api/collector-tokens/{token_id}/revoke", {}, session)
+        self.assertEqual(revoked.status_code, 200, revoked.text)
+        without_token = self._session_get(
+            f"/api/collector-setup?environment={environment}", session).json()
+        self.assertEqual(without_token["connection_status"], "not_configured")
+        self.assertIsNone(without_token["collector"])
+
+        replacement = self._session_post(
+            "/api/collector-tokens", {"environment": environment}, session)
+        self.assertEqual(replacement.status_code, 201, replacement.text)
+        awaiting_replacement = self._session_get(
+            f"/api/collector-setup?environment={environment}", session).json()
+        self.assertEqual(
+            awaiting_replacement["connection_status"], "configured_never_seen")
+        self.assertIsNone(awaiting_replacement["collector"])
+
+    def test_collector_registration_requires_the_supported_adapter(self):
+        for adapter in (None, "snowflake", "postgresql"):
+            body = {"collector_id": f"collector-{uuid.uuid4().hex[:8]}",
+                    "environment": self.env}
+            if adapter is not None:
+                body["adapter_type"] = adapter
+            response = self.client.post(
+                "/api/collectors", json=body, headers=self.ingest_auth)
+            self.assertEqual(response.status_code, 422, (adapter, response.text))
+
+    def test_verification_rejects_arbitrary_error_text(self):
+        collector_id = f"collector-{uuid.uuid4().hex[:8]}"
+        registered = self.client.post(
+            "/api/collectors",
+            json={"collector_id": collector_id, "environment": self.env,
+                  "adapter_type": "postgres"}, headers=self.ingest_auth)
+        self.assertEqual(registered.status_code, 200, registered.text)
+        response = self.client.post(
+            "/api/collectors/verification",
+            json={"collector_id": collector_id, "environment": self.env,
+                  "status": "failed",
+                  "error_category": "password=must-never-be-persisted"},
+            headers=self.ingest_auth)
+        self.assertEqual(response.status_code, 422, response.text)
 
     def test_collector_token_cannot_issue_or_list_collector_tokens(self):
         self.assertEqual(

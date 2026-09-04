@@ -251,7 +251,10 @@ def semantic_evidence_from_incident(incident) -> dict | None:
     metadata = incident.get("metadata") if isinstance(incident, dict) else None
     comparison = (metadata or {}).get("manifest_comparison") or {}
     evidence = comparison.get("sql_semantic_comparison")
-    if not isinstance(evidence, dict) or not evidence.get("models"):
+    if not isinstance(evidence, dict) or not any(
+        isinstance(model, dict) and model.get("status") == "evaluated"
+        for model in (evidence.get("models") or [])
+    ):
         return None
     return evidence
 

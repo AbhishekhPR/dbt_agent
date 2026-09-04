@@ -23,6 +23,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from agent.api.service import ConflictError, NotFoundError
+from agent.collector.adapters import POSTGRES_ADAPTER, SUPPORTED_ADAPTERS
 from agent.api.validation import (
     ValidationError,
     optional_choice,
@@ -53,6 +54,7 @@ MAX_TEXT_VALUE = 256
 COLLECTION_STATUSES = {"COLLECTED", "PARTIAL", "UNSUPPORTED", "FAILED", "SKIPPED"}
 COMPLETENESS = {"COMPLETE", "PARTIAL", "FAILED"}
 VERIFICATION_STATUSES = {"verified", "failed"}
+VERIFICATION_ERROR_CATEGORIES = {"warehouse_unavailable"}
 
 # Anything matching these must never arrive in, or be persisted from, a
 # snapshot payload.
@@ -380,6 +382,7 @@ def build_handlers():
         collected_at = body.get("collected_at")
         collected_at = require_timestamp(body, "collected_at") if collected_at else observed_at
 
+        adapter_type = optional_choice(body, "adapter_type", SUPPORTED_ADAPTERS)
         relations = _parse_relations(body)
         metrics = _parse_metrics(body)
 
@@ -423,7 +426,7 @@ def build_handlers():
                 relations=relations, metrics=metrics,
                 collector_id=collector_id,
                 collector_version=optional_str(body, "collector_version"),
-                adapter_type=optional_str(body, "adapter_type"),
+                adapter_type=adapter_type,
                 request_id=request_id, review_id=review_id,
                 base_sha=optional_str(body, "base_sha"),
                 head_sha=optional_str(body, "head_sha"),
@@ -542,12 +545,15 @@ def build_handlers():
     def register_collector(request, body, scope, service):
         collector_id = require_str(body, "collector_id")
         environment = scope.require_environment(optional_str(body, "environment"))
+        adapter_type = optional_choice(body, "adapter_type", SUPPORTED_ADAPTERS)
+        if adapter_type is None:
+            raise ValidationError("adapter_type is required")
         row = service.store.register_collector(
             scope.organization_id, scope.repository_id, environment,
             collector_id=collector_id,
             token_id=scope.token_id,
             collector_version=optional_str(body, "collector_version"),
-            adapter_type=optional_str(body, "adapter_type"),
+            adapter_type=adapter_type,
             description=optional_str(body, "description"))
         return 200, {"status": "registered", "collector": {
             "collector_id": row["collector_id"], "environment": row["environment"],
@@ -560,13 +566,18 @@ def build_handlers():
         status = optional_choice(body, "status", VERIFICATION_STATUSES)
         if status is None:
             raise ValidationError("status is required")
-        error_category = optional_str(body, "error_category")
+        error_category = optional_choice(
+            body, "error_category", VERIFICATION_ERROR_CATEGORIES)
         if status == "verified":
             error_category = None
+        elif error_category is None:
+            raise ValidationError(
+                "error_category is required when verification fails")
         row = service.store.record_collector_verification(
             scope.organization_id, scope.repository_id, environment,
             collector_id=collector_id, token_id=scope.token_id,
-            status=status, error_category=_bounded(error_category))
+            status=status, error_category=error_category,
+            adapter_type=POSTGRES_ADAPTER)
         if row is None:
             raise NotFoundError("collector not found")
         return 200, {"status": "recorded", "collector": {

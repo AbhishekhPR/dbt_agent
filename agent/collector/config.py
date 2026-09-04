@@ -15,6 +15,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from agent.collector.adapters import POSTGRES_ADAPTER
+
 DEFAULT_ENVIRONMENT = "production"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_STATEMENT_TIMEOUT_MS = 30_000
@@ -45,7 +47,7 @@ class CollectorConfig:
     warehouse_dsn: str = field(repr=False)
     environment: str = DEFAULT_ENVIRONMENT
     collector_id: str = "relium-collector"
-    adapter_type: str = "postgres"
+    adapter_type: str = POSTGRES_ADAPTER
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS
     ca_bundle: str | None = None

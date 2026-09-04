@@ -2577,7 +2577,8 @@ class PostgresLifecycleStore:
 
     def record_collector_verification(self, organization_id, repository_id,
                                       environment, *, collector_id, token_id,
-                                      status, error_category=None):
+                                      status, adapter_type,
+                                      error_category=None):
         if status not in ("verified", "failed"):
             raise ValueError("invalid collector verification status")
         timestamp_column = ("last_verified_at" if status == "verified"
@@ -2587,9 +2588,9 @@ class PostgresLifecycleStore:
             f"verification_error_category=%s, {timestamp_column}=now(), "
             "last_seen_at=now() WHERE organization_id=%s AND repository_id=%s "
             "AND environment=%s AND collector_id=%s AND token_id=%s "
-            "AND revoked=FALSE RETURNING *",
+            "AND adapter_type=%s AND revoked=FALSE RETURNING *",
             (status, error_category, organization_id, repository_id,
-             environment, collector_id, token_id),
+             environment, collector_id, token_id, adapter_type),
         ).fetchone()
         return dict(row) if row else None
 

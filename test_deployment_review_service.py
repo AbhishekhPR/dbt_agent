@@ -5,7 +5,10 @@ from unittest.mock import patch
 
 from agent.ast_analyzer import run_ast_analysis
 from agent.decision_assembly import assemble_decision_incident
-from agent.deployment_review_service import review_manifest_change
+from agent.deployment_review_service import (
+    review_manifest_change,
+    semantic_evidence_from_incident,
+)
 
 
 RISKY_SQL = """SELECT
@@ -19,6 +22,31 @@ GROUP BY o.customer_id"""
 
 
 class DeploymentReviewServiceTests(unittest.TestCase):
+    def test_semantic_evidence_requires_at_least_one_evaluated_model(self):
+        unavailable = {
+            "status": "unavailable",
+            "models": [{"model_name": "missing_sql", "status": "unavailable"}],
+        }
+        incident = {"metadata": {"manifest_comparison": {
+            "sql_semantic_comparison": unavailable,
+        }}}
+
+        self.assertIsNone(semantic_evidence_from_incident(incident))
+
+    def test_partial_semantic_evidence_keeps_supported_models(self):
+        partial = {
+            "status": "partial",
+            "models": [
+                {"model_name": "supported", "status": "evaluated", "changes": []},
+                {"model_name": "missing_sql", "status": "unavailable"},
+            ],
+        }
+        incident = {"metadata": {"manifest_comparison": {
+            "sql_semantic_comparison": partial,
+        }}}
+
+        self.assertIs(semantic_evidence_from_incident(incident), partial)
+
     def test_raw_code_is_preferred_for_customer_authored_ast_analysis(self):
         manifest = _manifest(
             compiled_code=RISKY_SQL,

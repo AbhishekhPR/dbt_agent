@@ -214,6 +214,38 @@ class NetworkConfigurationTests(unittest.TestCase):
         self.assertIn("RELIUM_API_TOKEN", message)
         self.assertIn("RELIUM_WAREHOUSE_DSN", message)
 
+    def test_verification_sanitizes_query_and_cleanup_failures(self):
+        from agent.collector.warehouse import (
+            PostgresMetadataReader,
+            WarehouseUnavailable,
+        )
+
+        class BrokenCursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def execute(self, _sql):
+                raise RuntimeError("password=must-never-leave-the-host")
+
+        class BrokenConnection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def cursor(self):
+                return BrokenCursor()
+
+        reader = PostgresMetadataReader("postgresql://secret")
+        reader._connect = BrokenConnection
+        with self.assertRaises(WarehouseUnavailable) as caught:
+            reader.verify_connection()
+        self.assertNotIn("must-never-leave-the-host", str(caught.exception))
+
 
 class CollectorArtifactTests(unittest.TestCase):
     def test_install_guide_verifies_the_checksum_shipped_with_the_wheel(self):
@@ -229,7 +261,8 @@ class CollectorArtifactTests(unittest.TestCase):
                     "collector-package.yml").read_text(encoding="utf-8")
         self.assertIn("python -m build --wheel", workflow)
         self.assertIn("relium collect --help", workflow)
-        self.assertIn("sha256sum dist/*.whl > dist/SHA256SUMS", workflow)
+        self.assertIn("working-directory: dist", workflow)
+        self.assertIn("sha256sum *.whl > SHA256SUMS", workflow)
         self.assertIn("sha256sum --check SHA256SUMS", workflow)
         self.assertIn("path: |", workflow)
         self.assertIn("dist/SHA256SUMS", workflow)

@@ -10,6 +10,7 @@ explicitly requested relation. Nothing this class returns contains a row.
 """
 from __future__ import annotations
 
+from agent.collector.adapters import POSTGRES_ADAPTER
 from agent.collector.signals import (
     UnsafeIdentifierError,
     profile_query,
@@ -45,7 +46,7 @@ class RelationNotReadable(RuntimeError):
 class PostgresMetadataReader:
     """Collects requested metadata from a PostgreSQL-compatible warehouse."""
 
-    provider = "postgres"
+    provider = POSTGRES_ADAPTER
 
     def __init__(self, dsn, *, statement_timeout_ms=30_000, connect_timeout=15):
         self._dsn = dsn
@@ -65,10 +66,19 @@ class PostgresMetadataReader:
         for collection and executes a constant query, so dashboard health is
         never inferred from token or tenant activity.
         """
-        with self._connect() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute("SELECT 1")
-                row = cursor.fetchone()
+        try:
+            with self._connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT 1")
+                    row = cursor.fetchone()
+        except WarehouseUnavailable:
+            raise
+        except Exception as exc:
+            # Driver errors can contain a DSN, SQL text or credentials. The
+            # type is enough for the local operator; never forward its text.
+            raise WarehouseUnavailable(
+                f"warehouse verification failed ({type(exc).__name__})"
+            ) from None
         if not row or row[0] != 1:
             raise WarehouseUnavailable("warehouse verification returned no result")
         return True

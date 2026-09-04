@@ -24,10 +24,9 @@ jobs:
           smoke/bin/pip install dist/*.whl
           smoke/bin/relium collect --help
       - name: Generate and verify checksum manifest
-        working-directory: .
+        working-directory: dist
         run: |
-          sha256sum dist/*.whl > dist/SHA256SUMS
-          cd dist
+          sha256sum *.whl > SHA256SUMS
           sha256sum --check SHA256SUMS
       - name: Upload wheel and checksum together
         uses: actions/upload-artifact@v4

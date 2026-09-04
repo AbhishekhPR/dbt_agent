@@ -18,6 +18,7 @@ from starlette.routing import Route
 
 from agent.api.collector_routes import COLLECTOR_ROUTES, build_handlers
 from agent.billing.entitlements import RUNTIME_EVIDENCE, WAREHOUSE_EVIDENCE
+from agent.collector.adapters import POSTGRES_ADAPTER, SUPPORTED_ADAPTERS
 from agent.api.auth import AuthenticationError, AuthorizationError, ServiceTokenAuthenticator, bearer_token
 from agent.api.authorization import (
     CI_MANIFEST_INGEST, COLLECTION_REQUEST_READ, COLLECTOR_INGEST, DASHBOARD_READ,
@@ -648,10 +649,16 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
         collectors = service.store.list_collectors(
             scope.organization_id, scope.repository_id,
             environment=environment)
-        collector = collectors[0] if collectors else None
+        active_token_ids = {row["token_id"] for row in active_tokens}
+        eligible_collectors = [
+            row for row in collectors
+            if row.get("token_id") in active_token_ids
+            and row.get("adapter_type") == POSTGRES_ADAPTER
+        ]
+        collector = eligible_collectors[0] if eligible_collectors else None
         stale_after = timedelta(minutes=5)
 
-        if collector is None and not active_tokens:
+        if not active_tokens:
             connection_status = "not_configured"
         elif collector is None:
             connection_status = "configured_never_seen"
@@ -687,7 +694,7 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
             "status": "ok",
             "environment": environment,
             "connection_status": connection_status,
-            "supported_adapters": ["postgresql"],
+            "supported_adapters": list(SUPPORTED_ADAPTERS),
             "request_ttl_minutes": 30,
             "stale_after_seconds": int(stale_after.total_seconds()),
             "collector": collector_view,
