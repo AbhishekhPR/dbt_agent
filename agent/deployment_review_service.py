@@ -198,6 +198,7 @@ def _material_ast_findings(incident, limit: int = 3) -> list[dict[str, str]]:
             findings.append(
                 {
                     "rule": str(bug.get("rule") or ""),
+                    "severity": str(bug.get("severity") or "low").lower(),
                     "title": title,
                     "impact": str(
                         bug.get("impact")
@@ -214,6 +215,49 @@ def _material_ast_findings(incident, limit: int = 3) -> list[dict[str, str]]:
             )
             if len(findings) >= limit:
                 return findings
+    return findings
+
+
+def semantic_evidence_from_incident(incident) -> dict | None:
+    """Return the SQL comparison already produced for this review.
+
+    ``None`` means no comparison ran. An evaluated document with zero changes
+    is deliberately preserved as a different state.
+    """
+    metadata = incident.get("metadata") if isinstance(incident, dict) else None
+    comparison = (metadata or {}).get("manifest_comparison") or {}
+    evidence = comparison.get("sql_semantic_comparison")
+    if not isinstance(evidence, dict) or not evidence.get("models"):
+        return None
+    return evidence
+
+
+def lifecycle_code_findings(result) -> list[dict]:
+    """Project reviewed SQL risks into the durable lifecycle vocabulary."""
+    severity_for = {
+        "critical": "block",
+        "high": "block",
+        "medium": "warn",
+        "low": "info",
+    }
+    findings = []
+    for item in (result or {}).get("material_findings") or []:
+        if not isinstance(item, dict):
+            continue
+        rule = str(item.get("rule") or "SQL_RISK")
+        source_severity = str(item.get("severity") or "medium").lower()
+        findings.append({
+            "code": rule,
+            "severity": severity_for.get(source_severity, "warn"),
+            "category": "code",
+            "message": str(item.get("impact") or item.get("title") or rule),
+            "relation": item.get("affected_model"),
+            "detail": {
+                "title": str(item.get("title") or rule),
+                "recommended_fix": str(item.get("recommended_fix") or ""),
+                "source_severity": source_severity,
+            },
+        })
     return findings
 
 

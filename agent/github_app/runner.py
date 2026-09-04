@@ -1,6 +1,10 @@
 import json
 
-from agent.deployment_review_service import review_manifest_change
+from agent.deployment_review_service import (
+    lifecycle_code_findings,
+    review_manifest_change,
+    semantic_evidence_from_incident,
+)
 from agent.evidence_policy import EvidenceState, evaluate_evidence_policy
 from agent.github_app.checks import CHECK_NAME, create_review_check
 from agent.github_app.client import GitHubNotFoundError
@@ -332,6 +336,7 @@ class PullRequestReviewRunner:
         health = incident.get("health")
         return self.lifecycle.begin(
             semantic_evidence=_semantic_evidence(incident),
+            code_findings=lifecycle_code_findings(result),
             organization_id=str(event.repository.owner),
             repository_id=str(event.repository.name),
             pull_number=event.pull_number,
@@ -682,9 +687,4 @@ def _semantic_evidence(incident) -> dict | None:
     manifest could not be fetched — so an absent comparison is stored as SQL
     NULL and can never be read back as "compared, nothing changed".
     """
-    metadata = incident.get("metadata") if isinstance(incident, dict) else None
-    comparison = (metadata or {}).get("manifest_comparison") or {}
-    evidence = comparison.get("sql_semantic_comparison")
-    if not isinstance(evidence, dict) or not evidence.get("models"):
-        return None
-    return evidence
+    return semantic_evidence_from_incident(incident)

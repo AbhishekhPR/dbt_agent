@@ -98,6 +98,39 @@ class RefundFixtureTests(unittest.TestCase):
 
 
 class SupportedChangeKindTests(unittest.TestCase):
+    def test_left_join_nullable_side_where_filter_is_visible_before_and_after(self):
+        comparison = compare_model_sql(
+            "int_subscription_revenue",
+            """select s.subscription_id, p.payment_status
+               from subscriptions s
+               left join payments p
+                 on s.subscription_id = p.subscription_id""",
+            """select s.subscription_id, p.payment_status
+               from subscriptions s
+               left join payments p
+                 on s.subscription_id = p.subscription_id
+               where p.payment_status = 'succeeded'""",
+        )
+
+        changed = by_kind(comparison, FILTER_CHANGED)
+        self.assertEqual(len(changed), 1, comparison.changes)
+        self.assertEqual(changed[0]["scope"], "where")
+        self.assertIsNone(changed[0]["before_sql"])
+        self.assertEqual(
+            changed[0]["after_sql"], "p.payment_status = 'succeeded'"
+        )
+
+    def test_unrelated_safe_projection_change_is_compared_without_a_risk_claim(self):
+        comparison = compare_model_sql(
+            "dim_subscriptions",
+            "select subscription_id from subscriptions",
+            "select subscription_id, plan_name from subscriptions",
+        )
+
+        self.assertEqual(kinds(comparison), [PROJECTION_ADDED])
+        self.assertEqual(comparison.changes[0]["output_name"], "plan_name")
+        self.assertNotIn("impact", comparison.changes[0])
+
     def test_join_added(self):
         comparison = compare_model_sql("m", "select a from t",
                                        "select a from t left join u on u.id = t.id")
