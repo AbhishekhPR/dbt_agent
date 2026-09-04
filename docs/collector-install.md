@@ -166,8 +166,10 @@ Schedule it with cron, or with whatever scheduler you already run:
 
 **How often:** every minute is reasonable and is what we suggest. A run with no
 pending request costs one authenticated API call and touches no warehouse.
-Collection requests expire in 60 minutes (15 for critical models), so a slower
-cadence risks a review waiting on evidence longer than a developer will.
+Every collection request is actionable for **30 minutes**. The separate
+production-observation freshness policy is 60 minutes for standard models and
+15 minutes for critical models; those freshness windows do not extend or
+shorten the request deadline.
 
 **Safe to invoke repeatedly.** Concurrent or repeated runs cannot corrupt
 anything: each run takes one request, and resubmitting identical evidence is

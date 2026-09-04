@@ -2648,13 +2648,18 @@ class PostgresLifecycleStore:
 
     def reconcile_terminal_collection_requests(self, organization_id, repository_id, *,
                                                environment=None):
-        """Expire stale requests and restore a superseded completed decision.
+        """Expire stale requests and reconcile the review projection.
 
         A refresh request temporarily moves an already-decided review to
         ``METADATA_REQUESTED``. If that refresh ends without evidence, the
         immutable prior attempt remains authoritative: only the review's
         lifecycle projection is restored. No attempt or publication job is
         created here.
+
+        A never-decided review has no prior decision to restore. Once its
+        request is terminal it returns to ``WAITING_FOR_METADATA`` so a new
+        request can be issued instead of remaining stranded in a state that
+        implies an actionable request still exists.
 
         The newest request must be unsuccessful and no actionable request may
         remain. This prevents an old expired request from reconciling away a
@@ -2687,7 +2692,7 @@ class PostgresLifecycleStore:
                 )
 
             candidates = self.connection.execute(
-                "SELECT r.review_id, latest.request_id, latest.state "
+                "SELECT r.review_id, r.decision, latest.request_id, latest.state "
                 "FROM reviews r "
                 "JOIN LATERAL ("
                 "  SELECT cr.request_id, cr.state FROM collection_requests cr "
@@ -2698,7 +2703,6 @@ class PostgresLifecycleStore:
                 ") latest ON TRUE "
                 "WHERE r.organization_id=%s AND r.repository_id=%s "
                 "AND r.lifecycle_state='METADATA_REQUESTED' "
-                "AND r.decision IS NOT NULL "
                 "AND latest.state IN ('EXPIRED','FAILED') "
                 "AND NOT EXISTS ("
                 "  SELECT 1 FROM collection_requests active "
@@ -2713,39 +2717,53 @@ class PostgresLifecycleStore:
             ).fetchall()
 
             restored = []
+            waiting = []
             for candidate in candidates:
+                target_state = (
+                    "DECISION_READY" if candidate.get("decision") is not None
+                    else "WAITING_FOR_METADATA"
+                )
+                reason = (
+                    "metadata refresh ended without new evidence"
+                    if target_state == "DECISION_READY"
+                    else "metadata request ended without evidence"
+                )
                 self.connection.execute(
-                    "UPDATE reviews SET lifecycle_state='DECISION_READY', updated_at=now() "
+                    "UPDATE reviews SET lifecycle_state=%s, updated_at=now() "
                     "WHERE organization_id=%s AND repository_id=%s AND review_id=%s "
                     "AND lifecycle_state='METADATA_REQUESTED'",
-                    (organization_id, repository_id, candidate["review_id"]),
+                    (target_state, organization_id, repository_id,
+                     candidate["review_id"]),
                 )
                 self.connection.execute(
                     "INSERT INTO review_lifecycle_transitions "
                     "(organization_id, repository_id, review_id, from_state, "
-                    "to_state, reason) VALUES (%s, %s, %s, 'METADATA_REQUESTED', "
-                    "'DECISION_READY', %s)",
+                    "to_state, reason) VALUES (%s, %s, %s, 'METADATA_REQUESTED', %s, %s)",
                     (organization_id, repository_id, candidate["review_id"],
-                     "metadata refresh ended without new evidence"),
+                     target_state, reason),
                 )
                 self.connection.execute(
                     "INSERT INTO audit_events "
                     "(organization_id, repository_id, actor, event_type, "
                     "reference_type, reference_id, payload) "
                     "VALUES (%s, %s, 'worker:lifecycle', "
-                    "'review.metadata_refresh_reconciled', 'review', %s, %s)",
+                    "'review.metadata_request_reconciled', 'review', %s, %s)",
                     (organization_id, repository_id, candidate["review_id"],
                      self._Jsonb({
                          "request_id": candidate["request_id"],
                          "request_state": candidate["state"],
-                         "restored_lifecycle_state": "DECISION_READY",
-                     })),
+                          "restored_lifecycle_state": target_state,
+                      })),
                 )
-                restored.append(candidate["review_id"])
+                if target_state == "DECISION_READY":
+                    restored.append(candidate["review_id"])
+                else:
+                    waiting.append(candidate["review_id"])
 
         return {
             "expired_request_ids": [row["request_id"] for row in expired],
             "restored_review_ids": restored,
+            "waiting_review_ids": waiting,
         }
 
     def acknowledge_collection_request(self, organization_id, repository_id, request_id, *,

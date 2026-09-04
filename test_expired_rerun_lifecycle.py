@@ -112,7 +112,7 @@ class ExpiredRerunLifecycleTests(unittest.TestCase):
         return self.store.get_snapshot(
             ORG, REPO, snapshot["snapshot_id"], expand=False)
 
-    def test_initial_review_stays_awaiting_its_first_metadata_after_expiry(self):
+    def test_initial_review_returns_to_waiting_after_its_first_request_expires(self):
         self._review()
         self._start_rerun("initial-expired")
 
@@ -121,9 +121,16 @@ class ExpiredRerunLifecycleTests(unittest.TestCase):
         review = self.store.get_review(ORG, REPO, REVIEW)
         request = self.store.get_collection_request(ORG, REPO, "initial-expired")
         self.assertEqual(request["state"], "EXPIRED")
-        self.assertEqual(review["lifecycle_state"], "METADATA_REQUESTED")
+        self.assertEqual(review["lifecycle_state"], "WAITING_FOR_METADATA")
         self.assertIsNone(review["decision"])
         self.assertEqual(self.store.review_attempts(ORG, REPO, REVIEW), [])
+        transitions = self.store.review_transitions(ORG, REPO, REVIEW)
+        self.assertEqual(transitions[-1]["to_state"], "WAITING_FOR_METADATA")
+        audit = self.store.audit_events(ORG, REPO)
+        self.assertIn(
+            "review.metadata_request_reconciled",
+            {row["event_type"] for row in audit},
+        )
 
     def test_decided_review_with_live_rerun_remains_metadata_requested(self):
         self._review()
