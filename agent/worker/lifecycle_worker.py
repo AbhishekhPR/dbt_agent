@@ -232,7 +232,6 @@ class LifecycleWorker:
             "    ORDER BY cr.created_at DESC, cr.request_id DESC LIMIT 1"
             "  ) latest ON TRUE "
             "  WHERE r.lifecycle_state='METADATA_REQUESTED' "
-            "    AND r.decision IS NOT NULL "
             "    AND latest.state IN ('EXPIRED','FAILED') "
             "    AND NOT EXISTS ("
             "      SELECT 1 FROM collection_requests active "

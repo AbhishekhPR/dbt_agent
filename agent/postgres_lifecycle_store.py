@@ -18,7 +18,10 @@ from datetime import datetime, timedelta, timezone
 
 from agent.lifecycle_models import ALLOWED_TRANSITIONS
 from agent.metadata_evidence.change_request import normalize_remote_review_id
-from agent.metadata_evidence.production_comparison import ELIGIBLE_COMPLETENESS
+from agent.metadata_evidence.production_comparison import (
+    ELIGIBLE_COMPLETENESS,
+    ELIGIBLE_FRESHNESS,
+)
 from agent.postgres_migrate import apply_migrations
 
 OUTBOX_LEASE_SECONDS = 300
@@ -1661,7 +1664,8 @@ class PostgresLifecycleStore:
         self.connection.execute(
             "DELETE FROM oauth_authorization_states WHERE expires_at < %s", (before,))
 
-    def list_service_tokens(self, organization_id=None, repository_id=None):
+    def list_service_tokens(self, organization_id=None, repository_id=None,
+                            *, environment=None, scope=None):
         """Tokens for an operator to identify later. The hash is never returned.
 
         A token has to be findable after issuance - to audit it, or to revoke
@@ -1669,7 +1673,7 @@ class PostgresLifecycleStore:
         is unrecoverable by design.
         """
         sql = ("SELECT token_id, organization_id, repository_id, environment, "
-               "description, created_at, expires_at, revoked_at "
+               "scope, description, created_at, expires_at, revoked_at "
                "FROM api_service_tokens")
         clauses, args = [], []
         if organization_id is not None:
@@ -1678,6 +1682,12 @@ class PostgresLifecycleStore:
         if repository_id is not None:
             clauses.append("repository_id=%s")
             args.append(repository_id)
+        if environment is not None:
+            clauses.append("environment=%s")
+            args.append(environment)
+        if scope is not None:
+            clauses.append("scope=%s")
+            args.append(scope)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY created_at DESC"
@@ -1694,6 +1704,17 @@ class PostgresLifecycleStore:
             "UPDATE api_service_tokens SET revoked_at=now() "
             "WHERE token_id=%s AND revoked_at IS NULL RETURNING token_id",
             (token_id,),
+        ).fetchone()
+        return row is not None
+
+    def revoke_service_token_for_scope(self, organization_id, repository_id,
+                                       token_id, *, scope):
+        """Revoke only when the named token belongs to this exact tenant."""
+        row = self.connection.execute(
+            "UPDATE api_service_tokens SET revoked_at=now() "
+            "WHERE token_id=%s AND organization_id=%s AND repository_id=%s "
+            "AND scope=%s AND revoked_at IS NULL RETURNING token_id",
+            (token_id, organization_id, repository_id, scope),
         ).fetchone()
         return row is not None
 
@@ -2533,12 +2554,74 @@ class PostgresLifecycleStore:
             "environment, token_id, collector_version, adapter_type, description) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (organization_id, repository_id, collector_id) DO UPDATE SET "
+            "verification_status=CASE WHEN collector_identities.token_id "
+            "IS DISTINCT FROM EXCLUDED.token_id THEN NULL ELSE "
+            "collector_identities.verification_status END, "
+            "verification_error_category=CASE WHEN collector_identities.token_id "
+            "IS DISTINCT FROM EXCLUDED.token_id THEN NULL ELSE "
+            "collector_identities.verification_error_category END, "
+            "last_verified_at=CASE WHEN collector_identities.token_id "
+            "IS DISTINCT FROM EXCLUDED.token_id THEN NULL ELSE "
+            "collector_identities.last_verified_at END, "
+            "last_failed_at=CASE WHEN collector_identities.token_id "
+            "IS DISTINCT FROM EXCLUDED.token_id THEN NULL ELSE "
+            "collector_identities.last_failed_at END, "
+            "token_id=EXCLUDED.token_id, "
             "collector_version=EXCLUDED.collector_version, "
-            "adapter_type=EXCLUDED.adapter_type, last_seen_at=now() RETURNING *",
+            "adapter_type=EXCLUDED.adapter_type, description=COALESCE("
+            "EXCLUDED.description, collector_identities.description), "
+            "last_seen_at=now(), revoked=FALSE, revoked_at=NULL, "
+            "revoked_reason=NULL RETURNING *",
             (organization_id, repository_id, collector_id, environment, token_id,
              collector_version, adapter_type, description),
         ).fetchone()
         return dict(row)
+
+    def list_collectors(self, organization_id, repository_id, *, environment=None):
+        sql = ("SELECT * FROM collector_identities WHERE organization_id=%s "
+               "AND repository_id=%s AND revoked=FALSE")
+        args = [organization_id, repository_id]
+        if environment is not None:
+            sql += " AND environment=%s"
+            args.append(environment)
+        sql += " ORDER BY last_seen_at DESC NULLS LAST, created_at DESC"
+        return [dict(row) for row in self.connection.execute(sql, tuple(args)).fetchall()]
+
+    def record_collector_verification(self, organization_id, repository_id,
+                                      environment, *, collector_id, token_id,
+                                      status, adapter_type,
+                                      error_category=None):
+        if status not in ("verified", "failed"):
+            raise ValueError("invalid collector verification status")
+        timestamp_column = ("last_verified_at" if status == "verified"
+                            else "last_failed_at")
+        row = self.connection.execute(
+            f"UPDATE collector_identities SET verification_status=%s, "
+            f"verification_error_category=%s, {timestamp_column}=now(), "
+            "last_seen_at=now() WHERE organization_id=%s AND repository_id=%s "
+            "AND environment=%s AND collector_id=%s AND token_id=%s "
+            "AND adapter_type=%s AND revoked=FALSE RETURNING *",
+            (status, error_category, organization_id, repository_id,
+             environment, collector_id, token_id, adapter_type),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def waiting_metadata_reviews(self, organization_id, repository_id, *,
+                                 environment):
+        rows = self.connection.execute(
+            "SELECT r.review_id, r.pull_number, r.lifecycle_state, "
+            "cr.request_id, cr.expires_at FROM reviews r "
+            "LEFT JOIN LATERAL (SELECT request_id, expires_at FROM "
+            "collection_requests WHERE organization_id=r.organization_id "
+            "AND repository_id=r.repository_id AND review_id=r.review_id "
+            "AND state IN ('PENDING','ACKNOWLEDGED') ORDER BY created_at DESC "
+            "LIMIT 1) cr ON TRUE WHERE r.organization_id=%s "
+            "AND r.repository_id=%s AND r.environment=%s "
+            "AND r.lifecycle_state IN ('METADATA_REQUESTED','WAITING_FOR_METADATA') "
+            "ORDER BY r.updated_at DESC",
+            (organization_id, repository_id, environment),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def revoke_collector(self, organization_id, repository_id, collector_id, *, reason=None):
         self.connection.execute(
@@ -2645,13 +2728,18 @@ class PostgresLifecycleStore:
 
     def reconcile_terminal_collection_requests(self, organization_id, repository_id, *,
                                                environment=None):
-        """Expire stale requests and restore a superseded completed decision.
+        """Expire stale requests and reconcile the review projection.
 
         A refresh request temporarily moves an already-decided review to
         ``METADATA_REQUESTED``. If that refresh ends without evidence, the
         immutable prior attempt remains authoritative: only the review's
         lifecycle projection is restored. No attempt or publication job is
         created here.
+
+        A never-decided review has no prior decision to restore. Once its
+        request is terminal it returns to ``WAITING_FOR_METADATA`` so a new
+        request can be issued instead of remaining stranded in a state that
+        implies an actionable request still exists.
 
         The newest request must be unsuccessful and no actionable request may
         remain. This prevents an old expired request from reconciling away a
@@ -2684,7 +2772,7 @@ class PostgresLifecycleStore:
                 )
 
             candidates = self.connection.execute(
-                "SELECT r.review_id, latest.request_id, latest.state "
+                "SELECT r.review_id, r.decision, latest.request_id, latest.state "
                 "FROM reviews r "
                 "JOIN LATERAL ("
                 "  SELECT cr.request_id, cr.state FROM collection_requests cr "
@@ -2695,7 +2783,6 @@ class PostgresLifecycleStore:
                 ") latest ON TRUE "
                 "WHERE r.organization_id=%s AND r.repository_id=%s "
                 "AND r.lifecycle_state='METADATA_REQUESTED' "
-                "AND r.decision IS NOT NULL "
                 "AND latest.state IN ('EXPIRED','FAILED') "
                 "AND NOT EXISTS ("
                 "  SELECT 1 FROM collection_requests active "
@@ -2710,39 +2797,53 @@ class PostgresLifecycleStore:
             ).fetchall()
 
             restored = []
+            waiting = []
             for candidate in candidates:
+                target_state = (
+                    "DECISION_READY" if candidate.get("decision") is not None
+                    else "WAITING_FOR_METADATA"
+                )
+                reason = (
+                    "metadata refresh ended without new evidence"
+                    if target_state == "DECISION_READY"
+                    else "metadata request ended without evidence"
+                )
                 self.connection.execute(
-                    "UPDATE reviews SET lifecycle_state='DECISION_READY', updated_at=now() "
+                    "UPDATE reviews SET lifecycle_state=%s, updated_at=now() "
                     "WHERE organization_id=%s AND repository_id=%s AND review_id=%s "
                     "AND lifecycle_state='METADATA_REQUESTED'",
-                    (organization_id, repository_id, candidate["review_id"]),
+                    (target_state, organization_id, repository_id,
+                     candidate["review_id"]),
                 )
                 self.connection.execute(
                     "INSERT INTO review_lifecycle_transitions "
                     "(organization_id, repository_id, review_id, from_state, "
-                    "to_state, reason) VALUES (%s, %s, %s, 'METADATA_REQUESTED', "
-                    "'DECISION_READY', %s)",
+                    "to_state, reason) VALUES (%s, %s, %s, 'METADATA_REQUESTED', %s, %s)",
                     (organization_id, repository_id, candidate["review_id"],
-                     "metadata refresh ended without new evidence"),
+                     target_state, reason),
                 )
                 self.connection.execute(
                     "INSERT INTO audit_events "
                     "(organization_id, repository_id, actor, event_type, "
                     "reference_type, reference_id, payload) "
                     "VALUES (%s, %s, 'worker:lifecycle', "
-                    "'review.metadata_refresh_reconciled', 'review', %s, %s)",
+                    "'review.metadata_request_reconciled', 'review', %s, %s)",
                     (organization_id, repository_id, candidate["review_id"],
                      self._Jsonb({
                          "request_id": candidate["request_id"],
                          "request_state": candidate["state"],
-                         "restored_lifecycle_state": "DECISION_READY",
-                     })),
+                          "restored_lifecycle_state": target_state,
+                      })),
                 )
-                restored.append(candidate["review_id"])
+                if target_state == "DECISION_READY":
+                    restored.append(candidate["review_id"])
+                else:
+                    waiting.append(candidate["review_id"])
 
         return {
             "expired_request_ids": [row["request_id"] for row in expired],
             "restored_review_ids": restored,
+            "waiting_review_ids": waiting,
         }
 
     def acknowledge_collection_request(self, organization_id, repository_id, request_id, *,
@@ -2979,8 +3080,9 @@ class PostgresLifecycleStore:
         never the current snapshot, is never from another repository or
         organization, and is never from another environment.
 
-        A snapshot whose collection FAILED is excluded: it is a record that
-        collection did not work, not an observation of production.
+        A snapshot whose collection FAILED or whose freshness is not CURRENT
+        is excluded: both remain audit records, but neither is an eligible
+        baseline description of production.
         """
         if received_at is None:
             # Only reachable for a snapshot that has not been read back from
@@ -2993,11 +3095,12 @@ class PostgresLifecycleStore:
             "SELECT snapshot_id FROM metadata_snapshots "
             "WHERE organization_id=%s AND repository_id=%s AND environment=%s "
             "AND completeness = ANY(%s) "
+            "AND freshness_state = ANY(%s) "
             "AND snapshot_id <> %s "
             "AND (observed_at, received_at, snapshot_id) < (%s, %s, %s) "
             "ORDER BY observed_at DESC, received_at DESC, snapshot_id DESC LIMIT 1",
             (organization_id, repository_id, environment,
-             list(ELIGIBLE_COMPLETENESS), snapshot_id,
+             list(ELIGIBLE_COMPLETENESS), list(ELIGIBLE_FRESHNESS), snapshot_id,
              observed_at, received_at, snapshot_id),
         ).fetchone()
         if row is None:

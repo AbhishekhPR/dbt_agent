@@ -1229,9 +1229,11 @@ def history(project, table, days):
 @cli.command()
 @click.option('--request-id', default=None,
               help='Collect a specific request instead of the oldest pending one')
+@click.option('--test', 'test_connection', is_flag=True,
+              help='Verify Relium authentication and warehouse connectivity, then exit')
 @click.option('--json', 'as_json', is_flag=True,
               help='Emit the outcome as JSON')
-def collect(request_id, as_json):
+def collect(request_id, test_connection, as_json):
     """Run the customer-side Relium Collector once.
 
     Reads a targeted collection request from Relium, queries the configured
@@ -1250,7 +1252,8 @@ def collect(request_id, as_json):
         click.echo(f"relium collect: {exc}", err=True)
         sys.exit(2)
 
-    outcome = run_collection(config)
+    outcome = run_collection(
+        config, request_id=request_id, verify_only=test_connection)
 
     if as_json:
         click.echo(_json.dumps(outcome.as_dict(), indent=2, sort_keys=True))

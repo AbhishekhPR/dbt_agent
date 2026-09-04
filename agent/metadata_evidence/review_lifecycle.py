@@ -26,6 +26,7 @@ from agent.metadata_evidence.decision import (
     evaluate_metadata_decision,
 )
 from agent.metadata_evidence.production_comparison import compute_comparison
+from agent.metadata_evidence.decision_explanation import build_attempt_payload
 
 # How long a collection request stays actionable. After this the review stops
 # waiting and the policy applies to the absent evidence.
@@ -111,7 +112,8 @@ def begin_review(store, *, organization_id, repository_id, environment,
                  pull_number, base_sha, head_sha, base_manifest, head_manifest,
                  changed_models, enforcement_mode, delivery_id=None,
                  code_health=100, code_findings=(), critical_models=(),
-                 evidence_level="profile", now=None, semantic_evidence=None):
+                 evidence_level="profile", now=None, semantic_evidence=None,
+                 health_explanation=None):
     """Persist a genuine GitHub review and decide what to publish.
 
     Returns a LifecycleOutcome. When production evidence is required and not
@@ -208,14 +210,21 @@ def begin_review(store, *, organization_id, repository_id, environment,
                             reason="metadata evidence evaluated")
 
     waiting = decision.decision is None
+    attempt_payload = build_attempt_payload(
+        decision=decision.decision,
+        health=decision.health,
+        findings=[f.as_dict() for f in decision.findings],
+        policy_reasons=decision.reasons,
+        health_explanation=health_explanation,
+        plan=plan_dict,
+    )
     store.record_review_decision(
         organization_id, repository_id, review_id,
         decision=decision.decision, evidence_coverage=decision.coverage,
         health=decision.health, attempt=attempt,
         trigger="initial", enforcement_mode=enforcement_mode,
         policy_version=decision.policy_version, policy_hash=decision.policy_hash,
-        payload={"findings": [f.as_dict() for f in decision.findings],
-                 "plan": plan_dict},
+        payload=attempt_payload,
         # Computed once, upstream, before this attempt existed. Never
         # recomputed for storage.
         semantic_evidence=semantic_evidence,

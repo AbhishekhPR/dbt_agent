@@ -46,6 +46,9 @@ STATUS_UNAVAILABLE = "unavailable"
 # eligible: it observed less than was asked for, which coverage reports, but
 # what it did observe is real.
 ELIGIBLE_COMPLETENESS = ("COMPLETE", "PARTIAL")
+# A stale observation is still retained for audit, but it cannot describe the
+# production state against which a later current observation is compared.
+ELIGIBLE_FRESHNESS = ("CURRENT",)
 
 # Relation and column rows the collector could not evaluate are present in the
 # snapshot but carry no observation. Treating them as observed would compare a

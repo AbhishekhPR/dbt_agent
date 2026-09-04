@@ -142,7 +142,9 @@ class MetadataReviewIntegrationTests(unittest.TestCase):
 
     # -- helpers ---------------------------------------------------------
 
-    def _begin(self, *, head_sha=HEAD_SHA, mode="enforce", pull_number=11):
+    def _begin(self, *, head_sha=HEAD_SHA, mode="enforce", pull_number=11,
+               code_health=100, code_findings=(), health_explanation=None,
+               semantic_evidence=None):
         from agent.metadata_evidence.review_lifecycle import begin_review
 
         with self.pool.acquire() as store:
@@ -152,7 +154,10 @@ class MetadataReviewIntegrationTests(unittest.TestCase):
                 base_sha=BASE_SHA, head_sha=head_sha,
                 base_manifest=self.base_manifest, head_manifest=self.head_manifest,
                 changed_models=["fct_orders"], enforcement_mode=mode,
-                delivery_id=f"delivery-{uuid.uuid4().hex[:8]}")
+                delivery_id=f"delivery-{uuid.uuid4().hex[:8]}",
+                code_health=code_health, code_findings=code_findings,
+                health_explanation=health_explanation,
+                semantic_evidence=semantic_evidence)
 
     def _post(self, path, body, *, key=None):
         headers = dict(self.auth)
@@ -434,6 +439,67 @@ class MetadataReviewIntegrationTests(unittest.TestCase):
         self.assertEqual(review["lifecycle_state"], "DECISION_READY")
         self.assertEqual([a["attempt"] for a in attempts], [1, 2])
         self.assertIsNone(attempts[0]["decision"], "waiting attempt is preserved")
+
+    def test_recomputation_replaces_pending_metadata_finding_but_preserves_code_risk(self):
+        code_finding = {
+            "code": "LEFT_JOIN_NULLIFIED",
+            "severity": "block",
+            "category": "code",
+            "message": (
+                "A WHERE filtering on right-side columns can convert LEFT JOIN "
+                "to INNER JOIN, dropping rows"
+            ),
+            "relation": "int_subscription_revenue",
+            "detail": {
+                "title": "LEFT JOIN possibly nullified by WHERE",
+                "source_severity": "high",
+            },
+        }
+        health_explanation = {
+            "score": 65,
+            "label": "Code review health",
+            "basis": "static_code_and_manifest_analysis",
+            "deductions": [{
+                "component": "ast",
+                "points": 35,
+                "reason": code_finding["message"],
+            }],
+        }
+        outcome = self._begin(
+            pull_number=40,
+            code_health=65,
+            code_findings=[code_finding],
+            health_explanation=health_explanation,
+            semantic_evidence=CERTIFIED_SEMANTIC,
+        )
+        first_before = self._attempts_by_number(outcome.review_id)[1]
+        self.assertIn(
+            "metadata.pending",
+            {finding["code"] for finding in first_before["payload"]["findings"]},
+        )
+
+        self._submit(outcome)
+        _, result = self._run_worker(outcome.review_id)
+
+        attempts = self._attempts_by_number(outcome.review_id)
+        first_after = attempts[1]
+        second = attempts[2]
+        self.assertEqual(first_after["payload"], first_before["payload"])
+        second_codes = {f["code"] for f in second["payload"]["findings"]}
+        self.assertIn("LEFT_JOIN_NULLIFIED", second_codes)
+        self.assertNotIn("metadata.pending", second_codes)
+        self.assertEqual(second["decision"], "BLOCK")
+        self.assertEqual(second["health"], 65)
+        self.assertEqual(second["payload"]["primary_reason"], code_finding["message"])
+        self.assertEqual(second["payload"]["health_explanation"], health_explanation)
+        self.assertEqual(result["primary_reason"], code_finding["message"])
+
+        api_attempts = self._get(
+            f"/api/reviews/{outcome.review_id}/attempts"
+        ).json()["attempts"]
+        current = next(item for item in api_attempts if item["attempt"] == 2)
+        self.assertEqual(current["primary_reason"], code_finding["message"])
+        self.assertEqual(current["health_explanation"]["score"], 65)
 
     def test_duplicate_recomputation_produces_one_final_decision(self):
         outcome = self._begin()

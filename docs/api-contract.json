@@ -32,6 +32,7 @@
     "GET /api/billing/subscription",
     "GET /api/collection-requests",
     "GET /api/collection-requests/{request_id}",
+    "GET /api/collector-setup",
     "GET /api/delivery-status",
     "GET /api/deployments",
     "GET /api/deployments/{deployment_id}",
@@ -68,7 +69,10 @@
     "POST /api/billing/webhooks/polar",
     "POST /api/collection-requests/{request_id}/acknowledge",
     "POST /api/collection-requests/{request_id}/failure",
+    "POST /api/collector-tokens",
+    "POST /api/collector-tokens/{token_id}/revoke",
     "POST /api/collectors",
+    "POST /api/collectors/verification",
     "POST /api/deployments/events",
     "POST /api/incidents",
     "POST /api/manifest-evidence",
@@ -167,8 +171,28 @@
     },
     {
       "authentication": "service-token",
+      "method": "GET",
+      "path": "/api/collector-setup"
+    },
+    {
+      "authentication": "service-token",
+      "method": "POST",
+      "path": "/api/collector-tokens"
+    },
+    {
+      "authentication": "service-token",
+      "method": "POST",
+      "path": "/api/collector-tokens/{token_id}/revoke"
+    },
+    {
+      "authentication": "service-token",
       "method": "POST",
       "path": "/api/collectors"
+    },
+    {
+      "authentication": "service-token",
+      "method": "POST",
+      "path": "/api/collectors/verification"
     },
     {
       "authentication": "service-token",

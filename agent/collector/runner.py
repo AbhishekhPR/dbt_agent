@@ -243,7 +243,8 @@ def collect_snapshot(request, reader, *, config, now=None):
     }
 
 
-def run_collection(config, *, client=None, reader=None, request_id=None, now=None):
+def run_collection(config, *, client=None, reader=None, request_id=None, now=None,
+                   verify_only=False):
     """Run one collection and report truthfully.
 
     Returns a CollectionOutcome. Never raises for an ordinary failure: the
@@ -256,6 +257,25 @@ def run_collection(config, *, client=None, reader=None, request_id=None, now=Non
     outcome = CollectionOutcome(ok=False)
 
     try:
+        # A registration is a heartbeat only. It proves the process reached
+        # Relium, not that the warehouse credentials work; connectivity is
+        # recorded separately after a real read-only warehouse operation.
+        client.register()
+
+        if verify_only:
+            try:
+                reader.verify_connection()
+            except WarehouseUnavailable as exc:
+                outcome.reason = str(exc)
+                _report_verification(
+                    client, status="failed",
+                    error_category="warehouse_unavailable")
+                return outcome
+            _report_verification(client, status="verified")
+            outcome.ok = True
+            outcome.reason = "collector verified warehouse connectivity"
+            return outcome
+
         if request_id:
             request = client.get_request(request_id)
             if request is None:
@@ -275,11 +295,6 @@ def run_collection(config, *, client=None, reader=None, request_id=None, now=Non
         logger.info("collection_request_accepted request_id=%s review_id=%s targets=%d",
                     outcome.request_id, outcome.review_id, len(request["targets"]))
 
-        # The API rejects a snapshot from an unregistered collector, so the
-        # identity must exist before the warehouse is queried - failing after
-        # the work is done would waste the collection.
-        client.register()
-
         try:
             client.acknowledge(request["request_id"])
         except ReliumApiError as exc:
@@ -288,6 +303,7 @@ def run_collection(config, *, client=None, reader=None, request_id=None, now=Non
                            outcome.request_id, exc.status)
 
         snapshot, summary = collect_snapshot(request, reader, config=config, now=now)
+        _report_verification(client, status="verified")
         outcome.relations_collected = len(snapshot["relations"])
         outcome.columns_collected = summary["columns_collected"]
         outcome.signals_collected = summary["signals_collected"]
@@ -331,3 +347,12 @@ def _report_failure(client, outcome):
     except ReliumApiError:
         # The run already failed; the reason is in the outcome either way.
         logger.warning("failure_report_failed request_id=%s", outcome.request_id)
+
+
+def _report_verification(client, *, status, error_category=None):
+    """Connectivity telemetry must never block evidence already collected."""
+    try:
+        client.report_verification(
+            status=status, error_category=error_category)
+    except ReliumApiError:
+        logger.warning("collector_verification_report_failed status=%s", status)

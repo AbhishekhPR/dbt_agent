@@ -19,6 +19,7 @@ import json
 import os
 import unittest
 import uuid
+from pathlib import Path
 
 from agent.api.auth import (
     AuthenticationError,
@@ -41,6 +42,7 @@ from agent.metadata_evidence.collection_plan import build_collection_plan
 DSN = os.environ.get("RELIUM_TEST_POSTGRES_DSN")
 
 DB = "analytics"
+ROOT = Path(__file__).resolve().parent
 
 
 # ------------------------------------------------- dbt manifest fixtures
@@ -211,6 +213,59 @@ class NetworkConfigurationTests(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("RELIUM_API_TOKEN", message)
         self.assertIn("RELIUM_WAREHOUSE_DSN", message)
+
+    def test_verification_sanitizes_query_and_cleanup_failures(self):
+        from agent.collector.warehouse import (
+            PostgresMetadataReader,
+            WarehouseUnavailable,
+        )
+
+        class BrokenCursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def execute(self, _sql):
+                raise RuntimeError("password=must-never-leave-the-host")
+
+        class BrokenConnection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def cursor(self):
+                return BrokenCursor()
+
+        reader = PostgresMetadataReader("postgresql://secret")
+        reader._connect = BrokenConnection
+        with self.assertRaises(WarehouseUnavailable) as caught:
+            reader.verify_connection()
+        self.assertNotIn("must-never-leave-the-host", str(caught.exception))
+
+
+class CollectorArtifactTests(unittest.TestCase):
+    def test_install_guide_verifies_the_checksum_shipped_with_the_wheel(self):
+        guide = (ROOT / "docs" / "collector-install.md").read_text(
+            encoding="utf-8")
+        self.assertIn("sha256sum --check SHA256SUMS", guide)
+        self.assertNotIn(
+            "779efed43584ebd2eaffd60c4893468046259dc35047ca588d59205e96708343",
+            guide)
+
+    def test_package_workflow_builds_tests_and_checksums_the_same_wheel(self):
+        workflow = (ROOT / ".github" / "workflows" /
+                    "collector-package.yml").read_text(encoding="utf-8")
+        self.assertIn("python -m build --wheel", workflow)
+        self.assertIn("relium collect --help", workflow)
+        self.assertIn("working-directory: dist", workflow)
+        self.assertIn("sha256sum *.whl > SHA256SUMS", workflow)
+        self.assertIn("sha256sum --check SHA256SUMS", workflow)
+        self.assertIn("path: |", workflow)
+        self.assertIn("dist/SHA256SUMS", workflow)
 
 
 # ------------------------------------------------------ token lifecycle

@@ -298,6 +298,15 @@ class Migration0004UpgradeTests(unittest.TestCase):
             "WHERE table_schema='public' AND table_name='metadata_snapshots'"
         ).fetchone()["n"]
         self.assertEqual(n, 1)
+        collector_columns = {
+            row["column_name"] for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name='collector_identities'"
+            ).fetchall()
+        }
+        self.assertTrue(
+            {"last_verified_at", "last_failed_at", "verification_status",
+             "verification_error_category"}.issubset(collector_columns))
 
 
 @unittest.skipUnless(DSN, "RELIUM_TEST_POSTGRES_DSN not set; PostgreSQL suite requires a real server")

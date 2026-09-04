@@ -13,7 +13,7 @@ It is a single command that runs, does one unit of work, and exits.
 - Python 3.10 or newer on the host that will run the collector
 - Network egress from that host to your Relium API URL (HTTPS)
 - Network access from that host to your PostgreSQL warehouse
-- A Relium collector token (§4 — your Relium contact issues this)
+- A Relium collector token (§4 — issued once in the Relium dashboard)
 
 The collector needs no inbound ports, no daemon, and no privileged access.
 
@@ -63,14 +63,11 @@ tried.
 
 ## 4. Issue the Relium collector token
 
-Performed by your Relium operator, not by you:
-
-```bash
-relium issue-collector-token --organization acme --repository analytics --environment production
-```
-
-The secret is printed **once** and is not recoverable — Relium stores only a
-SHA-256 hash. Transfer it over a secure channel and clear it from shell history.
+Open **Integrations → Warehouse evidence** in Relium, choose the production
+environment, and select **Generate collector token**. The token is shown
+**once** and is not recoverable — Relium stores only a SHA-256 hash. Put it
+directly into your secret manager; returning to or refreshing the setup panel
+will show only the non-secret token id.
 
 ---
 
@@ -80,16 +77,15 @@ Check the artifact before installing it. You are about to run this code
 against your warehouse, and the checksum is how you confirm the file you
 received is the file we built.
 
-| Artifact | SHA-256 |
-|---|---|
-| `relium-0.1.0-py3-none-any.whl` | `779efed43584ebd2eaffd60c4893468046259dc35047ca588d59205e96708343` |
-
 ```bash
-sha256sum relium-0.1.0-py3-none-any.whl
+sha256sum --check SHA256SUMS
 ```
 
-If the digest does not match the table above, stop and contact your Relium
-contact. Do not install it.
+Every supported collector bundle contains the wheel and the `SHA256SUMS` file
+generated from that exact wheel in the same packaging job. If verification
+fails, stop and contact your Relium contact. Do not install it. A checksum
+copied into documentation is intentionally not used because it can drift from
+the artifact it describes.
 
 ```bash
 python -m venv /opt/relium/venv
@@ -143,12 +139,14 @@ Use `sslmode=require` (or stricter) in the warehouse DSN.
 ## 7. Verify connectivity
 
 ```bash
-relium collect
+relium collect --test
 ```
 
-With nothing pending this exits `0` and prints
-`relium collect: no pending collection request`. That single command proves API
-reachability, token validity and warehouse access at once.
+This registers the collector, opens the same server-enforced read-only
+PostgreSQL session used for collection, runs `SELECT 1`, records the verified
+heartbeat in Relium, and exits. A normal idle `relium collect` proves API and
+token reachability but deliberately does not touch the warehouse, so it is not
+a connectivity test.
 
 ---
 
@@ -166,8 +164,10 @@ Schedule it with cron, or with whatever scheduler you already run:
 
 **How often:** every minute is reasonable and is what we suggest. A run with no
 pending request costs one authenticated API call and touches no warehouse.
-Collection requests expire in 60 minutes (15 for critical models), so a slower
-cadence risks a review waiting on evidence longer than a developer will.
+Every collection request is actionable for **30 minutes**. The separate
+production-observation freshness policy is 60 minutes for standard models and
+15 minutes for critical models; those freshness windows do not extend or
+shorten the request deadline.
 
 **Safe to invoke repeatedly.** Concurrent or repeated runs cannot corrupt
 anything: each run takes one request, and resubmitting identical evidence is

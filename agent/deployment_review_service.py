@@ -128,6 +128,7 @@ def _review_project_context_change(
 
     lifecycle = _deployment_lifecycle_metadata(review)
     material_findings = _material_ast_findings(review.incident)
+    health_explanation = _health_explanation(review.incident)
     incident = render_json(review.incident)
     cli_text = render_cli(review.incident)
     markdown = render_markdown(review.incident)
@@ -141,6 +142,7 @@ def _review_project_context_change(
         "changed_files": _ordered_unique(list(changed_files or [])),
         "changed_models": [spec["name"] for spec in model_specs],
         "material_findings": material_findings,
+        "health_explanation": health_explanation,
         "sql_sources": sql_sources,
         "semantic_comparison": {
             "evaluated": bool((metadata or {}).get("semantic_comparison_evaluated")),
@@ -154,6 +156,28 @@ def _review_project_context_change(
             "cli": f"{cli_text}\n\nDeployment History\n" + "\n".join(cli_status),
             "markdown": f"{markdown}\n\n## Deployment History\n" + "\n".join(markdown_status),
         },
+    }
+
+
+def _health_explanation(incident) -> dict:
+    deductions = []
+    for signal in incident.signals:
+        if signal.score >= 0:
+            continue
+        reason = next((str(value).strip() for value in signal.reasons or []
+                       if str(value).strip()), None)
+        if not reason:
+            reason = f"{signal.component} reduced code review health"
+        deductions.append({
+            "component": str(signal.component),
+            "points": abs(int(signal.score)),
+            "reason": reason,
+        })
+    return {
+        "score": int(incident.health),
+        "label": "Code review health",
+        "basis": "static_code_and_manifest_analysis",
+        "deductions": deductions,
     }
 
 
@@ -198,6 +222,7 @@ def _material_ast_findings(incident, limit: int = 3) -> list[dict[str, str]]:
             findings.append(
                 {
                     "rule": str(bug.get("rule") or ""),
+                    "severity": str(bug.get("severity") or "low").lower(),
                     "title": title,
                     "impact": str(
                         bug.get("impact")
@@ -214,6 +239,52 @@ def _material_ast_findings(incident, limit: int = 3) -> list[dict[str, str]]:
             )
             if len(findings) >= limit:
                 return findings
+    return findings
+
+
+def semantic_evidence_from_incident(incident) -> dict | None:
+    """Return the SQL comparison already produced for this review.
+
+    ``None`` means no comparison ran. An evaluated document with zero changes
+    is deliberately preserved as a different state.
+    """
+    metadata = incident.get("metadata") if isinstance(incident, dict) else None
+    comparison = (metadata or {}).get("manifest_comparison") or {}
+    evidence = comparison.get("sql_semantic_comparison")
+    if not isinstance(evidence, dict) or not any(
+        isinstance(model, dict) and model.get("status") == "evaluated"
+        for model in (evidence.get("models") or [])
+    ):
+        return None
+    return evidence
+
+
+def lifecycle_code_findings(result) -> list[dict]:
+    """Project reviewed SQL risks into the durable lifecycle vocabulary."""
+    severity_for = {
+        "critical": "block",
+        "high": "block",
+        "medium": "warn",
+        "low": "info",
+    }
+    findings = []
+    for item in (result or {}).get("material_findings") or []:
+        if not isinstance(item, dict):
+            continue
+        rule = str(item.get("rule") or "SQL_RISK")
+        source_severity = str(item.get("severity") or "medium").lower()
+        findings.append({
+            "code": rule,
+            "severity": severity_for.get(source_severity, "warn"),
+            "category": "code",
+            "message": str(item.get("impact") or item.get("title") or rule),
+            "relation": item.get("affected_model"),
+            "detail": {
+                "title": str(item.get("title") or rule),
+                "recommended_fix": str(item.get("recommended_fix") or ""),
+                "source_severity": source_severity,
+            },
+        })
     return findings
 
 

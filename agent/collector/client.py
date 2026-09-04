@@ -112,6 +112,20 @@ class ReliumClient:
             idempotency_key=f"register-{self._config.collector_id}")
         return payload.get("collector")
 
+    def report_verification(self, *, status, error_category=None):
+        """Record a bounded connectivity result; never send driver text."""
+        body = {
+            "collector_id": self._config.collector_id,
+            "environment": self._config.environment,
+            "status": status,
+        }
+        if error_category:
+            body["error_category"] = error_category
+        _, payload = self._call(
+            "POST", "/api/collectors/verification", body,
+            idempotency_key=(f"verify-{self._config.collector_id}-{status}"))
+        return payload
+
     # -- collection requests ------------------------------------------------
 
     def pending_requests(self, limit=1):

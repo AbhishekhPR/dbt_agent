@@ -33,6 +33,56 @@ CONFLICTING_MANIFEST = {
 }
 
 
+def _sql_manifest(sql):
+    return {
+        "metadata": {
+            "project_name": "subscriptions",
+            "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+        },
+        "nodes": {
+            "model.subscriptions.int_subscription_revenue": {
+                "unique_id": "model.subscriptions.int_subscription_revenue",
+                "resource_type": "model",
+                "name": "int_subscription_revenue",
+                "database": "warehouse",
+                "schema": "analytics",
+                "alias": "int_subscription_revenue",
+                "path": "models/int_subscription_revenue.sql",
+                "original_file_path": "models/int_subscription_revenue.sql",
+                "raw_code": sql,
+                "compiled_code": sql,
+                "depends_on": {"nodes": []},
+                "columns": {
+                    "subscription_id": {"name": "subscription_id"},
+                    "payment_status": {"name": "payment_status"},
+                },
+                "config": {"materialized": "table"},
+                "description": "",
+            }
+        },
+        "sources": {},
+        "exposures": {},
+        "macros": {},
+        "child_map": {},
+        "parent_map": {},
+    }
+
+
+LEFT_JOIN_BASE = _sql_manifest(
+    """select s.subscription_id, p.payment_status
+       from subscriptions s
+       left join payments p
+         on s.subscription_id = p.subscription_id"""
+)
+LEFT_JOIN_HEAD = _sql_manifest(
+    """select s.subscription_id, p.payment_status
+       from subscriptions s
+       left join payments p
+         on s.subscription_id = p.subscription_id
+       where p.payment_status = 'succeeded'"""
+)
+
+
 def _reset_schema():
     import psycopg
 
@@ -433,6 +483,55 @@ class ManifestEvidencePostgresTests(unittest.TestCase):
                 (self.org, self.repo),
             ).fetchone()["n"]
         self.assertEqual(count, 1)
+
+    def test_exact_manifest_resume_persists_left_join_filter_semantics_and_code_risk(self):
+        from agent.metadata_evidence.manifest_handoff import (
+            begin_manifest_wait,
+            resume_manifest_review,
+        )
+        from agent.metadata_evidence.collection_plan import manifest_hash
+
+        with self.pool.acquire() as store:
+            outcome = begin_manifest_wait(
+                store,
+                organization_id=self.org,
+                repository_id=self.repo,
+                environment=ENV,
+                pull_number=81,
+                base_sha=BASE_SHA,
+                head_sha=HEAD_SHA,
+                base_manifest=LEFT_JOIN_BASE,
+                head_manifest=LEFT_JOIN_HEAD,
+                changed_files=["models/int_subscription_revenue.sql"],
+                enforcement_mode="enforce",
+            )
+            resume_manifest_review(
+                store,
+                organization_id=self.org,
+                repository_id=self.repo,
+                environment=ENV,
+                review_id=outcome.review_id,
+                commit_sha=HEAD_SHA,
+            )
+            attempt = store.review_attempts(
+                self.org, self.repo, outcome.review_id
+            )[-1]
+
+        semantic = attempt["semantic_evidence"]
+        self.assertEqual(semantic["status"], "evaluated")
+        changes = [
+            change
+            for model in semantic["models"]
+            for change in model["changes"]
+        ]
+        filter_change = next(c for c in changes if c["kind"] == "filter_changed")
+        self.assertIsNone(filter_change["before_sql"])
+        self.assertEqual(
+            filter_change["after_sql"], "p.payment_status = 'succeeded'"
+        )
+        findings = attempt["payload"]["findings"]
+        self.assertIn("LEFT_JOIN_NULLIFIED", {f["code"] for f in findings})
+        self.assertEqual(attempt["health"], 65)
 
 
 @unittest.skipUnless(DSN, "RELIUM_TEST_POSTGRES_DSN not set")

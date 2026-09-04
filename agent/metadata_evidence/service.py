@@ -50,7 +50,7 @@ class ReviewLifecycleService:
               head_sha, base_manifest, head_manifest, changed_models,
               enforcement_mode, delivery_id=None, code_health=100,
               code_findings=(), critical_models=(), environment=None,
-              semantic_evidence=None):
+              semantic_evidence=None, health_explanation=None):
         """Persist the review and decide whether production evidence is needed."""
         with self._pool.acquire() as store:
             return begin_review(
@@ -69,6 +69,7 @@ class ReviewLifecycleService:
                 delivery_id=delivery_id,
                 code_health=code_health,
                 code_findings=code_findings,
+                health_explanation=health_explanation,
                 critical_models=critical_models,
             )
 

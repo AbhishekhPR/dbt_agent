@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from agent.evidence_policy import default_policy
 from agent.metadata_evidence.decision import evaluate_metadata_decision
 from agent.metadata_evidence.production_comparison import compute_comparison
+from agent.metadata_evidence.decision_explanation import build_attempt_payload
 from agent.metadata_evidence.publication_reconcile import (
     EVENT_TYPE as PUBLICATION_EVENT_TYPE,
 )
@@ -53,12 +54,6 @@ def recompute_review(store, *, organization_id, repository_id, environment,
         raise RecomputationError(
             "no accepted snapshot is bound to this review yet")
 
-    decision = evaluate_metadata_decision(
-        plan=plan, snapshot=snapshot, enforcement_mode=enforcement_mode,
-        code_health=int(review.get("health") or 100),
-        policy=default_policy(), now=now,
-    )
-
     # Idempotence keys on the SNAPSHOT that triggered this recomputation, not
     # on the attempt counter. Keying on the counter was wrong: the first
     # recomputation advances it, so a retry would always look like new work
@@ -79,6 +74,19 @@ def recompute_review(store, *, organization_id, repository_id, environment,
     # history exactly as it was published.
     previous = max(attempts, key=lambda a: a["attempt"]) if attempts else None
     next_attempt = (previous["attempt"] if previous else attempt) + 1
+    previous_payload = (previous or {}).get("payload") or {}
+    code_findings = [
+        finding for finding in (previous_payload.get("findings") or [])
+        if isinstance(finding, dict) and finding.get("category") == "code"
+    ]
+    code_health = review.get("health")
+    if code_health is None:
+        code_health = 100
+    decision = evaluate_metadata_decision(
+        plan=plan, snapshot=snapshot, enforcement_mode=enforcement_mode,
+        code_health=int(code_health), code_findings=code_findings,
+        policy=default_policy(), now=now,
+    )
 
     # SQL semantic evidence describes the review's CODE state, and a
     # recomputation changes production evidence rather than code provenance.
@@ -115,6 +123,14 @@ def recompute_review(store, *, organization_id, repository_id, environment,
     store.transition_review(organization_id, repository_id, review_id,
                             decision.lifecycle_state,
                             reason="production metadata evaluated")
+    attempt_payload = build_attempt_payload(
+        decision=decision.decision,
+        health=decision.health,
+        findings=[f.as_dict() for f in decision.findings],
+        policy_reasons=decision.reasons,
+        health_explanation=previous_payload.get("health_explanation"),
+        snapshot_id=snapshot["snapshot_id"],
+    )
     store.record_review_decision(
         organization_id, repository_id, review_id,
         decision=decision.decision, evidence_coverage=decision.coverage,
@@ -122,8 +138,7 @@ def recompute_review(store, *, organization_id, repository_id, environment,
         trigger="metadata_snapshot", snapshot_id=snapshot["snapshot_id"],
         enforcement_mode=enforcement_mode,
         policy_version=decision.policy_version, policy_hash=decision.policy_hash,
-        payload={"findings": [f.as_dict() for f in decision.findings],
-                 "snapshot_id": snapshot["snapshot_id"]},
+        payload=attempt_payload,
         semantic_evidence=semantic_evidence,
         metadata_comparison=metadata_comparison,
     )
@@ -165,6 +180,8 @@ def recompute_review(store, *, organization_id, repository_id, environment,
         "lifecycle_state": decision.lifecycle_state,
         "snapshot_id": snapshot["snapshot_id"],
         "findings": [f.as_dict() for f in decision.findings],
+        "primary_reason": attempt_payload["primary_reason"],
+        "health_explanation": attempt_payload["health_explanation"],
         "metadata_comparison": metadata_comparison,
         "applied": True,
     }

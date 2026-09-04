@@ -4,7 +4,11 @@ from __future__ import annotations
 import hashlib
 import json
 
-from agent.deployment_review_service import review_manifest_change
+from agent.deployment_review_service import (
+    lifecycle_code_findings,
+    review_manifest_change,
+    semantic_evidence_from_incident,
+)
 from agent.evidence_policy import default_policy
 from agent.metadata_evidence.publication_reconcile import (
     EVENT_TYPE as PUBLICATION_EVENT_TYPE,
@@ -138,6 +142,9 @@ def resume_manifest_review(store, *, organization_id, repository_id,
         enforcement_mode=review.get("enforcement_mode") or "shadow",
         delivery_id=review.get("github_delivery_id"),
         code_health=int(health) if isinstance(health, int) else 100,
+        code_findings=lifecycle_code_findings(result),
+        health_explanation=result.get("health_explanation"),
+        semantic_evidence=semantic_evidence_from_incident(incident),
     )
     store.enqueue_review_recomputation(
         organization_id, repository_id, environment, review_id=review_id,
