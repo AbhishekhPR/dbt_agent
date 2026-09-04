@@ -1801,6 +1801,56 @@ class BrowserAuthorizationBoundaryTests(PublicApiTestCase):
             awaiting_replacement["connection_status"], "configured_never_seen")
         self.assertIsNone(awaiting_replacement["collector"])
 
+        replacement_auth = {
+            "Authorization": f"Bearer {replacement.json()['token']}"}
+        reregistered = self.client.post(
+            "/api/collectors",
+            json={"collector_id": collector_id, "environment": environment,
+                  "adapter_type": "postgres"}, headers=replacement_auth)
+        self.assertEqual(reregistered.status_code, 200, reregistered.text)
+        after_rotation = self._session_get(
+            f"/api/collector-setup?environment={environment}", session).json()
+        self.assertEqual(after_rotation["connection_status"], "stale")
+        self.assertIsNone(after_rotation["collector"]["last_verified_at"])
+
+    def test_recent_verified_collector_wins_over_newer_unverified_collector(self):
+        environment = f"warehouse-{uuid.uuid4().hex[:8]}"
+        with self.pool.acquire() as store:
+            store.ensure_tenant(self.org, self.repo, environment)
+        session = self._sign_in(WRITE_PERMISSIONS, env=environment)
+        issued = self._session_post(
+            "/api/collector-tokens", {"environment": environment}, session)
+        auth = {"Authorization": f"Bearer {issued.json()['token']}"}
+
+        healthy_id = f"healthy-{uuid.uuid4().hex[:8]}"
+        newer_id = f"newer-{uuid.uuid4().hex[:8]}"
+        for collector_id in (healthy_id, newer_id):
+            registered = self.client.post(
+                "/api/collectors",
+                json={"collector_id": collector_id, "environment": environment,
+                      "adapter_type": "postgres"}, headers=auth)
+            self.assertEqual(registered.status_code, 200, registered.text)
+            if collector_id == healthy_id:
+                verified = self.client.post(
+                    "/api/collectors/verification",
+                    json={"collector_id": collector_id,
+                          "environment": environment, "status": "verified"},
+                    headers=auth)
+                self.assertEqual(verified.status_code, 200, verified.text)
+
+        with self.pool.acquire() as store:
+            store.connection.execute(
+                "UPDATE collector_identities SET last_seen_at=now() + "
+                "interval '1 minute' WHERE organization_id=%s AND "
+                "repository_id=%s AND collector_id=%s",
+                (self.org, self.repo, newer_id))
+
+        setup = self._session_get(
+            f"/api/collector-setup?environment={environment}", session)
+        self.assertEqual(setup.status_code, 200, setup.text)
+        self.assertEqual(setup.json()["connection_status"], "connected")
+        self.assertEqual(setup.json()["collector"]["collector_id"], healthy_id)
+
     def test_collector_registration_requires_the_supported_adapter(self):
         for adapter in (None, "snowflake", "postgresql"):
             body = {"collector_id": f"collector-{uuid.uuid4().hex[:8]}",

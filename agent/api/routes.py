@@ -655,16 +655,22 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
             if row.get("token_id") in active_token_ids
             and row.get("adapter_type") == POSTGRES_ADAPTER
         ]
-        collector = eligible_collectors[0] if eligible_collectors else None
         stale_after = timedelta(minutes=5)
+        verified_collectors = [
+            row for row in eligible_collectors
+            if row.get("verification_status") == "verified"
+            and row.get("last_verified_at") is not None
+            and row["last_verified_at"] >= now - stale_after
+        ]
+        collector = (verified_collectors[0] if verified_collectors
+                     else eligible_collectors[0] if eligible_collectors
+                     else None)
 
         if not active_tokens:
             connection_status = "not_configured"
         elif collector is None:
             connection_status = "configured_never_seen"
-        elif (collector.get("verification_status") == "verified"
-              and collector.get("last_verified_at") is not None
-              and collector["last_verified_at"] >= now - stale_after):
+        elif collector in verified_collectors:
             connection_status = "connected"
         else:
             connection_status = "stale"
