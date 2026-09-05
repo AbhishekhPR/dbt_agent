@@ -83,6 +83,11 @@ def _cap(name, *, human=False, token_scopes=(), human_identities=(GITHUB_IDENTIT
 #: work, not a view of the tenant's review history.
 DASHBOARD_READ = _cap("dashboard_read", human=True, token_scopes={"operator_read"})
 
+#: Downloading executable code is intentionally narrower than reading the
+#: dashboard. Only an authenticated GitHub dashboard session may fetch the
+#: collector package; no service-token scope is accepted.
+COLLECTOR_PACKAGE_DOWNLOAD = _cap("collector_package_download", human=True)
+
 #: Changing what happens to a pull request. Human only, and only a human with
 #: write authority on the repository. No service token scope grants this — a
 #: leaked machine credential must not be able to approve an exception.

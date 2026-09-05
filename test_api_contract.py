@@ -148,7 +148,10 @@ class RouteContractTests(unittest.TestCase):
                   "/api/onboarding/ci-token",
                   "/api/onboarding/ci-workflow",
                   "/api/onboarding/complete",
-                  "/api/onboarding/dashboard-session"}
+                  "/api/onboarding/dashboard-session",
+                  # Executable code is narrower than ordinary dashboard read:
+                  # a GitHub dashboard session is required, never a token.
+                  "/api/collector-package"}
         for entry in served_routes(self.app):
             if entry["path"].startswith("/api/") and entry["path"] not in exempt:
                 self.assertEqual(
