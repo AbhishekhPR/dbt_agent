@@ -1218,6 +1218,73 @@ class BillingRouteTests(unittest.TestCase):
         self.assertNotIn("access_token", body)
         self.assertNotIn(ACCESS_TOKEN, json.dumps(body))
 
+    def test_starter_to_pro_uses_portal_and_only_a_verified_webhook_promotes(self):
+        starter = {
+            "tenant_id": TENANT_A,
+            "polar_customer_id": "cus_0001",
+            "polar_subscription_id": "sub_0001",
+            "polar_product_id": STARTER_PRODUCT,
+            "plan": "starter",
+            "subscription_status": "active",
+            "cancel_at_period_end": False,
+            "current_period_end": NOW + timedelta(days=30),
+            "past_due_at": None,
+            "subscription_modified_at": NOW,
+        }
+        self.store.billing[TENANT_A] = dict(starter)
+
+        checkout = self.client.post(
+            "/api/billing/checkout", json={"plan": "pro"},
+            headers=self._auth())
+        self.assertEqual(checkout.status_code, 409)
+        self.assertEqual(checkout.json()["code"], "subscription_exists")
+        self.assertEqual(self.transport.requests, [])
+
+        self.transport.status = 403
+        portal_failure = self.client.post(
+            "/api/billing/portal", headers=self._auth())
+        self.assertEqual(portal_failure.status_code, 503)
+        failure_body = portal_failure.json()
+        self.assertEqual(failure_body["status"], "unavailable")
+        self.assertEqual(failure_body["code"], "billing_provider_unavailable")
+        self.assertRegex(failure_body["request_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(self.store.billing[TENANT_A], starter)
+
+        self.transport.status = 200
+        portal = self.client.post("/api/billing/portal", headers=self._auth())
+        self.assertEqual(portal.status_code, 200)
+        self.assertEqual(
+            self.transport.last["payload"]["external_customer_id"], TENANT_A)
+
+        document = subscription_payload(
+            event="subscription.updated", product_id=PRO_PRODUCT,
+            subscription_id="sub_0001", customer_id="cus_0001",
+            modified_at="2026-08-27T13:00:00Z")
+        raw = json.dumps(document, separators=(",", ":")).encode("utf-8")
+
+        unsigned = self.client.post(
+            "/api/billing/webhooks/polar", content=raw,
+            headers={"Content-Type": "application/json"})
+        self.assertEqual(unsigned.status_code, 401)
+        self.assertEqual(self.store.billing[TENANT_A]["plan"], "starter")
+
+        signed_headers = {
+            **sign_delivery(raw, delivery_id="msg_starter_to_pro"),
+            "Content-Type": "application/json",
+        }
+        applied = self.client.post(
+            "/api/billing/webhooks/polar", content=raw,
+            headers=signed_headers)
+        self.assertEqual(applied.status_code, 202)
+        self.assertEqual(applied.json()["status"], "applied")
+
+        status = self.client.get(
+            "/api/billing/subscription", headers=self._auth())
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["plan"], "pro")
+        self.assertTrue(status.json()["is_active"])
+        self.assertTrue(status.json()["entitlements"]["merge_blocking"])
+
     # -- cross-workspace isolation ---------------------------------------
 
     def test_a_member_of_one_workspace_bills_only_their_own(self):
