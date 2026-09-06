@@ -108,6 +108,12 @@ class PolarSettings:
         if server not in API_BASE_URLS:
             raise PolarConfigurationError(
                 "POLAR_SERVER must be 'production' or 'sandbox'.")
+        railway_environment = _text(values.get("RAILWAY_ENVIRONMENT_NAME"))
+        if railway_environment == "production" and server != SERVER_PRODUCTION:
+            raise PolarConfigurationError(
+                "Railway production requires POLAR_SERVER=production; sandbox "
+                "tokens, products, customers, subscriptions and webhooks are "
+                "separate.")
 
         starter = present["POLAR_STARTER_PRODUCT_ID"]
         pro = present["POLAR_PRO_PRODUCT_ID"]

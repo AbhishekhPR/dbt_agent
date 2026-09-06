@@ -137,7 +137,8 @@ class BillingService:
             logger.error("billing_checkout_failed",
                          extra={"error_category": "billing_provider",
                                 "operation": error.operation,
-                                "http_status": error.status_code})
+                                "http_status": error.status_code,
+                                "provider_code": error.provider_code})
             raise BillingError(CODE_PROVIDER_UNAVAILABLE) from None
 
         url = session.get("url")
@@ -191,7 +192,8 @@ class BillingService:
             logger.error("billing_portal_failed",
                          extra={"error_category": "billing_provider",
                                 "operation": error.operation,
-                                "http_status": error.status_code})
+                                "http_status": error.status_code,
+                                "provider_code": error.provider_code})
             raise BillingError(CODE_PROVIDER_UNAVAILABLE) from None
 
         url = session.get("customer_portal_url")
