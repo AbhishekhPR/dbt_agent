@@ -73,11 +73,11 @@ horizontally. Out of scope for this pilot.
 | `RELIUM_PORT` | yes | `${{PORT}}`. |
 | `RELIUM_HOST` | no | Defaults to `0.0.0.0`. |
 | `RELIUM_SLACK_WEBHOOK_URL` | no | Optional secondary output. |
-| `POLAR_ACCESS_TOKEN` | yes\*\* | Polar **Organization Access Token** (`polar_oat_…`). Server-side only. |
+| `POLAR_ACCESS_TOKEN` | yes\*\* | Polar **Organization Access Token** (`polar_oat_…`) with `products:read`, `checkouts:write`, and `customer_sessions:write`. Server-side only. |
 | `POLAR_WEBHOOK_SECRET` | yes\*\* | The secret configured on the Polar webhook endpoint. Must match exactly. |
 | `POLAR_STARTER_PRODUCT_ID` | yes\*\* | Product id of **Relium Starter** ($149/month) in the Polar organization this token belongs to. |
-| `POLAR_PRO_PRODUCT_ID` | yes\*\* | Product id of **Relium Pro** ($250/month). Must differ from Starter. |
-| `POLAR_SERVER` | no | `production` (default) or `sandbox`. Sandbox is a fully separate Polar environment with its own token, secret and product ids. |
+| `POLAR_PRO_PRODUCT_ID` | yes\*\* | Product id of **Relium Pro** ($249/month). Must differ from Starter. |
+| `POLAR_SERVER` | no | `production` (default) or `sandbox`. A Railway production deployment refuses `sandbox`. Sandbox is a fully separate Polar environment with its own token, secret and product ids. |
 | `POLAR_PAST_DUE_GRACE_DAYS` | no | `0`–`21`, default `0`. Mirrors Polar's own "Grace period for benefit revocation"; keep the two equal. |
 
 \* Exactly one key source is required. **The inline value wins** when both are
@@ -134,6 +134,55 @@ Under **Settings → Customer portal** in the Polar dashboard:
 | **Enable subscription plan changes** | **on** | A Starter customer has no way to reach Pro. Relium deliberately refuses a second checkout for a workspace that already subscribes — Polar's checkout creates a NEW subscription, so the customer would be billed for both — and sends every plan change to the portal instead. |
 
 Cancellation is always available in the portal and needs no setting.
+
+### Polar billing preflight
+
+Run this read-only catalog check before every billing deployment. It validates
+the selected server, distinct product ids, active monthly USD prices, and the
+expected $149 Starter / $249 Pro amounts without printing secrets:
+
+```shell
+python scripts/polar_billing_preflight.py --expected-server production
+```
+
+Before a sandbox end-to-end test, also prove that the token can create the
+Polar-hosted customer portal session used for Starter → Pro:
+
+```shell
+python scripts/polar_billing_preflight.py --expected-server sandbox --customer-external-id <sandbox-qa-tenant-id>
+```
+
+The optional check creates only an ephemeral customer session; it does not
+create or change a customer, subscription, checkout, product, or entitlement.
+A missing scope fails with the HTTP status and safe Polar error code. The
+required scope is `customer_sessions:write`.
+
+### Sandbox-to-live cutover
+
+Never copy Polar customer or subscription ids between environments. Treat the
+sandbox QA subscription as disposable and use this order:
+
+1. In live Polar, verify distinct active products: Starter $149/month and Pro
+   $249/month (USD, fixed recurring monthly prices).
+2. Create a live Organization Access Token with `products:read`,
+   `checkouts:write`, and `customer_sessions:write`.
+3. Register the live webhook above and retain its live secret.
+4. Prepare all five Railway values together: `POLAR_SERVER=production`, the
+   live token, live webhook secret, live Starter id, and live Pro id. Do not
+   reuse any sandbox value.
+5. Run the production preflight with the prepared values before applying them.
+6. Remove the disposable sandbox QA billing row using its exact tenant,
+   customer, subscription, and product ids in one guarded transaction. Do not
+   preserve those provider ids as live billing state.
+7. Apply the five prepared values and deploy the backend before deploying the
+   $249 frontend and marketing builds.
+8. Start a fresh live Starter checkout. Confirm the verified
+   `subscription.*` webhook grants Starter, then open `/api/billing/portal`,
+   change to Pro, and confirm a verified live webhook grants Pro.
+
+Provider failures and browser redirects never write plan state. Only a verified
+`subscription.*` webhook may change stored product, subscription, or plan data,
+so no temporary entitlement is needed for the disposable QA subscription.
 
 Set the App's **Callback URL** to `${RELIUM_PUBLIC_URL}/auth/github/callback`
 and its **Webhook URL** to `${RELIUM_PUBLIC_URL}/github/webhook`.
