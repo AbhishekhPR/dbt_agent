@@ -245,7 +245,11 @@ class RepositoryOnboardingService:
         client = self._client.with_token(token)
         found = []
         seen_total = None
-        for page in range(1, 11):
+        # A large installation can authorize more than GitHub's 100-item page.
+        # Never return a plausible-looking partial list: either reach the
+        # advertised total/an empty page, or fail closed at the safety bound.
+        max_pages = 10_000
+        for page in range(1, max_pages + 1):
             try:
                 document = self._client.list_installation_repositories(
                     token, page=page)
@@ -263,6 +267,8 @@ class RepositoryOnboardingService:
             seen_total = document.get("total_count")
             if not batch or (isinstance(seen_total, int) and len(found) >= seen_total):
                 break
+        else:
+            raise RepositoryOnboardingError(CODE_GITHUB_UNAVAILABLE)
         enriched = []
         for repository in found:
             if not hasattr(self._client, "get_branch"):
@@ -695,6 +701,7 @@ def repositories_payload(store, tenant_id, repositories):
             "full_name": repository.full_name,
             "owner": repository.owner_login,
             "name": repository.name,
+            "installation_id": repository.installation_id,
             "default_branch": repository.default_branch,
             "private": repository.private,
             "dbt_detected": detection.get("dbt_detected"),

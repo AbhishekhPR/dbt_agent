@@ -101,6 +101,37 @@ class _FakeClient:
         return b"name: analytics\nversion: '1.0'\n"
 
 
+class RepositoryPaginationTests(unittest.TestCase):
+    def test_more_than_ten_pages_are_returned_completely(self):
+        from agent.api.repository_onboarding import RepositoryOnboardingService
+
+        class _PagedClient(_FakeClient):
+            def list_installation_repositories(
+                    self, installation_token, *, page=1, per_page=100):
+                total = 1001
+                if page > total:
+                    repositories = []
+                else:
+                    repositories = [{
+                        "id": page,
+                        "name": f"repo-{page}",
+                        "private": True,
+                        "default_branch": "main",
+                        "owner": {"login": "large-installation"},
+                    }]
+                return {"total_count": total, "repositories": repositories}
+
+        service = RepositoryOnboardingService(
+            client=_PagedClient(), jwt_factory=lambda: "app-jwt",
+            installation_token_factory=lambda i: f"installation-token-{i}",
+            clock=lambda: NOW)
+
+        repositories = service._installation_repositories(ACME_INSTALLATION)
+
+        self.assertEqual(len(repositories), 1001)
+        self.assertEqual(repositories[-1].github_repository_id, 1001)
+
+
 def _reset_schema(dsn):
     import psycopg
 
