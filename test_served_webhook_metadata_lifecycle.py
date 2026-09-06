@@ -65,6 +65,34 @@ SELF_CONTAINED_HEAD = {"nodes": {"model.a.standalone": _model(
     "standalone", [], ["x"])}, "sources": {}}
 
 
+def _left_join_manifest(sql):
+    node = _model(
+        "int_subscription_revenue", [],
+        ["subscription_id", "payment_status"],
+    )
+    node.update({
+        "unique_id": "model.a.int_subscription_revenue",
+        "raw_code": sql,
+        "compiled_code": sql,
+    })
+    return {
+        "metadata": {"project_name": "a"},
+        "nodes": {"model.a.int_subscription_revenue": node},
+        "sources": {},
+    }
+
+
+LEFT_JOIN_SQL = (
+    "select s.subscription_id, p.payment_status "
+    "from subscriptions s left join payments p "
+    "on s.subscription_id = p.subscription_id"
+)
+LEFT_JOIN_BASE = _left_join_manifest(LEFT_JOIN_SQL)
+LEFT_JOIN_HEAD = _left_join_manifest(
+    LEFT_JOIN_SQL + " where p.payment_status = 'succeeded'"
+)
+
+
 class _FakeGitHubClient:
     """Records every publication call so duplication is detectable."""
 
@@ -209,6 +237,43 @@ class ServedWebhookLifecycleTests(unittest.TestCase):
         review = self._review(response["review_id"])
         self.assertEqual(review["base_manifest_hash"], manifest_hash(BASE_MANIFEST))
         self.assertEqual(review["head_manifest_hash"], manifest_hash(HEAD_MANIFEST))
+
+    def test_direct_webhook_persists_left_join_filter_semantics_and_code_risk(self):
+        self.client.manifests = {
+            BASE_SHA: LEFT_JOIN_BASE,
+            HEAD_SHA: LEFT_JOIN_HEAD,
+        }
+        self.client.compare_files = (
+            lambda *_args, **_kwargs:
+            ["models/int_subscription_revenue.sql"]
+        )
+
+        response = self._run()
+
+        with self.pool.acquire() as store:
+            attempt = store.review_attempts(
+                OWNER, REPO_NAME, response["review_id"]
+            )[-1]
+        semantic = attempt["semantic_evidence"]
+        self.assertEqual(semantic["status"], "evaluated")
+        changes = [
+            change
+            for model in semantic["models"]
+            for change in model["changes"]
+        ]
+        filter_change = next(
+            change for change in changes
+            if change["kind"] == "filter_changed"
+        )
+        self.assertIsNone(filter_change["before_sql"])
+        self.assertEqual(
+            filter_change["after_sql"],
+            "p.payment_status = 'succeeded'",
+        )
+        self.assertIn(
+            "LEFT_JOIN_NULLIFIED",
+            {finding["code"] for finding in attempt["payload"]["findings"]},
+        )
 
     # -- 7..11. waiting state -------------------------------------------
 

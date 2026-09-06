@@ -93,6 +93,52 @@ def _manifests():
     return base, head
 
 
+def _semantic_recovery_manifests(*, risky=True):
+    before_sql = (
+        "select s.subscription_id, p.payment_status "
+        "from subscriptions s left join payments p "
+        "on s.subscription_id = p.subscription_id"
+    )
+    after_sql = (
+        before_sql + " where p.payment_status = 'succeeded'"
+        if risky
+        else "select s.subscription_id, s.plan_name from subscriptions s"
+    )
+    if not risky:
+        before_sql = "select s.subscription_id from subscriptions s"
+
+    def document(sql, columns):
+        node = _model(
+            "int_subscription_revenue",
+            ["model.a.stg_subscriptions", "model.a.stg_payments"],
+            columns,
+        )
+        node.update({
+            "unique_id": "model.a.int_subscription_revenue",
+            "raw_code": sql,
+            "compiled_code": sql,
+            "original_file_path": "models/intermediate/int_subscription_revenue.sql",
+        })
+        return {
+            "metadata": {"project_name": "a"},
+            "nodes": {"model.a.int_subscription_revenue": node},
+            "sources": {},
+            "exposures": {},
+            "macros": {},
+            "child_map": {},
+            "parent_map": {},
+        }
+
+    return (
+        document(before_sql, ["subscription_id", "payment_status"]),
+        document(
+            after_sql,
+            ["subscription_id", "payment_status"] if risky
+            else ["subscription_id", "plan_name"],
+        ),
+    )
+
+
 @unittest.skipUnless(DSN, "RELIUM_TEST_POSTGRES_DSN not set; PostgreSQL suite requires a real server")
 class MetadataReviewIntegrationTests(unittest.TestCase):
     @classmethod
@@ -144,7 +190,7 @@ class MetadataReviewIntegrationTests(unittest.TestCase):
 
     def _begin(self, *, head_sha=HEAD_SHA, mode="enforce", pull_number=11,
                code_health=100, code_findings=(), health_explanation=None,
-               semantic_evidence=None):
+               semantic_evidence=None, changed_models=None):
         from agent.metadata_evidence.review_lifecycle import begin_review
 
         with self.pool.acquire() as store:
@@ -153,7 +199,7 @@ class MetadataReviewIntegrationTests(unittest.TestCase):
                 environment=self.env, pull_number=pull_number,
                 base_sha=BASE_SHA, head_sha=head_sha,
                 base_manifest=self.base_manifest, head_manifest=self.head_manifest,
-                changed_models=["fct_orders"], enforcement_mode=mode,
+                changed_models=changed_models or ["fct_orders"], enforcement_mode=mode,
                 delivery_id=f"delivery-{uuid.uuid4().hex[:8]}",
                 code_health=code_health, code_findings=code_findings,
                 health_explanation=health_explanation,
@@ -564,6 +610,21 @@ class MetadataReviewIntegrationTests(unittest.TestCase):
             return {a["attempt"]: a
                     for a in store.review_attempts(self.org, self.repo, review_id)}
 
+    def _submit_exact_manifests(self):
+        from agent.metadata_evidence.collection_plan import manifest_hash
+
+        with self.pool.acquire() as store:
+            for side, sha, document in (
+                ("base", BASE_SHA, self.base_manifest),
+                ("head", HEAD_SHA, self.head_manifest),
+            ):
+                store.submit_manifest_evidence(
+                    self.org, self.repo, commit_sha=sha, manifest=document,
+                    manifest_hash=manifest_hash(document),
+                    idempotency_key=f"{self.org}-{side}",
+                    payload_hash=f"payload-{self.org}-{side}",
+                )
+
     def test_semantic_evidence_is_preserved_onto_the_recomputed_attempt(self):
         outcome = self._begin_with_semantic(CERTIFIED_SEMANTIC)
         self._submit(outcome)
@@ -614,6 +675,80 @@ class MetadataReviewIntegrationTests(unittest.TestCase):
         attempts = self._attempts_by_number(outcome.review_id)
         self.assertIsNone(attempts[1]["semantic_evidence"])
         self.assertIsNone(attempts[2]["semantic_evidence"])
+
+    def test_recompute_recovers_exact_manifest_semantics_without_mutating_history(self):
+        self.base_manifest, self.head_manifest = _semantic_recovery_manifests()
+        existing_finding = {
+            "code": "EXISTING_CODE_EVIDENCE",
+            "severity": "info",
+            "category": "code",
+            "message": "Previously recorded code evidence.",
+            "relation": "int_subscription_revenue",
+            "detail": {},
+        }
+        outcome = self._begin(
+            pull_number=49, changed_models=["int_subscription_revenue"],
+            code_findings=[existing_finding],
+        )
+        first_before = self._attempts_by_number(outcome.review_id)[1]
+        self.assertIsNone(first_before["semantic_evidence"])
+        self._submit_exact_manifests()
+
+        self._submit(outcome)
+        self._run_worker(outcome.review_id)
+
+        attempts = self._attempts_by_number(outcome.review_id)
+        self.assertEqual(attempts[1], first_before)
+        recovered = attempts[2]["semantic_evidence"]
+        self.assertEqual(recovered["status"], "evaluated")
+        changes = [change for model in recovered["models"]
+                   for change in model["changes"]]
+        filter_change = next(change for change in changes
+                             if change["kind"] == "filter_changed")
+        self.assertIsNone(filter_change["before_sql"])
+        self.assertEqual(
+            filter_change["after_sql"], "p.payment_status = 'succeeded'"
+        )
+        self.assertIn(
+            "LEFT_JOIN_NULLIFIED",
+            {finding["code"] for finding in attempts[2]["payload"]["findings"]},
+        )
+        self.assertIn(
+            "EXISTING_CODE_EVIDENCE",
+            {finding["code"] for finding in attempts[2]["payload"]["findings"]},
+        )
+        self.assertEqual(attempts[2]["health"], 65)
+        self.assertEqual(
+            attempts[2]["payload"]["health_explanation"]["score"], 65
+        )
+
+        body = self._get(f"/api/reviews/{outcome.review_id}/attempts").json()
+        self.assertEqual(body["current_attempt"], 2)
+        current = next(item for item in body["attempts"]
+                       if item["attempt"] == body["current_attempt"])
+        self.assertEqual(current["semantic_evidence"]["status"], "evaluated")
+        self.assertEqual(current["semantic_evidence"]["changes"][0]["kind"],
+                         "filter_changed")
+
+    def test_recompute_recovers_safe_projection_without_inventing_a_risk(self):
+        self.base_manifest, self.head_manifest = _semantic_recovery_manifests(risky=False)
+        outcome = self._begin(
+            pull_number=50, changed_models=["int_subscription_revenue"]
+        )
+        self._submit_exact_manifests()
+
+        self._submit(outcome)
+        self._run_worker(outcome.review_id)
+
+        current = self._attempts_by_number(outcome.review_id)[2]
+        changes = [change for model in current["semantic_evidence"]["models"]
+                   for change in model["changes"]]
+        self.assertEqual([change["kind"] for change in changes],
+                         ["projection_added"])
+        self.assertNotIn(
+            "LEFT_JOIN_NULLIFIED",
+            {finding["code"] for finding in current["payload"]["findings"]},
+        )
 
     def test_repeated_recomputation_does_not_diverge(self):
         outcome = self._begin_with_semantic(CERTIFIED_SEMANTIC, pull_number=46)
