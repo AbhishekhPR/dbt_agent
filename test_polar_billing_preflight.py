@@ -3,14 +3,19 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
+import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 
 from agent.billing.config import PolarSettings
 
 
 STARTER_PRODUCT = "prod_starter"
 PRO_PRODUCT = "prod_pro"
+REPO_ROOT = Path(__file__).resolve().parent
 
 
 def settings(server="sandbox"):
@@ -28,6 +33,9 @@ def product(product_id, name, cents, **overrides):
         "id": product_id,
         "name": name,
         "is_archived": False,
+        "is_recurring": True,
+        "recurring_interval": "month",
+        "recurring_interval_count": 1,
         "prices": [{
             "id": "price_" + product_id,
             "source": "catalog",
@@ -71,12 +79,35 @@ class CatalogValidationTests(unittest.TestCase):
             },
         })
 
+    def test_accepts_the_current_product_level_recurring_price_shape(self):
+        from scripts.polar_billing_preflight import validate_catalog
+
+        products = dict(self.products)
+        products[PRO_PRODUCT] = product(
+            PRO_PRODUCT, "Relium Pro", 24900,
+            prices=[{
+                "id": "price_modern_pro",
+                "source": "catalog",
+                "amount_type": "fixed",
+                "price_currency": "usd",
+                "price_amount": 24900,
+                "is_archived": False,
+                "type": "fixed",
+            }])
+
+        result = validate_catalog(
+            settings(), get_json=lambda path:
+            products[path.rsplit("/", 1)[-1]])
+
+        self.assertEqual(result["pro"]["monthly_usd_cents"], 24900)
+
     def test_rejects_wrong_amount_cadence_archive_and_duplicate_ids(self):
         from scripts.polar_billing_preflight import PreflightError, validate_catalog
 
         cases = {
             "wrong amount": product(PRO_PRODUCT, "Relium Pro", 25000),
             "annual": product(PRO_PRODUCT, "Relium Pro", 24900,
+                              recurring_interval="year",
                               prices=[{
                                   "source": "catalog", "amount_type": "fixed",
                                   "type": "recurring",
@@ -105,9 +136,10 @@ class CatalogValidationTests(unittest.TestCase):
     def test_rejects_an_expected_environment_mismatch(self):
         from scripts.polar_billing_preflight import PreflightError, run_preflight
 
-        with self.assertRaisesRegex(PreflightError, "expected production"):
-            run_preflight(settings("sandbox"), expected_server="production",
-                          get_json=self.get_json)
+        with redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(PreflightError, "expected production"):
+                run_preflight(settings("sandbox"), expected_server="production",
+                              get_json=self.get_json)
 
 
 class PortalCapabilityTests(unittest.TestCase):
@@ -157,17 +189,32 @@ class PortalCapabilityTests(unittest.TestCase):
                 status_code=403, provider_code="insufficient_scope",
                 provider_description="sensitive provider prose")
 
-        with self.assertRaises(PreflightError) as caught:
-            run_preflight(
-                settings(), expected_server="sandbox",
-                customer_external_id="ten_qa_customer",
-                get_json=self.get_json, post_json=refused)
+        with redirect_stdout(io.StringIO()):
+            with self.assertRaises(PreflightError) as caught:
+                run_preflight(
+                    settings(), expected_server="sandbox",
+                    customer_external_id="ten_qa_customer",
+                    get_json=self.get_json, post_json=refused)
 
         message = str(caught.exception)
         self.assertIn("HTTP 403", message)
         self.assertIn("insufficient_scope", message)
         self.assertNotIn("sensitive provider prose", message)
         self.assertNotIn("ten_qa_customer", message)
+
+
+class PreflightCommandTests(unittest.TestCase):
+    def test_script_can_be_invoked_by_path_from_outside_the_repository(self):
+        with tempfile.TemporaryDirectory() as other_directory:
+            result = subprocess.run(
+                [sys.executable,
+                 str(REPO_ROOT / "scripts" / "polar_billing_preflight.py"),
+                 "--help"],
+                cwd=other_directory, capture_output=True, text=True,
+                check=False)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--expected-server", result.stdout)
 
 
 if __name__ == "__main__":

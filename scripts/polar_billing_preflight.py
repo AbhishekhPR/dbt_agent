@@ -12,6 +12,12 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from agent.billing.config import PolarConfigurationError, PolarSettings
 from agent.billing.plans import PLAN_PRO, PLAN_STARTER, plan_for_product
@@ -109,6 +115,11 @@ def validate_catalog(settings, *, get_json):
             raise PreflightError(f"{plan} product ID did not match Polar's response.")
         if product.get("is_archived") is not False:
             raise PreflightError(f"{plan} product is archived or has unknown state.")
+        if (product.get("is_recurring") is not True
+                or product.get("recurring_interval") != "month"
+                or product.get("recurring_interval_count") != 1):
+            raise PreflightError(
+                f"{plan} product must recur exactly once per month.")
         mapped = plan_for_product(
             product_id,
             starter_product_id=settings.starter_product_id,
@@ -121,8 +132,6 @@ def validate_catalog(settings, *, get_json):
             if isinstance(price, dict)
             and price.get("source") == "catalog"
             and price.get("amount_type") == "fixed"
-            and price.get("type") == "recurring"
-            and price.get("recurring_interval") == "month"
             and price.get("price_currency") == "usd"
             and price.get("is_archived") is False
         ]
