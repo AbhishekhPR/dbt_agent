@@ -210,6 +210,52 @@ def build_service(*, transport=None, settings=None, app_url="https://app.test",
     return service, transport
 
 
+class PolarClientTests(unittest.TestCase):
+    def test_a_refusal_retains_only_safe_provider_diagnostics(self):
+        from agent.billing.client import PolarAPIError, PolarClient
+
+        def refused(**_kwargs):
+            return 403, json.dumps({
+                "error": "insufficient_scope",
+                "error_description": (
+                    "The request requires higher privileges than provided "
+                    "by the access token."),
+                "customer_id": "cus_must_not_survive",
+            }).encode("utf-8")
+
+        client = PolarClient(_settings(), transport=refused)
+        with self.assertRaises(PolarAPIError) as caught:
+            client.create_customer_session(external_customer_id=TENANT_A)
+
+        error = caught.exception
+        self.assertEqual(error.status_code, 403)
+        self.assertEqual(error.provider_code, "insufficient_scope")
+        self.assertEqual(
+            error.provider_description,
+            "The request requires higher privileges than provided by the "
+            "access token.")
+        rendered = repr(error.__dict__) + str(error)
+        self.assertNotIn("cus_must_not_survive", rendered)
+        self.assertNotIn(TENANT_A, rendered)
+        self.assertNotIn(ACCESS_TOKEN, rendered)
+
+    def test_malformed_or_oversized_diagnostics_are_discarded(self):
+        from agent.billing.client import PolarAPIError, PolarClient
+
+        for raw in (
+                b"not-json",
+                json.dumps({"error": "x" * 129,
+                            "error_description": "y" * 513}).encode("utf-8"),
+                json.dumps(["insufficient_scope"]).encode("utf-8")):
+            with self.subTest(raw=raw[:20]):
+                client = PolarClient(
+                    _settings(), transport=lambda **_kwargs: (403, raw))
+                with self.assertRaises(PolarAPIError) as caught:
+                    client.create_customer_session(external_customer_id=TENANT_A)
+                self.assertIsNone(caught.exception.provider_code)
+                self.assertIsNone(caught.exception.provider_description)
+
+
 # ------------------------------------------------------------------ fake store
 
 class _FakeConnection:
@@ -866,6 +912,37 @@ class PortalTests(unittest.TestCase):
                                         "subscription_status": "active"}
         result = self.service.create_portal_session(self.store, TENANT_A)
         self.assertEqual(set(result), {"portal_url"})
+
+    def test_a_provider_refusal_logs_the_safe_code_and_preserves_starter(self):
+        from agent.billing.service import BillingError
+
+        starter = {"polar_customer_id": "cus_0001", "plan": "starter",
+                   "subscription_status": "active"}
+        self.store.billing[TENANT_A] = dict(starter)
+
+        def refused(**_kwargs):
+            return 403, json.dumps({
+                "error": "insufficient_scope",
+                "error_description": "secret-looking provider prose",
+                "customer_id": "cus_must_not_be_logged",
+            }).encode("utf-8")
+
+        service, _ = build_service(transport=refused)
+        with self.assertLogs("agent.billing.service", level="ERROR") as logs:
+            with self.assertRaises(BillingError) as caught:
+                service.create_portal_session(self.store, TENANT_A)
+
+        self.assertEqual(caught.exception.code, "billing_provider_unavailable")
+        self.assertEqual(self.store.billing[TENANT_A], starter)
+        record = logs.records[0]
+        self.assertEqual(record.operation, "create_customer_session")
+        self.assertEqual(record.http_status, 403)
+        self.assertEqual(record.provider_code, "insufficient_scope")
+        rendered = record.getMessage() + repr(record.__dict__)
+        self.assertNotIn("secret-looking provider prose", rendered)
+        self.assertNotIn("cus_must_not_be_logged", rendered)
+        self.assertNotIn(TENANT_A, rendered)
+        self.assertNotIn(ACCESS_TOKEN, rendered)
 
 
 # ============================================================ webhook handling

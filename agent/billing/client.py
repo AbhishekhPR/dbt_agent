@@ -34,10 +34,13 @@ class PolarAPIError(RuntimeError):
     rendered to a customer.
     """
 
-    def __init__(self, message, *, status_code=None, operation=None):
+    def __init__(self, message, *, status_code=None, operation=None,
+                 provider_code=None, provider_description=None):
         super().__init__(message)
         self.status_code = status_code
         self.operation = operation
+        self.provider_code = provider_code
+        self.provider_description = provider_description
 
     @property
     def retryable(self) -> bool:
@@ -122,8 +125,11 @@ class PolarClient:
                                 operation=operation) from None
 
         if status is None or not 200 <= status < 300:
+            provider_code, provider_description = _provider_diagnostic(raw)
             raise PolarAPIError("Polar refused the request.",
-                                status_code=status, operation=operation)
+                                status_code=status, operation=operation,
+                                provider_code=provider_code,
+                                provider_description=provider_description)
         try:
             document = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
@@ -146,7 +152,27 @@ def _urllib_transport(*, method, url, headers, body, timeout):
         # a caller whether retrying could ever help. The body is read and
         # discarded so the connection closes cleanly, and is never surfaced.
         try:
-            error.read(MAX_RESPONSE_BYTES)
+            raw = error.read(MAX_RESPONSE_BYTES)
         finally:
             error.close()
-        return error.code, b"{}"
+        return error.code, raw
+
+
+def _provider_diagnostic(raw):
+    """Allow-listed, bounded diagnostics from a Polar error response."""
+    if not isinstance(raw, bytes):
+        return None, None
+    try:
+        value = json.loads(raw[:MAX_RESPONSE_BYTES].decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None, None
+    if not isinstance(value, dict):
+        return None, None
+    return (_bounded_text(value.get("error"), 128),
+            _bounded_text(value.get("error_description"), 512))
+
+
+def _bounded_text(value, limit):
+    if not isinstance(value, str) or not value or len(value) > limit:
+        return None
+    return value
