@@ -66,7 +66,9 @@ def create_onboarding_repository_routes(*, store_pool, clerk_authenticator,
     configuration this application was built with — see
     ``agent.billing.access.get_workspace_entitlements``.
     """
-    from agent.billing.access import get_workspace_entitlements
+    from agent.billing.access import (
+        get_workspace_entitlements, get_workspace_plan,
+    )
 
     def _entitlements(store, principal):
         return get_workspace_entitlements(
@@ -90,8 +92,31 @@ def create_onboarding_repository_routes(*, store_pool, clerk_authenticator,
 
     def list_repositories(request, body, store, principal):
         repositories = service.list_repositories(store, principal.tenant_id)
-        return 200, {"repositories": repositories_payload(
-            store, principal.tenant_id, repositories)}
+        entitlements = _entitlements(store, principal)
+        installations = [
+            {
+                "installation_id": row["github_installation_id"],
+                "account_login": row["github_account_login"],
+                "account_type": row["github_account_type"],
+            }
+            for row in store.tenant_github_installations(principal.tenant_id)
+            if row["status"] == "active"
+        ]
+        return 200, {
+            "repositories": repositories_payload(
+                store, principal.tenant_id, repositories),
+            "authorization": {
+                "authorized_count": len(repositories),
+                "github_installations": installations,
+            },
+            "policy": {
+                "plan": get_workspace_plan(
+                    store, principal.tenant_id, billing_settings),
+                "repository_limit": entitlements.repository_limit,
+                "connected_repository_count":
+                    store.count_tenant_repositories(principal.tenant_id),
+            },
+        }
 
     def select_repository(request, body, store, principal):
         record = service.select_repository(

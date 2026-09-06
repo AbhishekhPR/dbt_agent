@@ -17,6 +17,7 @@ import json
 import os
 import unittest
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 DSN = os.environ.get("RELIUM_TEST_POSTGRES_DSN")
 
@@ -208,7 +209,8 @@ class _FlowHarness(unittest.TestCase):
                 jwks=_StubJwks(cls.signer), clock=lambda: NOW),
             installation_binder=binder, identity_linker=cls.linker,
             repository_service=repository_service,
-            app_url=APP_URL, api_url=API_URL)
+            app_url=APP_URL, api_url=API_URL,
+            billing_settings=SimpleNamespace(past_due_grace=timedelta(0)))
         cls.http = TestClient(cls.app, follow_redirects=False)
         cls.http.__enter__()
 
@@ -221,7 +223,8 @@ class _FlowHarness(unittest.TestCase):
         from agent.api.session_crypto import encrypt
 
         with self.pool.acquire() as store:
-            for table in ("tenant_repositories", "tenant_github_installations",
+            for table in ("tenant_repositories", "tenant_billing",
+                          "tenant_github_installations",
                           "github_installations", "github_installation_states",
                           "clerk_github_identities", "api_service_tokens",
                           "tenant_onboarding_state", "tenants"):
@@ -282,6 +285,19 @@ class _FlowHarness(unittest.TestCase):
         repositories = {r["repository_id"]: r
                         for r in listing.json()["repositories"]}
         self.assertEqual(set(repositories), {REPO_ID, OTHER_REPO_ID})
+        self.assertEqual(listing.json()["authorization"], {
+            "authorized_count": 2,
+            "github_installations": [{
+                "installation_id": INSTALLATION,
+                "account_login": "acme-analytics",
+                "account_type": "Organization",
+            }],
+        })
+        self.assertEqual(listing.json()["policy"], {
+            "plan": "free",
+            "repository_limit": 1,
+            "connected_repository_count": 0,
+        })
 
         # 5. Select one. dbt detection runs during selection.
         selected = self.http.put(f"/api/onboarding/repositories/{REPO_ID}",
@@ -345,6 +361,63 @@ class FirstUserFlowTests(_FlowHarness):
 
     def test_the_complete_first_user_flow(self):
         self._run_full_flow()
+
+    def test_listing_keeps_every_authorized_repository_visible_for_every_plan(self):
+        workspace = self.http.put(
+            "/api/tenants", headers=self._auth(),
+            json={"organization_name": "Acme"}).json()
+        self._install()
+
+        def listing():
+            response = self.http.get(
+                "/api/onboarding/repositories", headers=self._auth())
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()
+
+        free = listing()
+        self.assertEqual(
+            {repo["repository_id"] for repo in free["repositories"]},
+            {REPO_ID, OTHER_REPO_ID})
+        self.assertEqual(free["policy"]["plan"], "free")
+        self.assertEqual(free["policy"]["repository_limit"], 1)
+
+        with self.pool.acquire() as store:
+            result = store.upsert_billing_from_subscription(
+                tenant_id=workspace["id"],
+                polar_customer_id="live_customer",
+                polar_subscription_id="live_subscription",
+                polar_product_id="live_starter_product",
+                plan="starter", subscription_status="active",
+                current_period_end=NOW + timedelta(days=30),
+                cancel_at_period_end=False, past_due_at=None,
+                subscription_modified_at=NOW)
+        self.assertEqual(result, "applied")
+
+        starter = listing()
+        self.assertEqual(
+            {repo["repository_id"] for repo in starter["repositories"]},
+            {REPO_ID, OTHER_REPO_ID})
+        self.assertEqual(starter["policy"]["plan"], "starter")
+        self.assertEqual(starter["policy"]["repository_limit"], 3)
+
+        with self.pool.acquire() as store:
+            result = store.upsert_billing_from_subscription(
+                tenant_id=workspace["id"],
+                polar_customer_id="live_customer",
+                polar_subscription_id="live_subscription",
+                polar_product_id="live_pro_product",
+                plan="pro", subscription_status="active",
+                current_period_end=NOW + timedelta(days=30),
+                cancel_at_period_end=False, past_due_at=None,
+                subscription_modified_at=NOW + timedelta(seconds=1))
+        self.assertEqual(result, "applied")
+
+        pro = listing()
+        self.assertEqual(
+            {repo["repository_id"] for repo in pro["repositories"]},
+            {REPO_ID, OTHER_REPO_ID})
+        self.assertEqual(pro["policy"]["plan"], "pro")
+        self.assertIsNone(pro["policy"]["repository_limit"])
 
     def test_a_returning_user_is_already_complete(self):
         self._run_full_flow()
