@@ -66,9 +66,8 @@ def create_onboarding_repository_routes(*, store_pool, clerk_authenticator,
     configuration this application was built with — see
     ``agent.billing.access.get_workspace_entitlements``.
     """
-    from agent.billing.access import (
-        get_workspace_entitlements, get_workspace_plan,
-    )
+    from agent.billing.access import get_workspace_entitlements, get_workspace_plan
+    from agent.billing.entitlements import UNMETERED, entitlements_for
 
     def _entitlements(store, principal):
         return get_workspace_entitlements(
@@ -92,7 +91,10 @@ def create_onboarding_repository_routes(*, store_pool, clerk_authenticator,
 
     def list_repositories(request, body, store, principal):
         repositories = service.list_repositories(store, principal.tenant_id)
-        entitlements = _entitlements(store, principal)
+        plan = get_workspace_plan(
+            store, principal.tenant_id, billing_settings)
+        entitlements = (
+            UNMETERED if billing_settings is None else entitlements_for(plan))
         installations = [
             {
                 "installation_id": row["github_installation_id"],
@@ -110,8 +112,7 @@ def create_onboarding_repository_routes(*, store_pool, clerk_authenticator,
                 "github_installations": installations,
             },
             "policy": {
-                "plan": get_workspace_plan(
-                    store, principal.tenant_id, billing_settings),
+                "plan": plan,
                 "repository_limit": entitlements.repository_limit,
                 "connected_repository_count":
                     store.count_tenant_repositories(principal.tenant_id),

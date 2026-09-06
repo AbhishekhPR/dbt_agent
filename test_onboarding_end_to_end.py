@@ -285,6 +285,9 @@ class _FlowHarness(unittest.TestCase):
         repositories = {r["repository_id"]: r
                         for r in listing.json()["repositories"]}
         self.assertEqual(set(repositories), {REPO_ID, OTHER_REPO_ID})
+        self.assertEqual(
+            {row["installation_id"] for row in repositories.values()},
+            {INSTALLATION})
         self.assertEqual(listing.json()["authorization"], {
             "authorized_count": 2,
             "github_installations": [{
