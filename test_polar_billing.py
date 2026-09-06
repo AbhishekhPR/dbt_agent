@@ -470,6 +470,40 @@ class PolarConfigurationTests(unittest.TestCase):
         })
         self.assertEqual(settings.server, "production")
 
+    def test_railway_production_refuses_the_sandbox_billing_universe(self):
+        from agent.billing.config import PolarConfigurationError, PolarSettings
+
+        env = {
+            "POLAR_ACCESS_TOKEN": ACCESS_TOKEN,
+            "POLAR_WEBHOOK_SECRET": WEBHOOK_SECRET,
+            "POLAR_STARTER_PRODUCT_ID": STARTER_PRODUCT,
+            "POLAR_PRO_PRODUCT_ID": PRO_PRODUCT,
+            "POLAR_SERVER": "sandbox",
+            "RAILWAY_ENVIRONMENT_NAME": "production",
+        }
+        with self.assertRaisesRegex(
+                PolarConfigurationError,
+                "Railway production requires POLAR_SERVER=production"):
+            PolarSettings.from_environ(env)
+
+    def test_nonproduction_and_local_environments_may_use_sandbox(self):
+        from agent.billing.config import PolarSettings
+
+        base = {
+            "POLAR_ACCESS_TOKEN": ACCESS_TOKEN,
+            "POLAR_WEBHOOK_SECRET": WEBHOOK_SECRET,
+            "POLAR_STARTER_PRODUCT_ID": STARTER_PRODUCT,
+            "POLAR_PRO_PRODUCT_ID": PRO_PRODUCT,
+            "POLAR_SERVER": "sandbox",
+        }
+        for railway_environment in (None, "development", "staging"):
+            with self.subTest(railway_environment=railway_environment):
+                env = dict(base)
+                if railway_environment is not None:
+                    env["RAILWAY_ENVIRONMENT_NAME"] = railway_environment
+                self.assertEqual(PolarSettings.from_environ(env).server,
+                                 "sandbox")
+
     def test_an_unknown_server_name_is_refused(self):
         from agent.billing.config import PolarConfigurationError, PolarSettings
 
