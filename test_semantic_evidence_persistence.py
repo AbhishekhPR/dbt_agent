@@ -24,6 +24,8 @@ from agent.api.routes import _semantic_evidence_view
 from agent.deployment_review_service import review_manifest_change
 from agent.github_app.runner import _semantic_evidence
 from agent.metadata_evidence.review_lifecycle import begin_review
+from agent.metadata_evidence.recompute import _recover_exact_manifest_analysis
+from agent.metadata_evidence.collection_plan import manifest_hash
 
 DSN = os.environ.get("RELIUM_TEST_POSTGRES_DSN")
 
@@ -258,6 +260,55 @@ class RegexFallbackDoesNotFabricateEvidenceTests(unittest.TestCase):
         for change in comparison["material_sql_changes"]:
             self.assertEqual(change["detector"], "regex_fallback_unparsed_sql")
             self.assertNotIn("before_sql", change)
+
+
+class ExactManifestRecoverySafetyTests(unittest.TestCase):
+    def _review(self, before, after):
+        return {
+            "review_id": "review-1",
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "base_manifest_hash": manifest_hash(before),
+            "head_manifest_hash": manifest_hash(after),
+        }
+
+    @staticmethod
+    def _store(before, after):
+        class Store:
+            def get_manifest_evidence(self, _organization_id, _repository_id, sha):
+                document = before if sha == "a" * 40 else after
+                if document is None:
+                    return None
+                return {"manifest": document, "manifest_hash": manifest_hash(document)}
+        return Store()
+
+    def test_missing_manifest_side_never_fabricates_evidence(self):
+        review = self._review(UNCHANGED, UNCHANGED)
+        recovered = _recover_exact_manifest_analysis(
+            self._store(UNCHANGED, None), organization_id="acme",
+            repository_id="analytics", review=review,
+            changed_models=["fct_orders"],
+        )
+        self.assertIsNone(recovered)
+
+    def test_hash_mismatch_never_reuses_the_wrong_manifest(self):
+        review = self._review(UNCHANGED, UNCHANGED)
+        review["head_manifest_hash"] = "0" * 64
+        recovered = _recover_exact_manifest_analysis(
+            self._store(UNCHANGED, UNCHANGED), organization_id="acme",
+            repository_id="analytics", review=review,
+            changed_models=["fct_orders"],
+        )
+        self.assertIsNone(recovered)
+
+    def test_changed_model_missing_from_manifest_is_unavailable_not_a_job_failure(self):
+        review = self._review(UNCHANGED, UNCHANGED)
+        recovered = _recover_exact_manifest_analysis(
+            self._store(UNCHANGED, UNCHANGED), organization_id="acme",
+            repository_id="analytics", review=review,
+            changed_models=["not_in_manifest"],
+        )
+        self.assertIsNone(recovered)
 
 
 if __name__ == "__main__":

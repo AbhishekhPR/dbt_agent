@@ -13,6 +13,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from agent.deployment_review_service import (
+    lifecycle_code_findings,
+    review_manifest_change,
+    semantic_evidence_from_incident,
+)
 from agent.evidence_policy import default_policy
 from agent.metadata_evidence.decision import evaluate_metadata_decision
 from agent.metadata_evidence.production_comparison import compute_comparison
@@ -79,9 +84,27 @@ def recompute_review(store, *, organization_id, repository_id, environment,
         finding for finding in (previous_payload.get("findings") or [])
         if isinstance(finding, dict) and finding.get("category") == "code"
     ]
+    semantic_evidence = previous.get("semantic_evidence") if previous else None
+    recovered = None
+    if semantic_evidence is None:
+        recovered = _recover_exact_manifest_analysis(
+            store,
+            organization_id=organization_id,
+            repository_id=repository_id,
+            review=review,
+            changed_models=plan.get("changed_models") or [],
+        )
+        if recovered is not None:
+            semantic_evidence = recovered["semantic_evidence"]
+            code_findings = _merge_code_findings(
+                code_findings, recovered["code_findings"]
+            )
+
     code_health = review.get("health")
     if code_health is None:
         code_health = 100
+    if recovered is not None and recovered.get("code_health") is not None:
+        code_health = recovered["code_health"]
     decision = evaluate_metadata_decision(
         plan=plan, snapshot=snapshot, enforcement_mode=enforcement_mode,
         code_health=int(code_health), code_findings=code_findings,
@@ -95,19 +118,17 @@ def recompute_review(store, *, organization_id, repository_id, environment,
     # attempt of this review describes the same base/head pair and the
     # evidence computed for it stays true here.
     #
-    # It is carried from THIS review's previous attempt only - never selected
-    # globally, never taken from another review - and never recomputed, since
-    # the durable document already exists. A previous attempt that compared
-    # nothing carries NULL forward, because "no comparison ran" must not
-    # become "a comparison found no changes". Copying rather than referencing
-    # keeps the new attempt self-contained, which is what lets the dashboard
-    # keep reading exactly one attempt.
+    # It is carried from THIS review's previous attempt only. For reviews made
+    # before semantic evidence was persisted, the exact SHA-bound manifests
+    # may still exist in the immutable manifest store. In that one case the
+    # comparison is recovered from those same documents for the NEW attempt;
+    # historical attempts remain untouched. If either manifest, hash, changed
+    # model or readable SQL side is absent, recovery returns NULL rather than
+    # inventing a clean comparison.
     #
     # This is safe only while attempts cannot describe different head SHAs. If
     # the schema ever admits that, this must become a provenance check rather
     # than an unconditional carry-forward.
-    semantic_evidence = previous.get("semantic_evidence") if previous else None
-
     # Computed exactly once, here, where the current snapshot is already known
     # to be durably stored and accepted - and then written down. The read path
     # never re-selects "the latest previous snapshot", so an attempt keeps
@@ -128,7 +149,10 @@ def recompute_review(store, *, organization_id, repository_id, environment,
         health=decision.health,
         findings=[f.as_dict() for f in decision.findings],
         policy_reasons=decision.reasons,
-        health_explanation=previous_payload.get("health_explanation"),
+        health_explanation=(
+            (recovered or {}).get("health_explanation")
+            or previous_payload.get("health_explanation")
+        ),
         snapshot_id=snapshot["snapshot_id"],
     )
     store.record_review_decision(
@@ -185,6 +209,75 @@ def recompute_review(store, *, organization_id, repository_id, environment,
         "metadata_comparison": metadata_comparison,
         "applied": True,
     }
+
+
+def _recover_exact_manifest_analysis(store, *, organization_id, repository_id,
+                                     review, changed_models):
+    """Re-run code analysis only from this review's immutable manifest pair.
+
+    This is a compatibility bridge for attempts written before semantic/code
+    evidence reached ``review_attempts``. It never reads warehouse evidence,
+    never changes an existing attempt, and refuses provenance that does not
+    match the hashes recorded on the review.
+    """
+    if not changed_models:
+        return None
+    base_sha = review.get("base_sha")
+    head_sha = review.get("head_sha")
+    if not base_sha or not head_sha:
+        return None
+    base = store.get_manifest_evidence(organization_id, repository_id, base_sha)
+    head = store.get_manifest_evidence(organization_id, repository_id, head_sha)
+    if base is None or head is None:
+        return None
+    if (base.get("manifest_hash") != review.get("base_manifest_hash")
+            or head.get("manifest_hash") != review.get("head_manifest_hash")):
+        return None
+
+    try:
+        result = review_manifest_change(
+            manifest=head.get("manifest"),
+            previous_manifest=base.get("manifest"),
+            changed_files=[],
+            changed_models=list(changed_models),
+            deployment_id=f"recompute:{review.get('review_id')}:{head_sha}",
+            manifest_source={"base": "ci", "head": "ci"},
+            base_sha=base_sha,
+            head_sha=head_sha,
+        )
+    except ValueError:
+        # Compatibility recovery is optional. A stale plan/model identity must
+        # remain unavailable rather than poison an otherwise valid metadata
+        # recomputation job.
+        return None
+    incident = result.get("incident") or {}
+    semantic_evidence = semantic_evidence_from_incident(incident)
+    if semantic_evidence is None:
+        return None
+    health = incident.get("health")
+    return {
+        "semantic_evidence": semantic_evidence,
+        "code_findings": lifecycle_code_findings(result),
+        "code_health": int(health) if isinstance(health, int) else None,
+        "health_explanation": result.get("health_explanation"),
+    }
+
+
+def _merge_code_findings(existing, recovered):
+    """Keep prior code evidence and add newly recoverable findings once."""
+    merged = list(existing or [])
+    identities = {
+        (item.get("code"), item.get("relation"), item.get("column"))
+        for item in merged if isinstance(item, dict)
+    }
+    for item in recovered or []:
+        if not isinstance(item, dict):
+            continue
+        identity = (item.get("code"), item.get("relation"), item.get("column"))
+        if identity not in identities:
+            merged.append(item)
+            identities.add(identity)
+    return merged
 
 
 def register(registry):
