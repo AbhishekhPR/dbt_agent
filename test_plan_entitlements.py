@@ -408,6 +408,10 @@ class RepositoryLimitStoreTests(unittest.TestCase):
         with self.assertRaises(TenantRepositoryLimitReached):
             self._select(store, 400, 3)
 
+    def test_starter_can_reselect_a_repository_at_its_limit(self):
+        store = self._store(existing={100, 200, 300})
+        self.assertIsNotNone(self._select(store, 200, 3))
+
     def test_reselecting_a_repository_already_connected_is_never_refused(self):
         """The idempotent re-select. A workspace over its allowance after a
         downgrade must still be able to step back and forward through

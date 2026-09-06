@@ -305,6 +305,10 @@ class _FlowHarness(unittest.TestCase):
         self.assertEqual(selected.status_code, 200, selected.text)
         self.assertIs(selected.json()["dbt_detected"], True)
         self.assertEqual(selected.json()["dbt_project_dir"], "analytics")
+        after_selection = self.http.get(
+            "/api/onboarding/repositories", headers=self._auth()).json()
+        self.assertEqual(
+            after_selection["policy"]["connected_repository_count"], 1)
 
         # 6. Configure dbt.
         configured = self.http.put("/api/onboarding/dbt", headers=self._auth(),
