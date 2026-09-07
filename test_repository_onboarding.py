@@ -156,10 +156,13 @@ class RepositoryOnboardingTests(unittest.TestCase):
     def setUp(self):
         from agent.api.repository_onboarding import RepositoryOnboardingService
 
-        for table in ("tenant_repositories", "tenant_github_installations",
+        for table in ("tenant_operational_roots", "tenant_repositories",
+                      "tenant_github_installations",
                       "github_installations", "api_service_tokens",
                       "tenant_onboarding_state", "tenants"):
             self.store.connection.execute(f"DELETE FROM {table}")
+        self.store.connection.execute("DELETE FROM repositories")
+        self.store.connection.execute("DELETE FROM organizations")
 
         self.client = _FakeClient()
         self.service = RepositoryOnboardingService(
@@ -253,6 +256,27 @@ class RepositoryOnboardingTests(unittest.TestCase):
         with self._refused("repository_not_found"):
             self.service.select_repository(self.store, self.acme, GLOBEX_REPO)
         self.assertEqual(self.store.tenant_repositories(self.acme), [])
+
+    def test_selecting_a_verified_repository_maps_only_a_new_operational_root(self):
+        self.store.connection.execute(
+            "DELETE FROM repositories WHERE organization_id='acme-analytics'")
+        self.store.connection.execute(
+            "DELETE FROM organizations WHERE organization_id='acme-analytics'")
+
+        self.service.select_repository(self.store, self.acme, ACME_REPO)
+
+        mapping = self.store.connection.execute(
+            "SELECT tenant_id, mapping_basis, source_github_repository_id, "
+            "       source_github_installation_id "
+            "FROM tenant_operational_roots "
+            "WHERE organization_id='acme-analytics'"
+        ).fetchone()
+        self.assertEqual(dict(mapping), {
+            "tenant_id": self.acme,
+            "mapping_basis": "verified_github_repository",
+            "source_github_repository_id": ACME_REPO,
+            "source_github_installation_id": ACME_INSTALLATION,
+        })
 
     def test_a_spoofed_repository_id_cannot_be_configured(self):
         with self._refused("repository_not_found"):
@@ -454,6 +478,17 @@ class RepositoryOnboardingTests(unittest.TestCase):
         self.assertEqual(row["scope"], "ci")
         self.assertEqual(row["organization_id"], "acme-analytics")
         self.assertEqual(row["repository_id"], "analytics")
+        ownership = self.store.connection.execute(
+            "SELECT tenant_id, mapping_basis, source_github_repository_id, "
+            "       source_github_installation_id FROM tenant_operational_roots "
+            "WHERE organization_id = 'acme-analytics'"
+        ).fetchone()
+        self.assertEqual(dict(ownership), {
+            "tenant_id": self.acme,
+            "mapping_basis": "verified_github_repository",
+            "source_github_repository_id": ACME_REPO,
+            "source_github_installation_id": ACME_INSTALLATION,
+        })
 
     def test_only_the_hash_of_the_ci_token_is_stored(self):
         self._configure(self.acme, ACME_REPO)
@@ -492,6 +527,43 @@ class RepositoryOnboardingTests(unittest.TestCase):
         self.service.select_repository(self.store, self.acme, ACME_REPO)
         with self._refused("configuration_required"):
             self.service.issue_ci_credential(self.store, self.acme, ACME_REPO)
+
+    def test_ambiguous_root_fails_before_external_secret_write(self):
+        class _Writer:
+            available = True
+
+            def __init__(self):
+                self.writes = 0
+
+            def write(self, **kwargs):
+                self.writes += 1
+
+        # Existing multi-repository legacy data is intentionally not claimed
+        # by selecting one exact GitHub repository.
+        self.store.ensure_repository("acme-analytics", "analytics")
+        self.store.ensure_repository("acme-analytics", "unmapped-legacy")
+        writer = _Writer()
+        from agent.api.repository_onboarding import RepositoryOnboardingService
+        service = RepositoryOnboardingService(
+            client=self.client, jwt_factory=lambda: "app-jwt",
+            installation_token_factory=lambda i: f"installation-token-{i}",
+            secret_writer=writer, clock=lambda: NOW)
+        service.select_repository(self.store, self.acme, ACME_REPO)
+        service.configure_repository(
+            self.store, self.acme, ACME_REPO, project_dir="analytics",
+            manifest_path="analytics/target/manifest.json",
+            enforcement_mode="shadow")
+
+        with self._refused("operational_ownership_unavailable"):
+            service.issue_ci_credential(self.store, self.acme, ACME_REPO)
+
+        self.assertEqual(writer.writes, 0)
+        self.assertIsNone(
+            self.store.tenant_repository(self.acme, ACME_REPO)["ci_token_id"])
+        tokens = self.store.connection.execute(
+            "SELECT revoked_at FROM api_service_tokens").fetchall()
+        self.assertEqual(len(tokens), 1)
+        self.assertIsNotNone(tokens[0]["revoked_at"])
 
     def test_the_issued_token_authenticates_only_for_manifest_ingest(self):
         """End to end against the real authenticator and capability model."""

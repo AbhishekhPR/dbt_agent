@@ -223,12 +223,15 @@ class _FlowHarness(unittest.TestCase):
         from agent.api.session_crypto import encrypt
 
         with self.pool.acquire() as store:
-            for table in ("tenant_repositories", "tenant_billing",
+            for table in ("tenant_operational_roots", "tenant_repositories",
+                          "tenant_billing",
                           "tenant_github_installations",
                           "github_installations", "github_installation_states",
                           "clerk_github_identities", "api_service_tokens",
                           "tenant_onboarding_state", "tenants"):
                 store.connection.execute(f"DELETE FROM {table}")
+            store.connection.execute("DELETE FROM repositories")
+            store.connection.execute("DELETE FROM organizations")
             store.upsert_clerk_github_identity(
                 "user_alice", github_user_id=ALICE_GITHUB_ID,
                 github_login="alice",

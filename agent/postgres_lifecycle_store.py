@@ -81,6 +81,15 @@ class TenantInstallationConflict(ValueError):
     """
 
 
+class OperationalRootOwnershipConflict(ValueError):
+    """An operational root cannot be bound from authoritative evidence.
+
+    The exception deliberately carries no candidate tenant, repository, or
+    credential details. Callers may report the stable category without turning
+    a cross-tenant conflict into an information disclosure.
+    """
+
+
 
 def _bounded_text(value, limit: int = 256):
     """Never persist an unbounded text value from a warehouse.
@@ -98,7 +107,7 @@ def _bounded_text(value, limit: int = 256):
 class PostgresLifecycleStore:
     provider = "postgresql"
 
-    def __init__(self, dsn: str | None):
+    def __init__(self, dsn: str | None, *, migrate: bool = True):
         if not dsn:
             raise RuntimeError("POSTGRES lifecycle store is BLOCKED BY CREDENTIALS")
         try:
@@ -115,12 +124,26 @@ class PostgresLifecycleStore:
         # Multi-statement operations that must be atomic use an explicit
         # `with self.connection.transaction():` block instead.
         self.connection = psycopg.connect(dsn, row_factory=dict_row, autocommit=True)
-        apply_migrations(self.connection)
+        if migrate:
+            apply_migrations(self.connection)
 
     # -- schema / tenant lifecycle -----------------------------------------
 
     def ensure_schema(self):
         apply_migrations(self.connection)
+
+    def has_schema_migration(self, version):
+        """Read migration state without creating or changing any relation."""
+        relation = self.connection.execute(
+            "SELECT to_regclass('public.schema_migrations') AS relation"
+        ).fetchone()["relation"]
+        if relation is None:
+            return False
+        return bool(self.connection.execute(
+            "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = %s) "
+            "AS present",
+            (version,),
+        ).fetchone()["present"])
 
     def ensure_repository(self, organization_id, repository_id):
         """Create only the tenant/repository identity, without an environment."""
@@ -847,16 +870,14 @@ class PostgresLifecycleStore:
     # in the WHERE clause, so an id that belongs to another tenant matches no
     # row rather than being corrected after the fact.
 
-    def tenant_for_repository_slug(self, organization_id, repository_id):
-        """The tenant that connected one GitHub owner/name pair, or None.
-
-        The join between a service token's scope — which names a repository by
-        owner login and name — and billing, which is keyed by tenant. Reads a
-        mapping onboarding wrote; never creates one.
-        """
+    def tenant_for_operational_repository(self, organization_id, repository_id):
+        """Resolve billing ownership only through the authoritative bridge."""
         row = self.connection.execute(
-            "SELECT tenant_id FROM tenant_repositories "
-            "WHERE owner_login = %s AND name = %s LIMIT 1",
+            "SELECT ownership.tenant_id FROM repositories repository "
+            "JOIN tenant_operational_roots ownership "
+            "  ON ownership.organization_id = repository.organization_id "
+            "WHERE repository.organization_id = %s "
+            "  AND repository.repository_id = %s",
             (organization_id, repository_id),
         ).fetchone()
         return row["tenant_id"] if row else None
@@ -1091,6 +1112,614 @@ class PostgresLifecycleStore:
             (ci_token_id, delivery, issued_at, tenant_id, github_repository_id),
         ).fetchone()
         return dict(row) if row else None
+
+    def record_tenant_repository_ci_token_and_bind_root(
+            self, github_repository_id, *, tenant_id, ci_token_id, delivery,
+            issued_at, verified_at):
+        """Record a CI token and establish its operational-root ownership.
+
+        The opaque token id is the bridge: onboarding created the token for one
+        exact legacy repository, while the selected repository belongs to one
+        tenant by immutable GitHub id. Mutable owner/repository display names
+        are never joined to decide ownership.
+
+        The whole root must resolve to this tenant. A partial or mixed root
+        raises and rolls back the token projection as well as the bridge.
+        """
+        with self.connection.transaction():
+            selected = self.connection.execute(
+                "SELECT tr.tenant_id, tr.github_repository_id, "
+                "       tr.github_installation_id "
+                "FROM tenant_repositories tr "
+                "JOIN tenant_github_installations installation "
+                "  ON installation.github_installation_id = tr.github_installation_id "
+                " AND installation.tenant_id = tr.tenant_id "
+                "WHERE tr.tenant_id = %s AND tr.github_repository_id = %s "
+                "FOR UPDATE OF tr",
+                (tenant_id, github_repository_id),
+            ).fetchone()
+            token = self.connection.execute(
+                "SELECT token_id, organization_id, repository_id "
+                "FROM api_service_tokens "
+                "WHERE token_id = %s AND scope = 'ci'",
+                (ci_token_id,),
+            ).fetchone()
+            if selected is None or token is None:
+                raise OperationalRootOwnershipConflict(
+                    "authoritative CI repository binding is unavailable")
+
+            self.connection.execute(
+                "UPDATE tenant_repositories "
+                "SET ci_token_id = %s, ci_token_delivery = %s, "
+                "    ci_token_issued_at = %s, updated_at = now() "
+                "WHERE tenant_id = %s AND github_repository_id = %s",
+                (ci_token_id, delivery, issued_at, tenant_id,
+                 github_repository_id),
+            )
+
+            existing_mapping = self.connection.execute(
+                "SELECT organization_id, tenant_id, mapping_basis, "
+                "       source_github_repository_id, source_ci_token_id, "
+                "       source_github_installation_id, established_at, verified_at "
+                "FROM tenant_operational_roots WHERE organization_id = %s "
+                "FOR UPDATE",
+                (token["organization_id"],),
+            ).fetchone()
+            if existing_mapping is not None:
+                if existing_mapping["tenant_id"] != tenant_id:
+                    raise OperationalRootOwnershipConflict(
+                        "operational root belongs to another workspace")
+                refreshed = self.connection.execute(
+                    "UPDATE tenant_operational_roots "
+                    "SET verified_at = GREATEST(verified_at, %s) "
+                    "WHERE organization_id = %s RETURNING organization_id, "
+                    "tenant_id, mapping_basis, source_github_repository_id, "
+                    "source_ci_token_id, source_github_installation_id, "
+                    "established_at, verified_at",
+                    (verified_at, token["organization_id"]),
+                ).fetchone()
+                return dict(refreshed)
+
+            candidates = self.connection.execute(
+                "SELECT r.repository_id, count(candidate.tenant_id) AS matches, "
+                "       min(candidate.tenant_id) AS tenant_id "
+                "FROM repositories r "
+                "LEFT JOIN LATERAL ("
+                "  SELECT tr.tenant_id "
+                "  FROM tenant_repositories tr "
+                "  JOIN api_service_tokens scoped "
+                "    ON scoped.token_id = tr.ci_token_id "
+                "   AND scoped.scope = 'ci' "
+                "   AND scoped.organization_id = r.organization_id "
+                "   AND scoped.repository_id = r.repository_id "
+                "  JOIN tenant_github_installations installation "
+                "    ON installation.github_installation_id = tr.github_installation_id "
+                "   AND installation.tenant_id = tr.tenant_id "
+                ") candidate ON TRUE "
+                "WHERE r.organization_id = %s "
+                "GROUP BY r.repository_id",
+                (token["organization_id"],),
+            ).fetchall()
+            if (not candidates
+                    or any(row["matches"] != 1 for row in candidates)
+                    or {row["tenant_id"] for row in candidates} != {tenant_id}):
+                raise OperationalRootOwnershipConflict(
+                    "operational root ownership is partial or ambiguous")
+
+            mapping = self.connection.execute(
+                "INSERT INTO tenant_operational_roots "
+                "(organization_id, tenant_id, mapping_basis, "
+                " source_github_repository_id, source_ci_token_id, verified_at) "
+                "VALUES (%s, %s, 'ci_token_binding', %s, %s, %s) "
+                "ON CONFLICT (organization_id) DO UPDATE SET "
+                "  verified_at = GREATEST(tenant_operational_roots.verified_at, "
+                "                         EXCLUDED.verified_at) "
+                "WHERE tenant_operational_roots.tenant_id = EXCLUDED.tenant_id "
+                "RETURNING organization_id, tenant_id, mapping_basis, "
+                "          source_github_repository_id, source_ci_token_id, "
+                "          established_at, verified_at",
+                (token["organization_id"], tenant_id, github_repository_id,
+                 ci_token_id, verified_at),
+            ).fetchone()
+            if mapping is None:
+                raise OperationalRootOwnershipConflict(
+                    "operational root belongs to another workspace")
+            return dict(mapping)
+
+    def establish_tenant_operational_root_from_github(
+            self, *, tenant_id, github_repository_id, github_installation_id,
+            organization_id, verified_at):
+        """Bind a brand-new root from an immutable, verified GitHub repository.
+
+        The caller supplies the organization label from the same verified
+        GitHub repository object, but the tenant decision is checked only by
+        numeric repository and installation ids. An existing unmapped root is
+        never claimed through this path because it may contain legacy data
+        whose owner cannot be established from a mutable label.
+        """
+        with self.connection.transaction():
+            selected = self.connection.execute(
+                "SELECT 1 FROM tenant_repositories repository "
+                "JOIN tenant_github_installations installation "
+                "  ON installation.github_installation_id = "
+                "     repository.github_installation_id "
+                " AND installation.tenant_id = repository.tenant_id "
+                "WHERE repository.tenant_id = %s "
+                "  AND repository.github_repository_id = %s "
+                "  AND repository.github_installation_id = %s "
+                "FOR UPDATE OF repository",
+                (tenant_id, github_repository_id, github_installation_id),
+            ).fetchone()
+            if selected is None:
+                raise OperationalRootOwnershipConflict(
+                    "verified GitHub repository binding is unavailable")
+
+            existing_mapping = self.connection.execute(
+                "SELECT organization_id, tenant_id, mapping_basis, "
+                "       source_github_repository_id, "
+                "       source_github_installation_id, established_at, verified_at "
+                "FROM tenant_operational_roots WHERE organization_id = %s",
+                (organization_id,),
+            ).fetchone()
+            if existing_mapping is not None:
+                if existing_mapping["tenant_id"] != tenant_id:
+                    raise OperationalRootOwnershipConflict(
+                        "operational root belongs to another workspace")
+                return dict(existing_mapping)
+
+            created = self.connection.execute(
+                "INSERT INTO organizations (organization_id) VALUES (%s) "
+                "ON CONFLICT DO NOTHING RETURNING organization_id",
+                (organization_id,),
+            ).fetchone()
+            if created is None:
+                # The root predates this verified operation. Even an empty row
+                # is legacy state and is not silently assigned.
+                return None
+
+            mapping = self.connection.execute(
+                "INSERT INTO tenant_operational_roots "
+                "(organization_id, tenant_id, mapping_basis, "
+                " source_github_repository_id, source_github_installation_id, "
+                " verified_at) "
+                "VALUES (%s, %s, 'verified_github_repository', %s, %s, %s) "
+                "RETURNING organization_id, tenant_id, mapping_basis, "
+                "          source_github_repository_id, "
+                "          source_github_installation_id, established_at, verified_at",
+                (organization_id, tenant_id, github_repository_id,
+                 github_installation_id, verified_at),
+            ).fetchone()
+            return dict(mapping)
+
+    def tenant_operational_inventory(self, tenant_id):
+        """Count tenant-owned records without returning their contents."""
+        from agent.tenant_operational_ownership import (
+            EXCLUDED_SHARED_TABLES,
+            LEGACY_OPERATIONAL_TABLES,
+            TENANT_OWNED_TABLES,
+        )
+
+        tenant = self.connection.execute(
+            "SELECT tenant_id FROM tenants WHERE tenant_id = %s", (tenant_id,)
+        ).fetchone()
+        if tenant is None:
+            raise ValueError("tenant does not exist")
+        roots = [
+            row["organization_id"]
+            for row in self.connection.execute(
+                "SELECT organization_id FROM tenant_operational_roots "
+                "WHERE tenant_id = %s ORDER BY organization_id", (tenant_id,)
+            ).fetchall()
+        ]
+        unresolved_rows = self.connection.execute(
+            "SELECT DISTINCT token.organization_id, mapping.tenant_id AS mapped_tenant "
+            "FROM tenant_repositories repository "
+            "JOIN api_service_tokens token "
+            "  ON token.token_id = repository.ci_token_id "
+            " AND token.scope = 'ci' "
+            "LEFT JOIN tenant_operational_roots mapping "
+            "  ON mapping.organization_id = token.organization_id "
+            "WHERE repository.tenant_id = %s "
+            "  AND (mapping.organization_id IS NULL "
+            "       OR mapping.tenant_id <> repository.tenant_id) "
+            "ORDER BY token.organization_id",
+            (tenant_id,),
+        ).fetchall()
+        unresolved_roots = [
+            row["organization_id"] for row in unresolved_rows
+        ]
+        mapped_health = self.connection.execute(
+            self._operational_root_candidates_sql()
+            + "SELECT candidate.organization_id, candidate.repository_count, "
+              "       candidate.matched_count, candidate.complete, "
+              "       candidate.tenant_ids "
+              "FROM root_candidates candidate "
+              "JOIN tenant_operational_roots mapping "
+              "  ON mapping.organization_id = candidate.organization_id "
+              "WHERE mapping.tenant_id = %s",
+            (tenant_id,),
+        ).fetchall()
+        mapped_inconsistent = False
+        mapped_incomplete = False
+        for row in mapped_health:
+            candidate_tenants = set(row["tenant_ids"] or [])
+            if (len(candidate_tenants) > 1
+                    or (candidate_tenants
+                        and candidate_tenants != {tenant_id})):
+                mapped_inconsistent = True
+            elif (not row["complete"]
+                  or row["repository_count"] != row["matched_count"]):
+                mapped_incomplete = True
+        ownership_status = "complete"
+        if unresolved_rows or mapped_incomplete:
+            ownership_status = "incomplete"
+        if (mapped_inconsistent
+                or any(row["mapped_tenant"] is not None
+                       for row in unresolved_rows)):
+            ownership_status = "inconsistent"
+
+        counts = {}
+        for table in TENANT_OWNED_TABLES:
+            if table == "tenants":
+                sql = "SELECT count(*) AS n FROM tenants WHERE tenant_id = %s"
+            elif table == "github_installations":
+                sql = (
+                    "SELECT count(DISTINCT installation.github_installation_id) AS n "
+                    "FROM github_installations installation "
+                    "JOIN tenant_github_installations binding "
+                    "  ON binding.github_installation_id = "
+                    "     installation.github_installation_id "
+                    "WHERE binding.tenant_id = %s")
+            else:
+                sql = f"SELECT count(*) AS n FROM {table} WHERE tenant_id = %s"
+            counts[table] = int(self.connection.execute(
+                sql, (tenant_id,)).fetchone()["n"])
+
+        for table in LEGACY_OPERATIONAL_TABLES:
+            if not roots:
+                counts[table] = 0
+                continue
+            counts[table] = int(self.connection.execute(
+                f"SELECT count(*) AS n FROM {table} "
+                "WHERE organization_id = ANY(%s)", (roots,)
+            ).fetchone()["n"])
+
+        return {
+            "tenant_id": tenant_id,
+            "operational_roots": roots,
+            "ownership_status": ownership_status,
+            "unresolved_operational_roots": unresolved_roots,
+            "counts": counts,
+            "excluded_shared_tables": list(EXCLUDED_SHARED_TABLES),
+        }
+
+    @staticmethod
+    def _operational_root_candidates_sql():
+        return (
+            "WITH repository_candidates AS ("
+            " SELECT r.organization_id, r.repository_id, "
+            "        count(candidate.tenant_id) AS candidate_count, "
+            "        min(candidate.tenant_id) AS tenant_id, "
+            "        min(candidate.github_repository_id) AS github_repository_id, "
+            "        min(candidate.ci_token_id) AS ci_token_id "
+            " FROM repositories r "
+            " LEFT JOIN LATERAL ("
+            "   SELECT tr.tenant_id, tr.github_repository_id, tr.ci_token_id "
+            "   FROM tenant_repositories tr "
+            "   JOIN api_service_tokens token "
+            "     ON token.token_id = tr.ci_token_id "
+            "    AND token.scope = 'ci' "
+            "    AND token.organization_id = r.organization_id "
+            "    AND token.repository_id = r.repository_id "
+            "   JOIN tenant_github_installations installation "
+            "     ON installation.github_installation_id = "
+            "        tr.github_installation_id "
+            "    AND installation.tenant_id = tr.tenant_id "
+            "   WHERE tr.ci_token_id IS NOT NULL"
+            " ) candidate ON TRUE "
+            " GROUP BY r.organization_id, r.repository_id"
+            "), root_candidates AS ("
+            " SELECT organization_id, count(*) AS repository_count, "
+            "        count(*) FILTER (WHERE candidate_count = 1) AS matched_count, "
+            "        bool_and(candidate_count = 1) AS complete, "
+            "        array_remove(array_agg(DISTINCT tenant_id), NULL) AS tenant_ids, "
+            "        (array_agg(github_repository_id ORDER BY repository_id))[1] "
+            "          AS github_repository_id, "
+            "        (array_agg(ci_token_id ORDER BY repository_id))[1] "
+            "          AS ci_token_id "
+            " FROM repository_candidates GROUP BY organization_id"
+            ") ")
+
+    def tenant_operational_ownership_audit(self):
+        """Classify ownership gaps and inconsistencies without returning data."""
+        candidate_rows = self.connection.execute(
+            self._operational_root_candidates_sql()
+            + "SELECT * FROM root_candidates ORDER BY organization_id"
+        ).fetchall()
+        mappings = [dict(row) for row in self.connection.execute(
+            "SELECT organization_id, tenant_id, mapping_basis, "
+            "       source_github_repository_id, source_github_installation_id, "
+            "       established_at, verified_at "
+            "FROM tenant_operational_roots ORDER BY organization_id"
+        ).fetchall()]
+        by_root = {row["organization_id"]: row for row in mappings}
+        unmapped = []
+        ambiguous = []
+        reconcilable = []
+        cross_tenant = []
+        mapped_provenance_conflicts = []
+        for raw in candidate_rows:
+            row = dict(raw)
+            tenants = list(row.get("tenant_ids") or [])
+            mapping = by_root.get(row["organization_id"])
+            complete = bool(row["complete"] and row["repository_count"]
+                            == row["matched_count"])
+            if mapping is not None:
+                if (len(tenants) > 1
+                        or (tenants and mapping["tenant_id"] not in tenants)
+                        or (tenants and not complete)):
+                    mapped_provenance_conflicts.append(
+                        row["organization_id"])
+                continue
+            if not tenants:
+                unmapped.append(row["organization_id"])
+            elif len(tenants) > 1:
+                ambiguous.append({
+                    "organization_id": row["organization_id"],
+                    "reason": "multiple_tenants",
+                    "repository_count": int(row["repository_count"]),
+                    "matched_count": int(row["matched_count"]),
+                    "candidate_tenant_count": len(tenants),
+                })
+            elif not complete:
+                ambiguous.append({
+                    "organization_id": row["organization_id"],
+                    "reason": "partial_mapping",
+                    "repository_count": int(row["repository_count"]),
+                    "matched_count": int(row["matched_count"]),
+                    "candidate_tenant_count": 1,
+                })
+            else:
+                reconcilable.append({
+                    "organization_id": row["organization_id"],
+                    "tenant_id": tenants[0],
+                    "repository_count": int(row["repository_count"]),
+                })
+
+        if mapped_provenance_conflicts:
+            examples = [
+                {"organization_id": organization_id}
+                for organization_id in mapped_provenance_conflicts[:100]
+            ]
+            cross_tenant.append({
+                "kind": "mapped_root_provenance_conflict",
+                "count": len(mapped_provenance_conflicts),
+                "examples": examples,
+                "examples_truncated": (
+                    len(mapped_provenance_conflicts) > len(examples)),
+            })
+
+        consistency_queries = {
+            "repository_installation_tenant_mismatch": (
+                "SELECT count(*) AS n FROM tenant_repositories repository "
+                "LEFT JOIN tenant_github_installations installation "
+                "  ON installation.github_installation_id = "
+                "     repository.github_installation_id "
+                " AND installation.tenant_id = repository.tenant_id "
+                "WHERE installation.github_installation_id IS NULL"),
+            "detection_installation_tenant_mismatch": (
+                "SELECT count(*) AS n FROM tenant_repository_dbt_detection detection "
+                "LEFT JOIN tenant_github_installations installation "
+                "  ON installation.github_installation_id = "
+                "     detection.github_installation_id "
+                " AND installation.tenant_id = detection.tenant_id "
+                "WHERE installation.github_installation_id IS NULL"),
+            "onboarding_repository_tenant_mismatch": (
+                "SELECT count(*) AS n FROM tenant_onboarding_state onboarding "
+                "LEFT JOIN tenant_repositories repository "
+                "  ON repository.github_repository_id = "
+                "     onboarding.completed_repository_id "
+                " AND repository.tenant_id = onboarding.tenant_id "
+                "WHERE onboarding.completed_repository_id IS NOT NULL "
+                "  AND repository.github_repository_id IS NULL"),
+            "mapping_source_repository_tenant_mismatch": (
+                "SELECT count(*) AS n FROM tenant_operational_roots mapping "
+                "LEFT JOIN tenant_repositories repository "
+                "  ON repository.github_repository_id = "
+                "     mapping.source_github_repository_id "
+                " AND repository.tenant_id = mapping.tenant_id "
+                "WHERE mapping.source_github_repository_id IS NOT NULL "
+                "  AND repository.github_repository_id IS NULL"),
+            "mapping_source_installation_tenant_mismatch": (
+                "SELECT count(*) AS n FROM tenant_operational_roots mapping "
+                "LEFT JOIN tenant_github_installations installation "
+                "  ON installation.github_installation_id = "
+                "     mapping.source_github_installation_id "
+                " AND installation.tenant_id = mapping.tenant_id "
+                "WHERE mapping.source_github_installation_id IS NOT NULL "
+                "  AND installation.github_installation_id IS NULL"),
+            "mapping_source_ci_token_mismatch": (
+                "SELECT count(*) AS n FROM tenant_operational_roots mapping "
+                "LEFT JOIN tenant_repositories repository "
+                "  ON repository.github_repository_id = "
+                "     mapping.source_github_repository_id "
+                " AND repository.tenant_id = mapping.tenant_id "
+                "LEFT JOIN api_service_tokens token "
+                "  ON token.token_id = mapping.source_ci_token_id "
+                " AND token.scope = 'ci' "
+                " AND token.organization_id = mapping.organization_id "
+                "WHERE mapping.mapping_basis = 'ci_token_binding' "
+                "  AND (repository.github_repository_id IS NULL "
+                "       OR token.token_id IS NULL)"),
+        }
+        consistency_examples = {
+            "repository_installation_tenant_mismatch": (
+                "SELECT repository.github_repository_id, "
+                "       repository.github_installation_id, repository.tenant_id "
+                "FROM tenant_repositories repository "
+                "LEFT JOIN tenant_github_installations installation "
+                "  ON installation.github_installation_id = "
+                "     repository.github_installation_id "
+                " AND installation.tenant_id = repository.tenant_id "
+                "WHERE installation.github_installation_id IS NULL "
+                "ORDER BY repository.github_repository_id LIMIT 100"),
+            "detection_installation_tenant_mismatch": (
+                "SELECT detection.github_repository_id, "
+                "       detection.github_installation_id, detection.tenant_id "
+                "FROM tenant_repository_dbt_detection detection "
+                "LEFT JOIN tenant_github_installations installation "
+                "  ON installation.github_installation_id = "
+                "     detection.github_installation_id "
+                " AND installation.tenant_id = detection.tenant_id "
+                "WHERE installation.github_installation_id IS NULL "
+                "ORDER BY detection.github_repository_id LIMIT 100"),
+            "onboarding_repository_tenant_mismatch": (
+                "SELECT onboarding.completed_repository_id AS github_repository_id, "
+                "       onboarding.tenant_id "
+                "FROM tenant_onboarding_state onboarding "
+                "LEFT JOIN tenant_repositories repository "
+                "  ON repository.github_repository_id = "
+                "     onboarding.completed_repository_id "
+                " AND repository.tenant_id = onboarding.tenant_id "
+                "WHERE onboarding.completed_repository_id IS NOT NULL "
+                "  AND repository.github_repository_id IS NULL "
+                "ORDER BY onboarding.tenant_id LIMIT 100"),
+            "mapping_source_repository_tenant_mismatch": (
+                "SELECT mapping.organization_id, mapping.tenant_id, "
+                "       mapping.source_github_repository_id "
+                "FROM tenant_operational_roots mapping "
+                "LEFT JOIN tenant_repositories repository "
+                "  ON repository.github_repository_id = "
+                "     mapping.source_github_repository_id "
+                " AND repository.tenant_id = mapping.tenant_id "
+                "WHERE mapping.source_github_repository_id IS NOT NULL "
+                "  AND repository.github_repository_id IS NULL "
+                "ORDER BY mapping.organization_id LIMIT 100"),
+            "mapping_source_installation_tenant_mismatch": (
+                "SELECT mapping.organization_id, mapping.tenant_id, "
+                "       mapping.source_github_installation_id "
+                "FROM tenant_operational_roots mapping "
+                "LEFT JOIN tenant_github_installations installation "
+                "  ON installation.github_installation_id = "
+                "     mapping.source_github_installation_id "
+                " AND installation.tenant_id = mapping.tenant_id "
+                "WHERE mapping.source_github_installation_id IS NOT NULL "
+                "  AND installation.github_installation_id IS NULL "
+                "ORDER BY mapping.organization_id LIMIT 100"),
+            "mapping_source_ci_token_mismatch": (
+                "SELECT mapping.organization_id, mapping.tenant_id, "
+                "       mapping.source_github_repository_id "
+                "FROM tenant_operational_roots mapping "
+                "LEFT JOIN tenant_repositories repository "
+                "  ON repository.github_repository_id = "
+                "     mapping.source_github_repository_id "
+                " AND repository.tenant_id = mapping.tenant_id "
+                "LEFT JOIN api_service_tokens token "
+                "  ON token.token_id = mapping.source_ci_token_id "
+                " AND token.scope = 'ci' "
+                " AND token.organization_id = mapping.organization_id "
+                "WHERE mapping.mapping_basis = 'ci_token_binding' "
+                "  AND (repository.github_repository_id IS NULL "
+                "       OR token.token_id IS NULL) "
+                "ORDER BY mapping.organization_id LIMIT 100"),
+        }
+        for kind, sql in consistency_queries.items():
+            count = int(self.connection.execute(sql).fetchone()["n"])
+            if count:
+                examples = [dict(row) for row in self.connection.execute(
+                    consistency_examples[kind]).fetchall()]
+                cross_tenant.append({
+                    "kind": kind,
+                    "count": count,
+                    "examples": examples,
+                    "examples_truncated": count > len(examples),
+                })
+
+        scoped_orphans = (
+            "delivery_journal", "event_receipts", "outbox_events",
+            "outbox_dead_letters",
+        )
+        orphan_counts = {}
+        for table in scoped_orphans:
+            orphan_counts[table] = int(self.connection.execute(
+                f"SELECT count(*) AS n FROM {table} child "
+                "LEFT JOIN repositories repository "
+                "  ON repository.organization_id = child.organization_id "
+                " AND repository.repository_id = child.repository_id "
+                "WHERE repository.organization_id IS NULL"
+            ).fetchone()["n"])
+        orphan_counts["audit_events"] = int(self.connection.execute(
+            "SELECT count(*) AS n FROM audit_events child "
+            "LEFT JOIN organizations root "
+            "  ON root.organization_id = child.organization_id "
+            "LEFT JOIN repositories repository "
+            "  ON repository.organization_id = child.organization_id "
+            " AND repository.repository_id = child.repository_id "
+            "WHERE root.organization_id IS NULL "
+            "   OR (child.repository_id IS NOT NULL "
+            "       AND repository.organization_id IS NULL)"
+        ).fetchone()["n"])
+        orphan_counts["retention_tombstones"] = int(self.connection.execute(
+            "SELECT count(*) AS n FROM retention_tombstones child "
+            "LEFT JOIN organizations root "
+            "  ON root.organization_id = child.organization_id "
+            "WHERE root.organization_id IS NULL"
+        ).fetchone()["n"])
+
+        return {
+            "mapped_roots": mappings,
+            "unmapped_roots": sorted(unmapped),
+            "ambiguous_roots": sorted(
+                ambiguous, key=lambda row: row["organization_id"]),
+            "reconcilable_roots": sorted(
+                reconcilable, key=lambda row: row["organization_id"]),
+            "cross_tenant_inconsistencies": cross_tenant,
+            "orphan_counts": orphan_counts,
+        }
+
+    def reconcile_tenant_operational_roots(self, *, apply=False):
+        """Preview or insert only complete, single-tenant CI-proven roots."""
+        candidate_sql = self._operational_root_candidates_sql()
+        eligible = (
+            ", eligible_roots AS ("
+            " SELECT candidate.organization_id, candidate.tenant_ids[1] AS tenant_id, "
+            "        candidate.github_repository_id, candidate.ci_token_id "
+            " FROM root_candidates candidate "
+            " LEFT JOIN tenant_operational_roots mapping "
+            "   ON mapping.organization_id = candidate.organization_id "
+            " WHERE mapping.organization_id IS NULL "
+            "   AND candidate.complete "
+            "   AND candidate.repository_count = candidate.matched_count "
+            "   AND cardinality(candidate.tenant_ids) = 1"
+            ") ")
+        if not apply:
+            count = self.connection.execute(
+                candidate_sql + eligible
+                + "SELECT count(*) AS n FROM eligible_roots"
+            ).fetchone()["n"]
+            return {"eligible_count": int(count), "applied_count": 0,
+                    "dry_run": True}
+
+        with self.connection.transaction():
+            self.connection.execute(
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            eligible_count = int(self.connection.execute(
+                candidate_sql + eligible
+                + "SELECT count(*) AS n FROM eligible_roots"
+            ).fetchone()["n"])
+            inserted = self.connection.execute(
+                candidate_sql + eligible
+                + "INSERT INTO tenant_operational_roots "
+                " (organization_id, tenant_id, mapping_basis, "
+                "  source_github_repository_id, source_ci_token_id, verified_at) "
+                "SELECT organization_id, tenant_id, 'ci_token_binding', "
+                "       github_repository_id, ci_token_id, now() "
+                "FROM eligible_roots "
+                "ON CONFLICT (organization_id) DO NOTHING "
+                "RETURNING organization_id"
+            ).fetchall()
+            return {"eligible_count": eligible_count,
+                    "applied_count": len(inserted), "dry_run": False}
 
     def complete_tenant_onboarding(self, tenant_id, *, completed_at,
                                    repository_id=None, clerk_user_id=None):

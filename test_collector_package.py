@@ -19,7 +19,7 @@ class _Store:
     def __init__(self, plan="starter"):
         self.plan = plan
 
-    def tenant_for_repository_slug(self, organization_id, repository_id):
+    def tenant_for_operational_repository(self, organization_id, repository_id):
         if (organization_id, repository_id) == ("acme", "warehouse-dbt"):
             return "tenant-1"
         return None
