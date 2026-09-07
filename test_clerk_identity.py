@@ -375,6 +375,10 @@ class ClerkPrincipalTests(unittest.TestCase):
     def test_a_tenant_is_optional_before_the_workspace_exists(self):
         self.assertIsNone(self._principal(tenant_id=None).tenant_id)
 
+    def test_verified_clerk_organization_role_is_preserved(self):
+        principal = self._principal(clerk_organization_role="org:admin")
+        self.assertEqual(principal.clerk_organization_role, "org:admin")
+
 
 if __name__ == "__main__":
     unittest.main()
