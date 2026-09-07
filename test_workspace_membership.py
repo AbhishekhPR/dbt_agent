@@ -64,6 +64,14 @@ class MembershipProjectionTests(unittest.TestCase):
         self.assertEqual(projection.active_owner_count, 0)
         self.assertEqual(projection.memberships[0].role, "admin")
 
+    def test_creator_downgraded_to_member_is_not_restored_as_owner(self):
+        projection = project_memberships(self.snapshot(
+            self.membership("user_creator", "org:member"),
+        ))
+        self.assertEqual(projection.ownership_status, "ambiguous")
+        self.assertEqual(projection.active_owner_count, 0)
+        self.assertEqual(projection.memberships[0].role, "member")
+
     def test_unknown_clerk_role_maps_to_least_privileged_member(self):
         projection = project_memberships(self.snapshot(
             self.membership("user_creator", "org:owner"),
@@ -105,6 +113,14 @@ class _Source:
         if self.error:
             raise self.error
         return self.snapshot
+
+
+class _ChangingSource:
+    def __init__(self, snapshots):
+        self.snapshots = iter(snapshots)
+
+    def organization_snapshot(self, organization_id):
+        return next(self.snapshots)
 
 
 class _ProjectionStore:
@@ -274,6 +290,20 @@ class WorkspaceAuthorizationTests(unittest.TestCase):
         )
         with self.assertRaises(WorkspaceMembershipUnavailable):
             self.authorizer(snapshot).require_owner(self.principal())
+
+    def test_membership_change_between_complete_reads_fails_closed(self):
+        changed = ClerkOrganizationSnapshot(
+            organization_id="org_2acme", created_by_user_id="user_owner",
+            memberships=(
+                ClerkMembership("user_owner", "mem_owner", "org:admin"),
+                ClerkMembership("user_new", "mem_new", "org:member"),
+            ),
+        )
+        authorizer = WorkspaceMembershipAuthorizer(
+            store=self.store, source=_ChangingSource((self.snapshot, changed)))
+        with self.assertRaises(WorkspaceMembershipUnavailable):
+            authorizer.require_owner(self.principal())
+        self.assertEqual(self.store.saved, [])
 
 
 if __name__ == "__main__":

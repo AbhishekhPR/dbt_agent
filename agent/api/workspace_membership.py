@@ -76,8 +76,9 @@ def project_memberships(snapshot: ClerkOrganizationSnapshot) -> MembershipProjec
     """Normalize one complete Clerk organization snapshot.
 
     The organization creator is an owner fallback only when Clerk reports no
-    explicit owner role.  If neither source establishes an owner, the result
-    remains ambiguous rather than promoting an administrator.
+    explicit owner role and the creator remains a current administrator. If
+    neither source establishes an owner, the result remains ambiguous rather
+    than promoting an arbitrary administrator or downgraded creator.
     """
     if not isinstance(snapshot.organization_id, str) or not snapshot.organization_id:
         raise ValueError("Clerk organization snapshot has no organization id")
@@ -98,16 +99,20 @@ def project_memberships(snapshot: ClerkOrganizationSnapshot) -> MembershipProjec
         membership.clerk_role_key in OWNER_ROLE_KEYS
         for membership in snapshot.memberships
     )
-    creator_is_active = bool(
+    creator_is_current_admin = bool(
         snapshot.created_by_user_id
-        and snapshot.created_by_user_id in users
+        and any(
+            membership.clerk_user_id == snapshot.created_by_user_id
+            and membership.clerk_role_key in ADMIN_ROLE_KEYS
+            for membership in snapshot.memberships
+        )
     )
 
     projected = []
     for membership in snapshot.memberships:
         if membership.clerk_role_key in OWNER_ROLE_KEYS:
             role, basis = "owner", "explicit_clerk_role"
-        elif (not has_explicit_owner and creator_is_active
+        elif (not has_explicit_owner and creator_is_current_admin
               and membership.clerk_user_id == snapshot.created_by_user_id):
             role, basis = "owner", "organization_creator"
         elif membership.clerk_role_key in ADMIN_ROLE_KEYS:
@@ -208,11 +213,19 @@ class WorkspaceMembershipAuthorizer:
                 clerk_organization_id=principal.clerk_organization_id,
                 sync_generation=generation,
             )
-            snapshot = self._source.organization_snapshot(
+            first_snapshot = self._source.organization_snapshot(
                 principal.clerk_organization_id)
-            if snapshot.organization_id != principal.clerk_organization_id:
+            second_snapshot = self._source.organization_snapshot(
+                principal.clerk_organization_id)
+            if (first_snapshot.organization_id != principal.clerk_organization_id
+                    or second_snapshot.organization_id
+                    != principal.clerk_organization_id):
                 raise ValueError("organization mismatch")
-            projection = project_memberships(snapshot)
+            first_projection = project_memberships(first_snapshot)
+            projection = project_memberships(second_snapshot)
+            if first_projection.source_fingerprint != projection.source_fingerprint:
+                raise WorkspaceMembershipUnavailable(
+                    "Clerk membership changed during synchronization")
             self._store.replace_tenant_membership_projection(
                 tenant_id=principal.tenant_id,
                 projection=projection,

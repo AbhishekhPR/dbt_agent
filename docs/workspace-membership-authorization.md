@@ -12,19 +12,22 @@ parameters cannot select a different tenant or user.
 ## Roles
 
 - `owner`: an exact Clerk `owner`/`org:owner` role. For organizations with no
-  explicit owner role, Clerk's active `created_by` membership is the owner.
+  explicit owner role, Clerk's active `created_by` membership is the owner only
+  while that membership's current Clerk role is administrator.
 - `admin`: an exact Clerk `admin`/`org:admin` role.
 - `member`: every other verified active Clerk membership.
 
-If no explicit owner and no active Clerk-confirmed creator exist, ownership is
+If no explicit owner and no active administrator creator exist, ownership is
 ambiguous. Relium does not promote an administrator or consult onboarding,
 GitHub, billing, repository, or email data. Normal product behavior continues;
 sensitive owner/admin helpers fail closed.
 
 The organization role retained on `ClerkPrincipal` is authenticated context,
 not an authorization shortcut. Sensitive checks fetch the complete current
-Clerk membership list and authorize from the generation persisted by that
-fetch.
+Clerk membership list twice and require identical fingerprints before
+authorizing from the generation persisted by that refresh. Same-count changes
+during offset pagination therefore fail closed rather than granting from a
+mixed membership view.
 
 ## Reconciliation
 
