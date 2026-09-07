@@ -78,6 +78,7 @@ not touched.
 | `RELIUM_STORAGE_ROOT` | everything | server does not start |
 | `RELIUM_DATABASE_URL` | all onboarding | **onboarding routes absent entirely** |
 | `RELIUM_CLERK_ISSUER` | authentication | routes served, authenticate nobody (503) |
+| `RELIUM_CLERK_SECRET_KEY` | owner/admin/member authorization | normal flows continue; sensitive membership checks fail closed |
 | `RELIUM_SESSION_ENCRYPTION_KEY` | installation binding | binding and repository service disabled |
 | `RELIUM_GITHUB_CLIENT_ID` / `_SECRET` | GitHub identity link | no identity can be proved → no installation can bind |
 | `RELIUM_PUBLIC_URL` | OAuth callback, CI variables | link callback and `RELIUM_API_URL` unset |
@@ -107,8 +108,10 @@ comes from the backend, derived from `GET /app`.
   (`getToken({ skipCache: true })`). The organization id is a claim inside the
   token; a cached one still says there is none, and the refusal looks like a
   Relium bug. Asserted by `test_the_stale_token_still_fails_after_activation`.
-- Production instance issuer set in `RELIUM_CLERK_ISSUER`. No Clerk secret key
-  is needed anywhere — verification uses the public JWKS.
+- Production instance issuer set in `RELIUM_CLERK_ISSUER`. JWT verification
+  uses the public JWKS. The server-only `RELIUM_CLERK_SECRET_KEY` is required
+  only for authoritative owner/admin/member synchronization and must never be
+  exposed to the frontend.
 
 ### GitHub App configuration
 

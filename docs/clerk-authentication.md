@@ -199,9 +199,12 @@ Relium performs no step of this. It reports the state and waits.
 
 ## 5. Configuration
 
-No Clerk secret is required. Verification uses Clerk's **public** JWKS; no
-Clerk Secret Key is read, stored or logged, and the frontend holds only the
-publishable key.
+No Clerk secret is required for session-token verification. Verification uses
+Clerk's **public** JWKS, and the frontend holds only the publishable key.
+Workspace owner/admin/member authorization is a separate server-side concern:
+it uses Clerk's Backend API and requires `RELIUM_CLERK_SECRET_KEY`. Existing
+non-sensitive product flows remain available without it; sensitive membership
+authorization fails closed.
 
 | Variable | Required | Meaning |
 |---|---|---|
@@ -210,6 +213,7 @@ publishable key.
 | `RELIUM_CLERK_AUTHORIZED_PARTIES` | recommended in production | Comma-separated frontend origins accepted in `azp`. Unset means unchecked. |
 | `RELIUM_CLERK_AUDIENCE` | no | Comma-separated accepted `aud`. Clerk session tokens carry none by default. |
 | `RELIUM_CLERK_LEEWAY_SECONDS` | no | Clock skew allowed on exp/nbf/iat. Default 5, maximum 300. |
+| `RELIUM_CLERK_SECRET_KEY` | sensitive workspace authorization | Server-only Clerk Backend API credential. Never expose it through a `VITE_` variable. |
 
 A development Clerk instance and a production one differ by these values alone.
 No instance hostname, publishable key or issuer is compiled in.

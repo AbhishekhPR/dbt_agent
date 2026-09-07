@@ -248,6 +248,166 @@ class PostgresLifecycleStore:
         ).fetchone()
         return dict(row) if row else None
 
+    # -- authoritative Clerk workspace membership -----------------------
+
+    def begin_tenant_membership_sync(self, *, tenant_id,
+                                     clerk_organization_id,
+                                     sync_generation):
+        """Reserve the newest refresh generation using database lock order."""
+        with self.connection.transaction():
+            tenant = self.connection.execute(
+                "SELECT clerk_organization_id FROM tenants "
+                "WHERE tenant_id = %s FOR UPDATE",
+                (tenant_id,),
+            ).fetchone()
+            if (tenant is None
+                    or tenant["clerk_organization_id"] != clerk_organization_id):
+                raise ValueError("Clerk organization does not match tenant")
+            row = self.connection.execute(
+                "INSERT INTO tenant_membership_sync_state "
+                "(tenant_id, sync_generation, sync_status, ownership_status, "
+                " active_owner_count, last_attempted_at, failure_category) "
+                "VALUES (%s, %s, 'refreshing', 'ambiguous', 0, now(), NULL) "
+                "ON CONFLICT (tenant_id) DO UPDATE SET "
+                "sync_generation = EXCLUDED.sync_generation, "
+                "sync_status = 'refreshing', ownership_status = 'ambiguous', "
+                "active_owner_count = 0, last_attempted_at = now(), "
+                "failure_category = NULL, updated_at = now() "
+                "RETURNING sync_generation, last_attempted_at",
+                (tenant_id, sync_generation),
+            ).fetchone()
+        return dict(row)
+
+    def replace_tenant_membership_projection(self, *, tenant_id, projection,
+                                             sync_generation, synchronized_at):
+        """Atomically replace one tenant's complete Clerk membership view.
+
+        The tenant-to-Clerk-organization binding is locked and checked here,
+        inside the write transaction. A caller cannot put a valid snapshot for
+        one Clerk organization underneath another Relium tenant.
+        """
+        with self.connection.transaction():
+            tenant = self.connection.execute(
+                "SELECT clerk_organization_id FROM tenants "
+                "WHERE tenant_id = %s FOR UPDATE",
+                (tenant_id,),
+            ).fetchone()
+            if (tenant is None
+                    or tenant["clerk_organization_id"] != projection.organization_id):
+                raise ValueError("Clerk membership projection does not match tenant")
+            latest = self.connection.execute(
+                "SELECT sync_generation, sync_status "
+                "FROM tenant_membership_sync_state "
+                "WHERE tenant_id = %s FOR UPDATE",
+                (tenant_id,),
+            ).fetchone()
+            if (latest is None
+                    or latest["sync_generation"] != sync_generation
+                    or latest["sync_status"] != "refreshing"):
+                raise ValueError("Clerk membership projection was superseded")
+
+            # Rows absent from the new complete snapshot remain as provenance,
+            # but can no longer authorize. Upserts below reactivate only the
+            # memberships Clerk returned in this generation.
+            self.connection.execute(
+                "UPDATE tenant_memberships SET status = 'removed', "
+                "sync_generation = %s, synchronized_at = %s, updated_at = now() "
+                "WHERE tenant_id = %s",
+                (sync_generation, synchronized_at, tenant_id),
+            )
+            for membership in projection.memberships:
+                self.connection.execute(
+                    "INSERT INTO tenant_memberships "
+                    "(tenant_id, clerk_user_id, clerk_membership_id, role, "
+                    " clerk_role_key, role_basis, source_version, "
+                    " source_updated_at, sync_generation, status, synchronized_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', %s) "
+                    "ON CONFLICT (tenant_id, clerk_user_id) DO UPDATE SET "
+                    "clerk_membership_id = EXCLUDED.clerk_membership_id, "
+                    "role = EXCLUDED.role, clerk_role_key = EXCLUDED.clerk_role_key, "
+                    "role_basis = EXCLUDED.role_basis, "
+                    "source_version = EXCLUDED.source_version, "
+                    "source_updated_at = EXCLUDED.source_updated_at, "
+                    "sync_generation = EXCLUDED.sync_generation, status = 'active', "
+                    "synchronized_at = EXCLUDED.synchronized_at, updated_at = now()",
+                    (tenant_id, membership.clerk_user_id,
+                     membership.clerk_membership_id, membership.role,
+                     membership.clerk_role_key, membership.role_basis,
+                     membership.source_version, membership.source_updated_at,
+                     sync_generation, synchronized_at),
+                )
+
+            sync_status = (
+                "synchronized"
+                if projection.ownership_status == "authoritative"
+                else "ambiguous"
+            )
+            self.connection.execute(
+                "INSERT INTO tenant_membership_sync_state "
+                "(tenant_id, sync_generation, sync_status, ownership_status, "
+                " active_owner_count, source_version, source_fingerprint, "
+                " last_attempted_at, last_synchronized_at, failure_category) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL) "
+                "ON CONFLICT (tenant_id) DO UPDATE SET "
+                "sync_generation = EXCLUDED.sync_generation, "
+                "sync_status = EXCLUDED.sync_status, "
+                "ownership_status = EXCLUDED.ownership_status, "
+                "active_owner_count = EXCLUDED.active_owner_count, "
+                "source_version = EXCLUDED.source_version, "
+                "source_fingerprint = EXCLUDED.source_fingerprint, "
+                "last_attempted_at = EXCLUDED.last_attempted_at, "
+                "last_synchronized_at = EXCLUDED.last_synchronized_at, "
+                "failure_category = NULL, updated_at = now()",
+                (tenant_id, sync_generation, sync_status,
+                 projection.ownership_status, projection.active_owner_count,
+                 projection.source_version, projection.source_fingerprint,
+                 synchronized_at, synchronized_at),
+            )
+
+    def tenant_membership_authorization(self, *, tenant_id, clerk_user_id,
+                                        sync_generation):
+        """Read one member only from the named completed projection generation."""
+        row = self.connection.execute(
+            "SELECT m.tenant_id, m.clerk_user_id, m.role, m.status, "
+            "       m.sync_generation, s.ownership_status, s.active_owner_count "
+            "FROM tenant_memberships m "
+            "JOIN tenant_membership_sync_state s ON s.tenant_id = m.tenant_id "
+            "WHERE m.tenant_id = %s AND m.clerk_user_id = %s "
+            "  AND m.sync_generation = %s AND s.sync_generation = %s "
+            "  AND s.sync_status IN ('synchronized', 'ambiguous') "
+            "  AND m.status = 'active'",
+            (tenant_id, clerk_user_id, sync_generation, sync_generation),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def tenants_for_membership_reconciliation(self):
+        """All tenant/Clerk bindings for an explicit operator reconciliation."""
+        return [dict(row) for row in self.connection.execute(
+            "SELECT tenant_id, clerk_organization_id FROM tenants "
+            "ORDER BY tenant_id"
+        ).fetchall()]
+
+    def record_tenant_membership_sync_failure(self, *, tenant_id,
+                                              sync_generation, attempted_at,
+                                              failure_category):
+        """Record a sanitized failed refresh without changing membership rows."""
+        with self.connection.transaction():
+            tenant = self.connection.execute(
+                "SELECT 1 FROM tenants WHERE tenant_id = %s FOR UPDATE",
+                (tenant_id,),
+            ).fetchone()
+            if tenant is None:
+                raise ValueError("tenant does not exist")
+            self.connection.execute(
+                "UPDATE tenant_membership_sync_state "
+                "SET sync_status = 'failed', ownership_status = 'ambiguous', "
+                "    active_owner_count = 0, last_attempted_at = %s, "
+                "    failure_category = %s, updated_at = now() "
+                "WHERE tenant_id = %s AND sync_generation = %s "
+                "  AND sync_status = 'refreshing'",
+                (attempted_at, failure_category, tenant_id, sync_generation),
+            )
+
     # -- Polar billing, per tenant -----------------------------------------
     #
     # See migration 0018. The rules these methods exist to hold up: a

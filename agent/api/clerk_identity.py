@@ -693,6 +693,10 @@ class ClerkPrincipal:
     #: onboarding and no other time.
     tenant_id: str | None
     clerk_session_id: str | None = None
+    #: The role from the verified Clerk session. Preserved as authenticated
+    #: context, but never sufficient by itself for sensitive authorization;
+    #: workspace authority is resolved from Clerk's membership API projection.
+    clerk_organization_role: str | None = None
 
     is_human = True
     identity_provider = "clerk"

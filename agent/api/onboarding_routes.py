@@ -148,6 +148,7 @@ class ClerkAuthenticator:
             clerk_organization_id=identity.organization_id,
             tenant_id=tenant["tenant_id"] if tenant else None,
             clerk_session_id=identity.session_id,
+            clerk_organization_role=identity.organization_role,
         )
         capability = ONBOARDING_WRITE if write else ONBOARDING_READ
         try:
@@ -283,6 +284,7 @@ def create_onboarding_routes(*, store_pool, clerk_verifier=None, api_url=""):
             clerk_organization_id=identity.organization_id,
             tenant_id=tenant["tenant_id"] if tenant else None,
             clerk_session_id=identity.session_id,
+            clerk_organization_role=identity.organization_role,
         )
         try:
             authorize(principal, capability)
