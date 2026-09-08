@@ -1,8 +1,8 @@
 -- Durable, tenant-scoped controls for Polar reconciliation, revocation, and
 -- checkout recovery. No table here is an entitlement source: tenant_billing
 -- remains writable only from verified subscription webhooks.
-SET lock_timeout = '5s';
-SET statement_timeout = '30s';
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '30s';
 
 CREATE TABLE IF NOT EXISTS tenant_lifecycle_controls (
     tenant_id TEXT PRIMARY KEY REFERENCES tenants (tenant_id) ON DELETE RESTRICT,
@@ -88,7 +88,10 @@ CREATE TABLE IF NOT EXISTS billing_checkout_intents (
     requested_plan TEXT NOT NULL CHECK (requested_plan IN ('starter', 'pro')),
     polar_product_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN
-        ('claimed', 'provider_created', 'completed', 'failed', 'ambiguous')),
+        ('claimed', 'creating', 'provider_created', 'completed', 'failed', 'ambiguous')),
+    lifecycle_generation BIGINT NOT NULL CHECK (lifecycle_generation >= 0),
+    create_lease_id TEXT,
+    create_lease_expires_at TIMESTAMPTZ,
     polar_checkout_id TEXT,
     failure_category TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -97,9 +100,10 @@ CREATE TABLE IF NOT EXISTS billing_checkout_intents (
     CHECK (length(checkout_intent_id) BETWEEN 1 AND 255),
     CHECK (length(polar_product_id) BETWEEN 1 AND 255),
     CHECK (polar_checkout_id IS NULL OR length(polar_checkout_id) BETWEEN 1 AND 255),
+    CHECK (create_lease_id IS NULL OR length(create_lease_id) BETWEEN 1 AND 255),
     CHECK (failure_category IS NULL OR length(failure_category) BETWEEN 1 AND 64)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_billing_checkout_intents_active_tenant
     ON billing_checkout_intents (tenant_id)
-    WHERE state IN ('claimed', 'provider_created');
+    WHERE state IN ('claimed', 'creating', 'provider_created');

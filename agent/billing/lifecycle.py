@@ -7,7 +7,7 @@ from agent.billing.client import PolarAPIError
 
 
 POTENTIALLY_BILLABLE_STATUSES = frozenset({
-    "incomplete", "trialing", "active", "past_due",
+    "incomplete", "trialing", "active", "past_due", "paused",
 })
 TERMINAL_STATUSES = frozenset({"canceled", "unpaid", "incomplete_expired"})
 ACTIONABLE_CHECKOUT_STATUSES = frozenset({"open", "confirmed"})
@@ -33,7 +33,7 @@ def classify_subscription(subscription) -> str:
     if status in TERMINAL_STATUSES:
         return "terminal"
     if status in POTENTIALLY_BILLABLE_STATUSES:
-        if status == "active" and subscription.get("cancel_at_period_end") is True:
+        if subscription.get("cancel_at_period_end") is True:
             return "scheduled_cancel"
         return "potentially_billable"
     return "unknown"
@@ -60,13 +60,6 @@ def reconcile_workspace_billing(*, principal, authorizer, store, client,
             operation_id=operation["operation_id"],
             subscriptions=observations["subscriptions"],
             checkouts=observations["checkouts"], observed_at=now)
-        store.finish_billing_lifecycle_operation(
-            tenant_id=context.tenant_id,
-            operation_id=operation["operation_id"], state="reconciled",
-            failure_category=None,
-            subscription_count=len(observations["subscriptions"]),
-            actionable_checkout_count=observations["actionable_checkout_count"],
-            now=now)
     except BillingLifecycleError as error:
         store.finish_billing_lifecycle_operation(
             tenant_id=context.tenant_id,
@@ -83,6 +76,18 @@ def reconcile_workspace_billing(*, principal, authorizer, store, client,
             actionable_checkout_count=0, now=now)
         raise BillingLifecycleError(category) from None
 
+    ambiguity = _reconciliation_ambiguity(observations)
+    store.finish_billing_lifecycle_operation(
+        tenant_id=context.tenant_id,
+        operation_id=operation["operation_id"],
+        state="ambiguous" if ambiguity else "reconciled",
+        failure_category=ambiguity,
+        subscription_count=len(observations["subscriptions"]),
+        actionable_checkout_count=observations["actionable_checkout_count"],
+        now=now)
+    if ambiguity:
+        raise BillingLifecycleError(ambiguity)
+
     return {
         "state": "reconciled",
         "operation_id": operation["operation_id"],
@@ -96,6 +101,15 @@ def reconcile_workspace_billing(*, principal, authorizer, store, client,
             for item in observations["subscriptions"]),
         "actionable_checkout_count": observations["actionable_checkout_count"],
     }
+
+
+def _reconciliation_ambiguity(observations):
+    if any(item["classification"] == "unknown"
+           for item in observations["subscriptions"]):
+        return "unknown_subscription_state"
+    if observations["actionable_checkout_count"]:
+        return "actionable_checkout"
+    return None
 
 
 def revoke_workspace_subscriptions(*, principal, authorizer, store, client,
@@ -171,7 +185,12 @@ def revoke_workspace_subscriptions(*, principal, authorizer, store, client,
                   for item in final["subscriptions"])
     billable = any(item["classification"] != "terminal"
                    for item in final["subscriptions"])
-    if final["actionable_checkout_count"]:
+    in_flight_reader = getattr(store, "billing_checkout_create_in_flight", None)
+    create_in_flight = bool(in_flight_reader(context.tenant_id)) \
+        if in_flight_reader else False
+    if create_in_flight:
+        category = "checkout_create_in_flight"
+    elif final["actionable_checkout_count"]:
         category = "actionable_checkout"
     elif unknown:
         category = "unknown_subscription_state"
@@ -296,12 +315,13 @@ def _normalize_checkout(item):
     actionable = status in ACTIONABLE_CHECKOUT_STATUSES
     if status not in ACTIONABLE_CHECKOUT_STATUSES | TERMINAL_CHECKOUT_STATUSES:
         actionable = True
+    expires_at = _provider_timestamp(item.get("expires_at"))
     return {
         "polar_checkout_id": item["id"],
         "polar_customer_id": item.get("customer_id") or customer.get("id"),
         "provider_status": status,
         "checkout_intent_id": intent_id,
-        "expires_at": item.get("expires_at"),
+        "expires_at": expires_at,
         "actionable": actionable,
         # Transient recovery material. The PostgreSQL observation writer names
         # each stored field explicitly and deliberately does not persist this
@@ -325,3 +345,17 @@ def _provider_failure_category(error):
 
 def _bounded(value, maximum):
     return isinstance(value, str) and 0 < len(value) <= maximum
+
+
+def _provider_timestamp(value):
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > 64:
+        raise BillingLifecycleError("malformed_provider_state")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise BillingLifecycleError("malformed_provider_state") from None
+    if parsed.tzinfo is None:
+        raise BillingLifecycleError("malformed_provider_state")
+    return parsed

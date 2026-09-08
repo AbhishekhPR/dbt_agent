@@ -214,6 +214,15 @@ class BillingService:
                     failure_category="known_checkout_not_listed", now=self.now())
                 raise BillingError(CODE_PROVIDER_UNAVAILABLE)
 
+            create_claim = store.begin_billing_checkout_provider_create(
+                tenant_id=tenant_id,
+                checkout_intent_id=intent["checkout_intent_id"],
+                now=self.now())
+            if not create_claim:
+                # Another request owns the only provider-create lease, or a
+                # lifecycle generation/block superseded this intent.
+                raise BillingError(CODE_PROVIDER_UNAVAILABLE)
+
         try:
             session = self._client.create_checkout_session(
                 product_id=product_id,
@@ -253,7 +262,8 @@ class BillingService:
                 tenant_id=tenant_id,
                 checkout_intent_id=intent["checkout_intent_id"],
                 state="provider_created", polar_checkout_id=checkout_id,
-                failure_category=None, now=self.now())
+                failure_category=None, now=self.now(),
+                create_lease_id=create_claim["create_lease_id"])
         return {
             "checkout_url": url,
             # Returned for support and correlation only. It is not a credential

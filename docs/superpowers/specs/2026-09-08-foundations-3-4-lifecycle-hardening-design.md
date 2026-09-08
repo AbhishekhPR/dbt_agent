@@ -29,4 +29,3 @@ Results contain counts, safe failure categories, and customer remediation codes 
 ## Failure behavior
 
 Provider timeout, authentication failure, rate limit, 5xx, malformed/truncated pagination, unknown status, identity conflict, incomplete ownership, or active claimed work produces a durable retryable/blocked result. No failure is converted into deletion readiness. All operations are idempotent and tenant-isolated.
-

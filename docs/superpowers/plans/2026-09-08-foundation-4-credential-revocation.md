@@ -37,4 +37,3 @@
 - Run all requested migration, auth, ownership, isolation/security, GitHub/repository, collector/CI, review/manifest/warehouse/billing, and relevant backend suites.
 - Run immutable secret scan and `git diff --check`.
 - Request independent review, fix relevant findings, re-run verification, push, and open a PR targeting the Foundation 3 branch. Drive all required CI green without merging or deploying.
-

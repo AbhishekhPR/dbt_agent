@@ -43,4 +43,3 @@
 - Run migration/backfill, billing, webhook, auth/ownership, tenant isolation/security, repository/GitHub, collector/CI, and relevant backend suites using an isolated local PostgreSQL instance where required.
 - Run immutable secret scan and `git diff --check`.
 - Request independent review, resolve relevant findings, re-run verification, push, open PR targeting main, and drive required CI green.
-

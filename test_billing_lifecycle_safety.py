@@ -23,7 +23,10 @@ class BillingLifecycleMigrationContractTests(unittest.TestCase):
         self.assertIn("CREATE TABLE IF NOT EXISTS tenant_polar_checkouts", sql)
         self.assertIn("CREATE TABLE IF NOT EXISTS billing_checkout_intents", sql)
         self.assertGreaterEqual(sql.count("ON DELETE RESTRICT"), 5)
-        self.assertIn("WHERE state IN ('claimed', 'provider_created')", sql)
+        self.assertIn("WHERE state IN ('claimed', 'creating', 'provider_created')", sql)
+        self.assertIn("lifecycle_generation BIGINT NOT NULL", sql)
+        self.assertIn("create_lease_id TEXT", sql)
+        self.assertIn("'creating'", sql)
 
     def test_existing_tenants_are_backfilled_active_without_billing_inference(self):
         sql = MIGRATION.read_text(encoding="utf-8")
@@ -31,6 +34,12 @@ class BillingLifecycleMigrationContractTests(unittest.TestCase):
         self.assertIn("INSERT INTO tenant_lifecycle_controls", sql)
         self.assertIn("SELECT tenant_id, 'active', 'active' FROM tenants", sql)
         self.assertNotIn("FROM tenant_billing", sql)
+
+    def test_migration_timeouts_are_transaction_local(self):
+        sql = MIGRATION.read_text(encoding="utf-8")
+        self.assertIn("SET LOCAL lock_timeout", sql)
+        self.assertIn("SET LOCAL statement_timeout", sql)
+        self.assertNotIn("\nSET lock_timeout", sql)
 
 
 class PolarSubscriptionClassificationTests(unittest.TestCase):
@@ -43,6 +52,8 @@ class PolarSubscriptionClassificationTests(unittest.TestCase):
             {"status": "active", "cancel_at_period_end": True}),
             "scheduled_cancel")
         self.assertEqual(classify_subscription({"status": "past_due"}),
+                         "potentially_billable")
+        self.assertEqual(classify_subscription({"status": "paused"}),
                          "potentially_billable")
         self.assertEqual(classify_subscription({"status": "canceled"}), "terminal")
         self.assertEqual(classify_subscription({"status": "unpaid"}), "terminal")
@@ -90,6 +101,31 @@ class PolarLifecycleClientTests(unittest.TestCase):
         with self.assertRaises(PolarAPIError):
             client.list_subscriptions(external_customer_id="ten_" + "b" * 32)
 
+    def test_duplicate_ids_across_pages_are_not_complete_evidence(self):
+        duplicate = {"id": "sub_same"}
+        client = self._client([
+            (200, json.dumps({"items": [duplicate],
+                              "pagination": {"total_count": 2,
+                                             "max_page": 2}}).encode()),
+            (200, json.dumps({"items": [duplicate],
+                              "pagination": {"total_count": 2,
+                                             "max_page": 2}}).encode()),
+        ])
+        with self.assertRaises(PolarAPIError):
+            client.list_subscriptions(external_customer_id="ten_" + "c" * 32)
+
+    def test_pagination_metadata_must_be_stable(self):
+        client = self._client([
+            (200, json.dumps({"items": [{"id": "sub_one"}],
+                              "pagination": {"total_count": 2,
+                                             "max_page": 2}}).encode()),
+            (200, json.dumps({"items": [{"id": "sub_two"}],
+                              "pagination": {"total_count": 3,
+                                             "max_page": 2}}).encode()),
+        ])
+        with self.assertRaises(PolarAPIError):
+            client.list_subscriptions(external_customer_id="ten_" + "d" * 32)
+
     def test_immediate_revoke_uses_delete_and_returns_validated_subscription(self):
         client = self._client([
             (200, json.dumps({"id": "sub_live", "status": "canceled"}).encode()),
@@ -114,6 +150,7 @@ class _LifecycleStore:
         self.started = []
         self.saved = []
         self.finished = []
+        self.checkout_create_in_flight = False
 
     def billing_for_tenant(self, tenant_id):
         return self.billing
@@ -128,6 +165,9 @@ class _LifecycleStore:
 
     def finish_billing_lifecycle_operation(self, **values):
         self.finished.append(values)
+
+    def billing_checkout_create_in_flight(self, tenant_id):
+        return self.checkout_create_in_flight
 
 
 class _OwnerAuthorizer:
@@ -237,7 +277,9 @@ class BillingReconciliationTests(unittest.TestCase):
         self.assertEqual(store.started, [])
 
     def test_reconciliation_records_unknown_and_actionable_states_but_no_entitlement(self):
-        from agent.billing.lifecycle import reconcile_workspace_billing
+        from agent.billing.lifecycle import (
+            BillingLifecycleError, reconcile_workspace_billing,
+        )
 
         client = _LifecycleClient(
             external_subscriptions=[_subscription(
@@ -249,13 +291,34 @@ class BillingReconciliationTests(unittest.TestCase):
             }])
         store = _LifecycleStore()
 
-        result = reconcile_workspace_billing(
-            principal=object(), authorizer=_OwnerAuthorizer(), store=store,
-            client=client)
+        with self.assertRaises(BillingLifecycleError):
+            reconcile_workspace_billing(
+                principal=object(), authorizer=_OwnerAuthorizer(), store=store,
+                client=client)
 
-        self.assertEqual(result["unknown_subscription_count"], 1)
-        self.assertEqual(result["actionable_checkout_count"], 1)
+        self.assertEqual(store.finished[-1]["state"], "ambiguous")
+        self.assertEqual(store.finished[-1]["failure_category"],
+                         "unknown_subscription_state")
         self.assertFalse(hasattr(store, "upsert_billing_from_subscription"))
+
+    def test_malformed_checkout_expiry_is_durably_ambiguous(self):
+        from agent.billing.lifecycle import (
+            BillingLifecycleError, reconcile_workspace_billing,
+        )
+        client = _LifecycleClient(external_checkouts=[{
+            "id": "checkout_bad_time", "status": "open",
+            "customer": {"id": "cus_live", "external_id": self.tenant_id},
+            "expires_at": "not-a-time", "metadata": {},
+        }])
+        store = _LifecycleStore()
+
+        with self.assertRaises(BillingLifecycleError):
+            reconcile_workspace_billing(
+                principal=object(), authorizer=_OwnerAuthorizer(), store=store,
+                client=client)
+
+        self.assertEqual(store.finished[-1]["failure_category"],
+                         "malformed_provider_state")
 
 
 class _RevocationClient(_LifecycleClient):
@@ -358,6 +421,22 @@ class BillingRevocationTests(unittest.TestCase):
         self.assertEqual(store.finished[-1]["failure_category"],
                          "actionable_checkout")
 
+    def test_inflight_checkout_provider_call_prevents_verified_safe(self):
+        from agent.billing.lifecycle import (
+            BillingLifecycleError, revoke_workspace_subscriptions,
+        )
+        store = _LifecycleStore()
+        store.checkout_create_in_flight = True
+
+        with self.assertRaises(BillingLifecycleError):
+            revoke_workspace_subscriptions(
+                principal=object(), authorizer=_OwnerAuthorizer(), store=store,
+                client=_RevocationClient([[], []]))
+
+        self.assertEqual(store.finished[-1]["state"], "ambiguous")
+        self.assertEqual(store.finished[-1]["failure_category"],
+                         "checkout_create_in_flight")
+
 
 @unittest.skipUnless(os.environ.get("RELIUM_TEST_POSTGRES_DSN"),
                      "PostgreSQL lifecycle tests require RELIUM_TEST_POSTGRES_DSN")
@@ -426,6 +505,60 @@ class BillingLifecyclePostgresTests(unittest.TestCase):
                 operation_id=second_op["operation_id"], subscriptions=item,
                 checkouts=(), observed_at=now)
 
+    def test_superseded_operation_cannot_save_or_finish(self):
+        tenant_id = self.first["tenant_id"]
+        old = self.store.begin_billing_lifecycle_operation(
+            tenant_id=tenant_id, operation_kind="reconcile")
+        self.store.begin_billing_lifecycle_operation(
+            tenant_id=tenant_id, operation_kind="reconcile")
+
+        with self.assertRaises(Exception):
+            self.store.save_billing_reconciliation(
+                tenant_id=tenant_id, operation_id=old["operation_id"],
+                subscriptions=(), checkouts=(),
+                observed_at=datetime.now(timezone.utc))
+        with self.assertRaises(Exception):
+            self.store.finish_billing_lifecycle_operation(
+                tenant_id=tenant_id, operation_id=old["operation_id"],
+                state="reconciled", failure_category=None,
+                subscription_count=0, actionable_checkout_count=0)
+
+    def test_checkout_provider_create_is_exclusive_and_revocation_sees_inflight(self):
+        tenant_id = self.first["tenant_id"]
+        intent = self.store.claim_billing_checkout_intent(
+            tenant_id=tenant_id, requested_plan="starter",
+            polar_product_id="prod_starter", now=datetime.now(timezone.utc))
+
+        first = self.store.begin_billing_checkout_provider_create(
+            tenant_id=tenant_id,
+            checkout_intent_id=intent["checkout_intent_id"],
+            now=datetime.now(timezone.utc))
+        second = self.store.begin_billing_checkout_provider_create(
+            tenant_id=tenant_id,
+            checkout_intent_id=intent["checkout_intent_id"],
+            now=datetime.now(timezone.utc))
+        self.store.begin_billing_lifecycle_operation(
+            tenant_id=tenant_id, operation_kind="revoke", block_checkout=True)
+
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+        self.assertTrue(self.store.billing_checkout_create_in_flight(tenant_id))
+
+    def test_revocation_generation_fences_a_claimed_checkout_before_provider_call(self):
+        tenant_id = self.first["tenant_id"]
+        intent = self.store.claim_billing_checkout_intent(
+            tenant_id=tenant_id, requested_plan="starter",
+            polar_product_id="prod_starter", now=datetime.now(timezone.utc))
+        self.store.begin_billing_lifecycle_operation(
+            tenant_id=tenant_id, operation_kind="revoke", block_checkout=True)
+
+        claim = self.store.begin_billing_checkout_provider_create(
+            tenant_id=tenant_id,
+            checkout_intent_id=intent["checkout_intent_id"],
+            now=datetime.now(timezone.utc))
+
+        self.assertIsNone(claim)
+
 
 class _CheckoutIntentStore(_LifecycleStore):
     def __init__(self, billing=None, *, blocked=False):
@@ -433,6 +566,7 @@ class _CheckoutIntentStore(_LifecycleStore):
         self.blocked = blocked
         self.intent = None
         self.intent_finishes = []
+        self.create_claims = []
 
     def claim_billing_checkout_intent(self, *, tenant_id, requested_plan,
                                       polar_product_id, now):
@@ -444,10 +578,16 @@ class _CheckoutIntentStore(_LifecycleStore):
                 "checkout_intent_id": "bci_fixed", "requested_plan": requested_plan,
                 "polar_product_id": polar_product_id, "state": "claimed",
                 "polar_checkout_id": None, "created": True,
+                "lifecycle_generation": 0,
             }
         else:
             self.intent = dict(self.intent, created=False)
         return self.intent
+
+    def begin_billing_checkout_provider_create(self, *, tenant_id,
+                                               checkout_intent_id, now):
+        self.create_claims.append((tenant_id, checkout_intent_id))
+        return {"create_lease_id": "bcl_fixed"}
 
     def finish_billing_checkout_intent(self, **values):
         self.intent_finishes.append(values)
@@ -527,6 +667,7 @@ class BillingCheckoutIntentTests(unittest.TestCase):
             "checkout_intent_id": "bci_fixed", "requested_plan": "starter",
             "polar_product_id": "prod_starter", "state": "claimed",
             "polar_checkout_id": None, "created": False,
+            "lifecycle_generation": 0,
         }
 
         result = self._service(client).create_checkout(
@@ -550,6 +691,7 @@ class BillingCheckoutIntentTests(unittest.TestCase):
             "checkout_intent_id": "bci_fixed", "requested_plan": "starter",
             "polar_product_id": "prod_starter", "state": "claimed",
             "polar_checkout_id": None, "created": False,
+            "lifecycle_generation": 0,
         }
 
         with self.assertRaisesRegex(BillingError, "billing_provider_unavailable"):
@@ -566,6 +708,7 @@ class BillingCheckoutIntentTests(unittest.TestCase):
             "checkout_intent_id": "bci_fixed", "requested_plan": "starter",
             "polar_product_id": "prod_starter", "state": "provider_created",
             "polar_checkout_id": "checkout_known", "created": False,
+            "lifecycle_generation": 0,
         }
 
         with self.assertRaisesRegex(BillingError, "billing_provider_unavailable"):
@@ -583,6 +726,18 @@ class BillingCheckoutIntentTests(unittest.TestCase):
             self._service(client).create_checkout(store, self.tenant_id, "starter")
 
         self.assertEqual(client.calls, [])
+
+    def test_non_claimant_never_calls_provider_create(self):
+        from agent.billing.service import BillingError
+
+        client = _CheckoutClient()
+        store = _CheckoutIntentStore()
+        store.begin_billing_checkout_provider_create = lambda **_values: None
+
+        with self.assertRaisesRegex(BillingError, "billing_provider_unavailable"):
+            self._service(client).create_checkout(store, self.tenant_id, "starter")
+
+        self.assertEqual(client.created_payloads, [])
 
 
 if __name__ == "__main__":

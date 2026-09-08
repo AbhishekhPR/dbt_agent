@@ -137,6 +137,8 @@ class PolarClient:
         if not isinstance(identity, str) or not identity or len(identity) > 255:
             raise ValueError("invalid customer identity")
         items = []
+        seen_ids = set()
+        expected_pagination = None
         page = 1
         while True:
             query = urllib.parse.urlencode({key: identity, "page": page, "limit": 100})
@@ -154,6 +156,19 @@ class PolarClient:
                     or any(not isinstance(item, dict) for item in page_items)):
                 raise PolarAPIError("Polar returned an unexpected response.",
                                     operation=operation)
+            current_pagination = (pagination["total_count"], pagination["max_page"])
+            if expected_pagination is None:
+                expected_pagination = current_pagination
+            elif current_pagination != expected_pagination:
+                raise PolarAPIError("Polar returned unstable pagination.",
+                                    operation=operation)
+            for item in page_items:
+                identifier = item.get("id")
+                if (not isinstance(identifier, str) or not identifier
+                        or len(identifier) > 255 or identifier in seen_ids):
+                    raise PolarAPIError("Polar returned ambiguous pagination.",
+                                        operation=operation)
+                seen_ids.add(identifier)
             items.extend(page_items)
             if page >= pagination["max_page"]:
                 if len(items) != pagination["total_count"]:
