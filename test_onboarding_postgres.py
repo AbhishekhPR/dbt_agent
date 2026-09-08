@@ -622,6 +622,9 @@ class RepositoryOnboardingMigrationTests(unittest.TestCase):
             store.record_github_installation(
                 7001, github_account_id=1, github_account_login="a",
                 github_account_type="Organization")
+            store.bind_github_installation_to_tenant(
+                7001, tenant_id=first, bound_by_clerk_user_id="user-a",
+                verified_github_user_id=1)
             store.select_tenant_repository(
                 8001, tenant_id=first, github_installation_id=7001,
                 owner_login="a", name="repo")
@@ -642,6 +645,9 @@ class RepositoryOnboardingMigrationTests(unittest.TestCase):
             store.record_github_installation(
                 7002, github_account_id=1, github_account_login="c",
                 github_account_type="Organization")
+            store.bind_github_installation_to_tenant(
+                7002, tenant_id=tenant, bound_by_clerk_user_id="user-c",
+                verified_github_user_id=1)
             store.select_tenant_repository(
                 8002, tenant_id=tenant, github_installation_id=7002,
                 owner_login="c", name="repo")
@@ -661,6 +667,9 @@ class RepositoryOnboardingMigrationTests(unittest.TestCase):
             store.record_github_installation(
                 7003, github_account_id=1, github_account_login="d",
                 github_account_type="Organization")
+            store.bind_github_installation_to_tenant(
+                7003, tenant_id=tenant, bound_by_clerk_user_id="user-d",
+                verified_github_user_id=1)
             store.select_tenant_repository(
                 8003, tenant_id=tenant, github_installation_id=7003,
                 owner_login="d", name="repo")
@@ -681,6 +690,9 @@ class RepositoryOnboardingMigrationTests(unittest.TestCase):
             store.record_github_installation(
                 7004, github_account_id=1, github_account_login="e",
                 github_account_type="Organization")
+            store.bind_github_installation_to_tenant(
+                7004, tenant_id=tenant, bound_by_clerk_user_id="user-e",
+                verified_github_user_id=1)
             store.select_tenant_repository(
                 8004, tenant_id=tenant, github_installation_id=7004,
                 owner_login="e", name="repo")

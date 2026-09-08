@@ -8,6 +8,7 @@ from pathlib import Path
 MIGRATIONS_DIR = Path(__file__).with_name("migrations") / "postgres"
 
 _VERSION_RE = re.compile(r"^(\d{4})_")
+_MIGRATION_LOCK_NAMESPACE = 1380732245
 
 
 def _migration_files() -> list[Path]:
@@ -32,32 +33,55 @@ def apply_migrations(connection) -> list[int]:
     already-applied versions are skipped. A migration that fails is rolled back
     and no later migration is attempted.
     """
-    connection.execute(
-        "CREATE TABLE IF NOT EXISTS schema_migrations ("
-        "version INTEGER PRIMARY KEY, "
-        "checksum TEXT NOT NULL, "
-        "applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
-    )
+    if not connection.autocommit:
+        raise RuntimeError(
+            "apply_migrations requires an autocommit connection so each "
+            "migration commits independently"
+        )
 
-    applied = {
-        row["version"]
-        for row in connection.execute("SELECT version FROM schema_migrations").fetchall()
-    }
-    newly_applied = []
-    for path in pending_migrations(applied):
-        version = _version_of(path)
-        sql = path.read_text(encoding="utf-8")
-        checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
-        # Each migration file runs in its own transaction: a failure rolls back
-        # only that file, and it is never recorded as applied.
-        with connection.transaction():
-            connection.execute(sql)
-            connection.execute(
-                "INSERT INTO schema_migrations (version, checksum) VALUES (%s, %s)",
-                (version, checksum),
-            )
-        newly_applied.append(version)
-    return newly_applied
+    # Store construction happens concurrently during rolling deploys. A
+    # database-scoped session advisory lock must be acquired before even the
+    # migration table/version read, otherwise two starters can both decide the
+    # same version is pending. PostgreSQL releases the lock if the session
+    # disappears; the explicit finally handles normal errors and success.
+    connection.execute(
+        "SELECT pg_advisory_lock(hashtext(current_database()), %s)",
+        (_MIGRATION_LOCK_NAMESPACE,),
+    )
+    try:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "version INTEGER PRIMARY KEY, "
+            "checksum TEXT NOT NULL, "
+            "applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+
+        applied = {
+            row["version"]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations").fetchall()
+        }
+        newly_applied = []
+        for path in pending_migrations(applied):
+            version = _version_of(path)
+            sql = path.read_text(encoding="utf-8")
+            checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+            # Each migration file runs in its own transaction: a failure rolls
+            # back only that file, and it is never recorded as applied.
+            with connection.transaction():
+                connection.execute(sql)
+                connection.execute(
+                    "INSERT INTO schema_migrations (version, checksum) "
+                    "VALUES (%s, %s)",
+                    (version, checksum),
+                )
+            newly_applied.append(version)
+        return newly_applied
+    finally:
+        connection.execute(
+            "SELECT pg_advisory_unlock(hashtext(current_database()), %s)",
+            (_MIGRATION_LOCK_NAMESPACE,),
+        )
 
 
 def applied_versions(connection) -> list[int]:

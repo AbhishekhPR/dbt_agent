@@ -84,22 +84,17 @@ def get_workspace_entitlements(store, tenant_id, settings=None, *, now=None):
 def tenant_for_scope(store, scope):
     """The tenant that owns the repository a service-token scope points at.
 
-    Service tokens are scoped to an organization and a repository -- the GitHub
-    owner login and repository name -- while billing is keyed by tenant. This
-    is the join, and it reads a mapping Relium wrote during onboarding; it
-    never creates one.
+    Service tokens are scoped to a legacy operational repository while billing
+    is keyed by tenant. This read traverses the authoritative operational-root
+    bridge; owner/repository display names never establish tenant ownership.
 
-    Returns None when the repository was never onboarded through a tenant,
-    which is the case for a deployment that predates Clerk tenancy. Callers
-    treat None as "not metered": refusing evidence for a repository that has no
-    workspace would break an install that was working before entitlements
-    existed, and there is no subscription to enforce against anyway.
+    Returns None when the legacy root has not been authoritatively reconciled.
     """
     organization_id = getattr(scope, "organization_id", None)
     repository_id = getattr(scope, "repository_id", None)
     if not organization_id or not repository_id:
         return None
-    reader = getattr(store, "tenant_for_repository_slug", None)
+    reader = getattr(store, "tenant_for_operational_repository", None)
     if reader is None:
         return None
     return reader(str(organization_id), str(repository_id))
@@ -111,7 +106,10 @@ def entitlements_for_scope(store, scope, settings=None, *, now=None):
         return UNMETERED
     tenant_id = tenant_for_scope(store, scope)
     if tenant_id is None:
-        return UNMETERED
+        # Legacy collection/review behavior remains available, but sensitive
+        # paid capabilities (notably merge blocking) fail closed until the
+        # operational root has authoritative tenant ownership.
+        return entitlements_for(PLAN_FREE)
     return get_workspace_entitlements(store, tenant_id, settings, now=now)
 
 

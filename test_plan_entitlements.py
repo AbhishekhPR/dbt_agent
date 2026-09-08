@@ -43,7 +43,7 @@ class FakeStore:
     def billing_for_tenant(self, tenant_id):
         return self.billing.get(tenant_id)
 
-    def tenant_for_repository_slug(self, organization_id, repository_id):
+    def tenant_for_operational_repository(self, organization_id, repository_id):
         return self.slugs.get((organization_id, repository_id))
 
 
@@ -235,16 +235,15 @@ class ScopeResolutionTests(unittest.TestCase):
                                    Settings(), now=NOW),
             STARTER)
 
-    def test_a_repository_no_workspace_owns_is_not_metered(self):
-        """A deployment that predates Clerk tenancy has repositories with no
-        workspace. Refusing their evidence would break an install that worked
-        before entitlements existed, and there is no subscription to enforce."""
+    def test_an_unmapped_repository_cannot_inherit_paid_entitlements(self):
+        """Legacy reviews may continue, but an unowned root must fail closed
+        for paid capabilities such as merge blocking."""
         from agent.billing.access import entitlements_for_scope
 
         store = FakeStore(slugs={})
         self.assertEqual(
             entitlements_for_scope(store, Scope("acme", "orphan"), Settings()),
-            UNMETERED)
+            FREE)
 
     def test_one_tenants_plan_never_answers_for_another(self):
         from agent.billing.access import entitlements_for_scope

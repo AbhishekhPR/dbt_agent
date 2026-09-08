@@ -80,6 +80,7 @@ CODE_INVALID_CONFIG = "invalid_configuration"
 CODE_GITHUB_UNAVAILABLE = "github_unavailable"
 CODE_CONFIGURATION_REQUIRED = "configuration_required"
 CODE_CI_TOKEN_REQUIRED = "ci_token_required"
+CODE_OPERATIONAL_OWNERSHIP_UNAVAILABLE = "operational_ownership_unavailable"
 #: The workspace's plan does not include another connected repository. A
 #: conflict with current state, never an authorization failure: the caller may
 #: have this repository, they simply may not have one MORE.
@@ -324,7 +325,8 @@ class RepositoryOnboardingService:
         unlimited.
         """
         from agent.postgres_lifecycle_store import (
-            TenantRepositoryConflict, TenantRepositoryLimitReached)
+            OperationalRootOwnershipConflict, TenantRepositoryConflict,
+            TenantRepositoryLimitReached)
 
         repository = self.authorized_repository(
             store, tenant_id, github_repository_id)
@@ -357,6 +359,22 @@ class RepositoryOnboardingService:
                         extra={"operation": "select_repository"})
             raise RepositoryOnboardingError(
                 CODE_REPOSITORY_NOT_FOUND, str(exc)) from None
+        try:
+            store.establish_tenant_operational_root_from_github(
+                tenant_id=tenant_id,
+                github_repository_id=repository.github_repository_id,
+                github_installation_id=repository.installation_id,
+                organization_id=repository.owner_login,
+                verified_at=self._clock(),
+            )
+        except OperationalRootOwnershipConflict:
+            # An existing/mixed legacy root remains usable and unmapped. The
+            # operator audit reports the inconsistency; repository selection
+            # must not guess ownership or break non-destructive legacy use.
+            logger.warning(
+                "operational_root_ownership_unavailable",
+                extra={"operation": "select_repository"},
+            )
         return record
 
     # -- dbt detection ------------------------------------------------------
@@ -472,8 +490,32 @@ class RepositoryOnboardingService:
             repository_id=repository.name,
             description=f"Relium onboarding — {repository.full_name}")
 
-        # Revoke the old one in the same operation. Otherwise a re-issue leaves
-        # live credentials the customer cannot see and cannot revoke.
+        delivery = "display_once"
+        secret = presented
+        from agent.postgres_lifecycle_store import OperationalRootOwnershipConflict
+
+        try:
+            # Establish authoritative local ownership before sending a new
+            # credential to an external provider. Ambiguous legacy roots fail
+            # closed without changing the selected repository projection.
+            store.record_tenant_repository_ci_token_and_bind_root(
+                github_repository_id,
+                tenant_id=tenant_id,
+                ci_token_id=token_id,
+                delivery=delivery,
+                issued_at=self._clock(),
+                verified_at=self._clock(),
+            )
+        except OperationalRootOwnershipConflict:
+            # The token row was created before its ownership could be proven.
+            # Revoke it so a refused operation never leaves a usable orphan.
+            store.revoke_service_token(token_id)
+            raise RepositoryOnboardingError(
+                CODE_OPERATIONAL_OWNERSHIP_UNAVAILABLE) from None
+
+        # Revoke the old one only after the replacement is durably associated
+        # with the same tenant/root. Otherwise a failed rotation could disable
+        # the customer's last working credential.
         if previous:
             try:
                 store.revoke_service_token(previous)
@@ -481,8 +523,6 @@ class RepositoryOnboardingService:
                 logger.error("ci_token_revocation_failed",
                              extra={"error_category": "internal"})
 
-        delivery = "display_once"
-        secret = presented
         if getattr(self._secret_writer, "available", False):
             try:
                 self._secret_writer.write(
@@ -492,13 +532,16 @@ class RepositoryOnboardingService:
                 delivery = "actions_secret"
                 # The preferred path: the value never enters the browser.
                 secret = None
+                store.record_tenant_repository_ci_token(
+                    github_repository_id,
+                    tenant_id=tenant_id,
+                    ci_token_id=token_id,
+                    delivery=delivery,
+                    issued_at=self._clock(),
+                )
             except ActionsSecretUnavailable:
                 logger.info("ci_secret_write_unavailable",
                             extra={"operation": "issue_ci_credential"})
-
-        store.record_tenant_repository_ci_token(
-            github_repository_id, tenant_id=tenant_id, ci_token_id=token_id,
-            delivery=delivery, issued_at=self._clock())
 
         # Deliberately no logging of the token or any part of it: a partial
         # credential in a log narrows a brute force.

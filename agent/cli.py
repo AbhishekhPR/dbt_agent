@@ -1278,7 +1278,7 @@ def collect(request_id, test_connection, as_json):
     sys.exit(0 if outcome.ok else 1)
 
 
-def _admin_store():
+def _admin_store(*, migrate=True):
     """Open the evidence store for an operator command.
 
     Possession of RELIUM_DATABASE_URL is the authorization: a customer never
@@ -1294,7 +1294,58 @@ def _admin_store():
         sys.exit(2)
     from agent.postgres_lifecycle_store import PostgresLifecycleStore
 
-    return PostgresLifecycleStore(dsn)
+    return PostgresLifecycleStore(dsn, migrate=migrate)
+
+
+@cli.command(name="tenant-ownership-audit")
+@click.option(
+    "--apply-unambiguous", is_flag=True,
+    help="Insert only complete single-tenant CI-proven root mappings.")
+@click.option("--json", "as_json", is_flag=True,
+              help="Emit bounded machine-readable counts and identifiers.")
+@click.option(
+    "--storage-root", type=click.Path(file_okay=False, path_type=str),
+    help="Also count mapped/unmapped numeric repository storage directories.")
+def tenant_ownership_audit(apply_unambiguous, as_json, storage_root):
+    """Operator: audit tenant-to-operational-root ownership.
+
+    Read-only unless --apply-unambiguous is supplied. Neither output mode
+    includes credentials, manifests, webhook bodies, SQL, evidence, or
+    warehouse payloads.
+    """
+    import json
+
+    # An audit must not become a schema/data mutation merely because the
+    # operator ran it before deployment migrations completed.
+    store = _admin_store(migrate=False)
+    try:
+        if not store.has_schema_migration(22):
+            raise click.ClickException(
+                "migration 0022 must be applied before tenant ownership audit")
+        reconciliation = store.reconcile_tenant_operational_roots(
+            apply=apply_unambiguous)
+        report = store.tenant_operational_ownership_audit()
+        result = {"reconciliation": reconciliation, "audit": report}
+        if storage_root is not None:
+            from agent.tenant_operational_ownership import (
+                filesystem_ownership_audit,
+            )
+
+            result["filesystem"] = filesystem_ownership_audit(
+                store, storage_root=storage_root)
+    finally:
+        store.close()
+    if as_json:
+        click.echo(json.dumps(result, sort_keys=True, default=str))
+        return
+    click.echo(
+        "tenant ownership audit: "
+        f"mapped={len(report['mapped_roots'])} "
+        f"unmapped={len(report['unmapped_roots'])} "
+        f"ambiguous={len(report['ambiguous_roots'])} "
+        f"inconsistent={len(report['cross_tenant_inconsistencies'])} "
+        f"eligible={reconciliation['eligible_count']} "
+        f"applied={reconciliation['applied_count']}")
 
 
 @cli.command(name="issue-collector-token")
