@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS billing_lifecycle_operations (
     tenant_id TEXT NOT NULL REFERENCES tenants (tenant_id) ON DELETE RESTRICT,
     operation_kind TEXT NOT NULL CHECK (operation_kind IN ('reconcile', 'revoke')),
     state TEXT NOT NULL CHECK (state IN
-        ('claimed', 'provider_calls', 'verified_safe', 'failed', 'ambiguous')),
+        ('claimed', 'provider_calls', 'reconciled', 'verified_safe', 'failed', 'ambiguous')),
     generation BIGINT NOT NULL CHECK (generation > 0),
     lease_expires_at TIMESTAMPTZ,
     failure_category TEXT,
@@ -103,4 +103,3 @@ CREATE TABLE IF NOT EXISTS billing_checkout_intents (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_billing_checkout_intents_active_tenant
     ON billing_checkout_intents (tenant_id)
     WHERE state IN ('claimed', 'provider_created');
-

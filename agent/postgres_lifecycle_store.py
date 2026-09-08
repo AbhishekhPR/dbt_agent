@@ -455,6 +455,177 @@ class PostgresLifecycleStore:
         ).fetchone()
         return dict(row) if row else None
 
+    def begin_billing_lifecycle_operation(self, *, tenant_id, operation_kind,
+                                          block_checkout=False, now=None):
+        """Claim one durable generation while locking the authenticated tenant."""
+        if operation_kind not in {"reconcile", "revoke"}:
+            raise ValueError("invalid billing lifecycle operation")
+        operation_id = f"blo_{uuid.uuid4().hex}"
+        observed_at = now or datetime.now(timezone.utc)
+        with self.connection.transaction():
+            tenant = self.connection.execute(
+                "SELECT 1 FROM tenants WHERE tenant_id = %s FOR UPDATE",
+                (tenant_id,),
+            ).fetchone()
+            if tenant is None:
+                raise ValueError("tenant does not exist")
+            self.connection.execute(
+                "INSERT INTO tenant_lifecycle_controls "
+                "(tenant_id, billing_checkout_state, credential_state) "
+                "VALUES (%s, 'active', 'active') ON CONFLICT DO NOTHING",
+                (tenant_id,),
+            )
+            row = self.connection.execute(
+                "UPDATE tenant_lifecycle_controls SET "
+                "generation = generation + 1, "
+                "billing_checkout_state = CASE WHEN %s THEN 'blocked' "
+                "                              ELSE billing_checkout_state END, "
+                "updated_at = %s WHERE tenant_id = %s "
+                "RETURNING generation",
+                (bool(block_checkout), observed_at, tenant_id),
+            ).fetchone()
+            self.connection.execute(
+                "INSERT INTO billing_lifecycle_operations "
+                "(operation_id, tenant_id, operation_kind, state, generation, "
+                " lease_expires_at, created_at, updated_at) "
+                "VALUES (%s, %s, %s, 'claimed', %s, %s, %s, %s)",
+                (operation_id, tenant_id, operation_kind, row["generation"],
+                 observed_at + timedelta(minutes=5), observed_at, observed_at),
+            )
+        return {"operation_id": operation_id, "generation": row["generation"]}
+
+    def save_billing_reconciliation(self, *, tenant_id, operation_id,
+                                    subscriptions, checkouts, observed_at):
+        """Replace bounded provider observations for exactly one tenant."""
+        with self.connection.transaction():
+            operation = self.connection.execute(
+                "SELECT 1 FROM billing_lifecycle_operations "
+                "WHERE operation_id = %s AND tenant_id = %s FOR UPDATE",
+                (operation_id, tenant_id),
+            ).fetchone()
+            if operation is None:
+                raise ValueError("billing lifecycle operation does not match tenant")
+            self.connection.execute(
+                "DELETE FROM tenant_polar_subscriptions WHERE tenant_id = %s",
+                (tenant_id,),
+            )
+            self.connection.execute(
+                "DELETE FROM tenant_polar_checkouts WHERE tenant_id = %s",
+                (tenant_id,),
+            )
+            for item in subscriptions:
+                self.connection.execute(
+                    "INSERT INTO tenant_polar_subscriptions "
+                    "(polar_subscription_id, tenant_id, polar_customer_id, "
+                    " polar_product_id, provider_status, cancel_at_period_end, "
+                    " classification, last_operation_id, observed_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (item["polar_subscription_id"], tenant_id,
+                     item["polar_customer_id"], item["polar_product_id"],
+                     item["provider_status"], item["cancel_at_period_end"],
+                     item["classification"], operation_id, observed_at),
+                )
+            for item in checkouts:
+                self.connection.execute(
+                    "INSERT INTO tenant_polar_checkouts "
+                    "(polar_checkout_id, tenant_id, polar_customer_id, "
+                    " provider_status, checkout_intent_id, expires_at, actionable, "
+                    " last_operation_id, observed_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (item["polar_checkout_id"], tenant_id,
+                     item["polar_customer_id"], item["provider_status"],
+                     item["checkout_intent_id"], item["expires_at"],
+                     item["actionable"], operation_id, observed_at),
+                )
+
+    def finish_billing_lifecycle_operation(self, *, tenant_id, operation_id,
+                                           state, failure_category,
+                                           subscription_count,
+                                           actionable_checkout_count, now=None):
+        """Finish only the named tenant operation; retries cannot cross scope."""
+        completed_at = now or datetime.now(timezone.utc)
+        row = self.connection.execute(
+            "UPDATE billing_lifecycle_operations SET state = %s, "
+            "failure_category = %s, subscription_count = %s, "
+            "actionable_checkout_count = %s, lease_expires_at = NULL, "
+            "updated_at = %s, completed_at = %s "
+            "WHERE operation_id = %s AND tenant_id = %s "
+            "RETURNING operation_id",
+            (state, failure_category, subscription_count,
+             actionable_checkout_count, completed_at, completed_at,
+             operation_id, tenant_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("billing lifecycle operation does not match tenant")
+
+    def claim_billing_checkout_intent(self, *, tenant_id, requested_plan,
+                                      polar_product_id, now=None):
+        """Create or return the sole active checkout intent for a workspace."""
+        claimed_at = now or datetime.now(timezone.utc)
+        with self.connection.transaction():
+            tenant = self.connection.execute(
+                "SELECT 1 FROM tenants WHERE tenant_id = %s FOR UPDATE",
+                (tenant_id,),
+            ).fetchone()
+            if tenant is None:
+                raise ValueError("tenant does not exist")
+            self.connection.execute(
+                "INSERT INTO tenant_lifecycle_controls "
+                "(tenant_id, billing_checkout_state, credential_state) "
+                "VALUES (%s, 'active', 'active') ON CONFLICT DO NOTHING",
+                (tenant_id,),
+            )
+            control = self.connection.execute(
+                "SELECT billing_checkout_state FROM tenant_lifecycle_controls "
+                "WHERE tenant_id = %s FOR UPDATE", (tenant_id,),
+            ).fetchone()
+            if control["billing_checkout_state"] != "active":
+                from agent.billing.lifecycle import BillingLifecycleError
+                raise BillingLifecycleError("checkout_blocked")
+            existing = self.connection.execute(
+                "SELECT checkout_intent_id, requested_plan, polar_product_id, "
+                "state, polar_checkout_id FROM billing_checkout_intents "
+                "WHERE tenant_id = %s AND state IN ('claimed', 'provider_created') "
+                "FOR UPDATE", (tenant_id,),
+            ).fetchone()
+            if existing:
+                result = dict(existing)
+                result["created"] = False
+                return result
+            intent_id = f"bci_{uuid.uuid4().hex}"
+            row = self.connection.execute(
+                "INSERT INTO billing_checkout_intents "
+                "(checkout_intent_id, tenant_id, requested_plan, polar_product_id, "
+                " state, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, 'claimed', %s, %s) "
+                "RETURNING checkout_intent_id, requested_plan, polar_product_id, "
+                "state, polar_checkout_id",
+                (intent_id, tenant_id, requested_plan, polar_product_id,
+                 claimed_at, claimed_at),
+            ).fetchone()
+            result = dict(row)
+            result["created"] = True
+            return result
+
+    def finish_billing_checkout_intent(self, *, tenant_id, checkout_intent_id,
+                                       state, polar_checkout_id,
+                                       failure_category, now=None):
+        if state not in {"provider_created", "completed", "failed", "ambiguous"}:
+            raise ValueError("invalid checkout intent state")
+        changed_at = now or datetime.now(timezone.utc)
+        completed_at = changed_at if state in {"completed", "failed", "ambiguous"} else None
+        row = self.connection.execute(
+            "UPDATE billing_checkout_intents SET state = %s, "
+            "polar_checkout_id = COALESCE(%s, polar_checkout_id), "
+            "failure_category = %s, updated_at = %s, completed_at = %s "
+            "WHERE checkout_intent_id = %s AND tenant_id = %s "
+            "RETURNING checkout_intent_id",
+            (state, polar_checkout_id, failure_category, changed_at, completed_at,
+             checkout_intent_id, tenant_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("checkout intent does not match tenant")
+
     def tenant_for_polar_customer(self, polar_customer_id):
         """The tenant already bound to one Polar customer id, or None.
 

@@ -29,6 +29,7 @@ _TENANT_ID = re.compile(r"^ten_[0-9a-f]{32}$")
 #: subscription and customer. A second, independent path from a webhook back to
 #: the workspace.
 TENANT_METADATA_KEY = "relium_tenant_id"
+CHECKOUT_INTENT_METADATA_KEY = "relium_checkout_intent_id"
 
 #: Bound on identifiers taken out of a Polar payload before they are stored.
 MAX_POLAR_ID = 255
@@ -53,6 +54,8 @@ CODE_NO_BILLING_ACCOUNT = "no_billing_account"
 #: The workspace already has a live subscription. Changing plan is an update to
 #: that subscription, not a second purchase.
 CODE_SUBSCRIPTION_EXISTS = "subscription_exists"
+# A later lifecycle operation has disabled new purchases for this workspace.
+CODE_LIFECYCLE_BLOCKED = "billing_lifecycle_blocked"
 
 
 class BillingService:
@@ -124,13 +127,104 @@ class BillingService:
         if not product_id:
             raise BillingError(CODE_NOT_CONFIGURED)
 
+        intent = None
+        if hasattr(store, "claim_billing_checkout_intent"):
+            from agent.billing.lifecycle import (
+                BillingLifecycleError, _collect_provider_state,
+            )
+
+            try:
+                intent = store.claim_billing_checkout_intent(
+                    tenant_id=tenant_id, requested_plan=plan,
+                    polar_product_id=product_id, now=self.now())
+            except BillingLifecycleError as error:
+                if error.category == "checkout_blocked":
+                    raise BillingError(CODE_LIFECYCLE_BLOCKED) from None
+                raise BillingError(CODE_PROVIDER_UNAVAILABLE) from None
+            if (intent.get("requested_plan") != plan
+                    or intent.get("polar_product_id") != product_id):
+                store.finish_billing_checkout_intent(
+                    tenant_id=tenant_id,
+                    checkout_intent_id=intent["checkout_intent_id"],
+                    state="ambiguous", polar_checkout_id=None,
+                    failure_category="intent_conflict", now=self.now())
+                raise BillingError(CODE_PROVIDER_UNAVAILABLE)
+            try:
+                provider = _collect_provider_state(
+                    tenant_id=tenant_id, store=store, client=self._client)
+            except (BillingLifecycleError, PolarAPIError):
+                raise BillingError(CODE_PROVIDER_UNAVAILABLE) from None
+
+            if any(item["classification"] != "terminal"
+                   for item in provider["subscriptions"]):
+                store.finish_billing_checkout_intent(
+                    tenant_id=tenant_id,
+                    checkout_intent_id=intent["checkout_intent_id"],
+                    state="completed", polar_checkout_id=None,
+                    failure_category="subscription_exists", now=self.now())
+                raise BillingError(CODE_SUBSCRIPTION_EXISTS)
+
+            matches = [
+                checkout for checkout in provider["checkouts"]
+                if checkout["checkout_intent_id"] == intent["checkout_intent_id"]
+            ]
+            if len(matches) > 1:
+                store.finish_billing_checkout_intent(
+                    tenant_id=tenant_id,
+                    checkout_intent_id=intent["checkout_intent_id"],
+                    state="ambiguous", polar_checkout_id=None,
+                    failure_category="multiple_provider_checkouts", now=self.now())
+                raise BillingError(CODE_PROVIDER_UNAVAILABLE)
+            if len(matches) == 1:
+                match = matches[0]
+                url = match.get("url")
+                if (not match["actionable"] or not isinstance(url, str)
+                        or not url.startswith("https://")):
+                    store.finish_billing_checkout_intent(
+                        tenant_id=tenant_id,
+                        checkout_intent_id=intent["checkout_intent_id"],
+                        state="ambiguous",
+                        polar_checkout_id=match["polar_checkout_id"],
+                        failure_category="checkout_not_resumable", now=self.now())
+                    raise BillingError(CODE_PROVIDER_UNAVAILABLE)
+                store.finish_billing_checkout_intent(
+                    tenant_id=tenant_id,
+                    checkout_intent_id=intent["checkout_intent_id"],
+                    state="provider_created",
+                    polar_checkout_id=match["polar_checkout_id"],
+                    failure_category=None, now=self.now())
+                return {"checkout_url": url,
+                        "checkout_id": match["polar_checkout_id"], "plan": plan}
+            if any(item["actionable"] for item in provider["checkouts"]):
+                store.finish_billing_checkout_intent(
+                    tenant_id=tenant_id,
+                    checkout_intent_id=intent["checkout_intent_id"],
+                    state="ambiguous", polar_checkout_id=None,
+                    failure_category="unattributed_checkout", now=self.now())
+                raise BillingError(CODE_PROVIDER_UNAVAILABLE)
+            if intent.get("state") == "provider_created":
+                # Relium already received a concrete checkout id. A temporarily
+                # stale list response must never turn that evidence into a
+                # second checkout and potentially a second subscription.
+                store.finish_billing_checkout_intent(
+                    tenant_id=tenant_id,
+                    checkout_intent_id=intent["checkout_intent_id"],
+                    state="ambiguous",
+                    polar_checkout_id=intent.get("polar_checkout_id"),
+                    failure_category="known_checkout_not_listed", now=self.now())
+                raise BillingError(CODE_PROVIDER_UNAVAILABLE)
+
         try:
             session = self._client.create_checkout_session(
                 product_id=product_id,
                 # The workspace, and the whole basis of the association.
                 external_customer_id=tenant_id,
                 success_url=self.success_url(),
-                metadata={TENANT_METADATA_KEY: tenant_id},
+                metadata={
+                    TENANT_METADATA_KEY: tenant_id,
+                    **({CHECKOUT_INTENT_METADATA_KEY: intent["checkout_intent_id"]}
+                       if intent else {}),
+                },
                 customer_metadata={TENANT_METADATA_KEY: tenant_id},
             )
         except PolarAPIError as error:
@@ -147,6 +241,19 @@ class BillingService:
                          extra={"error_category": "billing_provider"})
             raise BillingError(CODE_PROVIDER_UNAVAILABLE)
         checkout_id = session.get("id")
+        if intent:
+            if not isinstance(checkout_id, str) or not checkout_id:
+                store.finish_billing_checkout_intent(
+                    tenant_id=tenant_id,
+                    checkout_intent_id=intent["checkout_intent_id"],
+                    state="ambiguous", polar_checkout_id=None,
+                    failure_category="checkout_id_missing", now=self.now())
+                raise BillingError(CODE_PROVIDER_UNAVAILABLE)
+            store.finish_billing_checkout_intent(
+                tenant_id=tenant_id,
+                checkout_intent_id=intent["checkout_intent_id"],
+                state="provider_created", polar_checkout_id=checkout_id,
+                failure_category=None, now=self.now())
         return {
             "checkout_url": url,
             # Returned for support and correlation only. It is not a credential
@@ -328,7 +435,17 @@ class BillingService:
                 _timestamp(data.get("modified_at"))
                 or _timestamp(data.get("created_at"))),
         }
-        return store.upsert_billing_from_subscription(**record)
+        outcome = store.upsert_billing_from_subscription(**record)
+        metadata = data.get("metadata")
+        intent_id = (_polar_id(metadata.get(CHECKOUT_INTENT_METADATA_KEY))
+                     if isinstance(metadata, dict) else None)
+        if (intent_id and outcome in {"applied", "stale"}
+                and hasattr(store, "finish_billing_checkout_intent")):
+            store.finish_billing_checkout_intent(
+                tenant_id=tenant_id, checkout_intent_id=intent_id,
+                state="completed", polar_checkout_id=None,
+                failure_category=None, now=self.now())
+        return outcome
 
     def _tenant_from(self, data):
         """Which workspace this subscription belongs to, or None.
