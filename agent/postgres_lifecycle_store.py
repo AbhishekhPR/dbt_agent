@@ -851,6 +851,128 @@ class PostgresLifecycleStore:
         ).fetchone()
         if row is None:
             raise ValueError("billing lifecycle operation does not match tenant")
+    # -- workspace credential/access lifecycle ---------------------------
+
+    def revoke_workspace_credentials_for_tenant(
+            self, *, tenant_id, expected_operational_roots, clerk_user_id):
+        """Atomically destroy local access for one authoritative workspace.
+
+        ``expected_operational_roots`` is a compare-and-set snapshot produced
+        by Foundation 2 immediately before this call. The roots are re-read
+        under the tenant lock so an ownership change can never broaden the
+        mutation silently.
+        """
+        expected = tuple(sorted(expected_operational_roots))
+        operation_id = f"wcr_{uuid.uuid4().hex}"
+        now = datetime.now(timezone.utc)
+        with self.connection.transaction():
+            tenant = self.connection.execute(
+                "SELECT 1 FROM tenants WHERE tenant_id = %s FOR UPDATE",
+                (tenant_id,),
+            ).fetchone()
+            if tenant is None:
+                raise ValueError("tenant does not exist")
+            roots = tuple(row["organization_id"] for row in
+                          self.connection.execute(
+                              "SELECT organization_id FROM tenant_operational_roots "
+                              "WHERE tenant_id = %s ORDER BY organization_id FOR UPDATE",
+                              (tenant_id,)).fetchall())
+            if roots != expected:
+                raise ValueError("operational ownership changed during revocation")
+
+            self.connection.execute(
+                "INSERT INTO tenant_lifecycle_controls "
+                "(tenant_id, billing_checkout_state, credential_state) "
+                "VALUES (%s, 'active', 'active') ON CONFLICT DO NOTHING",
+                (tenant_id,),
+            )
+            control = self.connection.execute(
+                "UPDATE tenant_lifecycle_controls SET generation = generation + 1, "
+                "credential_state = 'revoking', updated_at = %s "
+                "WHERE tenant_id = %s RETURNING generation",
+                (now, tenant_id),
+            ).fetchone()
+            generation = control["generation"]
+            self.connection.execute(
+                "INSERT INTO workspace_credential_revocations "
+                "(operation_id, tenant_id, generation, state, created_at) "
+                "VALUES (%s, %s, %s, 'claimed', %s)",
+                (operation_id, tenant_id, generation, now),
+            )
+
+            service_tokens = self.connection.execute(
+                "UPDATE api_service_tokens SET secret_hash = NULL, "
+                "revoked_at = COALESCE(revoked_at, %s) "
+                "WHERE organization_id = ANY(%s) "
+                "  AND (secret_hash IS NOT NULL OR revoked_at IS NULL)",
+                (now, list(roots)),
+            ).rowcount
+            self.connection.execute(
+                "UPDATE tenant_repositories SET ci_token_id = NULL, "
+                "ci_token_delivery = NULL, updated_at = %s "
+                "WHERE tenant_id = %s AND ci_token_id IS NOT NULL",
+                (now, tenant_id),
+            )
+            collectors = self.connection.execute(
+                "UPDATE collector_identities SET revoked = TRUE, "
+                "revoked_at = COALESCE(revoked_at, %s), "
+                "revoked_reason = 'workspace_credentials_revoked', token_id = NULL "
+                "WHERE organization_id = ANY(%s) "
+                "  AND (revoked = FALSE OR token_id IS NOT NULL)",
+                (now, list(roots)),
+            ).rowcount
+            requests = self.connection.execute(
+                "UPDATE collection_requests SET state = 'CANCELED', "
+                "canceled_at = %s, cancellation_reason = 'workspace_credentials_revoked' "
+                "WHERE organization_id = ANY(%s) "
+                "  AND state IN ('PENDING', 'ACKNOWLEDGED')",
+                (now, list(roots)),
+            ).rowcount
+            outbox = self.connection.execute(
+                "UPDATE outbox_events SET state = 'CANCELED', canceled_at = %s, "
+                "cancellation_reason = 'workspace_credentials_revoked', "
+                "lease_owner = NULL, lease_expires_at = NULL "
+                "WHERE organization_id = ANY(%s) AND state = 'PENDING'",
+                (now, list(roots)),
+            ).rowcount
+            sessions = self.connection.execute(
+                "UPDATE dashboard_sessions SET revoked_at = COALESCE(revoked_at, %s), "
+                "revocation_reason = 'workspace_credentials_revoked', "
+                "github_access_token = NULL, github_refresh_token = NULL "
+                "WHERE organization_id = ANY(%s) "
+                "  AND (revoked_at IS NULL OR github_access_token IS NOT NULL "
+                "       OR github_refresh_token IS NOT NULL)",
+                (now, list(roots)),
+            ).rowcount
+            installation_states = self.connection.execute(
+                "UPDATE github_installation_states SET consumed_at = %s "
+                "WHERE tenant_id = %s AND consumed_at IS NULL",
+                (now, tenant_id),
+            ).rowcount
+            claimed = int(self.connection.execute(
+                "SELECT count(*) AS n FROM outbox_events "
+                "WHERE organization_id = ANY(%s) AND state = 'CLAIMED'",
+                (list(roots),),
+            ).fetchone()["n"])
+
+            self.connection.execute(
+                "UPDATE tenant_lifecycle_controls SET credential_state = 'revoked', "
+                "updated_at = %s WHERE tenant_id = %s AND generation = %s",
+                (now, tenant_id, generation),
+            )
+            row = self.connection.execute(
+                "UPDATE workspace_credential_revocations SET state = 'revoked', "
+                "service_tokens_revoked = %s, collector_identities_revoked = %s, "
+                "collection_requests_canceled = %s, outbox_events_canceled = %s, "
+                "dashboard_sessions_revoked = %s, installation_states_consumed = %s, "
+                "claimed_work_remaining = %s, completed_at = %s "
+                "WHERE operation_id = %s AND tenant_id = %s AND generation = %s "
+                "RETURNING *",
+                (service_tokens, collectors, requests, outbox, sessions,
+                 installation_states, claimed, now, operation_id, tenant_id,
+                 generation),
+            ).fetchone()
+        return dict(row)
 
     def tenant_for_polar_customer(self, polar_customer_id):
         """The tenant already bound to one Polar customer id, or None.
