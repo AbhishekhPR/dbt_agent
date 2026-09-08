@@ -18,12 +18,16 @@ without a network, and the suite can never make a real charge.
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 #: Bound on a Polar response. These are small JSON objects; anything larger is
 #: not a checkout session and is not going to be parsed into one.
 MAX_RESPONSE_BYTES = 512 * 1024
+MAX_LIST_PAGES = 1000
+_POLAR_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,254}$")
 
 
 class PolarAPIError(RuntimeError):
@@ -100,11 +104,79 @@ class PolarClient:
         return self._post("/v1/customer-sessions/", payload,
                           operation="create_customer_session")
 
+    # -- lifecycle reads and immediate revocation ------------------------
+
+    def list_subscriptions(self, *, external_customer_id=None,
+                           customer_id=None):
+        return self._list("/v1/subscriptions/",
+                          external_customer_id=external_customer_id,
+                          customer_id=customer_id,
+                          operation="list_subscriptions")
+
+    def list_checkouts(self, *, external_customer_id=None, customer_id=None):
+        return self._list("/v1/checkouts/",
+                          external_customer_id=external_customer_id,
+                          customer_id=customer_id,
+                          operation="list_checkouts")
+
+    def get_subscription(self, subscription_id):
+        return self._get(
+            f"/v1/subscriptions/{_validated_id(subscription_id)}",
+            operation="get_subscription")
+
+    def revoke_subscription(self, subscription_id):
+        return self._delete(
+            f"/v1/subscriptions/{_validated_id(subscription_id)}",
+            operation="revoke_subscription")
+
+    def _list(self, path, *, external_customer_id, customer_id, operation):
+        if bool(external_customer_id) == bool(customer_id):
+            raise ValueError("exactly one customer identity is required")
+        key = "external_customer_id" if external_customer_id else "customer_id"
+        identity = external_customer_id or customer_id
+        if not isinstance(identity, str) or not identity or len(identity) > 255:
+            raise ValueError("invalid customer identity")
+        items = []
+        page = 1
+        while True:
+            query = urllib.parse.urlencode({key: identity, "page": page, "limit": 100})
+            document = self._get(f"{path}?{query}", operation=operation)
+            page_items = document.get("items")
+            pagination = document.get("pagination")
+            if (not isinstance(page_items, list) or not isinstance(pagination, dict)
+                    or not isinstance(pagination.get("total_count"), int)
+                    or isinstance(pagination.get("total_count"), bool)
+                    or not isinstance(pagination.get("max_page"), int)
+                    or isinstance(pagination.get("max_page"), bool)
+                    or pagination["total_count"] < 0
+                    or pagination["max_page"] < 1
+                    or pagination["max_page"] > MAX_LIST_PAGES
+                    or any(not isinstance(item, dict) for item in page_items)):
+                raise PolarAPIError("Polar returned an unexpected response.",
+                                    operation=operation)
+            items.extend(page_items)
+            if page >= pagination["max_page"]:
+                if len(items) != pagination["total_count"]:
+                    raise PolarAPIError("Polar returned incomplete pagination.",
+                                        operation=operation)
+                return items
+            page += 1
+
     # -- transport ---------------------------------------------------------
 
     def _post(self, path, payload, *, operation):
+        return self._request("POST", path, payload=payload, operation=operation)
+
+    def _get(self, path, *, operation):
+        return self._request("GET", path, operation=operation)
+
+    def _delete(self, path, *, operation):
+        return self._request("DELETE", path, operation=operation)
+
+    def _request(self, method, path, *, payload=None, operation):
         url = f"{self._settings.api_base_url}{path}"
-        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        body = (json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                if payload is not None else None)
         headers = {
             "Authorization": f"Bearer {self._settings.access_token}",
             "Content-Type": "application/json",
@@ -113,7 +185,7 @@ class PolarClient:
         }
         try:
             status, raw = self._transport(
-                method="POST", url=url, headers=headers, body=body,
+                method=method, url=url, headers=headers, body=body,
                 timeout=self._timeout)
         except PolarAPIError:
             raise
@@ -139,6 +211,12 @@ class PolarClient:
             raise PolarAPIError("Polar returned an unexpected response.",
                                 status_code=status, operation=operation)
         return document
+
+
+def _validated_id(value):
+    if not isinstance(value, str) or not _POLAR_ID.fullmatch(value):
+        raise ValueError("invalid Polar identifier")
+    return value
 
 
 def _urllib_transport(*, method, url, headers, body, timeout):
