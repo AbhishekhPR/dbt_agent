@@ -229,11 +229,21 @@ def revoke_workspace_subscriptions(*, principal, authorizer, store, client,
             actionable_checkout_count=final["actionable_checkout_count"])
         raise BillingLifecycleError(category)
 
-    store.finish_billing_lifecycle_operation(
-        tenant_id=context.tenant_id,
-        operation_id=operation["operation_id"], state="verified_safe",
-        failure_category=None, subscription_count=len(final["subscriptions"]),
-        actionable_checkout_count=0, now=observed_at)
+    verified_finisher = getattr(
+        store, "finish_billing_revocation_verified_safe", None)
+    if verified_finisher:
+        verified_finisher(
+            tenant_id=context.tenant_id,
+            operation_id=operation["operation_id"],
+            subscription_count=len(final["subscriptions"]),
+            now=observed_at)
+    else:
+        store.finish_billing_lifecycle_operation(
+            tenant_id=context.tenant_id,
+            operation_id=operation["operation_id"], state="verified_safe",
+            failure_category=None,
+            subscription_count=len(final["subscriptions"]),
+            actionable_checkout_count=0, now=observed_at)
     return {
         "state": "verified_safe",
         "operation_id": operation["operation_id"],
@@ -254,24 +264,29 @@ def _finish_failure(store, tenant_id, operation_id, state, category, now,
 def _collect_provider_state(*, tenant_id, store, client):
     billing = store.billing_for_tenant(tenant_id)
     persisted_customer = billing.get("polar_customer_id") if billing else None
-    subscriptions = _validated_union(
-        client.list_subscriptions(external_customer_id=tenant_id),
-        (), tenant_id=tenant_id, expected_customer_id=persisted_customer,
-        kind="subscription")
+    # All checkout views MUST precede all subscription views. A checkout can
+    # transition into a subscription while these non-transactional provider
+    # reads run. This ordering guarantees that the transition is observed on
+    # at least one side: open before it happens, or subscribed afterwards.
     checkouts = _validated_union(
         client.list_checkouts(external_customer_id=tenant_id),
         (), tenant_id=tenant_id, expected_customer_id=persisted_customer,
         kind="checkout")
+    if persisted_customer:
+        checkouts = _validated_union(
+            checkouts, client.list_checkouts(customer_id=persisted_customer),
+            tenant_id=tenant_id, expected_customer_id=persisted_customer,
+            kind="checkout")
+    subscriptions = _validated_union(
+        client.list_subscriptions(external_customer_id=tenant_id),
+        (), tenant_id=tenant_id, expected_customer_id=persisted_customer,
+        kind="subscription")
     if persisted_customer:
         subscriptions = _validated_union(
             subscriptions,
             client.list_subscriptions(customer_id=persisted_customer),
             tenant_id=tenant_id, expected_customer_id=persisted_customer,
             kind="subscription")
-        checkouts = _validated_union(
-            checkouts, client.list_checkouts(customer_id=persisted_customer),
-            tenant_id=tenant_id, expected_customer_id=persisted_customer,
-            kind="checkout")
 
     normalized_subscriptions = tuple(
         _normalize_subscription(item) for item in subscriptions)

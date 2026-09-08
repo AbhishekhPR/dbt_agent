@@ -245,10 +245,10 @@ class BillingReconciliationTests(unittest.TestCase):
         self.assertEqual(len(store.saved[0]["subscriptions"]), 2)
         self.assertEqual(store.finished[0]["state"], "reconciled")
         self.assertEqual(client.calls, [
-            ("subscriptions", {"external_customer_id": self.tenant_id}),
             ("checkouts", {"external_customer_id": self.tenant_id}),
-            ("subscriptions", {"customer_id": "cus_live"}),
             ("checkouts", {"customer_id": "cus_live"}),
+            ("subscriptions", {"external_customer_id": self.tenant_id}),
+            ("subscriptions", {"customer_id": "cus_live"}),
         ])
 
     def test_cross_tenant_provider_identity_fails_closed_and_is_durable(self):
@@ -449,6 +449,51 @@ class BillingRevocationTests(unittest.TestCase):
         self.assertEqual(store.finished[-1]["failure_category"],
                          "checkout_create_in_flight")
 
+    def test_checkout_completion_between_final_reads_is_seen_as_billable(self):
+        from agent.billing.lifecycle import (
+            BillingLifecycleError, revoke_workspace_subscriptions,
+        )
+
+        tenant_id = self.tenant_id
+
+        class TransitionClient(_LifecycleClient):
+            def __init__(self):
+                super().__init__()
+                self.checkout_reads = 0
+                self.subscription_reads = 0
+                self.transitioned = False
+
+            def list_checkouts(self, **identity):
+                self.checkout_reads += 1
+                if self.checkout_reads == 2:
+                    self.transitioned = True
+                    return [{
+                        "id": "checkout_race", "status": "succeeded",
+                        "customer": {"id": "cus_live",
+                                     "external_id": tenant_id},
+                        "metadata": {},
+                    }]
+                return []
+
+            def list_subscriptions(self, **identity):
+                self.subscription_reads += 1
+                if self.transitioned:
+                    return [_subscription("sub_race", tenant_id)]
+                return []
+
+        client = TransitionClient()
+        store = _LifecycleStore()
+
+        with self.assertRaisesRegex(
+                BillingLifecycleError, "subscription still billable"):
+            revoke_workspace_subscriptions(
+                principal=object(), authorizer=_OwnerAuthorizer(),
+                store=store, client=client)
+
+        self.assertEqual(store.finished[-1]["state"], "ambiguous")
+        self.assertEqual(store.finished[-1]["failure_category"],
+                         "subscription_still_billable")
+
 
 @unittest.skipUnless(os.environ.get("RELIUM_TEST_POSTGRES_DSN"),
                      "PostgreSQL lifecycle tests require RELIUM_TEST_POSTGRES_DSN")
@@ -637,6 +682,52 @@ class BillingLifecyclePostgresTests(unittest.TestCase):
         self.assertEqual(
             self.store.billing_for_tenant(tenant_id)["subscription_status"],
             "canceled")
+
+    def test_webhook_cannot_erase_revocation_blocker_before_atomic_finalization(self):
+        tenant_id = self.first["tenant_id"]
+        now = datetime.now(timezone.utc)
+        intent = self.store.claim_billing_checkout_intent(
+            tenant_id=tenant_id, requested_plan="starter",
+            polar_product_id="prod_starter", now=now)
+        lease = self.store.begin_billing_checkout_provider_create(
+            tenant_id=tenant_id,
+            checkout_intent_id=intent["checkout_intent_id"], now=now)
+        self.store.finish_billing_checkout_intent(
+            tenant_id=tenant_id,
+            checkout_intent_id=intent["checkout_intent_id"],
+            state="provider_created", polar_checkout_id="checkout_race",
+            failure_category=None, now=now,
+            create_lease_id=lease["create_lease_id"])
+        operation = self.store.begin_billing_lifecycle_operation(
+            tenant_id=tenant_id, operation_kind="revoke",
+            block_checkout=True, now=now)
+
+        # This is what a verified subscription webhook does after its
+        # entitlement upsert. It must not remove the revocation-owned blocker.
+        self.store.finish_billing_checkout_intent(
+            tenant_id=tenant_id,
+            checkout_intent_id=intent["checkout_intent_id"],
+            state="completed", polar_checkout_id=None,
+            failure_category=None, now=now)
+        state = self.store.connection.execute(
+            "SELECT state FROM billing_checkout_intents "
+            "WHERE checkout_intent_id = %s",
+            (intent["checkout_intent_id"],),
+        ).fetchone()["state"]
+        self.assertEqual(state, "provider_created")
+
+        self.store.save_billing_reconciliation(
+            tenant_id=tenant_id, operation_id=operation["operation_id"],
+            subscriptions=(), checkouts=(), observed_at=now)
+        self.store.finish_billing_revocation_verified_safe(
+            tenant_id=tenant_id, operation_id=operation["operation_id"],
+            subscription_count=0, now=now)
+        state = self.store.connection.execute(
+            "SELECT state FROM billing_checkout_intents "
+            "WHERE checkout_intent_id = %s",
+            (intent["checkout_intent_id"],),
+        ).fetchone()["state"]
+        self.assertEqual(state, "failed")
 
 
 class _CheckoutIntentStore(_LifecycleStore):

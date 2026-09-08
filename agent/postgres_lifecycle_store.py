@@ -678,7 +678,11 @@ class PostgresLifecycleStore:
         return row is not None
 
     def billing_checkout_revocation_blocker(self, tenant_id, now=None):
-        """Return a safe category while a provider create may still exist."""
+        """Return a blocker only while a provider create call can still run.
+
+        Expired/known outcomes remain durable rows, but the atomic verified-safe
+        finisher below may discharge them after checkout-first provider proof.
+        """
         observed_at = now or datetime.now(timezone.utc)
         row = self.connection.execute(
             "SELECT state, create_lease_expires_at "
@@ -693,7 +697,7 @@ class PostgresLifecycleStore:
                 and row["create_lease_expires_at"] is not None
                 and row["create_lease_expires_at"] >= observed_at):
             return "checkout_create_in_flight"
-        return "checkout_create_ambiguous"
+        return None
 
     def finish_billing_checkout_intent(self, *, tenant_id, checkout_intent_id,
                                        state, polar_checkout_id,
@@ -728,8 +732,13 @@ class PostgresLifecycleStore:
             prior_values = ()
         elif state == "completed":
             prior_guard = (
-                "state IN ('claimed', 'creating', 'provider_created', "
-                "          'ambiguous', 'completed')"
+                "(state = 'completed' OR ("
+                " state IN ('claimed', 'creating', 'provider_created', 'ambiguous') "
+                " AND EXISTS (SELECT 1 FROM tenant_lifecycle_controls c "
+                " WHERE c.tenant_id = billing_checkout_intents.tenant_id "
+                " AND c.billing_checkout_state = 'active' "
+                " AND c.checkout_generation = "
+                "     billing_checkout_intents.checkout_generation)))"
             )
             prior_values = ()
         else:
@@ -746,7 +755,80 @@ class PostgresLifecycleStore:
              checkout_intent_id, tenant_id) + prior_values,
         ).fetchone()
         if row is None:
+            if state == "completed":
+                # A verified webhook must still be able to update entitlement
+                # while revocation owns the checkout fence. Preserve the local
+                # active/terminal intent as a blocker instead of rolling back
+                # the webhook transaction or erasing the race evidence.
+                existing = self.connection.execute(
+                    "SELECT 1 FROM billing_checkout_intents "
+                    "WHERE checkout_intent_id = %s AND tenant_id = %s",
+                    (checkout_intent_id, tenant_id),
+                ).fetchone()
+                if existing is not None:
+                    return
             raise ValueError("checkout intent does not match tenant")
+
+    def finish_billing_revocation_verified_safe(
+            self, *, tenant_id, operation_id, subscription_count, now=None):
+        """Atomically discharge checkout blockers and commit provider safety."""
+        completed_at = now or datetime.now(timezone.utc)
+        with self.connection.transaction():
+            operation = self.connection.execute(
+                "SELECT o.generation FROM billing_lifecycle_operations o "
+                "JOIN tenant_lifecycle_controls c ON c.tenant_id = o.tenant_id "
+                "WHERE o.operation_id = %s AND o.tenant_id = %s "
+                "AND o.operation_kind = 'revoke' "
+                "AND o.state = 'provider_calls' "
+                "AND o.lease_expires_at >= %s "
+                "AND c.generation = o.generation "
+                "AND c.billing_checkout_state = 'blocked' "
+                "FOR UPDATE OF o, c",
+                (operation_id, tenant_id, completed_at),
+            ).fetchone()
+            if operation is None:
+                raise ValueError("billing lifecycle operation is stale or mismatched")
+            unsafe_subscription = self.connection.execute(
+                "SELECT 1 FROM tenant_polar_subscriptions "
+                "WHERE tenant_id = %s AND last_operation_id = %s "
+                "AND classification <> 'terminal' LIMIT 1",
+                (tenant_id, operation_id),
+            ).fetchone()
+            actionable_checkout = self.connection.execute(
+                "SELECT 1 FROM tenant_polar_checkouts "
+                "WHERE tenant_id = %s AND last_operation_id = %s "
+                "AND actionable LIMIT 1",
+                (tenant_id, operation_id),
+            ).fetchone()
+            active_create = self.connection.execute(
+                "SELECT 1 FROM billing_checkout_intents "
+                "WHERE tenant_id = %s AND state = 'creating' "
+                "AND create_lease_expires_at >= %s LIMIT 1",
+                (tenant_id, completed_at),
+            ).fetchone()
+            if unsafe_subscription or actionable_checkout or active_create:
+                raise ValueError("provider safety proof is no longer valid")
+            self.connection.execute(
+                "UPDATE billing_checkout_intents SET state = 'failed', "
+                "failure_category = 'billing_revocation_verified', "
+                "create_lease_id = NULL, create_lease_expires_at = NULL, "
+                "completed_at = %s, updated_at = %s "
+                "WHERE tenant_id = %s "
+                "AND state IN ('creating', 'provider_created', 'ambiguous')",
+                (completed_at, completed_at, tenant_id),
+            )
+            changed = self.connection.execute(
+                "UPDATE billing_lifecycle_operations SET "
+                "state = 'verified_safe', failure_category = NULL, "
+                "subscription_count = %s, actionable_checkout_count = 0, "
+                "lease_expires_at = NULL, updated_at = %s, completed_at = %s "
+                "WHERE operation_id = %s AND tenant_id = %s "
+                "AND state = 'provider_calls' RETURNING operation_id",
+                (subscription_count, completed_at, completed_at,
+                 operation_id, tenant_id),
+            ).fetchone()
+            if changed is None:
+                raise ValueError("billing lifecycle operation is stale or mismatched")
 
     def record_billing_subscription_revocation_result(
             self, *, tenant_id, operation_id, polar_subscription_id, outcome,
