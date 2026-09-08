@@ -147,13 +147,34 @@ def revoke_workspace_subscriptions(*, principal, authorizer, store, client,
     for subscription in initial["subscriptions"]:
         if subscription["classification"] == "terminal":
             continue
+        subscription_id = subscription["polar_subscription_id"]
         try:
-            client.revoke_subscription(subscription["polar_subscription_id"])
+            client.revoke_subscription(subscription_id)
+            store.record_billing_subscription_revocation_result(
+                tenant_id=context.tenant_id,
+                operation_id=operation["operation_id"],
+                polar_subscription_id=subscription_id,
+                outcome="provider_accepted", failure_category=None,
+                recorded_at=(clock or (lambda: datetime.now(timezone.utc)))())
         except PolarAPIError as error:
             # A 404 is only a provisional outcome. The complete final listing
             # below must independently prove the object is absent.
-            if error.status_code != 404:
-                failures.append(_provider_failure_category(error))
+            category = _provider_failure_category(error)
+            if error.status_code == 404:
+                store.record_billing_subscription_revocation_result(
+                    tenant_id=context.tenant_id,
+                    operation_id=operation["operation_id"],
+                    polar_subscription_id=subscription_id,
+                    outcome="absent_unconfirmed", failure_category=None,
+                    recorded_at=(clock or (lambda: datetime.now(timezone.utc)))())
+            else:
+                failures.append(category)
+                store.record_billing_subscription_revocation_result(
+                    tenant_id=context.tenant_id,
+                    operation_id=operation["operation_id"],
+                    polar_subscription_id=subscription_id,
+                    outcome="provider_failure", failure_category=category,
+                    recorded_at=(clock or (lambda: datetime.now(timezone.utc)))())
     if failures:
         category = failures[0] if len(set(failures)) == 1 else "provider_partial_failure"
         _finish_failure(
@@ -185,19 +206,21 @@ def revoke_workspace_subscriptions(*, principal, authorizer, store, client,
                   for item in final["subscriptions"])
     billable = any(item["classification"] != "terminal"
                    for item in final["subscriptions"])
-    in_flight_reader = getattr(store, "billing_checkout_create_in_flight", None)
-    create_in_flight = bool(in_flight_reader(context.tenant_id)) \
-        if in_flight_reader else False
-    if create_in_flight:
-        category = "checkout_create_in_flight"
-    elif final["actionable_checkout_count"]:
-        category = "actionable_checkout"
-    elif unknown:
-        category = "unknown_subscription_state"
-    elif billable:
-        category = "subscription_still_billable"
+    blocker_reader = getattr(store, "billing_checkout_revocation_blocker", None)
+    if blocker_reader:
+        category = blocker_reader(context.tenant_id, now=observed_at)
     else:
-        category = None
+        in_flight_reader = getattr(store, "billing_checkout_create_in_flight", None)
+        category = ("checkout_create_in_flight"
+                    if in_flight_reader and in_flight_reader(context.tenant_id)
+                    else None)
+    if not category:
+        if final["actionable_checkout_count"]:
+            category = "actionable_checkout"
+        elif unknown:
+            category = "unknown_subscription_state"
+        elif billable:
+            category = "subscription_still_billable"
     if category:
         _finish_failure(
             store, context.tenant_id, operation["operation_id"], "ambiguous",

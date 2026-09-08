@@ -187,12 +187,18 @@ class BillingService:
                         polar_checkout_id=match["polar_checkout_id"],
                         failure_category="checkout_not_resumable", now=self.now())
                     raise BillingError(CODE_PROVIDER_UNAVAILABLE)
-                store.finish_billing_checkout_intent(
-                    tenant_id=tenant_id,
-                    checkout_intent_id=intent["checkout_intent_id"],
-                    state="provider_created",
-                    polar_checkout_id=match["polar_checkout_id"],
-                    failure_category=None, now=self.now())
+                try:
+                    store.finish_billing_checkout_intent(
+                        tenant_id=tenant_id,
+                        checkout_intent_id=intent["checkout_intent_id"],
+                        state="provider_created",
+                        polar_checkout_id=match["polar_checkout_id"],
+                        failure_category=None, now=self.now())
+                except ValueError:
+                    # A destructive lifecycle fence may have advanced while
+                    # Polar was being reconciled. Never return a checkout URL
+                    # after the workspace has blocked new purchases.
+                    raise BillingError(CODE_PROVIDER_UNAVAILABLE) from None
                 return {"checkout_url": url,
                         "checkout_id": match["polar_checkout_id"], "plan": plan}
             if any(item["actionable"] for item in provider["checkouts"]):
@@ -212,6 +218,21 @@ class BillingService:
                     state="ambiguous",
                     polar_checkout_id=intent.get("polar_checkout_id"),
                     failure_category="known_checkout_not_listed", now=self.now())
+                raise BillingError(CODE_PROVIDER_UNAVAILABLE)
+            if intent.get("state") in {"creating", "ambiguous"}:
+                # A previous create call crossed the process boundary but has
+                # no single provider object we can prove belongs to it. Its
+                # outcome is unknown, so creating another checkout could create
+                # a second subscription. Preserve that durable ambiguity.
+                try:
+                    store.finish_billing_checkout_intent(
+                        tenant_id=tenant_id,
+                        checkout_intent_id=intent["checkout_intent_id"],
+                        state="ambiguous", polar_checkout_id=None,
+                        failure_category="checkout_create_outcome_unknown",
+                        now=self.now())
+                except ValueError:
+                    pass
                 raise BillingError(CODE_PROVIDER_UNAVAILABLE)
 
             create_claim = store.begin_billing_checkout_provider_create(
@@ -237,6 +258,16 @@ class BillingService:
                 customer_metadata={TENANT_METADATA_KEY: tenant_id},
             )
         except PolarAPIError as error:
+            if intent:
+                try:
+                    store.finish_billing_checkout_intent(
+                        tenant_id=tenant_id,
+                        checkout_intent_id=intent["checkout_intent_id"],
+                        state="ambiguous", polar_checkout_id=None,
+                        failure_category="checkout_create_outcome_unknown",
+                        now=self.now())
+                except ValueError:
+                    pass
             logger.error("billing_checkout_failed",
                          extra={"error_category": "billing_provider",
                                 "operation": error.operation,
@@ -246,6 +277,15 @@ class BillingService:
 
         url = session.get("url")
         if not isinstance(url, str) or not url.startswith("https://"):
+            if intent:
+                try:
+                    store.finish_billing_checkout_intent(
+                        tenant_id=tenant_id,
+                        checkout_intent_id=intent["checkout_intent_id"],
+                        state="ambiguous", polar_checkout_id=None,
+                        failure_category="checkout_url_missing", now=self.now())
+                except ValueError:
+                    pass
             logger.error("billing_checkout_url_missing",
                          extra={"error_category": "billing_provider"})
             raise BillingError(CODE_PROVIDER_UNAVAILABLE)
@@ -258,12 +298,18 @@ class BillingService:
                     state="ambiguous", polar_checkout_id=None,
                     failure_category="checkout_id_missing", now=self.now())
                 raise BillingError(CODE_PROVIDER_UNAVAILABLE)
-            store.finish_billing_checkout_intent(
-                tenant_id=tenant_id,
-                checkout_intent_id=intent["checkout_intent_id"],
-                state="provider_created", polar_checkout_id=checkout_id,
-                failure_category=None, now=self.now(),
-                create_lease_id=create_claim["create_lease_id"])
+            try:
+                store.finish_billing_checkout_intent(
+                    tenant_id=tenant_id,
+                    checkout_intent_id=intent["checkout_intent_id"],
+                    state="provider_created", polar_checkout_id=checkout_id,
+                    failure_category=None, now=self.now(),
+                    create_lease_id=create_claim["create_lease_id"])
+            except ValueError:
+                # The provider may have created the checkout, but the local
+                # lease/generation no longer proves it is safe to expose. Keep
+                # the durable creating record as a revocation blocker.
+                raise BillingError(CODE_PROVIDER_UNAVAILABLE) from None
         return {
             "checkout_url": url,
             # Returned for support and correlation only. It is not a credential

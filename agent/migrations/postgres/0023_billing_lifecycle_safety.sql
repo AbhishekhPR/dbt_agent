@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS tenant_lifecycle_controls (
     credential_state TEXT NOT NULL DEFAULT 'active'
         CHECK (credential_state IN ('active', 'revoking', 'revoked')),
     generation BIGINT NOT NULL DEFAULT 0 CHECK (generation >= 0),
+    checkout_generation BIGINT NOT NULL DEFAULT 0 CHECK (checkout_generation >= 0),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS billing_lifecycle_operations (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at TIMESTAMPTZ,
+    UNIQUE (operation_id, tenant_id),
     UNIQUE (tenant_id, generation),
     CHECK (failure_category IS NULL OR length(failure_category) BETWEEN 1 AND 64)
 );
@@ -50,13 +52,15 @@ CREATE TABLE IF NOT EXISTS tenant_polar_subscriptions (
     cancel_at_period_end BOOLEAN NOT NULL DEFAULT FALSE,
     classification TEXT NOT NULL CHECK (classification IN
         ('potentially_billable', 'scheduled_cancel', 'terminal', 'unknown')),
-    last_operation_id TEXT NOT NULL REFERENCES billing_lifecycle_operations
-        (operation_id) ON DELETE RESTRICT,
+    last_operation_id TEXT NOT NULL,
     observed_at TIMESTAMPTZ NOT NULL,
     CHECK (length(polar_subscription_id) BETWEEN 1 AND 255),
     CHECK (length(polar_customer_id) BETWEEN 1 AND 255),
     CHECK (polar_product_id IS NULL OR length(polar_product_id) BETWEEN 1 AND 255),
-    CHECK (length(provider_status) BETWEEN 1 AND 64)
+    CHECK (length(provider_status) BETWEEN 1 AND 64),
+    FOREIGN KEY (last_operation_id, tenant_id)
+        REFERENCES billing_lifecycle_operations (operation_id, tenant_id)
+        ON DELETE RESTRICT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tenant_polar_subscriptions_tenant
@@ -70,13 +74,15 @@ CREATE TABLE IF NOT EXISTS tenant_polar_checkouts (
     checkout_intent_id TEXT,
     expires_at TIMESTAMPTZ,
     actionable BOOLEAN NOT NULL,
-    last_operation_id TEXT NOT NULL REFERENCES billing_lifecycle_operations
-        (operation_id) ON DELETE RESTRICT,
+    last_operation_id TEXT NOT NULL,
     observed_at TIMESTAMPTZ NOT NULL,
     CHECK (length(polar_checkout_id) BETWEEN 1 AND 255),
     CHECK (polar_customer_id IS NULL OR length(polar_customer_id) BETWEEN 1 AND 255),
     CHECK (length(provider_status) BETWEEN 1 AND 64),
-    CHECK (checkout_intent_id IS NULL OR length(checkout_intent_id) BETWEEN 1 AND 255)
+    CHECK (checkout_intent_id IS NULL OR length(checkout_intent_id) BETWEEN 1 AND 255),
+    FOREIGN KEY (last_operation_id, tenant_id)
+        REFERENCES billing_lifecycle_operations (operation_id, tenant_id)
+        ON DELETE RESTRICT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tenant_polar_checkouts_tenant
@@ -89,7 +95,7 @@ CREATE TABLE IF NOT EXISTS billing_checkout_intents (
     polar_product_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN
         ('claimed', 'creating', 'provider_created', 'completed', 'failed', 'ambiguous')),
-    lifecycle_generation BIGINT NOT NULL CHECK (lifecycle_generation >= 0),
+    checkout_generation BIGINT NOT NULL CHECK (checkout_generation >= 0),
     create_lease_id TEXT,
     create_lease_expires_at TIMESTAMPTZ,
     polar_checkout_id TEXT,
@@ -106,4 +112,20 @@ CREATE TABLE IF NOT EXISTS billing_checkout_intents (
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_billing_checkout_intents_active_tenant
     ON billing_checkout_intents (tenant_id)
-    WHERE state IN ('claimed', 'creating', 'provider_created');
+    WHERE state IN ('claimed', 'creating', 'provider_created', 'ambiguous');
+
+CREATE TABLE IF NOT EXISTS billing_subscription_revocation_results (
+    operation_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL REFERENCES tenants (tenant_id) ON DELETE RESTRICT,
+    polar_subscription_id TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN
+        ('provider_accepted', 'absent_unconfirmed', 'provider_failure')),
+    failure_category TEXT,
+    recorded_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (operation_id, polar_subscription_id),
+    CHECK (length(polar_subscription_id) BETWEEN 1 AND 255),
+    CHECK (failure_category IS NULL OR length(failure_category) BETWEEN 1 AND 64),
+    FOREIGN KEY (operation_id, tenant_id)
+        REFERENCES billing_lifecycle_operations (operation_id, tenant_id)
+        ON DELETE RESTRICT
+);

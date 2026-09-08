@@ -478,12 +478,26 @@ class PostgresLifecycleStore:
             row = self.connection.execute(
                 "UPDATE tenant_lifecycle_controls SET "
                 "generation = generation + 1, "
+                "checkout_generation = checkout_generation + CASE "
+                "    WHEN %s THEN 1 ELSE 0 END, "
                 "billing_checkout_state = CASE WHEN %s THEN 'blocked' "
                 "                              ELSE billing_checkout_state END, "
                 "updated_at = %s WHERE tenant_id = %s "
                 "RETURNING generation",
-                (bool(block_checkout), observed_at, tenant_id),
+                (bool(block_checkout), bool(block_checkout), observed_at, tenant_id),
             ).fetchone()
+            if block_checkout:
+                # No provider call can have started while the intent is still
+                # merely claimed. The checkout-generation fence makes this a
+                # safe terminal transition and prevents an inert intent from
+                # blocking revocation forever.
+                self.connection.execute(
+                    "UPDATE billing_checkout_intents SET state = 'failed', "
+                    "failure_category = 'checkout_blocked_before_create', "
+                    "completed_at = %s, updated_at = %s "
+                    "WHERE tenant_id = %s AND state = 'claimed'",
+                    (observed_at, observed_at, tenant_id),
+                )
             self.connection.execute(
                 "INSERT INTO billing_lifecycle_operations "
                 "(operation_id, tenant_id, operation_kind, state, generation, "
@@ -591,7 +605,7 @@ class PostgresLifecycleStore:
                 (tenant_id,),
             )
             control = self.connection.execute(
-                "SELECT billing_checkout_state, generation "
+                "SELECT billing_checkout_state, checkout_generation "
                 "FROM tenant_lifecycle_controls "
                 "WHERE tenant_id = %s FOR UPDATE", (tenant_id,),
             ).fetchone()
@@ -600,9 +614,9 @@ class PostgresLifecycleStore:
                 raise BillingLifecycleError("checkout_blocked")
             existing = self.connection.execute(
                 "SELECT checkout_intent_id, requested_plan, polar_product_id, "
-                "state, polar_checkout_id, lifecycle_generation "
+                "state, polar_checkout_id, checkout_generation "
                 "FROM billing_checkout_intents WHERE tenant_id = %s "
-                "AND state IN ('claimed', 'creating', 'provider_created') "
+                "AND state IN ('claimed', 'creating', 'provider_created', 'ambiguous') "
                 "FOR UPDATE", (tenant_id,),
             ).fetchone()
             if existing:
@@ -613,12 +627,12 @@ class PostgresLifecycleStore:
             row = self.connection.execute(
                 "INSERT INTO billing_checkout_intents "
                 "(checkout_intent_id, tenant_id, requested_plan, polar_product_id, "
-                " state, lifecycle_generation, created_at, updated_at) "
+                " state, checkout_generation, created_at, updated_at) "
                 "VALUES (%s, %s, %s, %s, 'claimed', %s, %s, %s) "
                 "RETURNING checkout_intent_id, requested_plan, polar_product_id, "
-                "state, polar_checkout_id, lifecycle_generation",
+                "state, polar_checkout_id, checkout_generation",
                 (intent_id, tenant_id, requested_plan, polar_product_id,
-                 control["generation"], claimed_at, claimed_at),
+                 control["checkout_generation"], claimed_at, claimed_at),
             ).fetchone()
             result = dict(row)
             result["created"] = True
@@ -631,8 +645,8 @@ class PostgresLifecycleStore:
         lease_id = f"bcl_{uuid.uuid4().hex}"
         with self.connection.transaction():
             row = self.connection.execute(
-                "SELECT i.state, i.lifecycle_generation, "
-                "       c.generation, c.billing_checkout_state "
+                "SELECT i.state, i.checkout_generation AS intent_generation, "
+                "       c.checkout_generation, c.billing_checkout_state "
                 "FROM billing_checkout_intents i "
                 "JOIN tenant_lifecycle_controls c ON c.tenant_id = i.tenant_id "
                 "WHERE i.checkout_intent_id = %s AND i.tenant_id = %s "
@@ -641,7 +655,7 @@ class PostgresLifecycleStore:
             ).fetchone()
             if (row is None or row["state"] != "claimed"
                     or row["billing_checkout_state"] != "active"
-                    or row["lifecycle_generation"] != row["generation"]):
+                    or row["intent_generation"] != row["checkout_generation"]):
                 return None
             changed = self.connection.execute(
                 "UPDATE billing_checkout_intents SET state = 'creating', "
@@ -657,10 +671,29 @@ class PostgresLifecycleStore:
     def billing_checkout_create_in_flight(self, tenant_id):
         row = self.connection.execute(
             "SELECT 1 FROM billing_checkout_intents "
-            "WHERE tenant_id = %s AND state = 'creating' LIMIT 1",
+            "WHERE tenant_id = %s "
+            "  AND state IN ('creating', 'provider_created', 'ambiguous') LIMIT 1",
             (tenant_id,),
         ).fetchone()
         return row is not None
+
+    def billing_checkout_revocation_blocker(self, tenant_id, now=None):
+        """Return a safe category while a provider create may still exist."""
+        observed_at = now or datetime.now(timezone.utc)
+        row = self.connection.execute(
+            "SELECT state, create_lease_expires_at "
+            "FROM billing_checkout_intents WHERE tenant_id = %s "
+            "AND state IN ('creating', 'provider_created', 'ambiguous') "
+            "ORDER BY created_at DESC LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if (row["state"] == "creating"
+                and row["create_lease_expires_at"] is not None
+                and row["create_lease_expires_at"] >= observed_at):
+            return "checkout_create_in_flight"
+        return "checkout_create_ambiguous"
 
     def finish_billing_checkout_intent(self, *, tenant_id, checkout_intent_id,
                                        state, polar_checkout_id,
@@ -671,15 +704,36 @@ class PostgresLifecycleStore:
         changed_at = now or datetime.now(timezone.utc)
         completed_at = changed_at if state in {"completed", "failed", "ambiguous"} else None
         if state == "provider_created" and create_lease_id:
-            prior_guard = "state = 'creating' AND create_lease_id = %s"
-            prior_values = (create_lease_id,)
+            prior_guard = (
+                "state = 'creating' AND create_lease_id = %s "
+                "AND create_lease_expires_at >= %s "
+                "AND EXISTS (SELECT 1 FROM tenant_lifecycle_controls c "
+                " WHERE c.tenant_id = billing_checkout_intents.tenant_id "
+                " AND c.billing_checkout_state = 'active' "
+                " AND c.checkout_generation = "
+                "     billing_checkout_intents.checkout_generation)"
+            )
+            prior_values = (create_lease_id, changed_at)
         elif state == "provider_created":
             # Complete provider evidence with the exact intent metadata safely
             # recovers a process that died after starting the create call.
-            prior_guard = "state IN ('claimed', 'creating', 'provider_created')"
+            prior_guard = (
+                "state IN ('claimed', 'creating', 'provider_created', 'ambiguous') "
+                "AND EXISTS (SELECT 1 FROM tenant_lifecycle_controls c "
+                " WHERE c.tenant_id = billing_checkout_intents.tenant_id "
+                " AND c.billing_checkout_state = 'active' "
+                " AND c.checkout_generation = "
+                "     billing_checkout_intents.checkout_generation)"
+            )
+            prior_values = ()
+        elif state == "completed":
+            prior_guard = (
+                "state IN ('claimed', 'creating', 'provider_created', "
+                "          'ambiguous', 'completed')"
+            )
             prior_values = ()
         else:
-            prior_guard = "state IN ('claimed', 'creating', 'provider_created')"
+            prior_guard = "state IN ('claimed', 'creating', 'provider_created', 'ambiguous')"
             prior_values = ()
         row = self.connection.execute(
             "UPDATE billing_checkout_intents SET state = %s, "
@@ -693,6 +747,28 @@ class PostgresLifecycleStore:
         ).fetchone()
         if row is None:
             raise ValueError("checkout intent does not match tenant")
+
+    def record_billing_subscription_revocation_result(
+            self, *, tenant_id, operation_id, polar_subscription_id, outcome,
+            failure_category, recorded_at=None):
+        at = recorded_at or datetime.now(timezone.utc)
+        row = self.connection.execute(
+            "INSERT INTO billing_subscription_revocation_results "
+            "(operation_id, tenant_id, polar_subscription_id, outcome, "
+            " failure_category, recorded_at) "
+            "SELECT operation_id, tenant_id, %s, %s, %s, %s "
+            "FROM billing_lifecycle_operations "
+            "WHERE operation_id = %s AND tenant_id = %s "
+            "ON CONFLICT (operation_id, polar_subscription_id) DO UPDATE SET "
+            "outcome = EXCLUDED.outcome, "
+            "failure_category = EXCLUDED.failure_category, "
+            "recorded_at = EXCLUDED.recorded_at "
+            "RETURNING polar_subscription_id",
+            (polar_subscription_id, outcome, failure_category, at,
+             operation_id, tenant_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("billing lifecycle operation does not match tenant")
 
     def tenant_for_polar_customer(self, polar_customer_id):
         """The tenant already bound to one Polar customer id, or None.

@@ -23,10 +23,14 @@ class BillingLifecycleMigrationContractTests(unittest.TestCase):
         self.assertIn("CREATE TABLE IF NOT EXISTS tenant_polar_checkouts", sql)
         self.assertIn("CREATE TABLE IF NOT EXISTS billing_checkout_intents", sql)
         self.assertGreaterEqual(sql.count("ON DELETE RESTRICT"), 5)
-        self.assertIn("WHERE state IN ('claimed', 'creating', 'provider_created')", sql)
-        self.assertIn("lifecycle_generation BIGINT NOT NULL", sql)
+        self.assertIn(
+            "WHERE state IN ('claimed', 'creating', 'provider_created', 'ambiguous')",
+            sql)
+        self.assertNotIn("lifecycle_generation BIGINT NOT NULL", sql)
         self.assertIn("create_lease_id TEXT", sql)
         self.assertIn("'creating'", sql)
+        self.assertIn("checkout_generation BIGINT NOT NULL", sql)
+        self.assertIn("CREATE TABLE IF NOT EXISTS billing_subscription_revocation_results", sql)
 
     def test_existing_tenants_are_backfilled_active_without_billing_inference(self):
         sql = MIGRATION.read_text(encoding="utf-8")
@@ -151,6 +155,7 @@ class _LifecycleStore:
         self.saved = []
         self.finished = []
         self.checkout_create_in_flight = False
+        self.revocation_results = []
 
     def billing_for_tenant(self, tenant_id):
         return self.billing
@@ -168,6 +173,9 @@ class _LifecycleStore:
 
     def billing_checkout_create_in_flight(self, tenant_id):
         return self.checkout_create_in_flight
+
+    def record_billing_subscription_revocation_result(self, **values):
+        self.revocation_results.append(values)
 
 
 class _OwnerAuthorizer:
@@ -398,6 +406,10 @@ class BillingRevocationTests(unittest.TestCase):
 
         self.assertEqual(client.revoked, ["sub_bad", "sub_good"])
         self.assertEqual(store.finished[-1]["state"], "failed")
+        self.assertEqual(
+            {row["polar_subscription_id"]: row["outcome"]
+             for row in store.revocation_results},
+            {"sub_bad": "provider_failure", "sub_good": "provider_accepted"})
 
     def test_actionable_checkout_prevents_verified_safe(self):
         from agent.billing.lifecycle import (
@@ -558,6 +570,73 @@ class BillingLifecyclePostgresTests(unittest.TestCase):
             now=datetime.now(timezone.utc))
 
         self.assertIsNone(claim)
+
+    def test_normal_reconciliation_does_not_invalidate_checkout_generation(self):
+        tenant_id = self.first["tenant_id"]
+        intent = self.store.claim_billing_checkout_intent(
+            tenant_id=tenant_id, requested_plan="starter",
+            polar_product_id="prod_starter", now=datetime.now(timezone.utc))
+        self.store.begin_billing_lifecycle_operation(
+            tenant_id=tenant_id, operation_kind="reconcile", block_checkout=False)
+
+        claim = self.store.begin_billing_checkout_provider_create(
+            tenant_id=tenant_id,
+            checkout_intent_id=intent["checkout_intent_id"],
+            now=datetime.now(timezone.utc))
+
+        self.assertIsNotNone(claim)
+
+    def test_provider_completion_after_revocation_fence_is_rejected(self):
+        tenant_id = self.first["tenant_id"]
+        now = datetime.now(timezone.utc)
+        intent = self.store.claim_billing_checkout_intent(
+            tenant_id=tenant_id, requested_plan="starter",
+            polar_product_id="prod_starter", now=now)
+        lease = self.store.begin_billing_checkout_provider_create(
+            tenant_id=tenant_id,
+            checkout_intent_id=intent["checkout_intent_id"], now=now)
+        self.store.begin_billing_lifecycle_operation(
+            tenant_id=tenant_id, operation_kind="revoke", block_checkout=True)
+
+        with self.assertRaises(Exception):
+            self.store.finish_billing_checkout_intent(
+                tenant_id=tenant_id,
+                checkout_intent_id=intent["checkout_intent_id"],
+                state="provider_created", polar_checkout_id="checkout_late",
+                failure_category=None, now=now,
+                create_lease_id=lease["create_lease_id"])
+
+    def test_completed_checkout_intent_is_idempotent_for_later_signed_webhooks(self):
+        from agent.billing.service import BillingService
+
+        tenant_id = self.first["tenant_id"]
+        now = datetime.now(timezone.utc)
+        intent = self.store.claim_billing_checkout_intent(
+            tenant_id=tenant_id, requested_plan="starter",
+            polar_product_id="prod_starter", now=now)
+        self.store.finish_billing_checkout_intent(
+            tenant_id=tenant_id,
+            checkout_intent_id=intent["checkout_intent_id"], state="completed",
+            polar_checkout_id=None, failure_category=None, now=now)
+        settings = SimpleNamespace(
+            starter_product_id="prod_starter", pro_product_id="prod_pro",
+            past_due_grace=None)
+        service = BillingService(settings, client=object(), clock=lambda: now)
+        payload = _subscription("sub_webhook", tenant_id, status="active")
+        payload["product_id"] = "prod_starter"
+        payload["metadata"] = {
+            "relium_tenant_id": tenant_id,
+            "relium_checkout_intent_id": intent["checkout_intent_id"],
+        }
+
+        self.assertEqual(service.apply_subscription_event(
+            self.store, "subscription.created", payload), "applied")
+        payload["status"] = "canceled"
+        self.assertEqual(service.apply_subscription_event(
+            self.store, "subscription.canceled", payload), "applied")
+        self.assertEqual(
+            self.store.billing_for_tenant(tenant_id)["subscription_status"],
+            "canceled")
 
 
 class _CheckoutIntentStore(_LifecycleStore):
