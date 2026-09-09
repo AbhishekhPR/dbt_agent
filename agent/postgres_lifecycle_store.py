@@ -2724,6 +2724,9 @@ class PostgresLifecycleStore:
                 (tenant_id,)).fetchone()
             if tenant is None or tenant["clerk_organization_id"] != clerk_organization_id:
                 raise ValueError("workspace_scope_mismatch")
+            inventory = self.tenant_operational_inventory(tenant_id)
+            if inventory["ownership_status"] != "complete":
+                raise ValueError("operational_ownership_incomplete")
             current = self.connection.execute(
                 "SELECT clerk_membership_id,role,status FROM tenant_memberships "
                 "WHERE tenant_id=%s AND clerk_user_id=%s FOR UPDATE",
@@ -2794,6 +2797,9 @@ class PostgresLifecycleStore:
                 (clerk_organization_id, operation_id, clerk_user_id)).fetchone()
             if tenant is None or guard is None:
                 raise ValueError("workspace_departure_guard_failed")
+            inventory = self.tenant_operational_inventory(tenant["tenant_id"])
+            if inventory["ownership_status"] != "complete":
+                raise ValueError("operational_ownership_incomplete")
             roots = [row["organization_id"] for row in self.connection.execute(
                 "SELECT organization_id FROM tenant_operational_roots "
                 "WHERE tenant_id=%s", (tenant["tenant_id"],)).fetchall()]
@@ -4129,6 +4135,12 @@ class PostgresLifecycleStore:
                 ownership = self.connection.execute(
                     "SELECT tenant_id FROM tenant_operational_roots "
                     "WHERE organization_id=%s", (organization_id,)).fetchone()
+                membership = None if ownership is None else self.connection.execute(
+                    "SELECT status FROM tenant_memberships WHERE tenant_id=%s "
+                    "AND clerk_user_id=%s FOR SHARE",
+                    (ownership["tenant_id"], source_clerk_user_id)).fetchone()
+                if membership is not None and membership["status"] != "active":
+                    raise ValueError("workspace membership is not active")
                 if ownership is not None and self.connection.execute(
                         "SELECT 1 FROM clerk_membership_departure_guards guard "
                         "JOIN tenants tenant ON tenant.clerk_organization_id="

@@ -31,7 +31,10 @@ def leave_workspace(*, principal, authorizer, clerk_client, store,
             clerk_membership_id=context.clerk_membership_id,
             role=context.role, active_owner_count=context.active_owner_count)
     except ValueError as exc:
-        category = str(exc) if str(exc) in {"sole_owner", "concurrent_membership_departure"} \
+        category = str(exc) if str(exc) in {
+            "sole_owner", "concurrent_membership_departure",
+            "operational_ownership_incomplete",
+        } \
             else "workspace_departure_conflict"
         raise AccessControlBlocked(category) from None
     return resume_workspace_departure(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -316,6 +317,63 @@ class PostgresWorkspaceLifecycleTests(unittest.TestCase):
                 permission_checked_at=NOW, csrf_token="late-csrf",
                 expires_at=NOW + timedelta(hours=1),
                 source_clerk_user_id="departing_user")
+
+        self.store.complete_workspace_departure(
+            operation_id=operation["operation_id"],
+            clerk_organization_id="org_clerk_a",
+            clerk_user_id="departing_user")
+        from agent.postgres_lifecycle_store import PostgresLifecycleStore
+        late_store = PostgresLifecycleStore(DSN)
+        release = threading.Event()
+        failures = []
+
+        def create_after_departure():
+            release.wait(timeout=5)
+            try:
+                late_store.create_dashboard_session(
+                    "post-departure-session", organization_id="legacy-a",
+                    repository_id="repo-a", environment="prod",
+                    github_login="departing", github_user_id=44,
+                    github_permission="push", may_govern=True,
+                    permission_checked_at=NOW, csrf_token="post-departure-csrf",
+                    expires_at=NOW + timedelta(hours=1),
+                    source_clerk_user_id="departing_user")
+            except ValueError as exc:
+                failures.append(str(exc))
+
+        thread = threading.Thread(target=create_after_departure)
+        thread.start()
+        release.set()
+        thread.join(timeout=10)
+        late_store.close()
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(failures, ["workspace membership is not active"])
+        self.assertIsNone(self.store.connection.execute(
+            "SELECT 1 FROM dashboard_sessions "
+            "WHERE session_id_hash='post-departure-session'").fetchone())
+
+    def test_workspace_departure_fails_closed_when_operational_ownership_is_incomplete(self):
+        tenant_a = self._tenant("a")
+        self.store.connection.execute(
+            "INSERT INTO tenant_memberships "
+            "(tenant_id,clerk_user_id,clerk_membership_id,role,clerk_role_key,"
+            "role_basis,sync_generation,status,synchronized_at) VALUES "
+            "(%s,'departing_user','mem_departing','member','org:member',"
+            "'explicit_clerk_role','leave-generation','active',%s)",
+            (tenant_a, NOW))
+        self.store.connection.execute(
+            "UPDATE tenant_repositories SET ci_token_id=NULL WHERE tenant_id=%s",
+            (tenant_a,))
+
+        with self.assertRaisesRegex(ValueError, "operational_ownership_incomplete"):
+            self.store.begin_workspace_departure(
+                tenant_id=tenant_a, clerk_organization_id="org_clerk_a",
+                clerk_user_id="departing_user",
+                clerk_membership_id="mem_departing", role="member",
+                active_owner_count=1)
+        self.assertIsNone(self.store.connection.execute(
+            "SELECT 1 FROM clerk_membership_departure_guards "
+            "WHERE clerk_organization_id='org_clerk_a'").fetchone())
 
     def test_expired_workspace_lease_cannot_write_after_takeover(self):
         tenant_id = self._tenant("a")

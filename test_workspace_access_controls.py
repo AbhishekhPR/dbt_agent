@@ -71,6 +71,18 @@ class WorkspaceAccessControlTests(unittest.TestCase):
         self.assertEqual(raised.exception.category, "sole_owner")
         self.assertEqual(clerk.deleted, [])
 
+    def test_incomplete_operational_ownership_is_reported_without_collapsing_the_blocker(self):
+        store = _Store()
+        store.begin_workspace_departure = lambda **values: (_ for _ in ()).throw(
+            ValueError("operational_ownership_incomplete"))
+        with self.assertRaises(AccessControlBlocked) as raised:
+            leave_workspace(
+                principal=_principal(), authorizer=_Authorizer("member", 1),
+                clerk_client=_Clerk(), store=store,
+                clerk_organization_id="org_a")
+        self.assertEqual(
+            raised.exception.category, "operational_ownership_incomplete")
+
     def test_member_and_nonsole_owner_can_leave_without_touching_workspace(self):
         for role, owners in (("member", 1), ("admin", 1), ("owner", 2)):
             clerk = _Clerk()
