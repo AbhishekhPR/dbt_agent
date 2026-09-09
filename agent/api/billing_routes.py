@@ -58,7 +58,9 @@ MAX_WEBHOOK_BODY_BYTES = 1024 * 1024
 #: Codes rendered as 409 rather than 500: the request was well formed and the
 #: caller is who they say they are, but the workspace is not in a state where it
 #: can succeed.
-CONFLICT_CODES = frozenset({"no_billing_account", "subscription_exists"})
+CONFLICT_CODES = frozenset({
+    "no_billing_account", "subscription_exists", "billing_lifecycle_blocked",
+})
 
 #: Event families this endpoint acts on. Every `subscription.*` event Polar
 #: documents carries the full Subscription object, so they are applied through
