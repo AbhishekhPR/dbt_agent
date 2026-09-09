@@ -157,4 +157,3 @@ renders server-derived capabilities and blockers, uses Clerk reverification,
 requires exact typed confirmations, polls durable operation status, and clearly
 separates local GitHub disconnect from provider uninstall and customer-side
 secret/warehouse cleanup.
-

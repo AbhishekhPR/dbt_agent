@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from agent.api.clerk_identity import ClerkPrincipal
 from agent.api.clerk_management import ClerkResourceAbsent
@@ -231,6 +232,34 @@ class WorkspaceDeletionLifecycleTests(unittest.TestCase):
 
             self.assertFalse(owned.exists())
             self.assertTrue(other.exists())
+            self.assertEqual(store.operation["artifact_files_deleted"], 1)
+
+    def test_artifact_count_survives_crash_after_files_are_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            owned = root / "101"
+            owned.mkdir()
+            (owned / "manifest.json").write_text("private", encoding="utf-8")
+            engine, store = self._engine(repository_storage=root)
+            operation = engine.request(_principal(), confirmation="Exact Workspace")
+            engine.advance(_principal(), operation["operation_id"])
+            engine.advance(_principal(), operation["operation_id"])
+
+            from agent.workspace_deletion_lifecycle import purge_repository_storage
+            def remove_then_crash(storage, repository_ids):
+                purge_repository_storage(storage, repository_ids)
+                raise OSError("simulated crash boundary")
+
+            with patch("agent.workspace_deletion_lifecycle.purge_repository_storage",
+                       side_effect=remove_then_crash):
+                with self.assertRaises(LifecycleBlocked):
+                    engine.advance(_principal(), operation["operation_id"])
+            self.assertEqual(store.operation["phase"], "artifact_purge")
+            self.assertEqual(store.operation["artifact_files_deleted"], 1)
+            self.assertFalse(owned.exists())
+
+            engine.advance(_principal(), operation["operation_id"])
+            self.assertEqual(store.operation["phase"], "artifacts_purged")
             self.assertEqual(store.operation["artifact_files_deleted"], 1)
 
 

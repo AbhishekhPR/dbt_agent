@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS workspace_lifecycle_operations (
     phase TEXT NOT NULL CHECK (phase IN (
         'requested', 'frozen', 'billing_reconciliation', 'billing_revoked',
         'github_access_revocation', 'credentials_revoked', 'artifact_purge',
+        'artifacts_purged',
         'database_purge', 'clerk_organization_deletion', 'local_finalize',
         'completed')),
     disposition TEXT NOT NULL CHECK (disposition IN

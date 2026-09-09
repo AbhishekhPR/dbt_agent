@@ -107,4 +107,3 @@ provider ambiguity, race closure, tenant scope, receipt contents, and logs.
 - Independently review the frontend and combined contract.
 - Open focused PRs, remediate genuine CI/review findings, and stop with both PRs
   mergeable, clean, green, and unmerged.
-

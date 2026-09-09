@@ -182,15 +182,14 @@ class AccountLifecycleEngine:
                     return self._fail(operation, "sole_owner")
 
             for row in stored:
-                if row["state"] == "verified_absent":
-                    continue
                 if row["clerk_organization_id"] not in current_by_org:
-                    self.store.mark_account_membership_absent(
-                        operation_id=operation["operation_id"],
-                        organization_id=row["clerk_organization_id"],
-                        updated_at=self.clock(),
-                        expected_generation=operation.get("generation"),
-                        lease_id=operation.get("lease_id"))
+                    if row["state"] != "verified_absent":
+                        self.store.mark_account_membership_absent(
+                            operation_id=operation["operation_id"],
+                            organization_id=row["clerk_organization_id"],
+                            updated_at=self.clock(),
+                            expected_generation=operation.get("generation"),
+                            lease_id=operation.get("lease_id"))
                     continue
                 try:
                     self.clerk_client.delete_organization_membership(

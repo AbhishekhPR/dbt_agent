@@ -202,6 +202,20 @@ class AccountLifecycleTests(unittest.TestCase):
         self.assertEqual(raised.exception.category, "sole_owner")
         self.assertEqual(clerk.deleted_memberships, [])
 
+    def test_rejoined_membership_is_removed_even_after_prior_absence_was_recorded(self):
+        clerk = _Clerk({"org_a": [("user_a", "org:member"),
+                                   ("owner", "org:owner")]})
+        store = _Store()
+        engine = AccountLifecycleEngine(store=store, clerk_client=clerk,
+                                        clock=lambda: NOW)
+        op = engine.request(_principal(), confirmation="DELETE MY ACCOUNT")
+        store.memberships[0]["state"] = "verified_absent"
+
+        result = engine.advance(_principal(), op["operation_id"])
+
+        self.assertEqual(result["phase"], "credentials_revoked")
+        self.assertEqual(clerk.deleted_memberships, [("org_a", "user_a")])
+
 
 if __name__ == "__main__":
     unittest.main()

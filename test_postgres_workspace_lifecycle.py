@@ -150,7 +150,7 @@ class PostgresWorkspaceLifecycleTests(unittest.TestCase):
             "UPDATE tenant_lifecycle_controls SET credential_state='revoked' "
             "WHERE tenant_id=%s", (tenant_id,))
         self.store.connection.execute(
-            "UPDATE workspace_lifecycle_operations SET phase='artifact_purge', "
+            "UPDATE workspace_lifecycle_operations SET phase='artifacts_purged', "
             "billing_terminal_verified_at=%s, github_terminal_verified_at=%s, "
             "credentials_revoked_at=%s WHERE operation_id=%s",
             (NOW, NOW, NOW, operation["operation_id"]))
@@ -177,7 +177,7 @@ class PostgresWorkspaceLifecycleTests(unittest.TestCase):
             "UPDATE tenant_lifecycle_controls SET credential_state='revoked' "
             "WHERE tenant_id=%s", (tenant_id,))
         self.store.connection.execute(
-            "UPDATE workspace_lifecycle_operations SET phase='artifact_purge', "
+            "UPDATE workspace_lifecycle_operations SET phase='artifacts_purged', "
             "billing_terminal_verified_at=%s, github_terminal_verified_at=%s, "
             "credentials_revoked_at=%s WHERE operation_id=%s",
             (NOW, NOW, NOW, operation["operation_id"]))
@@ -185,7 +185,7 @@ class PostgresWorkspaceLifecycleTests(unittest.TestCase):
             tenant_id=tenant_id, operation_id=operation["operation_id"])
         self.store.set_workspace_lifecycle_phase(
             tenant_id=tenant_id, operation_id=operation["operation_id"],
-            expected_phases={"artifact_purge"}, phase="database_purge",
+            expected_phases={"artifacts_purged"}, phase="database_purge",
             updated_at=NOW, operational_records_deleted=1)
         self.store.set_workspace_lifecycle_phase(
             tenant_id=tenant_id, operation_id=operation["operation_id"],
@@ -289,6 +289,54 @@ class PostgresWorkspaceLifecycleTests(unittest.TestCase):
         current = self.store.workspace_lifecycle_operation_for_tenant(
             tenant_id, operation["operation_id"])
         self.assertEqual(current["lease_id"], "lease_second")
+
+    def test_expired_account_lease_cannot_steal_the_new_workers_fence(self):
+        operation = self.store.begin_account_deletion(
+            clerk_user_id="departing_user", memberships=(),
+            dissociated_actor_ref="deleted_actor_abcdef0123456789abcdef0123456789",
+            confirmation_verified_at=NOW)
+        first = self.store.claim_account_lifecycle_operation(
+            operation_id=operation["operation_id"], lease_id="lease_first",
+            now=NOW, lease_expires_at=NOW + timedelta(seconds=1))
+        second = self.store.claim_account_lifecycle_operation(
+            operation_id=operation["operation_id"], lease_id="lease_second",
+            now=NOW + timedelta(seconds=2),
+            lease_expires_at=NOW + timedelta(minutes=2))
+        self.assertIsNotNone(second)
+        with self.assertRaisesRegex(ValueError, "stale_account"):
+            self.store.set_account_lifecycle_phase(
+                operation_id=operation["operation_id"],
+                expected_phases={"leaving_workspaces"},
+                phase="leaving_workspaces", updated_at=NOW,
+                expected_generation=first["generation"], lease_id="lease_first")
+        current = self.store.account_lifecycle_operation(operation["operation_id"])
+        self.assertEqual(current["lease_id"], "lease_second")
+
+    def test_membership_projection_cannot_reintroduce_deleting_account(self):
+        from agent.api.workspace_membership import (
+            ClerkMembership, ClerkOrganizationSnapshot, project_memberships,
+        )
+        tenant_id = self._tenant("a")
+        generation = "sync_after_account_delete"
+        self.store.begin_tenant_membership_sync(
+            tenant_id=tenant_id, clerk_organization_id="org_clerk_a",
+            sync_generation=generation)
+        self.store.begin_account_deletion(
+            clerk_user_id="deleted_user", memberships=(),
+            dissociated_actor_ref="deleted_actor_fedcba9876543210fedcba9876543210",
+            confirmation_verified_at=NOW)
+        projection = project_memberships(ClerkOrganizationSnapshot(
+            organization_id="org_clerk_a", created_by_user_id="deleted_user",
+            memberships=(ClerkMembership(
+                "deleted_user", "mem_deleted", "org:owner"),)))
+
+        with self.assertRaisesRegex(ValueError, "account lifecycle"):
+            self.store.replace_tenant_membership_projection(
+                tenant_id=tenant_id, projection=projection,
+                sync_generation=generation, synchronized_at=NOW)
+        self.assertIsNone(self.store.tenant_membership_authorization(
+            tenant_id=tenant_id, clerk_user_id="deleted_user",
+            sync_generation=generation))
 
     def test_collector_and_repository_revocation_are_tenant_isolated(self):
         tenant_a = self._tenant("a")

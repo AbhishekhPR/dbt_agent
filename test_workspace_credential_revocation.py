@@ -225,14 +225,14 @@ class CredentialRevocationPostgresTests(unittest.TestCase):
                       "SELECT event_id, state FROM outbox_events "
                       "WHERE organization_id=%s", (self.first["root"],)).fetchall()}
         self.assertEqual(outbox["outbox-a-pending"], "CANCELED")
-        self.assertEqual(outbox["outbox-a-claimed"], "CLAIMED")
+        self.assertEqual(outbox["outbox-a-claimed"], "CANCELED")
         session = self.store.connection.execute(
             "SELECT revoked_at, github_access_token, github_refresh_token "
             "FROM dashboard_sessions WHERE session_id_hash='session-a'").fetchone()
         self.assertIsNotNone(session["revoked_at"])
         self.assertIsNone(session["github_access_token"])
         self.assertIsNone(session["github_refresh_token"])
-        self.assertEqual(result["claimed_work_remaining"], 1)
+        self.assertEqual(result["claimed_work_remaining"], 0)
 
         # Late worker callbacks cannot resurrect canceled work or requeue a
         # claim after the workspace fence became durable.

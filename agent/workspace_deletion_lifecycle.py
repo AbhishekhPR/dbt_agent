@@ -110,9 +110,9 @@ class WorkspaceDeletionEngine:
             return self._billing(principal, operation)
         if phase in {"billing_revoked", "github_access_revocation"}:
             return self._github_and_credentials(principal, operation)
-        if phase == "credentials_revoked":
+        if phase in {"credentials_revoked", "artifact_purge"}:
             return self._artifacts(operation)
-        if phase == "artifact_purge":
+        if phase == "artifacts_purged":
             return self._database(operation)
         if phase in {"database_purge", "clerk_organization_deletion"}:
             return self._clerk_and_finalize(operation)
@@ -221,13 +221,21 @@ class WorkspaceDeletionEngine:
     def _artifacts(self, operation):
         repository_ids = self.store.tenant_repository_storage_ids(
             operation["tenant_id"])
+        if operation["phase"] == "credentials_revoked":
+            try:
+                planned = count_repository_storage(
+                    self.repository_storage, repository_ids)
+            except (OSError, ValueError):
+                self._fail(operation, "artifact_purge_failed",
+                           disposition="retryable")
+            operation = self._phase(
+                operation, {"credentials_revoked"}, "artifact_purge",
+                artifact_files_deleted=planned)
         try:
-            count = purge_repository_storage(
-                self.repository_storage, repository_ids)
+            purge_repository_storage(self.repository_storage, repository_ids)
         except (OSError, ValueError):
             self._fail(operation, "artifact_purge_failed", disposition="retryable")
-        return self._phase(operation, {"credentials_revoked"}, "artifact_purge",
-                           artifact_files_deleted=count)
+        return self._phase(operation, {"artifact_purge"}, "artifacts_purged")
 
     def _database(self, operation):
         try:
@@ -241,7 +249,7 @@ class WorkspaceDeletionEngine:
                 else "database_purge_failed"
             self._fail(operation, category)
         return self._phase(
-            operation, {"artifact_purge"}, "database_purge",
+            operation, {"artifacts_purged"}, "database_purge",
             operational_records_deleted=result["operational_records_deleted"])
 
     def _clerk_and_finalize(self, operation):
@@ -340,6 +348,35 @@ def purge_repository_storage(storage_root, repository_ids):
             target.rename(quarantine)
         shutil.rmtree(quarantine)
     return deleted_files
+
+
+def count_repository_storage(storage_root, repository_ids):
+    """Count the frozen deletion set before the non-transactional purge."""
+    if storage_root is None:
+        return 0
+    root = Path(storage_root).resolve()
+    if not root.exists():
+        return 0
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError("repository storage root is unsafe")
+    count = 0
+    for repository_id in sorted({int(value) for value in repository_ids}):
+        if repository_id <= 0:
+            raise ValueError("repository id is unsafe")
+        target = root / str(repository_id)
+        quarantine = root / f".relium-delete-{repository_id}"
+        candidate = target if target.exists() else quarantine
+        if not candidate.exists():
+            continue
+        if candidate.is_symlink() or candidate.resolve().parent != root:
+            raise ValueError("repository storage target is unsafe")
+        for current, directories, files in os.walk(candidate, followlinks=False):
+            current_path = Path(current)
+            if any((current_path / name).is_symlink()
+                   for name in directories + files):
+                raise ValueError("repository storage contains a symlink")
+            count += len(files)
+    return count
 
 
 def _github_failure(error):

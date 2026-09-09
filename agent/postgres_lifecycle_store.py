@@ -382,28 +382,27 @@ class PostgresLifecycleStore:
             self, *, operation_id, tenant_id, provider, target_kind,
             target_reference, outcome, failure_category, recorded_at,
             expected_generation=None, lease_id=None):
-        guard = ""
-        parameters = [operation_id, tenant_id, provider, target_kind,
-                      target_reference, outcome, failure_category, recorded_at,
-                      operation_id, tenant_id]
-        if expected_generation is not None:
-            guard += " AND generation=%s"
-            parameters.append(expected_generation)
-        if lease_id is not None:
-            guard += " AND lease_id=%s"
-            parameters.append(lease_id)
-        row = self.connection.execute(
-            "INSERT INTO workspace_lifecycle_provider_results "
-            "(operation_id,tenant_id,provider,target_kind,target_reference,outcome,"
-            "failure_category,recorded_at) SELECT %s,%s,%s,%s,%s,%s,%s,%s "
-            "WHERE EXISTS (SELECT 1 FROM workspace_lifecycle_operations "
-            "WHERE operation_id=%s AND tenant_id=%s AND completed_at IS NULL" + guard + ") "
-            "ON CONFLICT (operation_id,provider,target_kind,target_reference) "
-            "DO UPDATE SET outcome=EXCLUDED.outcome, "
-            "failure_category=EXCLUDED.failure_category, "
-            "recorded_at=EXCLUDED.recorded_at RETURNING operation_id",
-            tuple(parameters),
-        ).fetchone()
+        with self.connection.transaction():
+            operation = self.connection.execute(
+                "SELECT generation,lease_id FROM workspace_lifecycle_operations "
+                "WHERE operation_id=%s AND tenant_id=%s AND completed_at IS NULL "
+                "FOR UPDATE", (operation_id, tenant_id)).fetchone()
+            if (operation is None
+                    or (expected_generation is not None
+                        and operation["generation"] != expected_generation)
+                    or (lease_id is not None and operation["lease_id"] != lease_id)):
+                raise ValueError("workspace lifecycle provider result is not scoped")
+            row = self.connection.execute(
+                "INSERT INTO workspace_lifecycle_provider_results "
+                "(operation_id,tenant_id,provider,target_kind,target_reference,outcome,"
+                "failure_category,recorded_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (operation_id,provider,target_kind,target_reference) "
+                "DO UPDATE SET outcome=EXCLUDED.outcome, "
+                "failure_category=EXCLUDED.failure_category, "
+                "recorded_at=EXCLUDED.recorded_at RETURNING operation_id",
+                (operation_id, tenant_id, provider, target_kind, target_reference,
+                 outcome, failure_category, recorded_at),
+            ).fetchone()
         if row is None:
             raise ValueError("workspace lifecycle provider result is not scoped")
 
@@ -534,6 +533,20 @@ class PostgresLifecycleStore:
                     or latest["sync_generation"] != sync_generation
                     or latest["sync_status"] != "refreshing"):
                 raise ValueError("Clerk membership projection was superseded")
+
+            existing_users = {row["clerk_user_id"] for row in
+                              self.connection.execute(
+                                  "SELECT clerk_user_id FROM tenant_memberships "
+                                  "WHERE tenant_id=%s", (tenant_id,)).fetchall()}
+            incoming_users = {member.clerk_user_id
+                              for member in projection.memberships}
+            # Serialize projection replacement with account deletion. Locks
+            # are sorted so two membership refreshes cannot deadlock while
+            # touching overlapping user sets.
+            for clerk_user_id in sorted(existing_users | incoming_users):
+                self._lock_account_lifecycle_user(clerk_user_id)
+            for clerk_user_id in sorted(incoming_users):
+                self._assert_account_lifecycle_active(clerk_user_id)
 
             # Rows absent from the new complete snapshot remain as provenance,
             # but can no longer authorize. Upserts below reactivate only the
@@ -1170,7 +1183,7 @@ class PostgresLifecycleStore:
                 "UPDATE outbox_events SET state = 'CANCELED', canceled_at = %s, "
                 "cancellation_reason = 'workspace_credentials_revoked', "
                 "lease_owner = NULL, lease_expires_at = NULL "
-                "WHERE organization_id = ANY(%s) AND state = 'PENDING'",
+                "WHERE organization_id = ANY(%s) AND state IN ('PENDING','CLAIMED')",
                 (now, list(roots)),
             ).rowcount
             sessions = self.connection.execute(
@@ -2281,7 +2294,7 @@ class PostgresLifecycleStore:
                  and operation["generation"] != expected_generation)
                     or (lease_id is not None and operation["lease_id"] != lease_id)):
                 raise ValueError("workspace lifecycle lease is stale")
-            if (operation["phase"] != "artifact_purge"
+            if (operation["phase"] != "artifacts_purged"
                     or operation["billing_terminal_verified_at"] is None
                     or operation["github_terminal_verified_at"] is None
                     or operation["credentials_revoked_at"] is None
@@ -2629,7 +2642,8 @@ class PostgresLifecycleStore:
                     "UPDATE outbox_events SET state='CANCELED',canceled_at=%s,"
                     "cancellation_reason='github_access_disconnected',lease_owner=NULL,"
                     "lease_expires_at=NULL WHERE organization_id=%s AND repository_id=%s "
-                    "AND state='PENDING'", (now, organization_id, repository_id))
+                    "AND state IN ('PENDING','CLAIMED')",
+                    (now, organization_id, repository_id))
                 self.connection.execute(
                     "UPDATE dashboard_sessions SET revoked_at=COALESCE(revoked_at,%s),"
                     "revocation_reason='github_access_disconnected',github_access_token=NULL,"
@@ -2909,9 +2923,10 @@ class PostgresLifecycleStore:
             "AND phase=ANY(%s)" + guard + " RETURNING *",
             tuple(parameters)).fetchone()
         if row is None:
-            current = self.account_lifecycle_operation(operation_id)
-            if current and current["phase"] == phase:
-                return current
+            if expected_generation is None and lease_id is None:
+                current = self.account_lifecycle_operation(operation_id)
+                if current and current["phase"] == phase:
+                    return current
             raise ValueError("stale_account_lifecycle_phase")
         return dict(row)
 
