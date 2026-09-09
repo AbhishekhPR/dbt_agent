@@ -30,6 +30,7 @@ SUPPORTED_COMMANDS = frozenset(
         "issue-ci-token",
         "issue-collector-token",
         "list-collector-tokens",
+        "lifecycle-operation",
         "outcome-summary",
         "pr-review-demo",
         "pr_guard",

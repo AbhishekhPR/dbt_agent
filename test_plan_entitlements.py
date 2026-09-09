@@ -355,6 +355,10 @@ class RepositoryLimitStoreTests(unittest.TestCase):
 
             class Result:
                 def fetchone(self):
+                    if "FROM tenant_lifecycle_controls" in sql:
+                        return {"credential_state": "active",
+                                "workspace_state": "active",
+                                "work_admission_state": "active"}
                     if "FOR UPDATE" in sql:
                         return {"tenant_id": params[0]}
                     if "WHERE tenant_id = %s AND github_repository_id = %s" in sql:
@@ -418,10 +422,10 @@ class RepositoryLimitStoreTests(unittest.TestCase):
         store = self._store(existing={100, 200, 300, 400})
         self.assertIsNotNone(self._select(store, 300, 1))
 
-    def test_an_unlimited_plan_takes_no_lock_at_all(self):
+    def test_an_unlimited_plan_still_locks_for_lifecycle_admission(self):
         store = self._store(existing={1, 2, 3})
         self._select(store, 400, None)
-        self.assertFalse(any("FOR UPDATE" in s for s in store.connection.statements))
+        self.assertTrue(any("FOR UPDATE" in s for s in store.connection.statements))
 
     def test_a_metered_plan_locks_the_tenant_row_before_counting(self):
         """Without the lock two concurrent selections both read the same count
