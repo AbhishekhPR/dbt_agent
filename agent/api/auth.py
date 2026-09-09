@@ -130,10 +130,14 @@ class ServiceTokenAuthenticator:
             hmac.compare_digest(presented_hash, hash_secret("absent"))
             raise AuthenticationError("invalid credentials")
 
-        if not hmac.compare_digest(record["secret_hash"], presented_hash):
+        stored_hash = record.get("secret_hash")
+        comparable_hash = (stored_hash if isinstance(stored_hash, str)
+                           else hash_secret("revoked"))
+        if not hmac.compare_digest(comparable_hash, presented_hash):
             raise AuthenticationError("invalid credentials")
 
-        if record.get("revoked_at") is not None:
+        if (record.get("revoked_at") is not None
+                or record.get("credential_state") not in {None, "active"}):
             raise AuthenticationError("credentials revoked")
         expires_at = record.get("expires_at")
         if expires_at is not None and expires_at <= now:

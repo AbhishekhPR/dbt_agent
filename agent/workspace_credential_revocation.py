@@ -19,6 +19,10 @@ class CredentialRevocationError(RuntimeError):
 def revoke_workspace_credentials(*, principal, authorizer, store):
     """Revoke credentials only for the refreshed owner workspace context."""
     context = authorizer.require_owner(principal)
+    status_reader = getattr(store, "workspace_credential_revocation_status", None)
+    existing = status_reader(context.tenant_id) if status_reader else None
+    if existing is not None:
+        return {**existing, "customer_remediation": CUSTOMER_REMEDIATION}
     inventory = store.tenant_operational_inventory(context.tenant_id)
     if inventory.get("ownership_status") != "complete":
         raise CredentialRevocationError("operational_ownership_incomplete")

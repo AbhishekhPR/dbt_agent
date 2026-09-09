@@ -263,6 +263,10 @@ class DashboardBridgeTests(unittest.TestCase):
                 REPO_ID, tenant_id=tenant_id, project_dir=".",
                 manifest_path="target/manifest.json", enforcement_mode="shadow",
                 configured_at=NOW)
+            store.ensure_tenant("acme", "analytics", "production")
+            if store.get_service_token("tok-1") is None:
+                store.create_service_token(
+                    "tok-1", "1" * 64, "acme", "analytics", scope="ci")
             store.record_tenant_repository_ci_token(
                 REPO_ID, tenant_id=tenant_id, ci_token_id="tok-1",
                 delivery="display_once", issued_at=NOW)
@@ -526,9 +530,11 @@ class DashboardBridgeTests(unittest.TestCase):
         self._establish()
         with self.pool.acquire() as store:
             row = store.connection.execute(
-                "SELECT github_access_token FROM dashboard_sessions").fetchone()
+                "SELECT github_access_token, source_clerk_user_id "
+                "FROM dashboard_sessions").fetchone()
         self.assertIsNotNone(row["github_access_token"])
         self.assertNotIn(b"alice-token", bytes(row["github_access_token"]))
+        self.assertEqual(row["source_clerk_user_id"], "user_alice")
 
     def test_no_clerk_token_appears_in_any_url(self):
         self._onboard()

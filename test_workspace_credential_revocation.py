@@ -19,6 +19,7 @@ class CredentialRevocationMigrationContractTests(unittest.TestCase):
         self.assertIn("ALTER COLUMN secret_hash DROP NOT NULL", sql)
         self.assertIn("'CANCELED'", sql)
         self.assertIn("source_clerk_user_id TEXT", sql)
+        self.assertIn("initiated_by_clerk_user_id TEXT NOT NULL", sql)
         self.assertIn("tenant_repositories_ci_token_fk", sql)
         self.assertIn("collector_identities_token_fk", sql)
         self.assertGreaterEqual(sql.count("NOT VALID"), 2)
@@ -232,6 +233,20 @@ class CredentialRevocationPostgresTests(unittest.TestCase):
         self.assertIsNone(session["github_refresh_token"])
         self.assertEqual(result["claimed_work_remaining"], 1)
 
+        # Late worker callbacks cannot resurrect canceled work or requeue a
+        # claim after the workspace fence became durable.
+        closed = self.store.close_collection_request(
+            self.first["root"], self.first["repository"], "request-a",
+            state="COMPLETED")
+        self.assertEqual(closed["state"], "CANCELED")
+        self.store.fail_outbox(
+            self.first["root"], self.first["repository"],
+            "outbox-a-claimed", error=RuntimeError("late failure"))
+        claimed = self.store.connection.execute(
+            "SELECT state FROM outbox_events WHERE event_id='outbox-a-claimed'"
+        ).fetchone()
+        self.assertEqual(claimed["state"], "CANCELED")
+
     def test_retry_is_idempotent(self):
         from agent.workspace_credential_revocation import revoke_workspace_credentials
 
@@ -244,7 +259,69 @@ class CredentialRevocationPostgresTests(unittest.TestCase):
 
         self.assertEqual(first["state"], "revoked")
         self.assertEqual(second["state"], "revoked")
-        self.assertEqual(second["service_tokens_revoked"], 0)
+        self.assertEqual(second["operation_id"], first["operation_id"])
+        self.assertEqual(second["service_tokens_revoked"],
+                         first["service_tokens_revoked"])
+
+    def test_revoked_workspace_rejects_old_and_new_machine_access(self):
+        from agent.api.auth import AuthenticationError, ServiceTokenAuthenticator
+        from agent.workspace_credential_revocation import revoke_workspace_credentials
+
+        revoke_workspace_credentials(
+            principal=object(), authorizer=_Authorizer(self.first["tenant_id"]),
+            store=self.store)
+
+        with self.assertRaises(AuthenticationError):
+            ServiceTokenAuthenticator(self.store).authenticate(
+                f"rlm_{self.first['token']}.not-the-secret")
+        with self.assertRaisesRegex(ValueError, "credentials are not active"):
+            self.store.create_service_token(
+                "new-token", "c" * 64, self.first["root"],
+                self.first["repository"], scope="ci")
+        with self.assertRaisesRegex(ValueError, "credentials are not active"):
+            self.store.create_dashboard_session(
+                "new-session", organization_id=self.first["root"],
+                repository_id=self.first["repository"], environment="production",
+                github_login="user", github_user_id=99,
+                github_permission="admin", may_govern=True,
+                permission_checked_at=self.store.connection.execute(
+                    "SELECT now() AS value").fetchone()["value"],
+                csrf_token="csrf", expires_at=self.store.connection.execute(
+                    "SELECT now() + interval '1 hour' AS value").fetchone()["value"])
+        with self.assertRaisesRegex(ValueError, "credentials are not active"):
+            self.store.claim_outbox(
+                self.first["root"], self.first["repository"],
+                "production", "worker-after-revoke")
+
+    def test_current_user_identity_revocation_is_exact_and_idempotent(self):
+        from agent.workspace_credential_revocation import (
+            revoke_current_user_github_identity,
+        )
+
+        self.store.upsert_clerk_github_identity(
+            "clerk-user-a", github_user_id=1, github_login="alice",
+            access_token=b"cipher-a", refresh_token=b"refresh-a")
+        self.store.upsert_clerk_github_identity(
+            "clerk-user-b", github_user_id=2, github_login="bob",
+            access_token=b"cipher-b", refresh_token=b"refresh-b")
+        principal = SimpleNamespace(identity_provider="clerk",
+                                    clerk_user_id="clerk-user-a")
+
+        first = revoke_current_user_github_identity(
+            principal=principal, store=self.store)
+        second = revoke_current_user_github_identity(
+            principal=principal, store=self.store)
+
+        self.assertEqual(first["identity_credentials_revoked"], 1)
+        self.assertEqual(second["identity_credentials_revoked"], 0)
+        self.assertIsNone(self.store.clerk_github_identity("clerk-user-a"))
+        self.assertIsNotNone(self.store.clerk_github_identity("clerk-user-b"))
+        session_a = self.store.get_dashboard_session("session-a")
+        session_b = self.store.get_dashboard_session("session-b")
+        self.assertIsNotNone(session_a["revoked_at"])
+        self.assertIsNone(session_a["github_access_token"])
+        self.assertIsNone(session_b["revoked_at"])
+        self.assertIsNotNone(session_b["github_access_token"])
 
     def test_inventory_change_between_authorization_and_mutation_fails_closed(self):
         with self.assertRaises(Exception):

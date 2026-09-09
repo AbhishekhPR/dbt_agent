@@ -139,6 +139,7 @@ class DashboardSessionBridge:
                                       associated=clerk_user_id),
                 access_expires_at=link.get("access_expires_at"),
                 refresh_expires_at=link.get("refresh_expires_at"),
+                source_clerk_user_id=clerk_user_id,
             )
         except SessionError:
             # GitHub says this person cannot see the repository. Their tenant

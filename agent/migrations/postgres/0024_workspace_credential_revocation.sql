@@ -6,6 +6,7 @@ SET LOCAL statement_timeout = '30s';
 CREATE TABLE IF NOT EXISTS workspace_credential_revocations (
     operation_id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL REFERENCES tenants (tenant_id) ON DELETE RESTRICT,
+    initiated_by_clerk_user_id TEXT NOT NULL,
     generation BIGINT NOT NULL CHECK (generation > 0),
     state TEXT NOT NULL CHECK (state IN ('claimed', 'revoked', 'failed')),
     failure_category TEXT,
@@ -26,6 +27,7 @@ CREATE TABLE IF NOT EXISTS workspace_credential_revocations (
     completed_at TIMESTAMPTZ,
     UNIQUE (tenant_id, generation),
     CHECK (length(operation_id) BETWEEN 1 AND 255),
+    CHECK (length(initiated_by_clerk_user_id) BETWEEN 1 AND 255),
     CHECK (failure_category IS NULL OR length(failure_category) BETWEEN 1 AND 64)
 );
 
@@ -33,6 +35,10 @@ ALTER TABLE api_service_tokens ALTER COLUMN secret_hash DROP NOT NULL;
 ALTER TABLE api_service_tokens
     ADD CONSTRAINT api_service_tokens_active_digest_check
     CHECK (revoked_at IS NOT NULL OR secret_hash IS NOT NULL) NOT VALID;
+UPDATE api_service_tokens SET secret_hash = NULL
+WHERE revoked_at IS NOT NULL AND secret_hash IS NOT NULL;
+ALTER TABLE api_service_tokens
+    VALIDATE CONSTRAINT api_service_tokens_active_digest_check;
 
 ALTER TABLE collection_requests ADD COLUMN IF NOT EXISTS canceled_at TIMESTAMPTZ;
 ALTER TABLE collection_requests ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
@@ -54,12 +60,15 @@ CREATE INDEX IF NOT EXISTS idx_dashboard_sessions_clerk_user
     WHERE source_clerk_user_id IS NOT NULL AND revoked_at IS NULL;
 
 ALTER TABLE tenant_repositories
+    DROP CONSTRAINT IF EXISTS tenant_repositories_ci_token_fk;
+ALTER TABLE tenant_repositories
     ADD CONSTRAINT tenant_repositories_ci_token_fk
     FOREIGN KEY (ci_token_id) REFERENCES api_service_tokens (token_id)
     ON DELETE SET NULL NOT VALID;
 
 ALTER TABLE collector_identities
+    DROP CONSTRAINT IF EXISTS collector_identities_token_fk;
+ALTER TABLE collector_identities
     ADD CONSTRAINT collector_identities_token_fk
     FOREIGN KEY (token_id) REFERENCES api_service_tokens (token_id)
     ON DELETE SET NULL NOT VALID;
-
