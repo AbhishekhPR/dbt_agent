@@ -101,7 +101,8 @@ class _Store:
         self.operation["disposition"] = values["disposition"]
         self.operation["failure_category"] = values["failure_category"]
 
-    def revoke_account_local_access(self, clerk_user_id, dissociated_actor_ref):
+    def revoke_account_local_access(self, clerk_user_id, dissociated_actor_ref,
+                                    **unused):
         self.local_revoked = True
         return {"state": "revoked"}
 
@@ -172,6 +173,34 @@ class AccountLifecycleTests(unittest.TestCase):
             engine.request(_principal(), confirmation="DELETE MY ACCOUNT")
         self.assertEqual(raised.exception.category, "membership_authority_changed")
         self.assertIsNone(store.operation)
+
+    def test_new_membership_after_request_blocks_before_any_leave(self):
+        clerk = _Clerk({"org_a": [("user_a", "org:member"),
+                                   ("owner", "org:owner")]})
+        store = _Store()
+        engine = AccountLifecycleEngine(store=store, clerk_client=clerk,
+                                        clock=lambda: NOW)
+        op = engine.request(_principal(), confirmation="DELETE MY ACCOUNT")
+        clerk.organizations["org_new"] = [("user_a", "org:admin")]
+        with self.assertRaises(AccountLifecycleBlocked) as raised:
+            engine.advance(_principal(), op["operation_id"])
+        self.assertEqual(raised.exception.category, "membership_inventory_changed")
+        self.assertEqual(clerk.deleted_memberships, [])
+
+    def test_later_sole_owner_blocks_before_first_membership_is_removed(self):
+        clerk = _Clerk({"org_a": [("user_a", "org:member"),
+                                   ("owner", "org:owner")],
+                        "org_b": [("user_a", "org:owner"),
+                                   ("owner_b", "org:owner")]})
+        store = _Store()
+        engine = AccountLifecycleEngine(store=store, clerk_client=clerk,
+                                        clock=lambda: NOW)
+        op = engine.request(_principal(), confirmation="DELETE MY ACCOUNT")
+        clerk.organizations["org_b"] = [("user_a", "org:owner")]
+        with self.assertRaises(AccountLifecycleBlocked) as raised:
+            engine.advance(_principal(), op["operation_id"])
+        self.assertEqual(raised.exception.category, "sole_owner")
+        self.assertEqual(clerk.deleted_memberships, [])
 
 
 if __name__ == "__main__":

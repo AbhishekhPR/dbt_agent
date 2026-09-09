@@ -77,7 +77,8 @@ class _Store:
     def tenant_repository_storage_ids(self, tenant_id):
         return [101]
 
-    def purge_workspace_operational_data(self, *, tenant_id, operation_id):
+    def purge_workspace_operational_data(self, *, tenant_id, operation_id,
+                                         **_guards):
         self.purged = True
         return {"operational_records_deleted": 42}
 

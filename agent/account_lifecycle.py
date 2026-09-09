@@ -108,6 +108,7 @@ class AccountLifecycleEngine:
             raise AccountLifecycleBlocked("lifecycle_operation_not_found")
         operation, lease_id = self._claim(operation)
         try:
+            operation = self._renew(operation)
             if operation["phase"] == "leaving_workspaces":
                 return self._leave_memberships(operation)
             if operation["phase"] in {"credentials_revoked", "clerk_user_deletion"}:
@@ -131,31 +132,66 @@ class AccountLifecycleEngine:
                                           disposition="retryable")
         return claimed, lease_id
 
+    def _renew(self, operation):
+        renew = getattr(self.store, "renew_account_lifecycle_operation", None)
+        if renew is None or operation.get("lease_id") is None:
+            return operation
+        now = self.clock()
+        try:
+            return renew(
+                operation_id=operation["operation_id"],
+                lease_id=operation["lease_id"],
+                expected_generation=operation["generation"], now=now,
+                lease_expires_at=now + timedelta(minutes=10))
+        except ValueError:
+            raise AccountLifecycleBlocked(
+                "lifecycle_operation_busy", disposition="retryable") from None
+
     def _leave_memberships(self, operation):
         user_id = operation["clerk_user_id"]
         try:
-            for row in self.store.account_lifecycle_memberships(
-                    operation["operation_id"]):
-                if row["state"] == "verified_absent":
-                    continue
+            stored = self.store.account_lifecycle_memberships(
+                operation["operation_id"])
+            listed_a = self.clerk_client.user_organization_memberships(user_id)
+            listed_b = self.clerk_client.user_organization_memberships(user_id)
+            if self._membership_fingerprint(listed_a) != self._membership_fingerprint(listed_b):
+                return self._fail(operation, "membership_authority_changed")
+            stored_orgs = {row["clerk_organization_id"] for row in stored}
+            current_by_org = {row.organization_id: row for row in listed_b}
+            if not set(current_by_org).issubset(stored_orgs):
+                return self._fail(operation, "membership_inventory_changed")
+
+            # Validate the complete current inventory before removing any one
+            # membership. Discovering a sole-owner blocker after an earlier
+            # provider mutation would violate the all-or-nothing preflight.
+            for organization_id, listed in current_by_org.items():
                 first = project_memberships(self.clerk_client.organization_snapshot(
-                    row["clerk_organization_id"]))
+                    organization_id))
                 second = project_memberships(self.clerk_client.organization_snapshot(
-                    row["clerk_organization_id"]))
+                    organization_id))
                 if first.source_fingerprint != second.source_fingerprint:
                     return self._fail(operation, "membership_authority_changed")
                 current = next((member for member in second.memberships
                                 if member.clerk_user_id == user_id), None)
-                if current is None:
-                    self.store.mark_account_membership_absent(
-                        operation_id=operation["operation_id"],
-                        organization_id=row["clerk_organization_id"],
-                        updated_at=self.clock())
-                    continue
+                if (current is None
+                        or current.clerk_membership_id != listed.clerk_membership_id):
+                    return self._fail(operation, "membership_authority_changed")
                 if (second.ownership_status != "authoritative"
                         or (current.role == "owner"
                             and second.active_owner_count <= 1)):
                     return self._fail(operation, "sole_owner")
+
+            for row in stored:
+                if row["state"] == "verified_absent":
+                    continue
+                if row["clerk_organization_id"] not in current_by_org:
+                    self.store.mark_account_membership_absent(
+                        operation_id=operation["operation_id"],
+                        organization_id=row["clerk_organization_id"],
+                        updated_at=self.clock(),
+                        expected_generation=operation.get("generation"),
+                        lease_id=operation.get("lease_id"))
+                    continue
                 try:
                     self.clerk_client.delete_organization_membership(
                         row["clerk_organization_id"], user_id)
@@ -173,24 +209,32 @@ class AccountLifecycleEngine:
                                       disposition="retryable")
                 self.store.mark_account_membership_absent(
                     operation_id=operation["operation_id"],
-                    organization_id=organization_id, updated_at=self.clock())
+                    organization_id=organization_id, updated_at=self.clock(),
+                    expected_generation=operation.get("generation"),
+                    lease_id=operation.get("lease_id"))
         except ClerkMembershipUnavailable:
             return self._fail(operation, "clerk_provider_failure",
                               disposition="retryable")
         result = self.store.revoke_account_local_access(
-            user_id, operation["dissociated_actor_ref"])
+            user_id, operation["dissociated_actor_ref"],
+            expected_generation=operation.get("generation"),
+            lease_id=operation.get("lease_id"))
         if result.get("state") != "revoked":
             return self._fail(operation, "account_credentials_not_revoked")
         return self.store.set_account_lifecycle_phase(
             operation_id=operation["operation_id"],
             expected_phases={"leaving_workspaces"}, phase="credentials_revoked",
-            updated_at=self.clock())
+            updated_at=self.clock(),
+            expected_generation=operation.get("generation"),
+            lease_id=operation.get("lease_id"))
 
     def _delete_clerk_user(self, operation):
         operation = self.store.set_account_lifecycle_phase(
             operation_id=operation["operation_id"],
             expected_phases={"credentials_revoked", "clerk_user_deletion"},
-            phase="clerk_user_deletion", updated_at=self.clock())
+            phase="clerk_user_deletion", updated_at=self.clock(),
+            expected_generation=operation.get("generation"),
+            lease_id=operation.get("lease_id"))
         try:
             try:
                 self.clerk_client.delete_user(operation["clerk_user_id"])
@@ -201,7 +245,9 @@ class AccountLifecycleEngine:
             except ClerkResourceAbsent:
                 return self.store.finalize_account_deletion(
                     operation_id=operation["operation_id"],
-                    completed_at=self.clock())
+                    completed_at=self.clock(),
+                    expected_generation=operation.get("generation"),
+                    lease_id=operation.get("lease_id"))
             return self._fail(operation, "clerk_user_not_terminal",
                               disposition="retryable")
         except ClerkMembershipUnavailable:
@@ -211,7 +257,9 @@ class AccountLifecycleEngine:
     def _fail(self, operation, category, *, disposition="blocked"):
         self.store.fail_account_lifecycle_phase(
             operation_id=operation["operation_id"], disposition=disposition,
-            failure_category=category, updated_at=self.clock())
+            failure_category=category, updated_at=self.clock(),
+            expected_generation=operation.get("generation"),
+            lease_id=operation.get("lease_id"))
         raise AccountLifecycleBlocked(category, disposition=disposition)
 
     @staticmethod

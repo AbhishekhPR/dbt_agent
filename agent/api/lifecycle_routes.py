@@ -24,7 +24,7 @@ from agent.api.workspace_membership import (
 )
 from agent.github_access_lifecycle import GitHubAccessBlocked, GitHubAccessLifecycle, disconnect_personal_github
 from agent.workspace_access_controls import AccessControlBlocked, leave_workspace
-from agent.workspace_collector_revocation import revoke_collector_access
+from agent.workspace_collector_revocation import CollectorAccessBlocked, revoke_collector_access
 from agent.workspace_deletion_lifecycle import LifecycleBlocked, WorkspaceDeletionEngine
 
 
@@ -80,12 +80,22 @@ def create_lifecycle_routes(*, store_pool, clerk_verifier, clerk_client,
                           "role": context.role,
                           "active_owner_count": context.active_owner_count},
             "capabilities": {
-                "delete_workspace": context.role == "owner",
+                "delete_workspace": (context.role == "owner"
+                                     and access["ownership_status"] == "complete"
+                                     and polar_client is not None
+                                     and github_client is not None
+                                     and github_app_jwt is not None),
                 "leave_workspace": (context.role != "owner"
                                     or context.active_owner_count > 1),
                 "manage_workspace_access": context.role in {"owner", "admin"},
                 "uninstall_github": context.role == "owner",
             },
+            "blockers": (
+                (["operational_ownership_" + access["ownership_status"]]
+                 if access["ownership_status"] != "complete" else [])
+                + (["provider_configuration_incomplete"]
+                   if polar_client is None or github_client is None
+                   or github_app_jwt is None else [])),
             "notices": {
                 "warehouse": "Rotate or drop the warehouse role and remove the collector configuration.",
                 "github_actions": "Remove RELIUM_CI_TOKEN from GitHub Actions after Relium-side revocation.",
@@ -185,7 +195,8 @@ def create_lifecycle_routes(*, store_pool, clerk_verifier, clerk_client,
             except WorkspaceMembershipUnavailable:
                 return _json({"status": "blocked", "code": "membership_authority_unavailable"}, 409, request_id)
             except (LifecycleBlocked, AccountLifecycleBlocked,
-                    AccessControlBlocked, GitHubAccessBlocked) as exc:
+                    AccessControlBlocked, GitHubAccessBlocked,
+                    CollectorAccessBlocked) as exc:
                 status = 403 if exc.category in {"recent_verification_required", "impersonated_session"} \
                     else 409
                 return _json({"status": exc.disposition, "code": exc.category}, status, request_id)
@@ -215,9 +226,11 @@ def create_lifecycle_routes(*, store_pool, clerk_verifier, clerk_client,
 
 
 async def _read_body(request):
-    raw = await request.body()
-    if len(raw) > MAX_BODY:
-        raise ValueError("body_too_large")
+    raw = bytearray()
+    async for chunk in request.stream():
+        if len(raw) + len(chunk) > MAX_BODY:
+            raise ValueError("body_too_large")
+        raw.extend(chunk)
     if not raw:
         return {}
     value = json.loads(raw)

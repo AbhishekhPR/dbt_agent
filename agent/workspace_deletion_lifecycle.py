@@ -104,6 +104,7 @@ class WorkspaceDeletionEngine:
             self._release(operation, lease_id)
 
     def _dispatch(self, principal, operation):
+        operation = self._renew(operation)
         phase = operation["phase"]
         if phase in {"frozen", "billing_reconciliation"}:
             return self._billing(principal, operation)
@@ -116,6 +117,22 @@ class WorkspaceDeletionEngine:
         if phase in {"database_purge", "clerk_organization_deletion"}:
             return self._clerk_and_finalize(operation)
         raise LifecycleBlocked("invalid_lifecycle_phase")
+
+    def _renew(self, operation):
+        renew = getattr(self.store, "renew_workspace_lifecycle_operation", None)
+        if renew is None or operation.get("lease_id") is None:
+            return operation
+        now = self.clock()
+        try:
+            return renew(
+                tenant_id=operation["tenant_id"],
+                operation_id=operation["operation_id"],
+                lease_id=operation["lease_id"],
+                expected_generation=operation["generation"], now=now,
+                lease_expires_at=now + timedelta(minutes=10))
+        except ValueError:
+            raise LifecycleBlocked("lifecycle_operation_busy",
+                                   disposition="retryable") from None
 
     def _claim(self, operation):
         claim = getattr(self.store, "claim_workspace_lifecycle_operation", None)
@@ -180,7 +197,9 @@ class WorkspaceDeletionEngine:
                     tenant_id=operation["tenant_id"], provider="github",
                     target_kind="installation",
                     target_reference=str(installation_id), outcome=outcome,
-                    failure_category=None, recorded_at=self.clock())
+                    failure_category=None, recorded_at=self.clock(),
+                    expected_generation=operation.get("generation"),
+                    lease_id=operation.get("lease_id"))
             except GitHubAPIError as exc:
                 self._fail(operation, _github_failure(exc),
                            disposition=("retryable" if exc.retryable
@@ -214,7 +233,9 @@ class WorkspaceDeletionEngine:
         try:
             result = self.store.purge_workspace_operational_data(
                 tenant_id=operation["tenant_id"],
-                operation_id=operation["operation_id"])
+                operation_id=operation["operation_id"],
+                expected_generation=operation.get("generation"),
+                lease_id=operation.get("lease_id"))
         except ValueError as exc:
             category = str(exc) if str(exc).startswith("operational_ownership_") \
                 else "database_purge_failed"
@@ -248,19 +269,25 @@ class WorkspaceDeletionEngine:
                 tenant_id=operation["tenant_id"], provider="clerk",
                 target_kind="organization", target_reference=tenant[
                     "clerk_organization_id"], outcome=outcome,
-                failure_category=None, recorded_at=self.clock())
+                failure_category=None, recorded_at=self.clock(),
+                expected_generation=operation.get("generation"),
+                lease_id=operation.get("lease_id"))
         except ClerkMembershipUnavailable:
             self._fail(operation, "clerk_provider_failure",
                        disposition="retryable")
         return self.store.finalize_workspace_deletion(
             tenant_id=operation["tenant_id"],
-            operation_id=operation["operation_id"], completed_at=self.clock())
+            operation_id=operation["operation_id"], completed_at=self.clock(),
+            expected_generation=operation.get("generation"),
+            lease_id=operation.get("lease_id"))
 
     def _phase(self, operation, expected, phase, **values):
         return self.store.set_workspace_lifecycle_phase(
             tenant_id=operation["tenant_id"],
             operation_id=operation["operation_id"],
             expected_phases=expected, phase=phase, updated_at=self.clock(),
+            expected_generation=operation.get("generation"),
+            lease_id=operation.get("lease_id"),
             **values)
 
     def _fail(self, operation, category, *, disposition="blocked"):
@@ -268,7 +295,9 @@ class WorkspaceDeletionEngine:
             tenant_id=operation["tenant_id"],
             operation_id=operation["operation_id"],
             disposition=disposition, failure_category=category,
-            updated_at=self.clock())
+            updated_at=self.clock(),
+            expected_generation=operation.get("generation"),
+            lease_id=operation.get("lease_id"))
         raise LifecycleBlocked(category, disposition=disposition)
 
     @staticmethod

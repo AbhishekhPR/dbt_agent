@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 DSN = os.environ.get("RELIUM_TEST_POSTGRES_DSN")
@@ -208,6 +208,13 @@ class PostgresWorkspaceLifecycleTests(unittest.TestCase):
 
     def test_account_deletion_preserves_every_shared_workspace(self):
         tenant_a, tenant_b = self._tenant("a"), self._tenant("b")
+        self.store.upsert_clerk_github_identity(
+            "shared_user", github_user_id=44, github_login="shared",
+            access_token="encrypted-before-delete")
+        self.store.create_github_installation_state(
+            state_hash="b" * 64, tenant_id=tenant_a,
+            clerk_user_id="shared_user", expires_at=NOW + timedelta(minutes=5),
+            created_at=NOW)
         operation = self.store.begin_account_deletion(
             clerk_user_id="shared_user",
             memberships=({"clerk_organization_id": "org_clerk_a",
@@ -218,6 +225,26 @@ class PostgresWorkspaceLifecycleTests(unittest.TestCase):
                           "authoritative_role": "owner", "active_owner_count": 2}),
             dissociated_actor_ref="deleted_actor_0123456789abcdef0123456789abcdef",
             confirmation_verified_at=NOW)
+        with self.assertRaisesRegex(ValueError, "account lifecycle"):
+            self.store.consume_github_installation_state(
+                "b" * 64, now=NOW + timedelta(minutes=1))
+        with self.assertRaisesRegex(ValueError, "account lifecycle"):
+            self.store.upsert_clerk_github_identity(
+                "shared_user", github_user_id=44, github_login="shared",
+                access_token="encrypted-test-value")
+        with self.assertRaisesRegex(ValueError, "account lifecycle"):
+            self.store.create_github_installation_state(
+                state_hash="a" * 64, tenant_id=tenant_a,
+                clerk_user_id="shared_user", expires_at=NOW.replace(minute=5),
+                created_at=NOW)
+        with self.assertRaisesRegex(ValueError, "account lifecycle"):
+            self.store.create_dashboard_session(
+                "session-hash", organization_id="legacy-a",
+                repository_id="repo-a", environment="prod",
+                github_login="shared", github_user_id=44,
+                github_permission="push", may_govern=True,
+                permission_checked_at=NOW, csrf_token="csrf", expires_at=NOW,
+                source_clerk_user_id="shared_user")
         for organization_id in ("org_clerk_a", "org_clerk_b"):
             self.store.mark_account_membership_absent(
                 operation_id=operation["operation_id"],
@@ -237,6 +264,31 @@ class PostgresWorkspaceLifecycleTests(unittest.TestCase):
         self.assertEqual(receipt["state"], "completed")
         self.assertIsNotNone(self.store.tenant_by_id(tenant_a))
         self.assertIsNotNone(self.store.tenant_by_id(tenant_b))
+
+    def test_expired_workspace_lease_cannot_write_after_takeover(self):
+        tenant_id = self._tenant("a")
+        operation = self.store.begin_workspace_deletion(
+            tenant_id=tenant_id, initiated_by_clerk_user_id="user_a",
+            confirmation_verified_at=NOW)
+        first = self.store.claim_workspace_lifecycle_operation(
+            tenant_id=tenant_id, operation_id=operation["operation_id"],
+            lease_id="lease_first", now=NOW,
+            lease_expires_at=NOW + timedelta(seconds=1))
+        second = self.store.claim_workspace_lifecycle_operation(
+            tenant_id=tenant_id, operation_id=operation["operation_id"],
+            lease_id="lease_second", now=NOW + timedelta(seconds=2),
+            lease_expires_at=NOW + timedelta(minutes=2))
+        self.assertIsNotNone(second)
+        with self.assertRaisesRegex(ValueError, "not scoped"):
+            self.store.record_workspace_lifecycle_provider_result(
+                operation_id=operation["operation_id"], tenant_id=tenant_id,
+                provider="github", target_kind="installation",
+                target_reference="9", outcome="verified_absent",
+                failure_category=None, recorded_at=NOW,
+                expected_generation=first["generation"], lease_id="lease_first")
+        current = self.store.workspace_lifecycle_operation_for_tenant(
+            tenant_id, operation["operation_id"])
+        self.assertEqual(current["lease_id"], "lease_second")
 
     def test_collector_and_repository_revocation_are_tenant_isolated(self):
         tenant_a = self._tenant("a")
@@ -262,6 +314,17 @@ class PostgresWorkspaceLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(token_b["secret_hash"])
         self.assertIsNone(token_b["revoked_at"])
 
+        self.store.create_service_token(
+            "collector-a-2", "collector-digest-a-2", "legacy-a", "repo-a",
+            environment="prod", scope="collector")
+        self.store.register_collector(
+            "legacy-a", "repo-a", "prod", collector_id="collector_a_2",
+            token_id="collector-a-2")
+        self.store.create_collection_request(
+            "legacy-a", "repo-a", "prod", request_id="request-a",
+            reason="test", expires_at=NOW + timedelta(hours=1),
+            targets=({"relation_name": "orders"},))
+
         operation = self.store.begin_github_access_operation(
             tenant_id=tenant_a, initiated_by_clerk_user_id="user_a",
             operation_kind="repository_disconnect", github_repository_id=101)
@@ -276,6 +339,21 @@ class PostgresWorkspaceLifecycleTests(unittest.TestCase):
         self.assertIsNone(repository_a["ci_token_id"])
         self.assertIsNone(repository_b["disconnected_at"])
         self.assertEqual(repository_b["ci_token_id"], "token-b")
+        collector_a_2 = self.store.connection.execute(
+            "SELECT secret_hash,revoked_at FROM api_service_tokens "
+            "WHERE token_id='collector-a-2'").fetchone()
+        self.assertIsNone(collector_a_2["secret_hash"])
+        self.assertIsNotNone(collector_a_2["revoked_at"])
+        self.assertFalse(self.store.connection.execute(
+            "SELECT connected FROM environments WHERE organization_id='legacy-a' "
+            "AND repository_id='repo-a' AND environment='prod'").fetchone()["connected"])
+        request = self.store.get_collection_request(
+            "legacy-a", "repo-a", "request-a")
+        self.assertEqual(request["state"], "CANCELED")
+        identity = self.store.get_collector(
+            "legacy-a", "repo-a", "collector_a_2")
+        self.assertTrue(identity["revoked"])
+        self.assertIsNone(identity["token_id"])
 
 
 if __name__ == "__main__":

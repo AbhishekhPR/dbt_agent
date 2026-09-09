@@ -8,6 +8,12 @@ from agent.github_access_lifecycle import (
 )
 from agent.workspace_collector_revocation import revoke_collector_access
 from agent.github_app.client import GitHubNotFoundError
+from agent.api.clerk_identity import ClerkPrincipal
+
+
+def _principal():
+    return ClerkPrincipal(clerk_user_id="user_a", clerk_organization_id="org_a",
+                          tenant_id="ten_a", factor_verification_age=(0, -1))
 
 
 class _Auth:
@@ -43,16 +49,35 @@ class _GitHub:
 
 
 class GitHubCollectorLifecycleTests(unittest.TestCase):
+    def test_every_access_revocation_rejects_stale_or_impersonated_session(self):
+        store = _Store()
+        stale = ClerkPrincipal(clerk_user_id="user_a", clerk_organization_id="org_a",
+                               tenant_id="ten_a", factor_verification_age=None)
+        impersonated = ClerkPrincipal(
+            clerk_user_id="user_a", clerk_organization_id="org_a",
+            tenant_id="ten_a", factor_verification_age=(0, -1),
+            is_impersonated=True)
+        with self.assertRaises(GitHubAccessBlocked):
+            disconnect_personal_github(principal=stale, store=store)
+        lifecycle = GitHubAccessLifecycle(authorizer=_Auth(), store=store,
+                                          github_client=_GitHub(),
+                                          github_app_jwt=lambda: "jwt")
+        with self.assertRaises(GitHubAccessBlocked):
+            lifecycle.disconnect_repository(principal=impersonated,
+                                            repository_id=1)
+        from agent.workspace_collector_revocation import CollectorAccessBlocked
+        with self.assertRaises(CollectorAccessBlocked):
+            revoke_collector_access(principal=stale, authorizer=_Auth(),
+                                    store=store)
     def test_personal_disconnect_is_user_scoped(self):
         store = _Store()
-        result = disconnect_personal_github(principal=type("P", (), {
-            "identity_provider": "clerk", "clerk_user_id": "user_a"})(), store=store)
+        result = disconnect_personal_github(principal=_principal(), store=store)
         self.assertEqual(result["state"], "revoked")
         self.assertEqual(store.calls, [("personal", "user_a")])
 
     def test_collector_revoke_uses_authorized_tenant_not_browser_scope(self):
         store = _Store()
-        result = revoke_collector_access(principal=object(), authorizer=_Auth(),
+        result = revoke_collector_access(principal=_principal(), authorizer=_Auth(),
                                          store=store, token_id="tok_1")
         self.assertEqual(result["state"], "revoked")
         self.assertEqual(store.calls[0][1]["tenant_id"], "ten_a")
@@ -63,7 +88,7 @@ class GitHubCollectorLifecycleTests(unittest.TestCase):
         lifecycle = GitHubAccessLifecycle(authorizer=_Auth(), store=store,
                                           github_client=github,
                                           github_app_jwt=lambda: "jwt")
-        result = lifecycle.uninstall(principal=object(), installation_id=9)
+        result = lifecycle.uninstall(principal=_principal(), installation_id=9)
         self.assertEqual(result["state"], "completed")
         self.assertEqual(github.deleted, [9])
         self.assertEqual([call[0] for call in store.calls], ["begin", "complete"])

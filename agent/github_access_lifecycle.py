@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from agent.github_app.client import GitHubAPIError, GitHubNotFoundError
+from agent.lifecycle_authorization import RecentVerificationRequired, require_recent_verification
 from agent.workspace_credential_revocation import revoke_current_user_github_identity
 
 
@@ -15,6 +16,7 @@ class GitHubAccessBlocked(RuntimeError):
 
 
 def disconnect_personal_github(*, principal, store):
+    _require_recent(principal)
     result = revoke_current_user_github_identity(principal=principal, store=store)
     return {**result, "external_history": EXTERNAL_HISTORY_NOTICE}
 
@@ -25,6 +27,7 @@ class GitHubAccessLifecycle:
         self.github_client, self.github_app_jwt = github_client, github_app_jwt
 
     def disconnect_repository(self, *, principal, repository_id):
+        _require_recent(principal)
         context = self.authorizer.require_admin_or_owner(principal)
         result = self.store.begin_github_access_operation(
             tenant_id=context.tenant_id,
@@ -34,6 +37,7 @@ class GitHubAccessLifecycle:
         return {**result, "external_history": EXTERNAL_HISTORY_NOTICE}
 
     def disconnect_installation(self, *, principal, installation_id):
+        _require_recent(principal)
         context = self.authorizer.require_admin_or_owner(principal)
         result = self.store.begin_github_access_operation(
             tenant_id=context.tenant_id,
@@ -43,6 +47,7 @@ class GitHubAccessLifecycle:
         return {**result, "external_history": EXTERNAL_HISTORY_NOTICE}
 
     def uninstall(self, *, principal, installation_id):
+        _require_recent(principal)
         context = self.authorizer.require_owner(principal)
         operation = self.store.begin_github_access_operation(
             tenant_id=context.tenant_id,
@@ -80,3 +85,10 @@ class GitHubAccessLifecycle:
                 failure_category=category)
             raise GitHubAccessBlocked(category,
                                       disposition="retryable" if category.endswith("retryable") else "blocked") from None
+
+
+def _require_recent(principal):
+    try:
+        require_recent_verification(principal)
+    except RecentVerificationRequired as exc:
+        raise GitHubAccessBlocked(exc.category) from None
