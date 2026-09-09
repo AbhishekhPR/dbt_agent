@@ -43,6 +43,9 @@ def resume_workspace_departure(*, operation, clerk_client, store):
     organization_id = operation["clerk_organization_id"]
     user_id = operation["clerk_user_id"]
     try:
+        store.revoke_workspace_departure_access(
+            operation_id=operation["operation_id"],
+            clerk_organization_id=organization_id, clerk_user_id=user_id)
         memberships = clerk_client.user_organization_memberships(user_id)
         if any(row.organization_id == organization_id for row in memberships):
             # The authorization path established owner safety immediately

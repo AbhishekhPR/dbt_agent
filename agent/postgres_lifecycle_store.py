@@ -2778,6 +2778,34 @@ class PostgresLifecycleStore:
             (operation_id,)).fetchone()
         return dict(row) if row else None
 
+    def revoke_workspace_departure_access(self, *, operation_id,
+                                          clerk_organization_id,
+                                          clerk_user_id):
+        """Revoke only this user's sessions attributable to this workspace."""
+        now = datetime.now(timezone.utc)
+        with self.connection.transaction():
+            tenant = self.connection.execute(
+                "SELECT tenant_id FROM tenants WHERE clerk_organization_id=%s "
+                "FOR UPDATE", (clerk_organization_id,)).fetchone()
+            guard = self.connection.execute(
+                "SELECT 1 FROM clerk_membership_departure_guards "
+                "WHERE clerk_organization_id=%s AND operation_id=%s "
+                "AND clerk_user_id=%s AND operation_kind='leave_workspace' FOR UPDATE",
+                (clerk_organization_id, operation_id, clerk_user_id)).fetchone()
+            if tenant is None or guard is None:
+                raise ValueError("workspace_departure_guard_failed")
+            roots = [row["organization_id"] for row in self.connection.execute(
+                "SELECT organization_id FROM tenant_operational_roots "
+                "WHERE tenant_id=%s", (tenant["tenant_id"],)).fetchall()]
+            if roots:
+                self.connection.execute(
+                    "UPDATE dashboard_sessions SET revoked_at=COALESCE(revoked_at,%s),"
+                    "revocation_reason='workspace_left',github_access_token=NULL,"
+                    "github_refresh_token=NULL WHERE source_clerk_user_id=%s "
+                    "AND organization_id=ANY(%s)",
+                    (now, clerk_user_id, roots))
+        return {"state": "revoked"}
+
     def account_lifecycle_operation_for_user(self, clerk_user_id):
         row = self.connection.execute(
             "SELECT * FROM account_lifecycle_operations "
@@ -4098,6 +4126,16 @@ class PostgresLifecycleStore:
             if source_clerk_user_id is not None:
                 self._lock_account_lifecycle_user(source_clerk_user_id)
                 self._assert_account_lifecycle_active(source_clerk_user_id)
+                ownership = self.connection.execute(
+                    "SELECT tenant_id FROM tenant_operational_roots "
+                    "WHERE organization_id=%s", (organization_id,)).fetchone()
+                if ownership is not None and self.connection.execute(
+                        "SELECT 1 FROM clerk_membership_departure_guards guard "
+                        "JOIN tenants tenant ON tenant.clerk_organization_id="
+                        "guard.clerk_organization_id WHERE tenant.tenant_id=%s "
+                        "AND guard.clerk_user_id=%s",
+                        (ownership["tenant_id"], source_clerk_user_id)).fetchone():
+                    raise ValueError("workspace membership departure is active")
                 identity = self.connection.execute(
                     "SELECT revoked_at FROM clerk_github_identities "
                     "WHERE clerk_user_id = %s FOR SHARE",

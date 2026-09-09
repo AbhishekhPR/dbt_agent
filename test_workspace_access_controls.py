@@ -45,9 +45,11 @@ class _Membership:
 
 
 class _Store:
-    def __init__(self): self.completed = []
+    def __init__(self): self.completed, self.revoked = [], []
     def begin_workspace_departure(self, **values):
         return {"operation_id": "leave_1", **values}
+    def revoke_workspace_departure_access(self, **values):
+        self.revoked.append(values)
     def complete_workspace_departure(self, **values): self.completed.append(values)
 
 
@@ -72,11 +74,17 @@ class WorkspaceAccessControlTests(unittest.TestCase):
     def test_member_and_nonsole_owner_can_leave_without_touching_workspace(self):
         for role, owners in (("member", 1), ("admin", 1), ("owner", 2)):
             clerk = _Clerk()
+            store = _Store()
             result = leave_workspace(
                 principal=_principal(), authorizer=_Authorizer(role, owners),
-                clerk_client=clerk, store=_Store(), clerk_organization_id="org_a")
+                clerk_client=clerk, store=store, clerk_organization_id="org_a")
             self.assertEqual(result["state"], "left")
             self.assertEqual(clerk.deleted, [("org_a", "user_a")])
+            self.assertEqual(store.revoked, [{
+                "operation_id": "leave_1",
+                "clerk_organization_id": "org_a",
+                "clerk_user_id": "user_a",
+            }])
 
 
 if __name__ == "__main__": unittest.main()

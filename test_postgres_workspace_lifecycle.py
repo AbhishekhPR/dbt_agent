@@ -265,6 +265,58 @@ class PostgresWorkspaceLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(self.store.tenant_by_id(tenant_a))
         self.assertIsNotNone(self.store.tenant_by_id(tenant_b))
 
+    def test_workspace_departure_revokes_only_attributable_tenant_sessions_and_fences_recreation(self):
+        tenant_a = self._tenant("a")
+        self.store.upsert_clerk_github_identity(
+            "departing_user", github_user_id=44, github_login="departing",
+            access_token="encrypted-test-token")
+        for suffix in ("a", "b"):
+            self.store.create_dashboard_session(
+                f"session-{suffix}", organization_id=f"legacy-{suffix}",
+                repository_id=f"repo-{suffix}", environment="prod",
+                github_login="departing", github_user_id=44,
+                github_permission="push", may_govern=True,
+                permission_checked_at=NOW, csrf_token=f"csrf-{suffix}",
+                expires_at=NOW + timedelta(hours=1),
+                github_access_token=f"encrypted-session-{suffix}",
+                source_clerk_user_id="departing_user")
+        self.store.connection.execute(
+            "INSERT INTO tenant_memberships "
+            "(tenant_id,clerk_user_id,clerk_membership_id,role,clerk_role_key,"
+            "role_basis,sync_generation,status,synchronized_at) VALUES "
+            "(%s,'departing_user','mem_departing','member','org:member',"
+            "'explicit_clerk_role','leave-generation','active',%s)",
+            (tenant_a, NOW))
+        operation = self.store.begin_workspace_departure(
+            tenant_id=tenant_a, clerk_organization_id="org_clerk_a",
+            clerk_user_id="departing_user", clerk_membership_id="mem_departing",
+            role="member", active_owner_count=1)
+
+        self.store.revoke_workspace_departure_access(
+            operation_id=operation["operation_id"],
+            clerk_organization_id="org_clerk_a",
+            clerk_user_id="departing_user")
+
+        session_a = self.store.connection.execute(
+            "SELECT revoked_at,github_access_token FROM dashboard_sessions "
+            "WHERE session_id_hash='session-a'").fetchone()
+        session_b = self.store.connection.execute(
+            "SELECT revoked_at,github_access_token FROM dashboard_sessions "
+            "WHERE session_id_hash='session-b'").fetchone()
+        self.assertIsNotNone(session_a["revoked_at"])
+        self.assertIsNone(session_a["github_access_token"])
+        self.assertIsNone(session_b["revoked_at"])
+        self.assertEqual(session_b["github_access_token"], b"encrypted-session-b")
+        with self.assertRaisesRegex(ValueError, "membership departure"):
+            self.store.create_dashboard_session(
+                "late-session", organization_id="legacy-a",
+                repository_id="repo-a", environment="prod",
+                github_login="departing", github_user_id=44,
+                github_permission="push", may_govern=True,
+                permission_checked_at=NOW, csrf_token="late-csrf",
+                expires_at=NOW + timedelta(hours=1),
+                source_clerk_user_id="departing_user")
+
     def test_expired_workspace_lease_cannot_write_after_takeover(self):
         tenant_id = self._tenant("a")
         operation = self.store.begin_workspace_deletion(
