@@ -902,6 +902,21 @@ class PostgresLifecycleStore:
                 "VALUES (%s, 'active', 'active') ON CONFLICT DO NOTHING",
                 (tenant_id,),
             )
+            current = self.connection.execute(
+                "SELECT credential_state FROM tenant_lifecycle_controls "
+                "WHERE tenant_id = %s FOR UPDATE",
+                (tenant_id,),
+            ).fetchone()
+            if current["credential_state"] == "revoked":
+                prior = self.connection.execute(
+                    "SELECT * FROM workspace_credential_revocations "
+                    "WHERE tenant_id = %s AND state = 'revoked' "
+                    "ORDER BY generation DESC LIMIT 1",
+                    (tenant_id,),
+                ).fetchone()
+                if prior is None:
+                    raise ValueError("revoked credential state has no operation")
+                return dict(prior)
             control = self.connection.execute(
                 "UPDATE tenant_lifecycle_controls SET generation = generation + 1, "
                 "credential_state = 'revoking', updated_at = %s "
@@ -1008,6 +1023,7 @@ class PostgresLifecycleStore:
             identities = self.connection.execute(
                 "UPDATE clerk_github_identities SET revoked_at = COALESCE(revoked_at, %s), "
                 "access_token = NULL, refresh_token = NULL, updated_at = %s "
+                ", revocation_generation = revocation_generation + 1 "
                 "WHERE clerk_user_id = %s "
                 "AND (revoked_at IS NULL OR access_token IS NOT NULL "
                 "OR refresh_token IS NOT NULL)",
@@ -1703,6 +1719,7 @@ class PostgresLifecycleStore:
         raises and rolls back the token projection as well as the bridge.
         """
         with self.connection.transaction():
+            self._lock_tenant_for_root_binding(tenant_id)
             selected = self.connection.execute(
                 "SELECT tr.tenant_id, tr.github_repository_id, "
                 "       tr.github_installation_id "
@@ -1814,6 +1831,7 @@ class PostgresLifecycleStore:
         whose owner cannot be established from a mutable label.
         """
         with self.connection.transaction():
+            self._lock_tenant_for_root_binding(tenant_id)
             selected = self.connection.execute(
                 "SELECT 1 FROM tenant_repositories repository "
                 "JOIN tenant_github_installations installation "
@@ -1866,6 +1884,22 @@ class PostgresLifecycleStore:
                  github_installation_id, verified_at),
             ).fetchone()
             return dict(mapping)
+
+    def _lock_tenant_for_root_binding(self, tenant_id):
+        """Serialize root establishment with workspace credential revocation."""
+        tenant = self.connection.execute(
+            "SELECT 1 FROM tenants WHERE tenant_id = %s FOR UPDATE",
+            (tenant_id,),
+        ).fetchone()
+        if tenant is None:
+            raise ValueError("tenant does not exist")
+        control = self.connection.execute(
+            "SELECT credential_state FROM tenant_lifecycle_controls "
+            "WHERE tenant_id = %s FOR UPDATE",
+            (tenant_id,),
+        ).fetchone()
+        if control is not None and control["credential_state"] != "active":
+            raise ValueError("workspace credentials are not active")
 
     def tenant_operational_inventory(self, tenant_id):
         """Count tenant-owned records without returning their contents."""
@@ -3000,6 +3034,14 @@ class PostgresLifecycleStore:
         with self.connection.transaction():
             self._assert_workspace_credentials_active(
                 organization_id, lock=True)
+            if source_clerk_user_id is not None:
+                identity = self.connection.execute(
+                    "SELECT revoked_at FROM clerk_github_identities "
+                    "WHERE clerk_user_id = %s FOR SHARE",
+                    (source_clerk_user_id,),
+                ).fetchone()
+                if identity is None or identity["revoked_at"] is not None:
+                    raise ValueError("github identity has been revoked")
             self.connection.execute(
                 "INSERT INTO dashboard_sessions ("
                 "session_id_hash, organization_id, repository_id, environment, "

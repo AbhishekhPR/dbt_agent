@@ -22,6 +22,7 @@ class CredentialRevocationMigrationContractTests(unittest.TestCase):
         self.assertIn("initiated_by_clerk_user_id TEXT NOT NULL", sql)
         self.assertIn("tenant_repositories_ci_token_fk", sql)
         self.assertIn("collector_identities_token_fk", sql)
+        self.assertIn("revocation_generation BIGINT", sql)
         self.assertGreaterEqual(sql.count("NOT VALID"), 2)
         self.assertNotIn("DELETE FROM reviews", sql)
         self.assertNotIn("DELETE FROM evidence", sql)
@@ -322,6 +323,17 @@ class CredentialRevocationPostgresTests(unittest.TestCase):
         self.assertIsNone(session_a["github_access_token"])
         self.assertIsNone(session_b["revoked_at"])
         self.assertIsNotNone(session_b["github_access_token"])
+
+        with self.assertRaisesRegex(ValueError, "github identity has been revoked"):
+            self.store.create_dashboard_session(
+                "new-session-a", organization_id=self.first["root"],
+                repository_id=self.first["repository"], environment="production",
+                github_login="alice", github_user_id=1, github_permission="admin",
+                may_govern=True, permission_checked_at=self.store.connection.execute(
+                    "SELECT now() AS value").fetchone()["value"],
+                csrf_token="csrf-new", expires_at=self.store.connection.execute(
+                    "SELECT now() + interval '1 hour' AS value").fetchone()["value"],
+                source_clerk_user_id="clerk-user-a")
 
     def test_inventory_change_between_authorization_and_mutation_fails_closed(self):
         with self.assertRaises(Exception):

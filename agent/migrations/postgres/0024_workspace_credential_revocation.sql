@@ -40,6 +40,14 @@ WHERE revoked_at IS NOT NULL AND secret_hash IS NOT NULL;
 ALTER TABLE api_service_tokens
     VALIDATE CONSTRAINT api_service_tokens_active_digest_check;
 
+ALTER TABLE clerk_github_identities
+    ADD COLUMN IF NOT EXISTS revocation_generation BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE clerk_github_identities
+    ADD CONSTRAINT clerk_github_identities_revocation_generation_check
+    CHECK (revocation_generation >= 0) NOT VALID;
+ALTER TABLE clerk_github_identities
+    VALIDATE CONSTRAINT clerk_github_identities_revocation_generation_check;
+
 ALTER TABLE collection_requests ADD COLUMN IF NOT EXISTS canceled_at TIMESTAMPTZ;
 ALTER TABLE collection_requests ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
 ALTER TABLE collection_requests DROP CONSTRAINT IF EXISTS collection_requests_state_check;
