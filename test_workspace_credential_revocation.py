@@ -293,6 +293,17 @@ class CredentialRevocationPostgresTests(unittest.TestCase):
             self.store.claim_outbox(
                 self.first["root"], self.first["repository"],
                 "production", "worker-after-revoke")
+        with self.assertRaisesRegex(ValueError, "credentials are not active"):
+            self.store.record_tenant_repository_ci_token(
+                self.first["github_repository_id"], tenant_id=self.first["tenant_id"],
+                ci_token_id=self.first["token"], delivery="actions_secret",
+                issued_at=self.store.connection.execute(
+                    "SELECT now() AS value").fetchone()["value"])
+        pointer = self.store.connection.execute(
+            "SELECT ci_token_id, ci_token_delivery FROM tenant_repositories "
+            "WHERE tenant_id=%s", (self.first["tenant_id"],)).fetchone()
+        self.assertIsNone(pointer["ci_token_id"])
+        self.assertIsNone(pointer["ci_token_delivery"])
 
     def test_current_user_identity_revocation_is_exact_and_idempotent(self):
         from agent.workspace_credential_revocation import (

@@ -1694,15 +1694,17 @@ class PostgresLifecycleStore:
         anywhere else. issue_ci_token keeps only sha256(secret) on
         api_service_tokens, which is the sole record of it.
         """
-        row = self.connection.execute(
-            "UPDATE tenant_repositories "
-            "SET ci_token_id = %s, ci_token_delivery = %s, "
-            "    ci_token_issued_at = %s, updated_at = now() "
-            "WHERE tenant_id = %s AND github_repository_id = %s "
-            "RETURNING github_repository_id, ci_token_id, ci_token_delivery, "
-            "          ci_token_issued_at",
-            (ci_token_id, delivery, issued_at, tenant_id, github_repository_id),
-        ).fetchone()
+        with self.connection.transaction():
+            self._lock_tenant_for_root_binding(tenant_id)
+            row = self.connection.execute(
+                "UPDATE tenant_repositories "
+                "SET ci_token_id = %s, ci_token_delivery = %s, "
+                "    ci_token_issued_at = %s, updated_at = now() "
+                "WHERE tenant_id = %s AND github_repository_id = %s "
+                "RETURNING github_repository_id, ci_token_id, ci_token_delivery, "
+                "          ci_token_issued_at",
+                (ci_token_id, delivery, issued_at, tenant_id, github_repository_id),
+            ).fetchone()
         return dict(row) if row else None
 
     def record_tenant_repository_ci_token_and_bind_root(
