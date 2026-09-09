@@ -363,6 +363,16 @@ class GitHubClient:
             route_template="/app/installations/{installation_id}",
         )
 
+    def delete_installation(self, installation_id, app_jwt):
+        """Request uninstall using this App's JWT, never a user credential."""
+        return self._request(
+            "DELETE",
+            f"/app/installations/{installation_id}",
+            token=app_jwt,
+            operation="delete_installation",
+            route_template="/app/installations/{installation_id}",
+        )
+
     def create_pull_request_review(self, owner, repository, pull_number, *,
                                    body, event="REQUEST_CHANGES"):
         """Submit a pull-request review.

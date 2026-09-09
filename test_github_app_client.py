@@ -227,6 +227,30 @@ class GitHubAppClientTests(unittest.TestCase):
         )
         self.assertIsNone(requests[0].data)
 
+    def test_installation_uninstall_uses_app_jwt_and_explicit_route(self):
+        from agent.github_app.client import GitHubClient
+
+        requests = []
+        client = GitHubClient(transport=lambda request: (
+            requests.append(request) or _Response(202, None)))
+
+        self.assertEqual(client.delete_installation(9, "app-jwt-secret"), {})
+
+        request = requests[0]
+        self.assertEqual(request.method, "DELETE")
+        self.assertEqual(request.selector, "/app/installations/9")
+        self.assertEqual(request.get_header("Authorization"),
+                         "Bearer app-jwt-secret")
+
+    def test_installation_absence_is_verified_with_app_authority(self):
+        from agent.github_app.client import GitHubClient, GitHubNotFoundError
+
+        client = GitHubClient(transport=lambda request: (_ for _ in ()).throw(
+            _http_error(404)))
+        with self.assertRaises(GitHubNotFoundError) as raised:
+            client.get_installation(9, "app-jwt-secret")
+        self.assertEqual(raised.exception.operation, "get_installation")
+
     def test_403_preserves_only_safe_operation_diagnostics(self):
         from agent.github_app.client import GitHubAPIError, GitHubClient
 

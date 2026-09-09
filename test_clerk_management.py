@@ -8,13 +8,16 @@ from agent.api.clerk_management import (
     ClerkManagementClient,
     ClerkManagementSettings,
     ClerkMembershipUnavailable,
+    ClerkResourceAbsent,
     _RefuseRedirects,
 )
 
 
 class _Response:
-    def __init__(self, document):
-        self.payload = json.dumps(document).encode("utf-8")
+    def __init__(self, document, *, status=200):
+        self.payload = (b"" if document is None
+                        else json.dumps(document).encode("utf-8"))
+        self.status = status
 
     def __enter__(self):
         return self
@@ -171,6 +174,71 @@ class ClerkManagementClientTests(unittest.TestCase):
         )
         with self.assertRaises(ClerkMembershipUnavailable):
             client.organization_snapshot("org_2acme")
+
+    def test_enumerates_every_authoritative_user_membership(self):
+        opener = _QueueOpener([
+            {"data": [
+                _membership("mem_a", "user_owner", "org:owner", "org_a"),
+                _membership("mem_b", "user_owner", "org:member", "org_b"),
+            ], "total_count": 3},
+            {"data": [
+                _membership("mem_c", "user_owner", "org:admin", "org_c"),
+            ], "total_count": 3},
+        ])
+        client = ClerkManagementClient(
+            ClerkManagementSettings(secret_key="sk_test_secret"),
+            opener=opener, page_size=2,
+        )
+
+        memberships = client.user_organization_memberships("user_owner")
+
+        self.assertEqual(
+            [(row.organization_id, row.clerk_membership_id, row.clerk_role_key)
+             for row in memberships],
+            [("org_a", "mem_a", "org:owner"),
+             ("org_b", "mem_b", "org:member"),
+             ("org_c", "mem_c", "org:admin")],
+        )
+        self.assertIn("offset=2", opener.requests[-1][0].full_url)
+
+    def test_user_membership_enumeration_rejects_another_user(self):
+        opener = _QueueOpener([{
+            "data": [_membership("mem_a", "someone_else", "org:member")],
+            "total_count": 1,
+        }])
+        client = ClerkManagementClient(
+            ClerkManagementSettings(secret_key="sk_test_secret"), opener=opener)
+        with self.assertRaises(ClerkMembershipUnavailable):
+            client.user_organization_memberships("user_owner")
+
+    def test_destructive_methods_use_server_selected_resources(self):
+        opener = _QueueOpener([{}, {}, {}])
+        client = ClerkManagementClient(
+            ClerkManagementSettings(secret_key="sk_test_secret"), opener=opener)
+
+        client.delete_organization_membership("org_a", "user_owner")
+        client.delete_organization("org_a")
+        client.delete_user("user_owner")
+
+        requests = [item[0] for item in opener.requests]
+        self.assertEqual([request.method for request in requests],
+                         ["DELETE", "DELETE", "DELETE"])
+        self.assertTrue(requests[0].full_url.endswith(
+            "/organizations/org_a/memberships/user_owner"))
+        self.assertTrue(requests[1].full_url.endswith("/organizations/org_a"))
+        self.assertTrue(requests[2].full_url.endswith("/users/user_owner"))
+        for request in requests:
+            self.assertEqual(request.get_header("Authorization"),
+                             "Bearer sk_test_secret")
+
+    def test_destructive_404_is_explicit_absence_not_generic_success(self):
+        opener = _QueueOpener([urllib.error.HTTPError(
+            "https://api.clerk.com/v1/users/user_owner", 404,
+            "not found", {}, None)])
+        client = ClerkManagementClient(
+            ClerkManagementSettings(secret_key="sk_test_secret"), opener=opener)
+        with self.assertRaises(ClerkResourceAbsent):
+            client.delete_user("user_owner")
 
 
 if __name__ == "__main__":

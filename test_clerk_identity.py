@@ -141,6 +141,18 @@ class ClerkTokenAcceptanceTests(unittest.TestCase):
         identity = self.verifier.verify(self._token())
         self.assertIsNotNone(identity.expires_at.tzinfo)
 
+    def test_signed_recent_verification_claims_are_preserved(self):
+        identity = self.verifier.verify(self._token(_claims(
+            fva=[2, -1], act={"sub": "support_user"})))
+        self.assertEqual(identity.factor_verification_age, (2, -1))
+        self.assertEqual(identity.issued_at, NOW)
+        self.assertTrue(identity.is_impersonated)
+
+    def test_absent_factor_age_is_preserved_as_unavailable(self):
+        identity = self.verifier.verify(self._token())
+        self.assertIsNone(identity.factor_verification_age)
+        self.assertFalse(identity.is_impersonated)
+
 
 class ClerkTokenRejectionTests(unittest.TestCase):
     """Every check has an attack behind it. Each one is exercised."""
@@ -257,6 +269,18 @@ class ClerkTokenRejectionTests(unittest.TestCase):
     def test_a_token_without_a_subject_is_refused(self):
         with self.assertRaises(ClerkVerificationError):
             self.verifier.verify(self._token(_claims(sub=_ABSENT)))
+
+    def test_malformed_factor_verification_age_is_refused(self):
+        for malformed in ("0,0", [0], [0, 0, 0], [True, 0], [-2, 0], [0, 1.5]):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(ClerkVerificationError):
+                    self.verifier.verify(self._token(_claims(fva=malformed)))
+
+    def test_malformed_actor_claim_is_refused(self):
+        for malformed in ("support", [], {}, {"sub": ""}):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(ClerkVerificationError):
+                    self.verifier.verify(self._token(_claims(act=malformed)))
 
     def test_an_unaccepted_authorized_party_is_refused(self):
         settings = ClerkSettings(
@@ -378,6 +402,15 @@ class ClerkPrincipalTests(unittest.TestCase):
     def test_verified_clerk_organization_role_is_preserved(self):
         principal = self._principal(clerk_organization_role="org:admin")
         self.assertEqual(principal.clerk_organization_role, "org:admin")
+
+    def test_recent_verification_context_is_preserved(self):
+        principal = self._principal(
+            factor_verification_age=(0, -1),
+            clerk_token_issued_at=NOW,
+            is_impersonated=False,
+        )
+        self.assertEqual(principal.factor_verification_age, (0, -1))
+        self.assertEqual(principal.clerk_token_issued_at, NOW)
 
 
 if __name__ == "__main__":

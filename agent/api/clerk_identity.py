@@ -177,6 +177,9 @@ class ClerkIdentity:
     organization_role: str | None
     #: Clerk session id, from ``sid``. Useful for correlating an audit trail.
     session_id: str | None
+    issued_at: datetime | None
+    factor_verification_age: tuple[int, int] | None
+    is_impersonated: bool
     expires_at: datetime
 
 
@@ -603,6 +606,22 @@ class ClerkVerifier:
             if issued_at - leeway > now:
                 raise ClerkVerificationError("token is not yet valid")
 
+        factor_verification_age = payload.get("fva")
+        if factor_verification_age is not None:
+            if (not isinstance(factor_verification_age, list)
+                    or len(factor_verification_age) != 2
+                    or any(isinstance(value, bool) or not isinstance(value, int)
+                           or value < -1 for value in factor_verification_age)):
+                raise ClerkVerificationError("token is malformed")
+            factor_verification_age = tuple(factor_verification_age)
+
+        actor = payload.get("act")
+        if actor is not None:
+            if (not isinstance(actor, dict)
+                    or not isinstance(actor.get("sub"), str)
+                    or not actor["sub"]):
+                raise ClerkVerificationError("token is malformed")
+
         # Authorized party: Clerk's binding to the frontend origin that the
         # token was minted for.
         if settings.authorized_parties:
@@ -632,6 +651,10 @@ class ClerkVerifier:
             organization_id=organization_id,
             organization_role=organization_role,
             session_id=session_id,
+            issued_at=(datetime.fromtimestamp(issued_at, tz=timezone.utc)
+                       if issued_at is not None else None),
+            factor_verification_age=factor_verification_age,
+            is_impersonated=actor is not None,
             expires_at=datetime.fromtimestamp(expires_at, tz=timezone.utc),
         )
 
@@ -697,6 +720,10 @@ class ClerkPrincipal:
     #: context, but never sufficient by itself for sensitive authorization;
     #: workspace authority is resolved from Clerk's membership API projection.
     clerk_organization_role: str | None = None
+    #: Signed Clerk session context used only for recent-authentication checks.
+    factor_verification_age: tuple[int, int] | None = None
+    clerk_token_issued_at: datetime | None = None
+    is_impersonated: bool = False
 
     is_human = True
     identity_provider = "clerk"

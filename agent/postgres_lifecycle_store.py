@@ -209,6 +209,144 @@ class PostgresLifecycleStore:
         ).fetchone()
         return dict(row) if row else None
 
+    def tenant_by_id(self, tenant_id):
+        row = self.connection.execute(
+            "SELECT tenant_id, clerk_organization_id, organization_name, role, "
+            "team_size, created_at, updated_at FROM tenants WHERE tenant_id = %s",
+            (tenant_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    # -- durable workspace/account lifecycle ------------------------------
+
+    def begin_workspace_deletion(self, *, tenant_id,
+                                 initiated_by_clerk_user_id,
+                                 confirmation_verified_at):
+        """Freeze one complete authoritative workspace and create one operation."""
+        with self.connection.transaction():
+            tenant = self.connection.execute(
+                "SELECT tenant_id FROM tenants WHERE tenant_id = %s FOR UPDATE",
+                (tenant_id,),
+            ).fetchone()
+            if tenant is None:
+                raise ValueError("workspace_not_found")
+            existing = self.connection.execute(
+                "SELECT * FROM workspace_lifecycle_operations "
+                "WHERE tenant_id = %s AND completed_at IS NULL FOR UPDATE",
+                (tenant_id,),
+            ).fetchone()
+            if existing is not None:
+                return dict(existing)
+            inventory = self.tenant_operational_inventory(tenant_id)
+            if inventory["ownership_status"] == "inconsistent":
+                raise ValueError("operational_ownership_inconsistent")
+            if inventory["ownership_status"] != "complete":
+                raise ValueError("operational_ownership_incomplete")
+            operation_id = f"wld_{uuid.uuid4().hex}"
+            self.connection.execute(
+                "INSERT INTO tenant_lifecycle_controls "
+                "(tenant_id, billing_checkout_state, credential_state, "
+                " workspace_state, work_admission_state) "
+                "VALUES (%s, 'active', 'active', 'active', 'active') "
+                "ON CONFLICT (tenant_id) DO NOTHING",
+                (tenant_id,),
+            )
+            self.connection.execute(
+                "UPDATE tenant_lifecycle_controls SET "
+                "workspace_state='deleting', work_admission_state='blocked', "
+                "billing_checkout_state='blocked', "
+                "checkout_generation=checkout_generation+1, updated_at=%s "
+                "WHERE tenant_id=%s",
+                (confirmation_verified_at, tenant_id),
+            )
+            row = self.connection.execute(
+                "INSERT INTO workspace_lifecycle_operations "
+                "(operation_id, tenant_id, initiated_by_clerk_user_id, "
+                " operation_kind, phase, disposition, confirmation_verified_at, "
+                " created_at, updated_at) "
+                "VALUES (%s,%s,%s,'delete_workspace','frozen','running',%s,%s,%s) "
+                "RETURNING *",
+                (operation_id, tenant_id, initiated_by_clerk_user_id,
+                 confirmation_verified_at, confirmation_verified_at,
+                 confirmation_verified_at),
+            ).fetchone()
+            return dict(row)
+
+    def workspace_lifecycle_operation_for_tenant(self, tenant_id, operation_id):
+        row = self.connection.execute(
+            "SELECT * FROM workspace_lifecycle_operations "
+            "WHERE tenant_id=%s AND operation_id=%s",
+            (tenant_id, operation_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def set_workspace_lifecycle_phase(self, *, tenant_id, operation_id,
+                                      expected_phases, phase, updated_at,
+                                      **values):
+        allowed_fields = {
+            "billing_terminal_verified_at", "github_terminal_verified_at",
+            "credentials_revoked_at", "artifact_files_deleted",
+            "operational_records_deleted",
+        }
+        if not set(values).issubset(allowed_fields):
+            raise ValueError("unsupported lifecycle field")
+        assignments = ["phase=%s", "disposition='running'",
+                       "failure_category=NULL", "generation=generation+1",
+                       "updated_at=%s"]
+        parameters = [phase, updated_at]
+        for field in sorted(values):
+            assignments.append(f"{field}=%s")
+            parameters.append(values[field])
+        parameters.extend([tenant_id, operation_id, list(expected_phases)])
+        row = self.connection.execute(
+            "UPDATE workspace_lifecycle_operations SET " + ", ".join(assignments)
+            + " WHERE tenant_id=%s AND operation_id=%s AND completed_at IS NULL "
+              "AND phase=ANY(%s) RETURNING *",
+            tuple(parameters),
+        ).fetchone()
+        if row is None:
+            raise ValueError("workspace lifecycle phase is stale")
+        return dict(row)
+
+    def fail_workspace_lifecycle_phase(self, *, tenant_id, operation_id,
+                                       disposition, failure_category,
+                                       updated_at):
+        if disposition not in {"retryable", "blocked"}:
+            raise ValueError("invalid lifecycle disposition")
+        row = self.connection.execute(
+            "UPDATE workspace_lifecycle_operations SET disposition=%s, "
+            "failure_category=%s, lease_id=NULL, lease_expires_at=NULL, "
+            "updated_at=%s WHERE tenant_id=%s AND operation_id=%s "
+            "AND completed_at IS NULL RETURNING operation_id",
+            (disposition, failure_category, updated_at, tenant_id, operation_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("workspace lifecycle operation is stale")
+
+    def record_workspace_lifecycle_provider_result(
+            self, *, operation_id, tenant_id, provider, target_kind,
+            target_reference, outcome, failure_category, recorded_at):
+        row = self.connection.execute(
+            "INSERT INTO workspace_lifecycle_provider_results "
+            "(operation_id,tenant_id,provider,target_kind,target_reference,outcome,"
+            "failure_category,recorded_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT (operation_id,provider,target_kind,target_reference) "
+            "DO UPDATE SET outcome=EXCLUDED.outcome, "
+            "failure_category=EXCLUDED.failure_category, "
+            "recorded_at=EXCLUDED.recorded_at RETURNING operation_id",
+            (operation_id, tenant_id, provider, target_kind, target_reference,
+             outcome, failure_category, recorded_at),
+        ).fetchone()
+        if row is None:
+            raise ValueError("workspace lifecycle provider result is not scoped")
+
+    def tenant_repository_storage_ids(self, tenant_id):
+        return [int(row["github_repository_id"]) for row in
+                self.connection.execute(
+                    "SELECT github_repository_id FROM tenant_repositories "
+                    "WHERE tenant_id=%s ORDER BY github_repository_id",
+                    (tenant_id,)).fetchall()]
+
     def upsert_tenant_for_clerk_organization(self, clerk_organization_id, *,
                                              organization_name, role=None,
                                              team_size=None):
@@ -1178,14 +1316,16 @@ class PostgresLifecycleStore:
         state silently expires early or late. One clock, one consistent pair.
         """
         state_id = f"ist_{uuid.uuid4().hex}"
-        self.connection.execute(
-            "INSERT INTO github_installation_states "
-            "(installation_state_id, state_hash, tenant_id, clerk_user_id, "
-            " purpose, created_at, expires_at) "
-            "VALUES (%s, %s, %s, %s, %s, COALESCE(%s, now()), %s)",
-            (state_id, state_hash, tenant_id, clerk_user_id, purpose,
-             created_at, expires_at),
-        )
+        with self.connection.transaction():
+            self._lock_tenant_for_root_binding(tenant_id)
+            self.connection.execute(
+                "INSERT INTO github_installation_states "
+                "(installation_state_id, state_hash, tenant_id, clerk_user_id, "
+                " purpose, created_at, expires_at) "
+                "VALUES (%s, %s, %s, %s, %s, COALESCE(%s, now()), %s)",
+                (state_id, state_hash, tenant_id, clerk_user_id, purpose,
+                 created_at, expires_at),
+            )
         return state_id
 
     def consume_github_installation_state(self, state_hash, *, now,
@@ -1389,41 +1529,39 @@ class PostgresLifecycleStore:
         ``TenantInstallationConflict``, which the HTTP layer renders as a
         non-disclosing 409.
         """
-        row = self.connection.execute(
-            "INSERT INTO tenant_github_installations "
-            "(github_installation_id, tenant_id, bound_by_clerk_user_id, "
-            " verified_github_user_id, bound_via_state_id) "
-            "VALUES (%s, %s, %s, %s, %s) "
-            "ON CONFLICT (github_installation_id) DO UPDATE SET "
-            "  updated_at = now() "
-            # The guard is what makes a cross-tenant claim fail instead of
-            # overwriting. On conflict with the SAME tenant this updates and
-            # returns the row; with a different tenant the WHERE excludes it,
-            # no row is returned, and the caller raises.
-            "  WHERE tenant_github_installations.tenant_id = EXCLUDED.tenant_id "
-            "RETURNING github_installation_id, tenant_id, bound_by_clerk_user_id, "
-            "          verified_github_user_id, bound_via_state_id, bound_at, "
-            "          updated_at, (xmax = 0) AS inserted",
-            (github_installation_id, tenant_id, bound_by_clerk_user_id,
-             verified_github_user_id, bound_via_state_id),
-        ).fetchone()
-
-        if row is None:
-            existing = self.connection.execute(
-                "SELECT tenant_id FROM tenant_github_installations "
-                "WHERE github_installation_id = %s",
-                (github_installation_id,),
+        with self.connection.transaction():
+            self._lock_tenant_for_root_binding(tenant_id)
+            row = self.connection.execute(
+                "INSERT INTO tenant_github_installations "
+                "(github_installation_id, tenant_id, bound_by_clerk_user_id, "
+                " verified_github_user_id, bound_via_state_id) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON CONFLICT (github_installation_id) DO UPDATE SET "
+                "  updated_at = now() "
+                "  WHERE tenant_github_installations.tenant_id = EXCLUDED.tenant_id "
+                "RETURNING github_installation_id, tenant_id, bound_by_clerk_user_id, "
+                "          verified_github_user_id, bound_via_state_id, bound_at, "
+                "          updated_at, (xmax = 0) AS inserted",
+                (github_installation_id, tenant_id, bound_by_clerk_user_id,
+                 verified_github_user_id, bound_via_state_id),
             ).fetchone()
-            if existing is not None:
-                raise TenantInstallationConflict(
-                    "this GitHub App installation is already connected to a "
-                    "different Relium workspace")
-            raise TenantInstallationConflict(
-                "the installation binding could not be created")
 
-        binding = dict(row)
-        created = bool(binding.pop("inserted", False))
-        return binding, created
+            if row is None:
+                existing = self.connection.execute(
+                    "SELECT tenant_id FROM tenant_github_installations "
+                    "WHERE github_installation_id = %s",
+                    (github_installation_id,),
+                ).fetchone()
+                if existing is not None:
+                    raise TenantInstallationConflict(
+                        "this GitHub App installation is already connected to a "
+                        "different Relium workspace")
+                raise TenantInstallationConflict(
+                    "the installation binding could not be created")
+
+            binding = dict(row)
+            created = bool(binding.pop("inserted", False))
+            return binding, created
 
     def tenant_github_installations(self, tenant_id, *, include_deleted=False):
         """Every installation bound to one tenant, newest binding first.
@@ -1503,23 +1641,22 @@ class PostgresLifecycleStore:
         for a workspace that is over its allowance after a downgrade.
         """
         if repository_limit is None:
-            return self._upsert_tenant_repository(
-                github_repository_id, tenant_id=tenant_id,
-                github_installation_id=github_installation_id,
-                owner_login=owner_login, name=name,
-                default_branch=default_branch, private=private,
-                dbt_detected=dbt_detected, dbt_project_dir=dbt_project_dir,
-                dbt_checked_at=dbt_checked_at)
+            with self.connection.transaction():
+                self._lock_tenant_for_root_binding(tenant_id)
+                return self._upsert_tenant_repository(
+                    github_repository_id, tenant_id=tenant_id,
+                    github_installation_id=github_installation_id,
+                    owner_login=owner_login, name=name,
+                    default_branch=default_branch, private=private,
+                    dbt_detected=dbt_detected, dbt_project_dir=dbt_project_dir,
+                    dbt_checked_at=dbt_checked_at)
 
         with self.connection.transaction():
             # Serialises concurrent selections for THIS tenant against each
             # other, so the count below cannot be read by two transactions that
             # then both insert. Other tenants are unaffected: the lock is one
             # row in `tenants`.
-            self.connection.execute(
-                "SELECT 1 FROM tenants WHERE tenant_id = %s FOR UPDATE",
-                (tenant_id,),
-            ).fetchone()
+            self._lock_tenant_for_root_binding(tenant_id)
             already_theirs = self.connection.execute(
                 "SELECT 1 FROM tenant_repositories "
                 "WHERE tenant_id = %s AND github_repository_id = %s",
@@ -1896,11 +2033,15 @@ class PostgresLifecycleStore:
         if tenant is None:
             raise ValueError("tenant does not exist")
         control = self.connection.execute(
-            "SELECT credential_state FROM tenant_lifecycle_controls "
+            "SELECT credential_state,workspace_state,work_admission_state "
+            "FROM tenant_lifecycle_controls "
             "WHERE tenant_id = %s FOR UPDATE",
             (tenant_id,),
         ).fetchone()
-        if control is not None and control["credential_state"] != "active":
+        if control is not None and (
+                control["credential_state"] != "active"
+                or control["workspace_state"] != "active"
+                or control["work_admission_state"] != "active"):
             raise ValueError("workspace credentials are not active")
 
     def tenant_operational_inventory(self, tenant_id):
@@ -2004,6 +2145,195 @@ class PostgresLifecycleStore:
             "counts": counts,
             "excluded_shared_tables": list(EXCLUDED_SHARED_TABLES),
         }
+
+    def purge_workspace_operational_data(self, *, tenant_id, operation_id):
+        """Purge only Foundation 2-owned data after every safety proof exists."""
+        from agent.tenant_operational_ownership import LEGACY_OPERATIONAL_TABLES
+
+        with self.connection.transaction():
+            self.connection.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            tenant = self.connection.execute(
+                "SELECT 1 FROM tenants WHERE tenant_id=%s FOR UPDATE",
+                (tenant_id,),
+            ).fetchone()
+            operation = self.connection.execute(
+                "SELECT phase,billing_terminal_verified_at,"
+                "github_terminal_verified_at,credentials_revoked_at "
+                "FROM workspace_lifecycle_operations "
+                "WHERE tenant_id=%s AND operation_id=%s FOR UPDATE",
+                (tenant_id, operation_id),
+            ).fetchone()
+            control = self.connection.execute(
+                "SELECT workspace_state,work_admission_state,credential_state,"
+                "billing_checkout_state FROM tenant_lifecycle_controls "
+                "WHERE tenant_id=%s FOR UPDATE",
+                (tenant_id,),
+            ).fetchone()
+            if tenant is None or operation is None or control is None:
+                raise ValueError("workspace lifecycle operation is stale")
+            if (operation["phase"] != "artifact_purge"
+                    or operation["billing_terminal_verified_at"] is None
+                    or operation["github_terminal_verified_at"] is None
+                    or operation["credentials_revoked_at"] is None
+                    or control["workspace_state"] != "deleting"
+                    or control["work_admission_state"] != "blocked"
+                    or control["credential_state"] != "revoked"
+                    or control["billing_checkout_state"] != "blocked"):
+                raise ValueError("workspace lifecycle prerequisites are incomplete")
+            inventory = self.tenant_operational_inventory(tenant_id)
+            if inventory["ownership_status"] == "inconsistent":
+                raise ValueError("operational_ownership_inconsistent")
+            if inventory["ownership_status"] != "complete":
+                raise ValueError("operational_ownership_incomplete")
+            roots = list(inventory["operational_roots"])
+            deleted = 0
+            installation_ids = [row["github_installation_id"] for row in
+                                self.connection.execute(
+                                    "SELECT github_installation_id "
+                                    "FROM tenant_github_installations "
+                                    "WHERE tenant_id=%s ORDER BY github_installation_id",
+                                    (tenant_id,)).fetchall()]
+            if roots:
+                self.connection.execute(
+                    "SELECT set_config('relium.lifecycle_purge_tenant', %s, true)",
+                    (tenant_id,))
+                child_first = (
+                    "snapshot_columns", "snapshot_metrics",
+                    "snapshot_review_bindings", "snapshot_relations",
+                    "metadata_snapshots", "collection_request_targets",
+                    "review_evidence_coverage", "review_change_requests",
+                    "review_exceptions", "review_lifecycle_transitions",
+                    "review_attempts", "collection_requests", "manifest_evidence",
+                    "rca_evidence_links", "rca_reports", "incidents", "anomalies",
+                    "monitoring_observations", "metadata_baselines", "kpi_impact",
+                    "lineage_edges", "lineage_records", "deployment_transitions",
+                    "deployments", "evidence", "configuration_versions",
+                    "collector_identities", "dashboard_sessions", "reviews",
+                    "delivery_journal", "event_receipts", "outbox_dead_letters",
+                    "outbox_events", "audit_events", "retention_tombstones",
+                    "api_service_tokens", "environments", "repositories",
+                )
+                if set(child_first) != set(LEGACY_OPERATIONAL_TABLES) - {
+                        "organizations", "review_recomputation_jobs"}:
+                    raise RuntimeError("operational purge table coverage drifted")
+                for table in child_first:
+                    deleted += self.connection.execute(
+                        f"DELETE FROM {table} WHERE organization_id=ANY(%s)",
+                        (roots,)).rowcount
+                deleted += self.connection.execute(
+                    "DELETE FROM tenant_onboarding_state WHERE tenant_id=%s",
+                    (tenant_id,)).rowcount
+                deleted += self.connection.execute(
+                    "DELETE FROM tenant_repository_dbt_detection WHERE tenant_id=%s",
+                    (tenant_id,)).rowcount
+                deleted += self.connection.execute(
+                    "DELETE FROM tenant_repositories WHERE tenant_id=%s",
+                    (tenant_id,)).rowcount
+                deleted += self.connection.execute(
+                    "DELETE FROM tenant_operational_roots WHERE tenant_id=%s",
+                    (tenant_id,)).rowcount
+                deleted += self.connection.execute(
+                    "DELETE FROM organizations WHERE organization_id=ANY(%s)",
+                    (roots,)).rowcount
+            else:
+                # Empty workspaces are safe to delete; still remove any purely
+                # tenant-side repository/onboarding state under the tenant lock.
+                for table in ("tenant_onboarding_state",
+                              "tenant_repository_dbt_detection",
+                              "tenant_repositories"):
+                    deleted += self.connection.execute(
+                        f"DELETE FROM {table} WHERE tenant_id=%s", (tenant_id,)
+                    ).rowcount
+            deleted += self.connection.execute(
+                "DELETE FROM github_installation_states WHERE tenant_id=%s",
+                (tenant_id,)).rowcount
+            deleted += self.connection.execute(
+                "DELETE FROM tenant_github_installations WHERE tenant_id=%s",
+                (tenant_id,)).rowcount
+            if installation_ids:
+                deleted += self.connection.execute(
+                    "DELETE FROM github_installations "
+                    "WHERE github_installation_id=ANY(%s) "
+                    "AND NOT EXISTS (SELECT 1 FROM tenant_github_installations b "
+                    "WHERE b.github_installation_id="
+                    "github_installations.github_installation_id)",
+                    (installation_ids,)).rowcount
+            return {"operational_records_deleted": deleted}
+
+    def finalize_workspace_deletion(self, *, tenant_id, operation_id,
+                                    completed_at):
+        """Write an unlinkable receipt and remove the final local identity."""
+        with self.connection.transaction():
+            self.connection.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            operation = self.connection.execute(
+                "SELECT * FROM workspace_lifecycle_operations "
+                "WHERE tenant_id=%s AND operation_id=%s FOR UPDATE",
+                (tenant_id, operation_id),
+            ).fetchone()
+            if operation is None:
+                existing = self.deletion_receipt(operation_id)
+                if existing is not None:
+                    return {**existing, "state": "completed"}
+                raise ValueError("workspace lifecycle operation is stale")
+            if (operation["phase"] != "clerk_organization_deletion"
+                    or operation["billing_terminal_verified_at"] is None
+                    or operation["github_terminal_verified_at"] is None
+                    or operation["credentials_revoked_at"] is None):
+                raise ValueError("workspace lifecycle prerequisites are incomplete")
+            if self.connection.execute(
+                    "SELECT 1 FROM tenant_operational_roots WHERE tenant_id=%s",
+                    (tenant_id,)).fetchone() is not None:
+                raise ValueError("operational_ownership_not_purged")
+            self.connection.execute(
+                "INSERT INTO deletion_receipts "
+                "(receipt_id,operation_kind,requested_at,completed_at,"
+                "billing_terminal_verified,provider_access_terminal_verified,"
+                "credentials_revoked,operational_records_deleted,"
+                "artifact_files_deleted,warehouse_cleanup_required,"
+                "github_actions_cleanup_required,historical_external_records_retained) "
+                "VALUES (%s,'delete_workspace',%s,%s,TRUE,TRUE,TRUE,%s,%s,"
+                "TRUE,TRUE,TRUE) ON CONFLICT (receipt_id) DO NOTHING",
+                (operation_id, operation["created_at"], completed_at,
+                 operation["operational_records_deleted"],
+                 operation["artifact_files_deleted"]),
+            )
+            # Explicit order for every RESTRICT edge. CASCADE is not treated as
+            # an ownership decision, and webhook deliveries are removed instead
+            # of being silently detached with their payloads retained.
+            for table in ("tenant_polar_subscriptions", "tenant_polar_checkouts",
+                          "billing_subscription_revocation_results"):
+                self.connection.execute(
+                    f"DELETE FROM {table} WHERE tenant_id=%s", (tenant_id,))
+            for table in ("billing_lifecycle_operations",
+                          "billing_checkout_intents",
+                          "workspace_credential_revocations", "tenant_billing",
+                          "billing_webhook_deliveries", "tenant_memberships",
+                          "tenant_membership_sync_state", "tenant_onboarding_state",
+                          "tenant_repository_dbt_detection", "tenant_repositories",
+                          "github_installation_states", "tenant_github_installations"):
+                self.connection.execute(
+                    f"DELETE FROM {table} WHERE tenant_id=%s", (tenant_id,))
+            self.connection.execute(
+                "DELETE FROM workspace_lifecycle_operations "
+                "WHERE tenant_id=%s AND operation_id=%s",
+                (tenant_id, operation_id))
+            self.connection.execute(
+                "DELETE FROM tenant_lifecycle_controls WHERE tenant_id=%s",
+                (tenant_id,))
+            removed = self.connection.execute(
+                "DELETE FROM tenants WHERE tenant_id=%s RETURNING tenant_id",
+                (tenant_id,)).fetchone()
+            if removed is None:
+                raise ValueError("workspace lifecycle tenant is stale")
+            receipt = self.deletion_receipt(operation_id)
+            return {**receipt, "state": "completed"}
+
+    def deletion_receipt(self, receipt_id):
+        row = self.connection.execute(
+            "SELECT * FROM deletion_receipts WHERE receipt_id=%s",
+            (receipt_id,),
+        ).fetchone()
+        return dict(row) if row else None
 
     @staticmethod
     def _operational_root_candidates_sql():
@@ -2407,6 +2737,7 @@ class PostgresLifecycleStore:
         ).fetchone()
         if not row or (not allow_disconnected and not row["connected"]):
             raise ValueError("Unknown, disconnected, or unauthorized tenant")
+        self._assert_workspace_credentials_active(organization_id)
 
     # -- configuration / policy / detector versions -------------------------
 
@@ -2958,11 +3289,15 @@ class PostgresLifecycleStore:
                 (ownership["tenant_id"],),
             ).fetchone()
         control = self.connection.execute(
-            "SELECT credential_state FROM tenant_lifecycle_controls "
+            "SELECT credential_state, workspace_state, work_admission_state "
+            "FROM tenant_lifecycle_controls "
             "WHERE tenant_id = %s",
             (ownership["tenant_id"],),
         ).fetchone()
-        if control is not None and control["credential_state"] != "active":
+        if control is not None and (
+                control["credential_state"] != "active"
+                or control["workspace_state"] != "active"
+                or control["work_admission_state"] != "active"):
             raise ValueError("workspace credentials are not active")
 
     @contextmanager
