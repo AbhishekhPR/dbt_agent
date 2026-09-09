@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -532,10 +533,17 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
                     with store_pool.acquire() as store:
                         scope = _authenticate(request, store, capability,
                                               mutating=write)
-                        if plan_capability is not None:
-                            _require_entitlement(store, scope, plan_capability)
-                        service = LifecycleService(store)
-                        return fn(request, body, scope, service)
+                        guard_factory = getattr(
+                            store, "workspace_mutation_guard", None)
+                        guard = (guard_factory(
+                            scope.organization_id, scope.repository_id)
+                            if write and guard_factory else nullcontext())
+                        with guard:
+                            if plan_capability is not None:
+                                _require_entitlement(
+                                    store, scope, plan_capability)
+                            service = LifecycleService(store)
+                            return fn(request, body, scope, service)
 
                 result = await run_in_threadpool(work)
                 if download:

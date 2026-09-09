@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from agent.lifecycle_models import ALLOWED_TRANSITIONS
@@ -604,6 +605,21 @@ class PostgresLifecycleStore:
                 "VALUES (%s, 'active', 'active') ON CONFLICT DO NOTHING",
                 (tenant_id,),
             )
+            existing_control = self.connection.execute(
+                "SELECT credential_state FROM tenant_lifecycle_controls "
+                "WHERE tenant_id = %s FOR UPDATE",
+                (tenant_id,),
+            ).fetchone()
+            if existing_control["credential_state"] == "revoked":
+                prior = self.connection.execute(
+                    "SELECT * FROM workspace_credential_revocations "
+                    "WHERE tenant_id = %s AND state = 'revoked' "
+                    "ORDER BY generation DESC LIMIT 1",
+                    (tenant_id,),
+                ).fetchone()
+                if prior is None:
+                    raise ValueError("revoked credential state has no operation")
+                return dict(prior)
             control = self.connection.execute(
                 "SELECT billing_checkout_state, checkout_generation "
                 "FROM tenant_lifecycle_controls "
@@ -851,6 +867,185 @@ class PostgresLifecycleStore:
         ).fetchone()
         if row is None:
             raise ValueError("billing lifecycle operation does not match tenant")
+    # -- workspace credential/access lifecycle ---------------------------
+
+    def revoke_workspace_credentials_for_tenant(
+            self, *, tenant_id, expected_operational_roots, clerk_user_id):
+        """Atomically destroy local access for one authoritative workspace.
+
+        ``expected_operational_roots`` is a compare-and-set snapshot produced
+        by Foundation 2 immediately before this call. The roots are re-read
+        under the tenant lock so an ownership change can never broaden the
+        mutation silently.
+        """
+        expected = tuple(sorted(expected_operational_roots))
+        operation_id = f"wcr_{uuid.uuid4().hex}"
+        now = datetime.now(timezone.utc)
+        with self.connection.transaction():
+            tenant = self.connection.execute(
+                "SELECT 1 FROM tenants WHERE tenant_id = %s FOR UPDATE",
+                (tenant_id,),
+            ).fetchone()
+            if tenant is None:
+                raise ValueError("tenant does not exist")
+            roots = tuple(row["organization_id"] for row in
+                          self.connection.execute(
+                              "SELECT organization_id FROM tenant_operational_roots "
+                              "WHERE tenant_id = %s ORDER BY organization_id FOR UPDATE",
+                              (tenant_id,)).fetchall())
+            if roots != expected:
+                raise ValueError("operational ownership changed during revocation")
+
+            self.connection.execute(
+                "INSERT INTO tenant_lifecycle_controls "
+                "(tenant_id, billing_checkout_state, credential_state) "
+                "VALUES (%s, 'active', 'active') ON CONFLICT DO NOTHING",
+                (tenant_id,),
+            )
+            current = self.connection.execute(
+                "SELECT credential_state FROM tenant_lifecycle_controls "
+                "WHERE tenant_id = %s FOR UPDATE",
+                (tenant_id,),
+            ).fetchone()
+            if current["credential_state"] == "revoked":
+                prior = self.connection.execute(
+                    "SELECT * FROM workspace_credential_revocations "
+                    "WHERE tenant_id = %s AND state = 'revoked' "
+                    "ORDER BY generation DESC LIMIT 1",
+                    (tenant_id,),
+                ).fetchone()
+                if prior is None:
+                    raise ValueError("revoked credential state has no operation")
+                return dict(prior)
+            control = self.connection.execute(
+                "UPDATE tenant_lifecycle_controls SET generation = generation + 1, "
+                "credential_state = 'revoking', updated_at = %s "
+                "WHERE tenant_id = %s RETURNING generation",
+                (now, tenant_id),
+            ).fetchone()
+            generation = control["generation"]
+            self.connection.execute(
+                "INSERT INTO workspace_credential_revocations "
+                "(operation_id, tenant_id, initiated_by_clerk_user_id, "
+                " generation, state, created_at) "
+                "VALUES (%s, %s, %s, %s, 'claimed', %s)",
+                (operation_id, tenant_id, clerk_user_id, generation, now),
+            )
+
+            service_tokens = self.connection.execute(
+                "UPDATE api_service_tokens SET secret_hash = NULL, "
+                "revoked_at = COALESCE(revoked_at, %s) "
+                "WHERE organization_id = ANY(%s) "
+                "  AND (secret_hash IS NOT NULL OR revoked_at IS NULL)",
+                (now, list(roots)),
+            ).rowcount
+            self.connection.execute(
+                "UPDATE tenant_repositories SET ci_token_id = NULL, "
+                "ci_token_delivery = NULL, updated_at = %s "
+                "WHERE tenant_id = %s AND ci_token_id IS NOT NULL",
+                (now, tenant_id),
+            )
+            collectors = self.connection.execute(
+                "UPDATE collector_identities SET revoked = TRUE, "
+                "revoked_at = COALESCE(revoked_at, %s), "
+                "revoked_reason = 'workspace_credentials_revoked', token_id = NULL "
+                "WHERE organization_id = ANY(%s) "
+                "  AND (revoked = FALSE OR token_id IS NOT NULL)",
+                (now, list(roots)),
+            ).rowcount
+            requests = self.connection.execute(
+                "UPDATE collection_requests SET state = 'CANCELED', "
+                "canceled_at = %s, cancellation_reason = 'workspace_credentials_revoked' "
+                "WHERE organization_id = ANY(%s) "
+                "  AND state IN ('PENDING', 'ACKNOWLEDGED')",
+                (now, list(roots)),
+            ).rowcount
+            outbox = self.connection.execute(
+                "UPDATE outbox_events SET state = 'CANCELED', canceled_at = %s, "
+                "cancellation_reason = 'workspace_credentials_revoked', "
+                "lease_owner = NULL, lease_expires_at = NULL "
+                "WHERE organization_id = ANY(%s) AND state = 'PENDING'",
+                (now, list(roots)),
+            ).rowcount
+            sessions = self.connection.execute(
+                "UPDATE dashboard_sessions SET revoked_at = COALESCE(revoked_at, %s), "
+                "revocation_reason = 'workspace_credentials_revoked', "
+                "github_access_token = NULL, github_refresh_token = NULL "
+                "WHERE organization_id = ANY(%s) "
+                "  AND (revoked_at IS NULL OR github_access_token IS NOT NULL "
+                "       OR github_refresh_token IS NOT NULL)",
+                (now, list(roots)),
+            ).rowcount
+            installation_states = self.connection.execute(
+                "UPDATE github_installation_states SET consumed_at = %s "
+                "WHERE tenant_id = %s AND consumed_at IS NULL",
+                (now, tenant_id),
+            ).rowcount
+            claimed = int(self.connection.execute(
+                "SELECT count(*) AS n FROM outbox_events "
+                "WHERE organization_id = ANY(%s) AND state = 'CLAIMED'",
+                (list(roots),),
+            ).fetchone()["n"])
+
+            self.connection.execute(
+                "UPDATE tenant_lifecycle_controls SET credential_state = 'revoked', "
+                "updated_at = %s WHERE tenant_id = %s AND generation = %s",
+                (now, tenant_id, generation),
+            )
+            row = self.connection.execute(
+                "UPDATE workspace_credential_revocations SET state = 'revoked', "
+                "service_tokens_revoked = %s, collector_identities_revoked = %s, "
+                "collection_requests_canceled = %s, outbox_events_canceled = %s, "
+                "dashboard_sessions_revoked = %s, installation_states_consumed = %s, "
+                "claimed_work_remaining = %s, completed_at = %s "
+                "WHERE operation_id = %s AND tenant_id = %s AND generation = %s "
+                "RETURNING *",
+                (service_tokens, collectors, requests, outbox, sessions,
+                 installation_states, claimed, now, operation_id, tenant_id,
+                 generation),
+            ).fetchone()
+        return dict(row)
+
+    def workspace_credential_revocation_status(self, tenant_id):
+        row = self.connection.execute(
+            "SELECT r.* FROM workspace_credential_revocations r "
+            "JOIN tenant_lifecycle_controls c ON c.tenant_id = r.tenant_id "
+            "WHERE r.tenant_id = %s AND c.credential_state = 'revoked' "
+            "ORDER BY r.generation DESC LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def revoke_current_user_github_identity(self, clerk_user_id):
+        """Destroy one Clerk user's OAuth material and attributable sessions."""
+        now = datetime.now(timezone.utc)
+        with self.connection.transaction():
+            identities = self.connection.execute(
+                "UPDATE clerk_github_identities SET revoked_at = COALESCE(revoked_at, %s), "
+                "access_token = NULL, refresh_token = NULL, updated_at = %s "
+                ", revocation_generation = revocation_generation + 1 "
+                "WHERE clerk_user_id = %s "
+                "AND (revoked_at IS NULL OR access_token IS NOT NULL "
+                "OR refresh_token IS NOT NULL)",
+                (now, now, clerk_user_id),
+            ).rowcount
+            sessions = self.connection.execute(
+                "UPDATE dashboard_sessions SET revoked_at = COALESCE(revoked_at, %s), "
+                "revocation_reason = 'github_identity_revoked', "
+                "github_access_token = NULL, github_refresh_token = NULL "
+                "WHERE source_clerk_user_id = %s "
+                "AND (revoked_at IS NULL OR github_access_token IS NOT NULL "
+                "OR github_refresh_token IS NOT NULL)",
+                (now, clerk_user_id),
+            ).rowcount
+            pending_states = self.connection.execute(
+                "UPDATE github_installation_states SET consumed_at = %s "
+                "WHERE clerk_user_id = %s AND consumed_at IS NULL",
+                (now, clerk_user_id),
+            ).rowcount
+        return {"state": "revoked", "identity_credentials_revoked": identities,
+                "dashboard_sessions_revoked": sessions,
+                "pending_github_states_consumed": pending_states}
 
     def tenant_for_polar_customer(self, polar_customer_id):
         """The tenant already bound to one Polar customer id, or None.
@@ -1499,15 +1694,17 @@ class PostgresLifecycleStore:
         anywhere else. issue_ci_token keeps only sha256(secret) on
         api_service_tokens, which is the sole record of it.
         """
-        row = self.connection.execute(
-            "UPDATE tenant_repositories "
-            "SET ci_token_id = %s, ci_token_delivery = %s, "
-            "    ci_token_issued_at = %s, updated_at = now() "
-            "WHERE tenant_id = %s AND github_repository_id = %s "
-            "RETURNING github_repository_id, ci_token_id, ci_token_delivery, "
-            "          ci_token_issued_at",
-            (ci_token_id, delivery, issued_at, tenant_id, github_repository_id),
-        ).fetchone()
+        with self.connection.transaction():
+            self._lock_tenant_for_root_binding(tenant_id)
+            row = self.connection.execute(
+                "UPDATE tenant_repositories "
+                "SET ci_token_id = %s, ci_token_delivery = %s, "
+                "    ci_token_issued_at = %s, updated_at = now() "
+                "WHERE tenant_id = %s AND github_repository_id = %s "
+                "RETURNING github_repository_id, ci_token_id, ci_token_delivery, "
+                "          ci_token_issued_at",
+                (ci_token_id, delivery, issued_at, tenant_id, github_repository_id),
+            ).fetchone()
         return dict(row) if row else None
 
     def record_tenant_repository_ci_token_and_bind_root(
@@ -1524,6 +1721,7 @@ class PostgresLifecycleStore:
         raises and rolls back the token projection as well as the bridge.
         """
         with self.connection.transaction():
+            self._lock_tenant_for_root_binding(tenant_id)
             selected = self.connection.execute(
                 "SELECT tr.tenant_id, tr.github_repository_id, "
                 "       tr.github_installation_id "
@@ -1635,6 +1833,7 @@ class PostgresLifecycleStore:
         whose owner cannot be established from a mutable label.
         """
         with self.connection.transaction():
+            self._lock_tenant_for_root_binding(tenant_id)
             selected = self.connection.execute(
                 "SELECT 1 FROM tenant_repositories repository "
                 "JOIN tenant_github_installations installation "
@@ -1687,6 +1886,22 @@ class PostgresLifecycleStore:
                  github_installation_id, verified_at),
             ).fetchone()
             return dict(mapping)
+
+    def _lock_tenant_for_root_binding(self, tenant_id):
+        """Serialize root establishment with workspace credential revocation."""
+        tenant = self.connection.execute(
+            "SELECT 1 FROM tenants WHERE tenant_id = %s FOR UPDATE",
+            (tenant_id,),
+        ).fetchone()
+        if tenant is None:
+            raise ValueError("tenant does not exist")
+        control = self.connection.execute(
+            "SELECT credential_state FROM tenant_lifecycle_controls "
+            "WHERE tenant_id = %s FOR UPDATE",
+            (tenant_id,),
+        ).fetchone()
+        if control is not None and control["credential_state"] != "active":
+            raise ValueError("workspace credentials are not active")
 
     def tenant_operational_inventory(self, tenant_id):
         """Count tenant-owned records without returning their contents."""
@@ -2342,11 +2557,14 @@ class PostgresLifecycleStore:
 
     def claim_outbox(self, organization_id, repository_id, environment, worker):
         self._tenant(organization_id, repository_id, environment, allow_disconnected=True)
-        self._recover_expired_claims(organization_id, repository_id, environment)
         # The SELECT ... FOR UPDATE SKIP LOCKED and the UPDATE that claims the
         # winning row must share one transaction: the row lock only prevents a
         # concurrent claim for as long as the transaction holding it is open.
         with self.connection.transaction():
+            self._assert_workspace_credentials_active(
+                organization_id, lock=True)
+            self._recover_expired_claims(
+                organization_id, repository_id, environment)
             row = self.connection.execute(
                 "SELECT * FROM outbox_events WHERE organization_id=%s AND repository_id=%s AND environment=%s "
                 "AND state='PENDING' AND next_attempt_at <= now() "
@@ -2381,12 +2599,26 @@ class PostgresLifecycleStore:
     def fail_outbox(self, organization_id, repository_id, event_id, *, error,
                     max_attempts=5, retry_backoff_seconds=30):
         with self.connection.transaction():
+            try:
+                self._assert_workspace_credentials_active(
+                    organization_id, lock=True)
+            except ValueError:
+                self.connection.execute(
+                    "UPDATE outbox_events SET state='CANCELED', canceled_at=now(), "
+                    "cancellation_reason='workspace_credentials_revoked', "
+                    "lease_owner=NULL, lease_expires_at=NULL "
+                    "WHERE organization_id=%s AND repository_id=%s "
+                    "AND event_id=%s AND state='CLAIMED'",
+                    (organization_id, repository_id, event_id),
+                )
+                return
             row = self.connection.execute(
                 "SELECT * FROM outbox_events "
                 "WHERE organization_id=%s AND repository_id=%s AND event_id=%s FOR UPDATE",
                 (organization_id, repository_id, event_id),
             ).fetchone()
-            if not row or row["state"] in ("DEAD_LETTER", "COMPLETED"):
+            if not row or row["state"] in (
+                    "DEAD_LETTER", "COMPLETED", "CANCELED"):
                 return
             if row["attempts"] >= max_attempts:
                 self._dead_letter(row, error)
@@ -2707,6 +2939,47 @@ class PostgresLifecycleStore:
 
     # -- service tokens (public API authentication) -------------------------
 
+    def _assert_workspace_credentials_active(self, organization_id, *, lock=False):
+        ownership = self.connection.execute(
+            "SELECT tenant_id FROM tenant_operational_roots "
+            "WHERE organization_id = %s",
+            (organization_id,),
+        ).fetchone()
+        # Unmapped legacy roots retain normal non-destructive compatibility.
+        if ownership is None:
+            return
+        if lock:
+            # Revocation takes this same tenant row FOR UPDATE before it
+            # creates/changes lifecycle control. The shared lock therefore
+            # linearizes normal work even for a newly-created tenant whose
+            # default-active control row has not been materialized yet.
+            self.connection.execute(
+                "SELECT 1 FROM tenants WHERE tenant_id = %s FOR SHARE",
+                (ownership["tenant_id"],),
+            ).fetchone()
+        control = self.connection.execute(
+            "SELECT credential_state FROM tenant_lifecycle_controls "
+            "WHERE tenant_id = %s",
+            (ownership["tenant_id"],),
+        ).fetchone()
+        if control is not None and control["credential_state"] != "active":
+            raise ValueError("workspace credentials are not active")
+
+    @contextmanager
+    def workspace_mutation_guard(self, organization_id, repository_id):
+        """Linearize an authenticated write against bulk credential revocation."""
+        with self.connection.transaction():
+            self._assert_workspace_credentials_active(
+                organization_id, lock=True)
+            repository = self.connection.execute(
+                "SELECT 1 FROM repositories WHERE organization_id = %s "
+                "AND repository_id = %s",
+                (organization_id, repository_id),
+            ).fetchone()
+            if repository is None:
+                raise ValueError("unknown repository")
+            yield
+
     def create_service_token(self, token_id, secret_hash, organization_id, repository_id,
                              *, environment=None, description=None, expires_at=None,
                              scope="collector"):
@@ -2716,20 +2989,30 @@ class PostgresLifecycleStore:
         defaults to ``collector`` for backwards compatibility. Governance is
         not a scope any token can hold — that requires a human session.
         """
-        self.connection.execute(
-            "INSERT INTO api_service_tokens "
-            "(token_id, secret_hash, organization_id, repository_id, environment, "
-            "description, expires_at, scope) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-            (token_id, secret_hash, organization_id, repository_id, environment,
-             description, expires_at, scope),
-        )
+        with self.connection.transaction():
+            self._assert_workspace_credentials_active(
+                organization_id, lock=True)
+            self.connection.execute(
+                "INSERT INTO api_service_tokens "
+                "(token_id, secret_hash, organization_id, repository_id, environment, "
+                "description, expires_at, scope) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (token_id, secret_hash, organization_id, repository_id, environment,
+                 description, expires_at, scope),
+            )
         return token_id
 
     def get_service_token(self, token_id):
         row = self.connection.execute(
-            "SELECT token_id, secret_hash, organization_id, repository_id, environment, "
-            "scope, expires_at, revoked_at FROM api_service_tokens WHERE token_id=%s",
+            "SELECT token.token_id, token.secret_hash, token.organization_id, "
+            "token.repository_id, token.environment, token.scope, "
+            "token.expires_at, token.revoked_at, control.credential_state "
+            "FROM api_service_tokens token "
+            "LEFT JOIN tenant_operational_roots ownership "
+            "  ON ownership.organization_id = token.organization_id "
+            "LEFT JOIN tenant_lifecycle_controls control "
+            "  ON control.tenant_id = ownership.tenant_id "
+            "WHERE token.token_id=%s",
             (token_id,),
         ).fetchone()
         return dict(row) if row else None
@@ -2748,19 +3031,33 @@ class PostgresLifecycleStore:
                                  github_access_token=None,
                                  github_access_expires_at=None,
                                  github_refresh_token=None,
-                                 github_refresh_expires_at=None):
-        self.connection.execute(
-            "INSERT INTO dashboard_sessions ("
-            "session_id_hash, organization_id, repository_id, environment, "
-            "github_login, github_user_id, github_permission, may_govern, "
-            "permission_checked_at, github_access_token, github_access_expires_at, "
-            "github_refresh_token, github_refresh_expires_at, csrf_token, expires_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            (session_id_hash, organization_id, repository_id, environment,
-             github_login, github_user_id, github_permission, may_govern,
-             permission_checked_at, github_access_token, github_access_expires_at,
-             github_refresh_token, github_refresh_expires_at, csrf_token, expires_at),
-        )
+                                 github_refresh_expires_at=None,
+                                 source_clerk_user_id=None):
+        with self.connection.transaction():
+            self._assert_workspace_credentials_active(
+                organization_id, lock=True)
+            if source_clerk_user_id is not None:
+                identity = self.connection.execute(
+                    "SELECT revoked_at FROM clerk_github_identities "
+                    "WHERE clerk_user_id = %s FOR SHARE",
+                    (source_clerk_user_id,),
+                ).fetchone()
+                if identity is None or identity["revoked_at"] is not None:
+                    raise ValueError("github identity has been revoked")
+            self.connection.execute(
+                "INSERT INTO dashboard_sessions ("
+                "session_id_hash, organization_id, repository_id, environment, "
+                "github_login, github_user_id, github_permission, may_govern, "
+                "permission_checked_at, github_access_token, github_access_expires_at, "
+                "github_refresh_token, github_refresh_expires_at, csrf_token, expires_at, "
+                "source_clerk_user_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (session_id_hash, organization_id, repository_id, environment,
+                 github_login, github_user_id, github_permission, may_govern,
+                 permission_checked_at, github_access_token, github_access_expires_at,
+                 github_refresh_token, github_refresh_expires_at, csrf_token,
+                 expires_at, source_clerk_user_id),
+            )
         return session_id_hash
 
     def get_dashboard_session(self, session_id_hash):
@@ -2887,7 +3184,7 @@ class PostgresLifecycleStore:
         claim to have revoked something it did not.
         """
         row = self.connection.execute(
-            "UPDATE api_service_tokens SET revoked_at=now() "
+            "UPDATE api_service_tokens SET revoked_at=now(), secret_hash=NULL "
             "WHERE token_id=%s AND revoked_at IS NULL RETURNING token_id",
             (token_id,),
         ).fetchone()
@@ -2897,7 +3194,7 @@ class PostgresLifecycleStore:
                                        token_id, *, scope):
         """Revoke only when the named token belongs to this exact tenant."""
         row = self.connection.execute(
-            "UPDATE api_service_tokens SET revoked_at=now() "
+            "UPDATE api_service_tokens SET revoked_at=now(), secret_hash=NULL "
             "WHERE token_id=%s AND organization_id=%s AND repository_id=%s "
             "AND scope=%s AND revoked_at IS NULL RETURNING token_id",
             (token_id, organization_id, repository_id, scope),
@@ -4049,7 +4346,7 @@ class PostgresLifecycleStore:
         self.connection.execute(
             "UPDATE collection_requests SET state=%s, failure_reason=%s, completed_at=now() "
             "WHERE organization_id=%s AND repository_id=%s AND request_id=%s "
-            "AND state NOT IN ('COMPLETED','FAILED','EXPIRED')",
+            "AND state NOT IN ('COMPLETED','FAILED','EXPIRED','CANCELED')",
             (state, failure_reason, organization_id, repository_id, request_id),
         )
         return self.get_collection_request(organization_id, repository_id, request_id)

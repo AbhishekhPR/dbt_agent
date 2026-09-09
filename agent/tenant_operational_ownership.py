@@ -26,6 +26,7 @@ TENANT_OWNED_TABLES = (
     "tenant_polar_checkouts",
     "billing_checkout_intents",
     "billing_subscription_revocation_results",
+    "workspace_credential_revocations",
     "github_installation_states",
     "tenant_github_installations",
     "tenant_repositories",

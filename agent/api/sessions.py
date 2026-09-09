@@ -197,7 +197,8 @@ class SessionManager:
                                          organization_id, repository_id,
                                          environment, refresh_token=None,
                                          access_expires_at=None,
-                                         refresh_expires_at=None):
+                                         refresh_expires_at=None,
+                                         source_clerk_user_id=None):
         """Mint a dashboard session from an ALREADY-VERIFIED GitHub credential.
 
         ###############################################################
@@ -272,6 +273,7 @@ class SessionManager:
             github_refresh_token=encrypt(
                 self._key, refresh_token, associated=session_hash),
             github_refresh_expires_at=refresh_expires_at,
+            source_clerk_user_id=source_clerk_user_id,
         )
         return {
             "session_id": session_id,
