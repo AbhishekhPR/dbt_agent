@@ -70,6 +70,7 @@ class WorkspaceAuthorizationContext:
     ownership_status: str
     active_owner_count: int
     sync_generation: str
+    clerk_membership_id: str | None = None
 
 
 def project_memberships(snapshot: ClerkOrganizationSnapshot) -> MembershipProjection:
@@ -174,6 +175,10 @@ class WorkspaceMembershipAuthorizer:
 
     def current_workspace_role(self, principal) -> str:
         return self._context(principal, require_authoritative_ownership=False).role
+
+    def authorization_context(self, principal) -> WorkspaceAuthorizationContext:
+        """Return the refreshed authoritative context for sensitive flows."""
+        return self._context(principal, require_authoritative_ownership=True)
 
     def require_owner(self, principal) -> WorkspaceAuthorizationContext:
         context = self._context(principal, require_authoritative_ownership=True)
@@ -282,4 +287,5 @@ class WorkspaceMembershipAuthorizer:
             ownership_status=row["ownership_status"],
             active_owner_count=owner_count,
             sync_generation=generation,
+            clerk_membership_id=row.get("clerk_membership_id"),
         )

@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import os
 import shutil
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from agent.api.clerk_management import ClerkMembershipUnavailable, ClerkResourceAbsent
@@ -79,6 +80,30 @@ class WorkspaceDeletionEngine:
                 return {"receipt_id": receipt["receipt_id"], "state": "completed"}
             raise LifecycleBlocked("lifecycle_operation_not_found")
 
+        operation, lease_id = self._claim(operation)
+        try:
+            return self._dispatch(principal, operation)
+        finally:
+            self._release(operation, lease_id)
+
+    def advance_server(self, operation_id):
+        """Finish the post-Clerk crash window from trusted durable state."""
+        operation_reader = getattr(self.store, "workspace_lifecycle_operation", None)
+        operation = operation_reader(operation_id) if operation_reader else None
+        if operation is None:
+            receipt = self.store.deletion_receipt(operation_id)
+            if receipt:
+                return {"receipt_id": receipt["receipt_id"], "state": "completed"}
+            raise LifecycleBlocked("lifecycle_operation_not_found")
+        if operation["phase"] != "clerk_organization_deletion":
+            raise LifecycleBlocked("server_resume_not_available")
+        operation, lease_id = self._claim(operation)
+        try:
+            return self._clerk_and_finalize(operation)
+        finally:
+            self._release(operation, lease_id)
+
+    def _dispatch(self, principal, operation):
         phase = operation["phase"]
         if phase in {"frozen", "billing_reconciliation"}:
             return self._billing(principal, operation)
@@ -91,6 +116,27 @@ class WorkspaceDeletionEngine:
         if phase in {"database_purge", "clerk_organization_deletion"}:
             return self._clerk_and_finalize(operation)
         raise LifecycleBlocked("invalid_lifecycle_phase")
+
+    def _claim(self, operation):
+        claim = getattr(self.store, "claim_workspace_lifecycle_operation", None)
+        if claim is None:
+            return operation, None
+        now = self.clock()
+        lease_id = f"lease_{uuid.uuid4().hex}"
+        claimed = claim(
+            tenant_id=operation["tenant_id"],
+            operation_id=operation["operation_id"], lease_id=lease_id, now=now,
+            lease_expires_at=now + timedelta(minutes=2))
+        if claimed is None:
+            raise LifecycleBlocked("lifecycle_operation_busy",
+                                   disposition="retryable")
+        return claimed, lease_id
+
+    def _release(self, operation, lease_id):
+        release = getattr(self.store, "release_workspace_lifecycle_operation", None)
+        if lease_id is not None and release is not None:
+            release(tenant_id=operation["tenant_id"],
+                    operation_id=operation["operation_id"], lease_id=lease_id)
 
     def _billing(self, principal, operation):
         operation = self._phase(operation, {"frozen", "billing_reconciliation"},
@@ -188,9 +234,15 @@ class WorkspaceDeletionEngine:
             try:
                 self.clerk_client.delete_organization(
                     tenant["clerk_organization_id"])
-                outcome = "accepted"
+            except ClerkResourceAbsent:
+                pass
+            try:
+                self.clerk_client.get_organization(tenant["clerk_organization_id"])
             except ClerkResourceAbsent:
                 outcome = "verified_absent"
+            else:
+                self._fail(operation, "clerk_organization_not_terminal",
+                           disposition="retryable")
             self.store.record_workspace_lifecycle_provider_result(
                 operation_id=operation["operation_id"],
                 tenant_id=operation["tenant_id"], provider="clerk",

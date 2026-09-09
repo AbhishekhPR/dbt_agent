@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS workspace_lifecycle_provider_results (
 CREATE TABLE IF NOT EXISTS account_lifecycle_operations (
     operation_id TEXT PRIMARY KEY,
     clerk_user_id TEXT NOT NULL,
+    dissociated_actor_ref TEXT NOT NULL,
     operation_kind TEXT NOT NULL CHECK (operation_kind IN ('delete_account')),
     phase TEXT NOT NULL CHECK (phase IN (
         'requested', 'membership_inventory', 'leaving_workspaces',
@@ -94,6 +95,7 @@ CREATE TABLE IF NOT EXISTS account_lifecycle_operations (
     completed_at TIMESTAMPTZ,
     CHECK (length(operation_id) BETWEEN 1 AND 255),
     CHECK (length(clerk_user_id) BETWEEN 1 AND 255),
+    CHECK (dissociated_actor_ref ~ '^deleted_actor_[0-9a-f]{32}$'),
     CHECK (lease_id IS NULL OR length(lease_id) BETWEEN 1 AND 255),
     CHECK (failure_category IS NULL OR length(failure_category) BETWEEN 1 AND 100),
     CHECK ((disposition = 'completed') = (completed_at IS NOT NULL))
@@ -102,6 +104,57 @@ CREATE TABLE IF NOT EXISTS account_lifecycle_operations (
 CREATE UNIQUE INDEX uq_account_lifecycle_active_user
     ON account_lifecycle_operations (clerk_user_id)
     WHERE completed_at IS NULL;
+
+CREATE TABLE clerk_membership_departure_guards (
+    clerk_organization_id TEXT PRIMARY KEY,
+    operation_kind TEXT NOT NULL CHECK (operation_kind IN ('leave_workspace','delete_account')),
+    operation_id TEXT NOT NULL,
+    clerk_user_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (length(clerk_organization_id) BETWEEN 1 AND 255),
+    CHECK (length(operation_id) BETWEEN 1 AND 255),
+    CHECK (length(clerk_user_id) BETWEEN 1 AND 255)
+);
+
+-- Local connection state is distinct from GitHub's installation state. Rows
+-- remain as historical ownership evidence and can be reconnected only through
+-- the verified onboarding flow.
+ALTER TABLE tenant_repositories ADD COLUMN disconnected_at TIMESTAMPTZ;
+ALTER TABLE tenant_repositories ADD COLUMN disconnect_reason TEXT;
+ALTER TABLE tenant_repositories ADD CONSTRAINT tenant_repository_disconnect_check
+    CHECK ((disconnected_at IS NULL) = (disconnect_reason IS NULL));
+ALTER TABLE tenant_github_installations ADD COLUMN disconnected_at TIMESTAMPTZ;
+ALTER TABLE tenant_github_installations ADD COLUMN github_absence_verified_at TIMESTAMPTZ;
+
+CREATE TABLE github_access_operations (
+    operation_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants (tenant_id) ON DELETE RESTRICT,
+    initiated_by_clerk_user_id TEXT NOT NULL,
+    operation_kind TEXT NOT NULL CHECK (operation_kind IN
+        ('repository_disconnect','installation_disconnect','installation_uninstall')),
+    github_repository_id BIGINT,
+    github_installation_id BIGINT,
+    phase TEXT NOT NULL CHECK (phase IN ('local_revoked','provider_revocation','completed')),
+    disposition TEXT NOT NULL CHECK (disposition IN
+        ('running','retryable','blocked','completed')),
+    failure_category TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,
+    CHECK (length(operation_id) BETWEEN 1 AND 255),
+    CHECK (length(initiated_by_clerk_user_id) BETWEEN 1 AND 255),
+    CHECK ((operation_kind='repository_disconnect') = (github_repository_id IS NOT NULL)),
+    CHECK ((operation_kind IN ('installation_disconnect','installation_uninstall')) =
+           (github_installation_id IS NOT NULL)),
+    CHECK ((disposition='completed') = (completed_at IS NOT NULL)),
+    UNIQUE (operation_id, tenant_id)
+);
+CREATE UNIQUE INDEX uq_github_access_active_repository
+    ON github_access_operations (tenant_id, github_repository_id)
+    WHERE completed_at IS NULL AND github_repository_id IS NOT NULL;
+CREATE UNIQUE INDEX uq_github_access_active_installation
+    ON github_access_operations (tenant_id, github_installation_id)
+    WHERE completed_at IS NULL AND github_installation_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS account_lifecycle_memberships (
     operation_id TEXT NOT NULL REFERENCES account_lifecycle_operations (operation_id)
@@ -118,6 +171,12 @@ CREATE TABLE IF NOT EXISTS account_lifecycle_memberships (
     CHECK (length(clerk_organization_id) BETWEEN 1 AND 255),
     CHECK (length(clerk_membership_id) BETWEEN 1 AND 255)
 );
+
+-- Serialize departures from the same Clerk organization. Without this, two
+-- owners could both observe an owner count of two and concurrently leave.
+CREATE UNIQUE INDEX uq_account_lifecycle_membership_departure
+    ON account_lifecycle_memberships (clerk_organization_id)
+    WHERE state <> 'verified_absent';
 
 CREATE TABLE IF NOT EXISTS deletion_receipts (
     receipt_id TEXT PRIMARY KEY,

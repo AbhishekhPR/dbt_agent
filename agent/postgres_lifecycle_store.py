@@ -280,6 +280,30 @@ class PostgresLifecycleStore:
         ).fetchone()
         return dict(row) if row else None
 
+    def workspace_lifecycle_operation(self, operation_id):
+        row = self.connection.execute(
+            "SELECT * FROM workspace_lifecycle_operations WHERE operation_id=%s",
+            (operation_id,)).fetchone()
+        return dict(row) if row else None
+
+    def claim_workspace_lifecycle_operation(self, *, tenant_id, operation_id,
+                                            lease_id, now, lease_expires_at):
+        row = self.connection.execute(
+            "UPDATE workspace_lifecycle_operations SET lease_id=%s,"
+            "lease_expires_at=%s,generation=generation+1,updated_at=%s "
+            "WHERE tenant_id=%s AND operation_id=%s AND completed_at IS NULL "
+            "AND (lease_id IS NULL OR lease_expires_at<%s) RETURNING *",
+            (lease_id, lease_expires_at, now, tenant_id, operation_id, now)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def release_workspace_lifecycle_operation(self, *, tenant_id, operation_id,
+                                              lease_id):
+        self.connection.execute(
+            "UPDATE workspace_lifecycle_operations SET lease_id=NULL,"
+            "lease_expires_at=NULL WHERE tenant_id=%s AND operation_id=%s "
+            "AND lease_id=%s", (tenant_id, operation_id, lease_id))
+
     def set_workspace_lifecycle_phase(self, *, tenant_id, operation_id,
                                       expected_phases, phase, updated_at,
                                       **values):
@@ -1537,7 +1561,8 @@ class PostgresLifecycleStore:
                 " verified_github_user_id, bound_via_state_id) "
                 "VALUES (%s, %s, %s, %s, %s) "
                 "ON CONFLICT (github_installation_id) DO UPDATE SET "
-                "  updated_at = now() "
+                "  updated_at = now(), disconnected_at = NULL, "
+                "  github_absence_verified_at = NULL "
                 "  WHERE tenant_github_installations.tenant_id = EXCLUDED.tenant_id "
                 "RETURNING github_installation_id, tenant_id, bound_by_clerk_user_id, "
                 "          verified_github_user_id, bound_via_state_id, bound_at, "
@@ -1569,13 +1594,15 @@ class PostgresLifecycleStore:
         Joined to the facts table so a caller gets account and status in one
         read. No credential or token is selected, because none is stored.
         """
-        clause = "" if include_deleted else " AND i.status <> 'deleted'"
+        clause = ("" if include_deleted else
+                  " AND i.status <> 'deleted' AND b.disconnected_at IS NULL")
         rows = self.connection.execute(
             "SELECT b.github_installation_id, b.tenant_id, b.bound_at, "
             "       b.bound_by_clerk_user_id, b.verified_github_user_id, "
             "       i.github_app_id, i.github_account_id, i.github_account_login, "
             "       i.github_account_type, i.repository_selection, i.status, "
-            "       i.suspended_at, i.deleted_at "
+            "       i.suspended_at, i.deleted_at, b.disconnected_at, "
+            "       b.github_absence_verified_at "
             "FROM tenant_github_installations b "
             "JOIN github_installations i "
             "  ON i.github_installation_id = b.github_installation_id "
@@ -1589,7 +1616,7 @@ class PostgresLifecycleStore:
         """Which tenant owns an installation, or None if it is unbound."""
         row = self.connection.execute(
             "SELECT tenant_id FROM tenant_github_installations "
-            "WHERE github_installation_id = %s",
+            "WHERE github_installation_id = %s AND disconnected_at IS NULL",
             (github_installation_id,),
         ).fetchone()
         return row["tenant_id"] if row else None
@@ -1614,7 +1641,8 @@ class PostgresLifecycleStore:
 
     def count_tenant_repositories(self, tenant_id):
         row = self.connection.execute(
-            "SELECT count(*) AS n FROM tenant_repositories WHERE tenant_id = %s",
+            "SELECT count(*) AS n FROM tenant_repositories WHERE tenant_id = %s "
+            "AND disconnected_at IS NULL",
             (tenant_id,),
         ).fetchone()
         return int(row["n"]) if row else 0
@@ -1695,6 +1723,7 @@ class PostgresLifecycleStore:
             "  dbt_detected = EXCLUDED.dbt_detected, "
             "  dbt_project_dir = EXCLUDED.dbt_project_dir, "
             "  dbt_checked_at = EXCLUDED.dbt_checked_at, "
+            "  disconnected_at = NULL, disconnect_reason = NULL, "
             "  updated_at = now() "
             # The guard. On conflict with the SAME tenant this updates and
             # returns; with a different tenant no row is returned and the
@@ -1705,7 +1734,7 @@ class PostgresLifecycleStore:
             "          dbt_detected, dbt_project_dir, dbt_checked_at, "
             "          project_dir, manifest_path, enforcement_mode, "
             "          ci_token_id, ci_token_issued_at, ci_token_delivery, "
-            "          selected_at, configured_at",
+            "          selected_at, configured_at, disconnected_at, disconnect_reason",
             (github_repository_id, tenant_id, github_installation_id,
              owner_login, name, default_branch, private, dbt_detected,
              dbt_project_dir, dbt_checked_at),
@@ -1724,7 +1753,8 @@ class PostgresLifecycleStore:
             "       owner_login, name, default_branch, private, dbt_detected, "
             "       dbt_project_dir, dbt_checked_at, project_dir, manifest_path, "
             "       enforcement_mode, ci_token_id, ci_token_issued_at, "
-            "       ci_token_delivery, selected_at, configured_at "
+            "       ci_token_delivery, selected_at, configured_at, "
+            "       disconnected_at, disconnect_reason "
             "FROM tenant_repositories "
             "WHERE tenant_id = %s AND github_repository_id = %s",
             (tenant_id, github_repository_id),
@@ -1737,7 +1767,7 @@ class PostgresLifecycleStore:
             "       owner_login, name, default_branch, private, dbt_detected, "
             "       dbt_project_dir, project_dir, manifest_path, "
             "       enforcement_mode, ci_token_id, ci_token_delivery, "
-            "       selected_at, configured_at "
+            "       selected_at, configured_at, disconnected_at, disconnect_reason "
             "FROM tenant_repositories WHERE tenant_id = %s "
             "ORDER BY owner_login, name",
             (tenant_id,),
@@ -1794,6 +1824,7 @@ class PostgresLifecycleStore:
             "       ci_token_issued_at, ci_token_delivery, configured_at "
             "FROM tenant_repositories "
             "WHERE tenant_id = %s AND manifest_path IS NOT NULL "
+            "AND disconnected_at IS NULL "
             "ORDER BY configured_at DESC NULLS LAST, github_repository_id "
             "LIMIT 1",
             (tenant_id,),
@@ -2310,7 +2341,8 @@ class PostgresLifecycleStore:
                           "billing_webhook_deliveries", "tenant_memberships",
                           "tenant_membership_sync_state", "tenant_onboarding_state",
                           "tenant_repository_dbt_detection", "tenant_repositories",
-                          "github_installation_states", "tenant_github_installations"):
+                          "github_installation_states", "github_access_operations",
+                          "tenant_github_installations"):
                 self.connection.execute(
                     f"DELETE FROM {table} WHERE tenant_id=%s", (tenant_id,))
             self.connection.execute(
@@ -2334,6 +2366,477 @@ class PostgresLifecycleStore:
             (receipt_id,),
         ).fetchone()
         return dict(row) if row else None
+
+    # -- user-facing GitHub/collector access controls -------------------
+
+    def tenant_lifecycle_access_inventory(self, tenant_id):
+        inventory = self.tenant_operational_inventory(tenant_id)
+        if inventory.get("ownership_status") != "complete":
+            raise ValueError("operational_ownership_incomplete")
+        roots = list(inventory.get("operational_roots") or ())
+        repositories = [dict(row) for row in self.connection.execute(
+            "SELECT github_repository_id AS id,owner_login AS owner,name,"
+            "github_installation_id AS installation_id,"
+            "(disconnected_at IS NULL) AS connected "
+            "FROM tenant_repositories WHERE tenant_id=%s ORDER BY owner_login,name",
+            (tenant_id,)).fetchall()]
+        installations = [dict(row) for row in self.connection.execute(
+            "SELECT binding.github_installation_id AS id,"
+            "facts.github_account_login AS account_login,facts.status,"
+            "(binding.disconnected_at IS NULL AND facts.status<>'deleted') AS connected "
+            "FROM tenant_github_installations binding JOIN github_installations facts "
+            "ON facts.github_installation_id=binding.github_installation_id "
+            "WHERE binding.tenant_id=%s ORDER BY binding.github_installation_id",
+            (tenant_id,)).fetchall()]
+        collectors = [dict(row) for row in self.connection.execute(
+            "SELECT token_id,repository_id,environment,"
+            "(revoked_at IS NULL AND secret_hash IS NOT NULL) AS active "
+            "FROM api_service_tokens WHERE organization_id=ANY(%s) "
+            "AND scope='collector' ORDER BY repository_id,environment,token_id",
+            (roots,)).fetchall()]
+        return {"ownership_status": "complete", "repositories": repositories,
+                "installations": installations, "collector_tokens": collectors}
+
+    def revoke_tenant_collector_access(self, *, tenant_id, token_id=None,
+                                       initiated_by_clerk_user_id=None):
+        now = datetime.now(timezone.utc)
+        with self.connection.transaction():
+            self._lock_tenant_for_root_binding(tenant_id)
+            inventory = self.tenant_operational_inventory(tenant_id)
+            if inventory.get("ownership_status") != "complete":
+                raise ValueError("operational_ownership_incomplete")
+            roots = list(inventory.get("operational_roots") or ())
+            if token_id is not None:
+                targets = self.connection.execute(
+                    "SELECT token_id,organization_id,repository_id,environment "
+                    "FROM api_service_tokens WHERE token_id=%s AND scope='collector' "
+                    "AND organization_id=ANY(%s) FOR UPDATE",
+                    (token_id, roots)).fetchall()
+                if not targets:
+                    raise ValueError("collector_token_not_found")
+            else:
+                targets = self.connection.execute(
+                    "SELECT token_id,organization_id,repository_id,environment "
+                    "FROM api_service_tokens WHERE scope='collector' "
+                    "AND organization_id=ANY(%s) FOR UPDATE", (roots,)).fetchall()
+            ids = [row["token_id"] for row in targets]
+            if not ids:
+                return {"state": "revoked", "tokens_revoked": 0,
+                        "collector_identities_revoked": 0,
+                        "collection_requests_canceled": 0}
+            tokens = self.connection.execute(
+                "UPDATE api_service_tokens SET secret_hash=NULL,"
+                "revoked_at=COALESCE(revoked_at,%s) WHERE token_id=ANY(%s) "
+                "AND (secret_hash IS NOT NULL OR revoked_at IS NULL)",
+                (now, ids)).rowcount
+            collectors = self.connection.execute(
+                "UPDATE collector_identities SET revoked=TRUE,"
+                "revoked_at=COALESCE(revoked_at,%s),revoked_reason='collector_access_revoked',"
+                "token_id=NULL WHERE token_id=ANY(%s)", (now, ids)).rowcount
+            requests = 0
+            for target in targets:
+                sql = (
+                    "UPDATE collection_requests SET state='CANCELED',canceled_at=%s,"
+                    "cancellation_reason='collector_access_revoked' "
+                    "WHERE organization_id=%s AND repository_id=%s ")
+                args = [now, target["organization_id"], target["repository_id"]]
+                if target["environment"] is not None:
+                    sql += "AND environment=%s "
+                    args.append(target["environment"])
+                sql += "AND state IN ('PENDING','ACKNOWLEDGED')"
+                requests += self.connection.execute(sql, tuple(args)).rowcount
+        return {"state": "revoked", "tokens_revoked": tokens,
+                "collector_identities_revoked": collectors,
+                "collection_requests_canceled": requests}
+
+    def begin_github_access_operation(self, *, tenant_id,
+                                      initiated_by_clerk_user_id,
+                                      operation_kind,
+                                      github_repository_id=None,
+                                      github_installation_id=None):
+        if operation_kind not in {"repository_disconnect", "installation_disconnect",
+                                  "installation_uninstall"}:
+            raise ValueError("invalid_github_access_operation")
+        operation_id = f"gha_{uuid.uuid4().hex}"
+        now = datetime.now(timezone.utc)
+        with self.connection.transaction():
+            self._lock_tenant_for_root_binding(tenant_id)
+            if operation_kind == "repository_disconnect":
+                repository = self.connection.execute(
+                    "SELECT * FROM tenant_repositories WHERE tenant_id=%s "
+                    "AND github_repository_id=%s FOR UPDATE",
+                    (tenant_id, github_repository_id)).fetchone()
+                if repository is None:
+                    raise ValueError("repository_not_found")
+                existing = self.connection.execute(
+                    "SELECT * FROM github_access_operations WHERE tenant_id=%s "
+                    "AND github_repository_id=%s AND completed_at IS NULL FOR UPDATE",
+                    (tenant_id, github_repository_id)).fetchone()
+                if existing:
+                    return {**dict(existing), "state": "running"}
+                token_ids = ([repository["ci_token_id"]]
+                             if repository["ci_token_id"] else [])
+                self.connection.execute(
+                    "UPDATE tenant_repositories SET ci_token_id=NULL,"
+                    "ci_token_delivery=NULL,disconnected_at=COALESCE(disconnected_at,%s),"
+                    "disconnect_reason='repository_disconnected',updated_at=%s "
+                    "WHERE tenant_id=%s AND github_repository_id=%s",
+                    (now, now, tenant_id, github_repository_id))
+            else:
+                binding = self.connection.execute(
+                    "SELECT 1 FROM tenant_github_installations WHERE tenant_id=%s "
+                    "AND github_installation_id=%s FOR UPDATE",
+                    (tenant_id, github_installation_id)).fetchone()
+                if binding is None:
+                    raise ValueError("installation_not_found")
+                existing = self.connection.execute(
+                    "SELECT * FROM github_access_operations WHERE tenant_id=%s "
+                    "AND github_installation_id=%s AND completed_at IS NULL FOR UPDATE",
+                    (tenant_id, github_installation_id)).fetchone()
+                if existing:
+                    return {**dict(existing), "state": "running"}
+                token_ids = [row["ci_token_id"] for row in self.connection.execute(
+                    "SELECT ci_token_id FROM tenant_repositories WHERE tenant_id=%s "
+                    "AND github_installation_id=%s AND ci_token_id IS NOT NULL FOR UPDATE",
+                    (tenant_id, github_installation_id)).fetchall()]
+                self.connection.execute(
+                    "UPDATE tenant_repositories SET ci_token_id=NULL,"
+                    "ci_token_delivery=NULL,disconnected_at=COALESCE(disconnected_at,%s),"
+                    "disconnect_reason='installation_disconnected',updated_at=%s "
+                    "WHERE tenant_id=%s AND github_installation_id=%s",
+                    (now, now, tenant_id, github_installation_id))
+                self.connection.execute(
+                    "UPDATE tenant_github_installations SET disconnected_at=COALESCE(disconnected_at,%s),"
+                    "updated_at=%s WHERE tenant_id=%s AND github_installation_id=%s",
+                    (now, now, tenant_id, github_installation_id))
+            if token_ids:
+                self.connection.execute(
+                    "UPDATE api_service_tokens SET secret_hash=NULL,"
+                    "revoked_at=COALESCE(revoked_at,%s) WHERE token_id=ANY(%s)",
+                    (now, token_ids))
+                self.connection.execute(
+                    "UPDATE collector_identities SET revoked=TRUE,"
+                    "revoked_at=COALESCE(revoked_at,%s),"
+                    "revoked_reason='github_access_disconnected',token_id=NULL "
+                    "WHERE token_id=ANY(%s)", (now, token_ids))
+            terminal = operation_kind != "installation_uninstall"
+            row = self.connection.execute(
+                "INSERT INTO github_access_operations "
+                "(operation_id,tenant_id,initiated_by_clerk_user_id,operation_kind,"
+                "github_repository_id,github_installation_id,phase,disposition,completed_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *",
+                (operation_id, tenant_id, initiated_by_clerk_user_id, operation_kind,
+                 github_repository_id, github_installation_id,
+                 "completed" if terminal else "local_revoked",
+                 "completed" if terminal else "running", now if terminal else None)
+            ).fetchone()
+        result = dict(row)
+        result["state"] = "completed" if terminal else "running"
+        return result
+
+    def complete_github_access_operation(self, *, tenant_id, operation_id,
+                                         provider_absence_verified):
+        if provider_absence_verified is not True:
+            raise ValueError("github_absence_not_verified")
+        now = datetime.now(timezone.utc)
+        with self.connection.transaction():
+            operation = self.connection.execute(
+                "SELECT * FROM github_access_operations WHERE tenant_id=%s "
+                "AND operation_id=%s FOR UPDATE", (tenant_id, operation_id)).fetchone()
+            if operation is None:
+                raise ValueError("github_access_operation_not_found")
+            if operation["operation_kind"] != "installation_uninstall":
+                raise ValueError("invalid_github_access_operation")
+            self.connection.execute(
+                "UPDATE tenant_github_installations SET github_absence_verified_at=%s "
+                "WHERE tenant_id=%s AND github_installation_id=%s",
+                (now, tenant_id, operation["github_installation_id"]))
+            self.connection.execute(
+                "UPDATE github_access_operations SET phase='completed',"
+                "disposition='completed',failure_category=NULL,updated_at=%s,completed_at=%s "
+                "WHERE operation_id=%s", (now, now, operation_id))
+        return {"operation_id": operation_id, "state": "completed"}
+
+    def fail_github_access_operation(self, *, tenant_id, operation_id,
+                                     disposition, failure_category):
+        if disposition not in {"retryable", "blocked"}:
+            raise ValueError("invalid_github_access_disposition")
+        self.connection.execute(
+            "UPDATE github_access_operations SET phase='provider_revocation',"
+            "disposition=%s,failure_category=%s,updated_at=now() "
+            "WHERE tenant_id=%s AND operation_id=%s",
+            (disposition, failure_category, tenant_id, operation_id))
+
+    # -- account lifecycle ----------------------------------------------
+
+    def begin_workspace_departure(self, *, tenant_id, clerk_organization_id,
+                                  clerk_user_id, clerk_membership_id, role,
+                                  active_owner_count):
+        if role == "owner" and active_owner_count <= 1:
+            raise ValueError("sole_owner")
+        operation_id = f"leave_{uuid.uuid4().hex}"
+        with self.connection.transaction():
+            tenant = self.connection.execute(
+                "SELECT clerk_organization_id FROM tenants WHERE tenant_id=%s FOR UPDATE",
+                (tenant_id,)).fetchone()
+            if tenant is None or tenant["clerk_organization_id"] != clerk_organization_id:
+                raise ValueError("workspace_scope_mismatch")
+            current = self.connection.execute(
+                "SELECT clerk_membership_id,role,status FROM tenant_memberships "
+                "WHERE tenant_id=%s AND clerk_user_id=%s FOR UPDATE",
+                (tenant_id, clerk_user_id)).fetchone()
+            if (current is None or current["status"] != "active"
+                    or current["clerk_membership_id"] != clerk_membership_id
+                    or current["role"] != role):
+                raise ValueError("membership_projection_changed")
+            existing = self.connection.execute(
+                "SELECT * FROM clerk_membership_departure_guards "
+                "WHERE clerk_organization_id=%s FOR UPDATE",
+                (clerk_organization_id,)).fetchone()
+            if existing:
+                if existing["clerk_user_id"] == clerk_user_id:
+                    return dict(existing)
+                raise ValueError("concurrent_membership_departure")
+            row = self.connection.execute(
+                "INSERT INTO clerk_membership_departure_guards "
+                "(clerk_organization_id,operation_kind,operation_id,clerk_user_id) "
+                "VALUES (%s,'leave_workspace',%s,%s) RETURNING *",
+                (clerk_organization_id, operation_id, clerk_user_id)).fetchone()
+        return dict(row)
+
+    def complete_workspace_departure(self, *, operation_id,
+                                     clerk_organization_id, clerk_user_id):
+        with self.connection.transaction():
+            guard = self.connection.execute(
+                "SELECT * FROM clerk_membership_departure_guards "
+                "WHERE clerk_organization_id=%s FOR UPDATE",
+                (clerk_organization_id,)).fetchone()
+            if (guard is None or guard["operation_id"] != operation_id
+                    or guard["clerk_user_id"] != clerk_user_id
+                    or guard["operation_kind"] != "leave_workspace"):
+                raise ValueError("workspace_departure_guard_failed")
+            tenant = self.connection.execute(
+                "SELECT tenant_id FROM tenants WHERE clerk_organization_id=%s",
+                (clerk_organization_id,)).fetchone()
+            if tenant:
+                self.connection.execute(
+                    "UPDATE tenant_memberships SET status='removed',updated_at=now() "
+                    "WHERE tenant_id=%s AND clerk_user_id=%s",
+                    (tenant["tenant_id"], clerk_user_id))
+            self.connection.execute(
+                "DELETE FROM clerk_membership_departure_guards "
+                "WHERE clerk_organization_id=%s AND operation_id=%s",
+                (clerk_organization_id, operation_id))
+
+    def account_lifecycle_operation_for_user(self, clerk_user_id):
+        row = self.connection.execute(
+            "SELECT * FROM account_lifecycle_operations "
+            "WHERE clerk_user_id=%s AND completed_at IS NULL",
+            (clerk_user_id,)).fetchone()
+        return dict(row) if row else None
+
+    def account_lifecycle_operation(self, operation_id):
+        row = self.connection.execute(
+            "SELECT * FROM account_lifecycle_operations WHERE operation_id=%s",
+            (operation_id,)).fetchone()
+        return dict(row) if row else None
+
+    def claim_account_lifecycle_operation(self, *, operation_id, lease_id,
+                                          now, lease_expires_at):
+        row = self.connection.execute(
+            "UPDATE account_lifecycle_operations SET lease_id=%s,"
+            "lease_expires_at=%s,generation=generation+1,updated_at=%s "
+            "WHERE operation_id=%s AND completed_at IS NULL "
+            "AND (lease_id IS NULL OR lease_expires_at<%s) RETURNING *",
+            (lease_id, lease_expires_at, now, operation_id, now)).fetchone()
+        return dict(row) if row else None
+
+    def release_account_lifecycle_operation(self, *, operation_id, lease_id):
+        self.connection.execute(
+            "UPDATE account_lifecycle_operations SET lease_id=NULL,lease_expires_at=NULL "
+            "WHERE operation_id=%s AND lease_id=%s", (operation_id, lease_id))
+
+    def begin_account_deletion(self, *, clerk_user_id, memberships,
+                               dissociated_actor_ref,
+                               confirmation_verified_at):
+        operation_id = f"ald_{uuid.uuid4().hex}"
+        memberships = tuple(memberships)
+        organization_ids = [row["clerk_organization_id"] for row in memberships]
+        if len(organization_ids) != len(set(organization_ids)):
+            raise ValueError("duplicate_account_membership")
+        if any(row["authoritative_role"] == "owner"
+               and int(row["active_owner_count"]) <= 1 for row in memberships):
+            raise ValueError("sole_owner")
+        with self.connection.transaction():
+            existing = self.connection.execute(
+                "SELECT * FROM account_lifecycle_operations "
+                "WHERE clerk_user_id=%s AND completed_at IS NULL FOR UPDATE",
+                (clerk_user_id,)).fetchone()
+            if existing:
+                return dict(existing)
+            active_workspace = self.connection.execute(
+                "SELECT 1 FROM workspace_lifecycle_operations "
+                "WHERE initiated_by_clerk_user_id=%s AND completed_at IS NULL LIMIT 1",
+                (clerk_user_id,)).fetchone()
+            if active_workspace:
+                raise ValueError("active_workspace_deletion")
+            row = self.connection.execute(
+                "INSERT INTO account_lifecycle_operations "
+                "(operation_id,clerk_user_id,dissociated_actor_ref,operation_kind,"
+                " phase,disposition,confirmation_verified_at) "
+                "VALUES (%s,%s,%s,'delete_account','leaving_workspaces','running',%s) "
+                "RETURNING *",
+                (operation_id, clerk_user_id, dissociated_actor_ref,
+                 confirmation_verified_at)).fetchone()
+            for membership in memberships:
+                guard = self.connection.execute(
+                    "INSERT INTO clerk_membership_departure_guards "
+                    "(clerk_organization_id,operation_kind,operation_id,clerk_user_id) "
+                    "VALUES (%s,'delete_account',%s,%s) ON CONFLICT DO NOTHING "
+                    "RETURNING clerk_organization_id",
+                    (membership["clerk_organization_id"], operation_id,
+                     clerk_user_id)).fetchone()
+                if guard is None:
+                    raise ValueError("concurrent_membership_departure")
+                self.connection.execute(
+                    "INSERT INTO account_lifecycle_memberships "
+                    "(operation_id,clerk_organization_id,clerk_membership_id,"
+                    " authoritative_role,active_owner_count,state) "
+                    "VALUES (%s,%s,%s,%s,%s,'verified_shared')",
+                    (operation_id, membership["clerk_organization_id"],
+                     membership["clerk_membership_id"],
+                     membership["authoritative_role"],
+                     membership["active_owner_count"]))
+        return dict(row)
+
+    def account_lifecycle_memberships(self, operation_id):
+        return [dict(row) for row in self.connection.execute(
+            "SELECT * FROM account_lifecycle_memberships WHERE operation_id=%s "
+            "ORDER BY clerk_organization_id", (operation_id,)).fetchall()]
+
+    def mark_account_membership_absent(self, *, operation_id, organization_id,
+                                       updated_at):
+        row = self.connection.execute(
+            "UPDATE account_lifecycle_memberships SET state='verified_absent', "
+            "updated_at=%s WHERE operation_id=%s AND clerk_organization_id=%s "
+            "RETURNING clerk_organization_id",
+            (updated_at, operation_id, organization_id)).fetchone()
+        if row is None:
+            raise ValueError("account_membership_not_found")
+
+    def set_account_lifecycle_phase(self, *, operation_id, expected_phases,
+                                    phase, updated_at):
+        allowed = {"leaving_workspaces", "credentials_revoked",
+                   "clerk_user_deletion"}
+        if phase not in allowed or not expected_phases or not set(expected_phases) <= allowed:
+            raise ValueError("invalid_account_lifecycle_phase")
+        row = self.connection.execute(
+            "UPDATE account_lifecycle_operations SET phase=%s, disposition='running', "
+            "failure_category=NULL, updated_at=%s WHERE operation_id=%s "
+            "AND phase=ANY(%s) RETURNING *",
+            (phase, updated_at, operation_id, list(expected_phases))).fetchone()
+        if row is None:
+            current = self.account_lifecycle_operation(operation_id)
+            if current and current["phase"] == phase:
+                return current
+            raise ValueError("stale_account_lifecycle_phase")
+        return dict(row)
+
+    def fail_account_lifecycle_phase(self, *, operation_id, disposition,
+                                     failure_category, updated_at):
+        if disposition not in {"blocked", "retryable"}:
+            raise ValueError("invalid_account_lifecycle_disposition")
+        self.connection.execute(
+            "UPDATE account_lifecycle_operations SET disposition=%s, "
+            "failure_category=%s, updated_at=%s WHERE operation_id=%s",
+            (disposition, failure_category, updated_at, operation_id))
+
+    def revoke_account_local_access(self, clerk_user_id, dissociated_actor_ref):
+        """Revoke attributable access and dissociate retained shared history."""
+        now = datetime.now(timezone.utc)
+        with self.connection.transaction():
+            operation = self.connection.execute(
+                "SELECT * FROM account_lifecycle_operations "
+                "WHERE clerk_user_id=%s AND completed_at IS NULL FOR UPDATE",
+                (clerk_user_id,)).fetchone()
+            if operation is None or operation["dissociated_actor_ref"] != dissociated_actor_ref:
+                raise ValueError("account_lifecycle_guard_failed")
+            if operation["phase"] != "leaving_workspaces":
+                if operation["phase"] in {"credentials_revoked", "clerk_user_deletion"}:
+                    return {"state": "revoked"}
+                raise ValueError("account_lifecycle_guard_failed")
+            pending = self.connection.execute(
+                "SELECT 1 FROM account_lifecycle_memberships "
+                "WHERE operation_id=%s AND state<>'verified_absent' LIMIT 1",
+                (operation["operation_id"],)).fetchone()
+            if pending:
+                raise ValueError("clerk_memberships_not_terminal")
+            self.connection.execute(
+                "UPDATE clerk_github_identities SET revoked_at=COALESCE(revoked_at,%s), "
+                "access_token=NULL,refresh_token=NULL,updated_at=%s,"
+                "revocation_generation=revocation_generation+1 "
+                "WHERE clerk_user_id=%s AND (revoked_at IS NULL OR access_token IS NOT NULL "
+                "OR refresh_token IS NOT NULL)", (now, now, clerk_user_id))
+            self.connection.execute(
+                "UPDATE dashboard_sessions SET revoked_at=COALESCE(revoked_at,%s), "
+                "revocation_reason='account_deleted',github_access_token=NULL,"
+                "github_refresh_token=NULL,source_clerk_user_id=NULL "
+                "WHERE source_clerk_user_id=%s", (now, clerk_user_id))
+            self.connection.execute(
+                "UPDATE github_installation_states SET consumed_at=COALESCE(consumed_at,%s), "
+                "clerk_user_id=%s WHERE clerk_user_id=%s",
+                (now, dissociated_actor_ref, clerk_user_id))
+            self.connection.execute(
+                "UPDATE tenant_github_installations SET bound_by_clerk_user_id=%s "
+                "WHERE bound_by_clerk_user_id=%s",
+                (dissociated_actor_ref, clerk_user_id))
+            self.connection.execute(
+                "UPDATE tenant_onboarding_state SET completed_by_clerk_user_id=%s "
+                "WHERE completed_by_clerk_user_id=%s",
+                (dissociated_actor_ref, clerk_user_id))
+            self.connection.execute(
+                "UPDATE workspace_credential_revocations SET initiated_by_clerk_user_id=%s "
+                "WHERE initiated_by_clerk_user_id=%s AND completed_at IS NOT NULL",
+                (dissociated_actor_ref, clerk_user_id))
+            self.connection.execute(
+                "UPDATE audit_events SET actor=%s WHERE actor=%s",
+                (dissociated_actor_ref, f"clerk:{clerk_user_id}"))
+            self.connection.execute(
+                "DELETE FROM tenant_memberships WHERE clerk_user_id=%s",
+                (clerk_user_id,))
+            self.connection.execute(
+                "DELETE FROM clerk_github_identities WHERE clerk_user_id=%s",
+                (clerk_user_id,))
+        return {"state": "revoked"}
+
+    def finalize_account_deletion(self, *, operation_id, completed_at):
+        with self.connection.transaction():
+            operation = self.connection.execute(
+                "SELECT * FROM account_lifecycle_operations "
+                "WHERE operation_id=%s FOR UPDATE", (operation_id,)).fetchone()
+            if operation is None:
+                receipt = self.deletion_receipt(operation_id)
+                if receipt:
+                    return {"receipt_id": receipt["receipt_id"], "state": "completed"}
+                raise ValueError("account_lifecycle_not_found")
+            if operation["phase"] != "clerk_user_deletion":
+                raise ValueError("account_lifecycle_not_terminal")
+            self.connection.execute(
+                "INSERT INTO deletion_receipts "
+                "(receipt_id,operation_kind,requested_at,completed_at,"
+                " billing_terminal_verified,provider_access_terminal_verified,"
+                " credentials_revoked,warehouse_cleanup_required,"
+                " historical_external_records_retained) "
+                "VALUES (%s,'delete_account',%s,%s,TRUE,TRUE,TRUE,FALSE,TRUE) "
+                "ON CONFLICT DO NOTHING",
+                (operation_id, operation["created_at"], completed_at))
+            self.connection.execute(
+                "DELETE FROM clerk_membership_departure_guards WHERE operation_id=%s",
+                (operation_id,))
+            self.connection.execute(
+                "DELETE FROM account_lifecycle_operations WHERE operation_id=%s",
+                (operation_id,))
+        return {"receipt_id": operation_id, "state": "completed"}
 
     @staticmethod
     def _operational_root_candidates_sql():

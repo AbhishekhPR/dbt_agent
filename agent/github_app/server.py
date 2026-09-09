@@ -205,6 +205,7 @@ def build_application(settings, *, client_factory=None, logger=None,
     # is built only when the credentials it needs are actually present, and the
     # routes answer 503 rather than vanishing when one is absent.
     clerk_verifier = None
+    clerk_management_client = None
     installation_binder = None
     identity_linker = None
     repository_service = None
@@ -224,6 +225,12 @@ def build_application(settings, *, client_factory=None, logger=None,
             raise SettingsError(str(exc)) from None
         if clerk_settings is not None:
             clerk_verifier = ClerkVerifier(clerk_settings)
+            from agent.api.clerk_management import (
+                ClerkManagementClient, ClerkManagementSettings,
+            )
+            management_settings = ClerkManagementSettings.from_environ(environ)
+            if management_settings is not None:
+                clerk_management_client = ClerkManagementClient(management_settings)
             logger.info("clerk authentication enabled")
         else:
             logger.warning(
@@ -345,6 +352,10 @@ def build_application(settings, *, client_factory=None, logger=None,
         dashboard_bridge=dashboard_bridge,
         billing_service=billing_service,
         billing_settings=polar_settings,
+        clerk_management_client=clerk_management_client,
+        lifecycle_github_client=(onboarding_client if store_pool is not None else None),
+        lifecycle_github_app_jwt=(app_jwt if store_pool is not None else None),
+        repository_storage=storage,
         secure_cookies=settings.secure_cookies,
         # Where a GitHub round trip returns the browser to, and the API origin
         # the customer's CI will submit manifests to. Both come from

@@ -384,6 +384,8 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
                       repository_service=None, api_url="",
                       dashboard_bridge=None, secure_cookies=True,
                       billing_service=None, billing_settings=None,
+                      clerk_management_client=None, lifecycle_github_client=None,
+                      lifecycle_github_app_jwt=None, repository_storage=None,
                       collector_package_path=None):
     """Build the /api route table. Registration stays explicit and inspectable.
 
@@ -1770,6 +1772,15 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
         store_pool=store_pool,
         clerk_authenticator=clerk_authenticator,
         service=billing_service,
+    ))
+    from agent.api.lifecycle_routes import create_lifecycle_routes
+    routes.extend(create_lifecycle_routes(
+        store_pool=store_pool, clerk_verifier=clerk_verifier,
+        clerk_client=clerk_management_client,
+        polar_client=(billing_service.client if billing_service else None),
+        github_client=lifecycle_github_client,
+        github_app_jwt=lifecycle_github_app_jwt,
+        repository_storage=repository_storage,
     ))
     return routes
 

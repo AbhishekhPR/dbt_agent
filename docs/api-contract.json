@@ -62,6 +62,7 @@
     "GET /api/reviews/{review_id}/findings",
     "GET /api/reviews/{review_id}/publications",
     "GET /api/reviews/{review_id}/snapshots",
+    "GET /api/settings/lifecycle",
     "GET /healthz",
     "GET /readyz",
     "POST /api/anomalies",
@@ -76,6 +77,17 @@
     "POST /api/collectors/verification",
     "POST /api/deployments/events",
     "POST /api/incidents",
+    "POST /api/lifecycle/account-deletion",
+    "POST /api/lifecycle/account-deletion/{operation_id}/advance",
+    "POST /api/lifecycle/collector-access/revoke-all",
+    "POST /api/lifecycle/collector-tokens/{token_id}/revoke",
+    "POST /api/lifecycle/github/installations/{installation_id}/disconnect",
+    "POST /api/lifecycle/github/installations/{installation_id}/uninstall",
+    "POST /api/lifecycle/github/personal/disconnect",
+    "POST /api/lifecycle/github/repositories/{repository_id}/disconnect",
+    "POST /api/lifecycle/workspace-deletion",
+    "POST /api/lifecycle/workspace-deletion/{operation_id}/advance",
+    "POST /api/lifecycle/workspace/leave",
     "POST /api/manifest-evidence",
     "POST /api/metadata-snapshots",
     "POST /api/monitoring/baselines",
@@ -249,6 +261,61 @@
       "authentication": "service-token",
       "method": "GET",
       "path": "/api/kpis/{kpi}/impact"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "POST",
+      "path": "/api/lifecycle/account-deletion"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "POST",
+      "path": "/api/lifecycle/account-deletion/{operation_id}/advance"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "POST",
+      "path": "/api/lifecycle/collector-access/revoke-all"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "POST",
+      "path": "/api/lifecycle/collector-tokens/{token_id}/revoke"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "POST",
+      "path": "/api/lifecycle/github/installations/{installation_id}/disconnect"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "POST",
+      "path": "/api/lifecycle/github/installations/{installation_id}/uninstall"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "POST",
+      "path": "/api/lifecycle/github/personal/disconnect"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "POST",
+      "path": "/api/lifecycle/github/repositories/{repository_id}/disconnect"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "POST",
+      "path": "/api/lifecycle/workspace-deletion"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "POST",
+      "path": "/api/lifecycle/workspace-deletion/{operation_id}/advance"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "POST",
+      "path": "/api/lifecycle/workspace/leave"
     },
     {
       "authentication": "service-token",
@@ -434,6 +501,11 @@
       "authentication": "service-token",
       "method": "GET",
       "path": "/api/reviews/{review_id}/snapshots"
+    },
+    {
+      "authentication": "clerk-session",
+      "method": "GET",
+      "path": "/api/settings/lifecycle"
     },
     {
       "authentication": "clerk-session",

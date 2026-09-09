@@ -29,6 +29,7 @@ TENANT_OWNED_TABLES = (
     "workspace_credential_revocations",
     "workspace_lifecycle_operations",
     "workspace_lifecycle_provider_results",
+    "github_access_operations",
     "github_installation_states",
     "tenant_github_installations",
     "tenant_repositories",
@@ -44,6 +45,7 @@ EXCLUDED_SHARED_TABLES = (
     "oauth_authorization_states",
     "account_lifecycle_operations",
     "account_lifecycle_memberships",
+    "clerk_membership_departure_guards",
     "deletion_receipts",
     "schema_migrations",
 )

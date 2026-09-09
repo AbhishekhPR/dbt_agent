@@ -186,6 +186,21 @@ class ClerkManagementClient:
         user = urllib.parse.quote(_identifier(user_id, "Clerk user id"), safe="")
         return self._request_json(f"/users/{user}", method="DELETE")
 
+    def get_user(self, user_id: str):
+        user = urllib.parse.quote(_identifier(user_id, "Clerk user id"), safe="")
+        document = self._request_json(f"/users/{user}")
+        if not isinstance(document, dict) or document.get("id") != user_id:
+            raise ClerkMembershipUnavailable("Clerk returned a different user")
+        return document
+
+    def get_organization(self, organization_id: str):
+        organization = urllib.parse.quote(_identifier(
+            organization_id, "Clerk organization id"), safe="")
+        document = self._request_json(f"/organizations/{organization}")
+        if not isinstance(document, dict) or document.get("id") != organization_id:
+            raise ClerkMembershipUnavailable("Clerk returned a different organization")
+        return document
+
     def _request_json(self, path, *, method="GET"):
         request = urllib.request.Request(self.settings.api_base + path, method=method)
         request.add_header("Accept", "application/json")

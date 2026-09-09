@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agent.api.clerk_identity import ClerkPrincipal
+from agent.api.clerk_management import ClerkResourceAbsent
 from agent.api.workspace_membership import WorkspaceAuthorizationContext
 from agent.billing.lifecycle import BillingLifecycleError
 from agent.github_app.client import GitHubAPIError, GitHubNotFoundError
@@ -108,6 +109,11 @@ class _Clerk:
     def delete_organization(self, organization_id):
         self.deleted.append(organization_id)
         return {}
+
+    def get_organization(self, organization_id):
+        if organization_id in self.deleted:
+            raise ClerkResourceAbsent("absent")
+        return {"id": organization_id}
 
 
 def _principal(**overrides):

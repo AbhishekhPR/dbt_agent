@@ -81,6 +81,19 @@ class PostgresWorkspaceLifecycleTests(unittest.TestCase):
         self.assertIsNone(self.store.workspace_lifecycle_operation_for_tenant(
             self._tenant("b"), first["operation_id"]))
 
+        claimed = self.store.claim_workspace_lifecycle_operation(
+            tenant_id=tenant_id, operation_id=first["operation_id"],
+            lease_id="lease_first", now=NOW,
+            lease_expires_at=NOW.replace(minute=2))
+        self.assertIsNotNone(claimed)
+        self.assertIsNone(self.store.claim_workspace_lifecycle_operation(
+            tenant_id=tenant_id, operation_id=first["operation_id"],
+            lease_id="lease_second", now=NOW,
+            lease_expires_at=NOW.replace(minute=3)))
+        self.store.release_workspace_lifecycle_operation(
+            tenant_id=tenant_id, operation_id=first["operation_id"],
+            lease_id="lease_first")
+
     def test_begin_refuses_incomplete_operational_ownership_without_freezing(self):
         tenant = self.store.upsert_tenant_for_clerk_organization(
             "org_unmapped", organization_name="Unmapped")
@@ -192,6 +205,77 @@ class PostgresWorkspaceLifecycleTests(unittest.TestCase):
         self.assertTrue(columns.isdisjoint({
             "tenant_id", "clerk_user_id", "organization_id",
             "polar_customer_id", "github_installation_id"}))
+
+    def test_account_deletion_preserves_every_shared_workspace(self):
+        tenant_a, tenant_b = self._tenant("a"), self._tenant("b")
+        operation = self.store.begin_account_deletion(
+            clerk_user_id="shared_user",
+            memberships=({"clerk_organization_id": "org_clerk_a",
+                          "clerk_membership_id": "mem_a",
+                          "authoritative_role": "member", "active_owner_count": 1},
+                         {"clerk_organization_id": "org_clerk_b",
+                          "clerk_membership_id": "mem_b",
+                          "authoritative_role": "owner", "active_owner_count": 2}),
+            dissociated_actor_ref="deleted_actor_0123456789abcdef0123456789abcdef",
+            confirmation_verified_at=NOW)
+        for organization_id in ("org_clerk_a", "org_clerk_b"):
+            self.store.mark_account_membership_absent(
+                operation_id=operation["operation_id"],
+                organization_id=organization_id, updated_at=NOW)
+        self.assertEqual(self.store.revoke_account_local_access(
+            "shared_user", operation["dissociated_actor_ref"])["state"], "revoked")
+        self.store.set_account_lifecycle_phase(
+            operation_id=operation["operation_id"],
+            expected_phases={"leaving_workspaces"}, phase="credentials_revoked",
+            updated_at=NOW)
+        self.store.set_account_lifecycle_phase(
+            operation_id=operation["operation_id"],
+            expected_phases={"credentials_revoked"}, phase="clerk_user_deletion",
+            updated_at=NOW)
+        receipt = self.store.finalize_account_deletion(
+            operation_id=operation["operation_id"], completed_at=NOW)
+        self.assertEqual(receipt["state"], "completed")
+        self.assertIsNotNone(self.store.tenant_by_id(tenant_a))
+        self.assertIsNotNone(self.store.tenant_by_id(tenant_b))
+
+    def test_collector_and_repository_revocation_are_tenant_isolated(self):
+        tenant_a = self._tenant("a")
+        self.store.create_service_token(
+            "collector-a", "collector-digest-a", "legacy-a", "repo-a",
+            environment="prod", scope="collector")
+        self.store.create_service_token(
+            "collector-b", "collector-digest-b", "legacy-b", "repo-b",
+            environment="prod", scope="collector")
+        self.store.register_collector(
+            "legacy-a", "repo-a", "prod", collector_id="collector_a",
+            token_id="collector-a")
+        self.store.register_collector(
+            "legacy-b", "repo-b", "prod", collector_id="collector_b",
+            token_id="collector-b")
+        result = self.store.revoke_tenant_collector_access(
+            tenant_id=tenant_a, token_id="collector-a",
+            initiated_by_clerk_user_id="user_a")
+        self.assertEqual(result["tokens_revoked"], 1)
+        token_b = self.store.connection.execute(
+            "SELECT secret_hash,revoked_at FROM api_service_tokens "
+            "WHERE token_id='collector-b'").fetchone()
+        self.assertIsNotNone(token_b["secret_hash"])
+        self.assertIsNone(token_b["revoked_at"])
+
+        operation = self.store.begin_github_access_operation(
+            tenant_id=tenant_a, initiated_by_clerk_user_id="user_a",
+            operation_kind="repository_disconnect", github_repository_id=101)
+        self.assertEqual(operation["state"], "completed")
+        repository_a = self.store.connection.execute(
+            "SELECT disconnected_at,ci_token_id FROM tenant_repositories "
+            "WHERE github_repository_id=101").fetchone()
+        repository_b = self.store.connection.execute(
+            "SELECT disconnected_at,ci_token_id FROM tenant_repositories "
+            "WHERE github_repository_id=202").fetchone()
+        self.assertIsNotNone(repository_a["disconnected_at"])
+        self.assertIsNone(repository_a["ci_token_id"])
+        self.assertIsNone(repository_b["disconnected_at"])
+        self.assertEqual(repository_b["ci_token_id"], "token-b")
 
 
 if __name__ == "__main__":
