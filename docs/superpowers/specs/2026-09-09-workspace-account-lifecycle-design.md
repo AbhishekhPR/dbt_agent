@@ -52,10 +52,11 @@ Workspace phases are:
 5. `github_access_revocation`
 6. `credentials_revoked`
 7. `artifact_purge`
-8. `database_purge`
-9. `clerk_organization_deletion`
-10. `local_finalize`
-11. `completed`
+8. `artifacts_purged`
+9. `database_purge`
+10. `clerk_organization_deletion`
+11. `local_finalize`
+12. `completed`
 
 Each unfinished operation also has a disposition of `running`, `retryable`, or
 `blocked`, plus a bounded non-secret failure category. Provider responses,
