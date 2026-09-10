@@ -451,5 +451,221 @@ class AttestationStoreTests(unittest.TestCase):
                          "operator_attested_legacy")
 
 
+@unittest.skipUnless(
+    DSN, "RELIUM_TEST_POSTGRES_DSN not set; PostgreSQL suite requires a real server")
+class AttestedRootProvenanceAgreementTests(AttestationStoreTests):
+    """Coexistence of provenance kinds is not a conflict. DISAGREEMENT is.
+
+    The audit flagged `mapped_root_provenance_conflict` the moment a same-tenant
+    attestation succeeded, because it treated "some repository under this root
+    has no derived proof" as a conflict on every basis. For a derived mapping
+    that is genuinely suspicious. For an attestation it is the normal case and
+    the whole reason the basis exists -- a partially provable root is exactly
+    what an operator attests.
+
+    Every test here pins the boundary: same tenant corroborates, a different
+    tenant conflicts, and several tenants conflict.
+    """
+
+    def _attest_directly(self, organization_id, tenant_id):
+        """Record an attestation without the store's guards.
+
+        Cases 2 and 3 cannot be reached through `attest_tenant_operational_root`
+        -- it refuses them up front. They model a root that becomes
+        contradictory AFTER an attestation was legitimately recorded, which is
+        the state the audit and the gate actually have to survive.
+        """
+        self.store.connection.execute(
+            "INSERT INTO tenant_operational_roots "
+            "(organization_id, tenant_id, mapping_basis, verified_at) "
+            "VALUES (%s, %s, 'operator_attested_legacy', now())",
+            (organization_id, tenant_id))
+        self.store.connection.commit()
+
+    def _conflicts(self):
+        report = self.store.tenant_operational_ownership_audit()
+        return [entry["kind"]
+                for entry in report["cross_tenant_inconsistencies"]]
+
+    # -- case 1: partial CI evidence agreeing with the attestation ---------
+
+    def test_case_1_same_tenant_partial_evidence_is_allowed_and_audits_clean(self):
+        tenant_id = self._proven_repository(
+            "case1", 501, 5001, "Case1Root", "proven", "token-case1")
+        self.store.ensure_repository("Case1Root", "unproven")
+
+        result = self.store.attest_tenant_operational_root(
+            organization_id="Case1Root", tenant_id=tenant_id,
+            reason="reviewed by operator")
+
+        self.assertEqual(result["status"], "attested")
+        self.assertEqual(self._conflicts(), [])
+        report = self.store.tenant_operational_ownership_audit()
+        self.assertEqual(report["ambiguous_roots"], [])
+
+    # -- case 2: CI evidence naming a different tenant ---------------------
+
+    def test_case_2_evidence_for_another_tenant_is_refused_up_front(self):
+        self._proven_repository(
+            "case2-owner", 502, 5002, "Case2Root", "proven", "token-case2")
+        self.store.ensure_repository("Case2Root", "unproven")
+        claimant = self._tenant("case2-claimant")
+
+        with self.assertRaises(ValueError) as raised:
+            self.store.attest_tenant_operational_root(
+                organization_id="Case2Root", tenant_id=claimant,
+                reason="reviewed by operator")
+
+        self.assertEqual(str(raised.exception), "cross_tenant_inconsistency")
+        self.assertIsNone(self._mapping("Case2Root"))
+
+    def test_case_2_evidence_appearing_later_is_reported_as_a_conflict(self):
+        # The attestation was legitimate when recorded; contradicting evidence
+        # arrived afterwards. The audit must say so.
+        claimant = self._tenant("case2-late-claimant")
+        self.store.ensure_repository("Case2LateRoot", "unproven")
+        self._attest_directly("Case2LateRoot", claimant)
+        self.assertEqual(self._conflicts(), [])
+
+        self._proven_repository(
+            "case2-late-owner", 503, 5003, "Case2LateRoot", "proven",
+            "token-case2-late")
+
+        self.assertEqual(self._conflicts(), ["mapped_root_provenance_conflict"])
+
+    # -- case 3: CI evidence across several tenants ------------------------
+
+    def test_case_3_evidence_across_several_tenants_is_inconsistent(self):
+        first = self._proven_repository(
+            "case3-a", 504, 5004, "Case3Root", "first", "token-case3-a")
+        self._proven_repository(
+            "case3-b", 505, 5005, "Case3Root", "second", "token-case3-b")
+
+        with self.assertRaises(ValueError) as raised:
+            self.store.attest_tenant_operational_root(
+                organization_id="Case3Root", tenant_id=first,
+                reason="reviewed by operator")
+        self.assertEqual(str(raised.exception), "ambiguous_candidate_tenants")
+
+        # And if such a state is reached anyway, the audit reports it.
+        self._attest_directly("Case3Root", first)
+        self.assertEqual(self._conflicts(), ["mapped_root_provenance_conflict"])
+
+    # -- case 4: a fully provable root -------------------------------------
+
+    def test_case_4_a_fully_provable_root_still_refuses_attestation(self):
+        tenant_id = self._proven_repository(
+            "case4", 506, 5006, "Case4Root", "only", "token-case4")
+
+        with self.assertRaises(ValueError) as raised:
+            self.store.attest_tenant_operational_root(
+                organization_id="Case4Root", tenant_id=tenant_id,
+                reason="reviewed by operator")
+
+        self.assertEqual(str(raised.exception), "provable_without_attestation")
+
+    def test_case_4_partial_and_complete_are_distinguished_by_the_same_rule(self):
+        # Why production was allowed to attest: the refusal fires only when
+        # EVERY repository is proven. One of four is not "provable".
+        tenant_id = self._proven_repository(
+            "case4b", 507, 5007, "Case4bRoot", "proven", "token-case4b")
+        self.store.ensure_repository("Case4bRoot", "unproven")
+
+        self.assertEqual(
+            self.store.attest_tenant_operational_root(
+                organization_id="Case4bRoot", tenant_id=tenant_id,
+                reason="reviewed by operator")["status"],
+            "attested")
+
+    # -- case 5: the exact production shape ---------------------------------
+
+    def test_case_5_the_production_shape_audits_clean_after_attestation(self):
+        # AbhishekhPR: four repositories, one CI-proven, attested to that same
+        # tenant. Reported `mapped_root_provenance_conflict` before this fix.
+        tenant_id = self._production_shape()
+        self.store.attest_tenant_operational_root(
+            organization_id="LegacyRoot", tenant_id=tenant_id,
+            reason="pre-tenant legacy operational data reviewed by operator")
+
+        report = self.store.tenant_operational_ownership_audit()
+
+        self.assertEqual(report["cross_tenant_inconsistencies"], [])
+        self.assertEqual(report["ambiguous_roots"], [])
+        self.assertEqual(
+            [row["organization_id"] for row in report["mapped_roots"]],
+            ["LegacyRoot"])
+
+    def test_case_5_a_derived_mapping_that_went_partial_is_still_flagged(self):
+        # The clause is not removed, only made basis-aware: a ci_token_binding
+        # mapping whose chain no longer covers every repository stays a conflict.
+        tenant_id = self._proven_repository(
+            "case5b", 508, 5008, "Case5bRoot", "proven", "token-case5b")
+        self.store.reconcile_tenant_operational_roots(apply=True)
+        self.assertEqual(self._conflicts(), [])
+
+        self.store.ensure_repository("Case5bRoot", "added-later")
+
+        self.assertEqual(self._conflicts(), ["mapped_root_provenance_conflict"])
+        self.assertEqual(self._mapping("Case5bRoot")["mapping_basis"],
+                         "ci_token_binding")
+        self.assertIsNotNone(tenant_id)
+
+    # -- case 6: the destructive lifecycle gate ------------------------------
+
+    def test_case_6_the_deletion_gate_accepts_agreeing_evidence(self):
+        tenant_id = self._production_shape()
+        self.store.attest_tenant_operational_root(
+            organization_id="LegacyRoot", tenant_id=tenant_id,
+            reason="reviewed by operator")
+
+        inventory = self.store.tenant_operational_inventory(tenant_id)
+
+        self.assertEqual(inventory["ownership_status"], "complete")
+        self.assertEqual(inventory["attested_operational_roots"], ["LegacyRoot"])
+
+    def test_case_6_the_deletion_gate_fails_closed_on_another_tenant(self):
+        claimant = self._tenant("case6-claimant")
+        self.store.ensure_repository("Case6Root", "unproven")
+        self._attest_directly("Case6Root", claimant)
+        self._proven_repository(
+            "case6-owner", 509, 5009, "Case6Root", "proven", "token-case6")
+
+        inventory = self.store.tenant_operational_inventory(claimant)
+
+        self.assertEqual(inventory["ownership_status"], "inconsistent")
+        with self.assertRaises(ValueError) as raised:
+            self.store.begin_workspace_deletion(
+                tenant_id=claimant,
+                initiated_by_clerk_user_id="operator",
+                confirmation_verified_at=datetime.now(timezone.utc))
+        self.assertEqual(str(raised.exception),
+                         "operational_ownership_inconsistent")
+
+    def test_case_6_the_deletion_gate_fails_closed_on_several_tenants(self):
+        first = self._proven_repository(
+            "case6-multi-a", 510, 5010, "Case6MultiRoot", "first",
+            "token-case6-a")
+        self._proven_repository(
+            "case6-multi-b", 511, 5011, "Case6MultiRoot", "second",
+            "token-case6-b")
+        self.store.connection.execute(
+            "INSERT INTO tenant_operational_roots "
+            "(organization_id, tenant_id, mapping_basis, verified_at) "
+            "VALUES ('Case6MultiRoot', %s, 'operator_attested_legacy', now())",
+            (first,))
+        self.store.connection.commit()
+
+        inventory = self.store.tenant_operational_inventory(first)
+
+        self.assertEqual(inventory["ownership_status"], "inconsistent")
+        with self.assertRaises(ValueError) as raised:
+            self.store.begin_workspace_deletion(
+                tenant_id=first,
+                initiated_by_clerk_user_id="operator",
+                confirmation_verified_at=datetime.now(timezone.utc))
+        self.assertEqual(str(raised.exception),
+                         "operational_ownership_inconsistent")
+
+
 if __name__ == "__main__":
     unittest.main()

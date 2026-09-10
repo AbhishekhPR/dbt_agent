@@ -3183,9 +3183,26 @@ class PostgresLifecycleStore:
             complete = bool(row["complete"] and row["repository_count"]
                             == row["matched_count"])
             if mapping is not None:
+                # A conflict is DISAGREEMENT, never the mere coexistence of two
+                # provenance kinds.
+                #
+                # `not complete` means some repository under the root has no
+                # derived proof. For a derived mapping that is genuinely
+                # suspicious: the mapping claims a chain that no longer holds
+                # for every repository. For an operator attestation it is the
+                # normal case and the entire reason the basis exists -- a
+                # partially provable root is exactly what an operator attests.
+                # Flagging it made a same-tenant attestation report as a
+                # cross-tenant inconsistency the moment it succeeded.
+                #
+                # The two tenant checks below apply on EVERY basis, so evidence
+                # naming another tenant, or naming several, is still a conflict
+                # whoever recorded the mapping.
+                attested = (mapping["mapping_basis"]
+                            == self.ATTESTED_LEGACY_BASIS)
                 if (len(tenants) > 1
                         or (tenants and mapping["tenant_id"] not in tenants)
-                        or (tenants and not complete)):
+                        or (tenants and not complete and not attested)):
                     mapped_provenance_conflicts.append(
                         row["organization_id"])
                 continue
