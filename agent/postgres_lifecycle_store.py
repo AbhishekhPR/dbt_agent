@@ -263,12 +263,16 @@ class PostgresLifecycleStore:
                 "INSERT INTO workspace_lifecycle_operations "
                 "(operation_id, tenant_id, initiated_by_clerk_user_id, "
                 " operation_kind, phase, disposition, confirmation_verified_at, "
-                " created_at, updated_at) "
-                "VALUES (%s,%s,%s,'delete_workspace','frozen','running',%s,%s,%s) "
+                " operational_ownership_verified_at, created_at, updated_at) "
+                "VALUES (%s,%s,%s,'delete_workspace','frozen','running',%s,%s,%s,%s) "
                 "RETURNING *",
                 (operation_id, tenant_id, initiated_by_clerk_user_id,
-                 confirmation_verified_at, confirmation_verified_at,
-                 confirmation_verified_at),
+                 confirmation_verified_at,
+                 # Ownership was proven above, in this transaction, before
+                 # anything was revoked. Recording when is what lets the purge
+                 # trust it later, once the proof material is gone.
+                 confirmation_verified_at,
+                 confirmation_verified_at, confirmation_verified_at),
             ).fetchone()
             return dict(row)
 
@@ -2291,7 +2295,7 @@ class PostgresLifecycleStore:
             operation = self.connection.execute(
                 "SELECT phase,billing_terminal_verified_at,"
                 "github_terminal_verified_at,credentials_revoked_at,"
-                "generation,lease_id "
+                "operational_ownership_verified_at,generation,lease_id "
                 "FROM workspace_lifecycle_operations "
                 "WHERE tenant_id=%s AND operation_id=%s FOR UPDATE",
                 (tenant_id, operation_id),
@@ -2318,10 +2322,21 @@ class PostgresLifecycleStore:
                     or control["billing_checkout_state"] != "blocked"):
                 raise ValueError("workspace lifecycle prerequisites are incomplete")
             inventory = self.tenant_operational_inventory(tenant_id)
+            # A CONTRADICTION is never excused by the checkpoint. Ownership
+            # degrading to `incomplete` is the expected consequence of this
+            # operation's own revocation steps; ownership becoming
+            # `inconsistent` means somebody else now claims this data, which no
+            # earlier proof can answer for.
             if inventory["ownership_status"] == "inconsistent":
                 raise ValueError("operational_ownership_inconsistent")
-            if inventory["ownership_status"] != "complete":
+            if (operation["operational_ownership_verified_at"] is None
+                    and inventory["ownership_status"] != "complete"):
+                # No durable proof was recorded for this operation, so it must
+                # still be provable from live evidence.
                 raise ValueError("operational_ownership_incomplete")
+            # The mapping rows themselves survive until the end of this purge,
+            # so the roots to delete are still readable even after the CI token
+            # and projections that PROVED them have been revoked.
             roots = list(inventory["operational_roots"])
             deleted = 0
             installation_ids = [row["github_installation_id"] for row in
