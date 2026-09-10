@@ -218,7 +218,25 @@ class PolarClient:
                     or not isinstance(pagination.get("max_page"), int)
                     or isinstance(pagination.get("max_page"), bool)
                     or pagination["total_count"] < 0
-                    or pagination["max_page"] < 1
+                    or pagination["max_page"] < 0
+                    # An EMPTY listing is `max_page: 0`, and that is Polar's
+                    # documented shape rather than a broken one. Polar builds
+                    # the envelope as `max_page=ceil(total_count / limit)`
+                    # (server/polar/kit/pagination.py), so a total_count of 0
+                    # gives a max_page of 0 and there is no page 1 to ask for.
+                    # `Pagination` declares `max_page: int` with no minimum.
+                    #
+                    # Requiring `max_page >= 1` therefore rejected every
+                    # workspace that had never created a checkout, on the FIRST
+                    # provider call of reconciliation, permanently.
+                    #
+                    # It is accepted only when the listing is genuinely empty.
+                    # `ceil(n/limit) >= 1` for every n > 0, so `max_page == 0`
+                    # with a non-zero total_count, or with items in hand, is a
+                    # contradiction Polar cannot produce, and stays malformed.
+                    or (pagination["max_page"] == 0
+                        and (pagination["total_count"] != 0
+                             or page_items or page != 1))
                     or pagination["max_page"] > MAX_LIST_PAGES
                     or any(not isinstance(item, dict) for item in page_items)):
                 raise self._integrity_error(

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import socket
 import time
 import unittest
@@ -691,6 +692,162 @@ class ProductionLogBoundaryTests(unittest.TestCase):
                     self.assertNotIn("api.polar.sh", rendered)
                     self.assertNotIn("card_declined", rendered)
                     self.assertNotIn("?", rendered)
+
+
+# ---------------------------------------------------------------------------
+# Polar's empty-list envelope.
+#
+# Polar builds every list response as
+#     max_page = math.ceil(total_count / limit)   [server/polar/kit/pagination.py]
+# so a listing with nothing in it is {"items": [], "pagination":
+# {"total_count": 0, "max_page": 0}}, and Pagination declares `max_page: int`
+# with no minimum. That is the documented shape, not a broken one.
+#
+# Relium required `max_page >= 1`, so the FIRST provider call of billing
+# reconciliation rejected it and every workspace that had never created a
+# checkout became permanently undeletable. Production, verbatim:
+#
+#   {"identity_kind": "external_customer_id",
+#    "inconsistency_subtype": "malformed_envelope", "observed_items": 0,
+#    "operation": "list_checkouts", "page": 1, "route_template": "/v1/checkouts/"}
+#
+# Because ceil(n/limit) >= 1 for every n > 0, `max_page == 0` can ONLY mean a
+# total_count of 0. Anything else carrying max_page 0 is a contradiction Polar
+# cannot produce, and must still fail closed.
+# ---------------------------------------------------------------------------
+
+def _polar_envelope(items, total_count, limit=100):
+    """The envelope Polar itself would build, by its own arithmetic."""
+    return (200, json.dumps({
+        "items": items,
+        "pagination": {"total_count": total_count,
+                       "max_page": math.ceil(total_count / limit)},
+    }).encode())
+
+
+def _raw(document):
+    return (200, json.dumps(document).encode())
+
+
+class PolarEmptyListEnvelopeTests(unittest.TestCase):
+    def setUp(self):
+        self.settings = SimpleNamespace(
+            api_base_url="https://api.polar.sh", access_token=TOKEN)
+
+    def _list(self, outcomes, *, checkouts=True):
+        client = PolarClient(self.settings,
+                             transport=_RecordingTransport(outcomes))
+        call = client.list_checkouts if checkouts else client.list_subscriptions
+        return call(external_customer_id=TENANT_ID)
+
+    def test_the_exact_empty_envelope_polar_returns_is_accepted(self):
+        self.assertEqual(self._list([_polar_envelope([], 0)]), [])
+
+    def test_the_empty_envelope_is_accepted_for_subscriptions_too(self):
+        # Same call shape, same bug, on the other listing.
+        self.assertEqual(
+            self._list([_polar_envelope([], 0)], checkouts=False), [])
+
+    def test_polars_own_arithmetic_validates_across_page_counts(self):
+        for total in (0, 1, 99, 100):
+            with self.subTest(total_count=total):
+                items = [{"id": "co_%d" % n} for n in range(total)]
+                self.assertEqual(
+                    len(self._list([_polar_envelope(items, total)])), total)
+
+    def test_a_multi_page_listing_is_unaffected(self):
+        first = [{"id": "co_%d" % n} for n in range(100)]
+        second = [{"id": "co_100"}]
+        self.assertEqual(len(self._list([_polar_envelope(first, 101),
+                                         _polar_envelope(second, 101)])), 101)
+
+    # -- near neighbours that must still fail closed -----------------------
+
+    def test_max_page_zero_with_a_non_zero_total_count_is_still_malformed(self):
+        # A contradiction: ceil(n/limit) >= 1 for every n > 0.
+        with self.assertRaises(PolarAPIError) as raised:
+            self._list([_raw({"items": [],
+                              "pagination": {"total_count": 4, "max_page": 0}})])
+        self.assertEqual(raised.exception.inconsistency_subtype,
+                         "malformed_envelope")
+
+    def test_max_page_zero_while_holding_items_is_still_malformed(self):
+        with self.assertRaises(PolarAPIError) as raised:
+            self._list([_raw({"items": [{"id": "co_1"}],
+                              "pagination": {"total_count": 0, "max_page": 0}})])
+        self.assertEqual(raised.exception.inconsistency_subtype,
+                         "malformed_envelope")
+
+    def test_a_negative_max_page_is_still_malformed(self):
+        with self.assertRaises(PolarAPIError) as raised:
+            self._list([_raw({"items": [],
+                              "pagination": {"total_count": 0, "max_page": -1}})])
+        self.assertEqual(raised.exception.inconsistency_subtype,
+                         "malformed_envelope")
+
+    def test_an_absent_or_mistyped_pagination_block_is_still_malformed(self):
+        cases = {
+            "no pagination": {"items": []},
+            "no max_page": {"items": [], "pagination": {"total_count": 0}},
+            "no total_count": {"items": [], "pagination": {"max_page": 0}},
+            "string max_page": {"items": [],
+                                "pagination": {"total_count": 0, "max_page": "0"}},
+            "boolean max_page": {"items": [],
+                                 "pagination": {"total_count": 0, "max_page": False}},
+            "negative total": {"items": [],
+                               "pagination": {"total_count": -1, "max_page": 0}},
+            "items not a list": {"items": {},
+                                 "pagination": {"total_count": 0, "max_page": 0}},
+            "over the page ceiling": {"items": [],
+                                      "pagination": {"total_count": 0,
+                                                     "max_page": 10_000}},
+        }
+        for name, document in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaises(PolarAPIError) as raised:
+                    self._list([_raw(document)])
+                self.assertEqual(raised.exception.inconsistency_subtype,
+                                 "malformed_envelope")
+
+    def test_a_short_non_empty_listing_still_fails_the_completeness_proof(self):
+        with self.assertRaises(PolarAPIError) as raised:
+            self._list([_raw({"items": [{"id": "co_1"}],
+                              "pagination": {"total_count": 5, "max_page": 1}})])
+        self.assertEqual(raised.exception.inconsistency_subtype,
+                         "incomplete_pagination")
+
+    def test_unstable_and_duplicate_detection_are_untouched(self):
+        with self.assertRaises(PolarAPIError) as raised:
+            self._list([_polar_envelope([{"id": "co_1"}], 101),
+                        _raw({"items": [{"id": "co_2"}],
+                              "pagination": {"total_count": 999, "max_page": 2}})])
+        self.assertEqual(raised.exception.inconsistency_subtype,
+                         "unstable_pagination")
+
+        with self.assertRaises(PolarAPIError) as raised:
+            self._list([_polar_envelope([{"id": "co_dup"}], 101),
+                        _polar_envelope([{"id": "co_dup"}], 101)])
+        self.assertEqual(raised.exception.inconsistency_subtype,
+                         "duplicate_object")
+
+
+class EmptyWorkspaceReachesVerifiedSafeTests(unittest.TestCase):
+    """The production outcome: a workspace with no billing can be proven safe."""
+
+    def test_a_workspace_with_no_checkouts_or_subscriptions_is_verified_safe(self):
+        client = _CountingClient(listings=[[], []])
+        store = _Store()
+
+        result = revoke_workspace_subscriptions(
+            principal=object(), authorizer=_Owner(), store=store,
+            client=client, clock=_clock)
+
+        self.assertEqual(result["state"], "verified_safe")
+        self.assertEqual(result["subscription_count"], 0)
+        self.assertEqual(result["actionable_checkout_count"], 0)
+        # Nothing was revoked because nothing was billable -- and that
+        # conclusion is now REACHABLE rather than blocked at the first call.
+        self.assertEqual(client.revoked, [])
 
 
 if __name__ == "__main__":
