@@ -40,6 +40,7 @@ SUPPORTED_COMMANDS = frozenset(
         "revoke-collector-token",
         "root_cause",
         "scan",
+        "tenant-ownership-attest",
         "tenant-ownership-audit",
         "watch",
     }

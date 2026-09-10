@@ -1297,6 +1297,77 @@ def _admin_store(*, migrate=True):
     return PostgresLifecycleStore(dsn, migrate=migrate)
 
 
+@cli.command(name="tenant-ownership-attest")
+@click.option("--organization-id", required=True,
+              help="Exact legacy organization id. Never a name or a login.")
+@click.option("--tenant-id", required=True,
+              help="Exact existing tenant id to attest ownership to.")
+@click.option("--reason", required=True,
+              help="Non-secret operator justification, recorded durably.")
+@click.option("--confirm", required=True,
+              help="Must exactly equal --organization-id.")
+@click.option("--json", "as_json", is_flag=True,
+              help="Emit the bounded machine-readable result.")
+def tenant_ownership_attest(organization_id, tenant_id, reason, confirm,
+                            as_json):
+    """Operator: attest ownership of a pre-tenant legacy operational root.
+
+    \b
+    ###################################################################
+    # THIS RECORDS A CLAIM. IT DOES NOT PROVE ONE.                    #
+    ###################################################################
+
+    Use this ONLY for a legacy root that carries no provider-issued identifier
+    from which ownership could be derived -- confirm that first with
+    `relium tenant-ownership-audit --json`. If the root is CI-provable, this
+    command refuses and `--apply-unambiguous` is the correct tool.
+
+    The mapping is recorded under the distinct basis `operator_attested_legacy`
+    with no provider provenance columns, so it can never be mistaken for a
+    verified mapping, and the reason is stored in a durable audit record.
+    """
+    import json
+
+    if confirm != organization_id:
+        raise click.ClickException(
+            "--confirm must exactly equal --organization-id")
+    if not reason.strip():
+        raise click.ClickException("--reason must not be empty")
+
+    store = _admin_store(migrate=False)
+    try:
+        if not store.has_schema_migration(26):
+            raise click.ClickException(
+                "migration 0026 must be applied before ownership attestation")
+        try:
+            result = store.attest_tenant_operational_root(
+                organization_id=organization_id, tenant_id=tenant_id,
+                reason=reason)
+        except ValueError as error:
+            # Every refusal is a named safe state, never a partial write: the
+            # store raises inside a SERIALIZABLE transaction that then rolls
+            # back untouched.
+            raise click.ClickException(
+                f"attestation refused: {error}") from None
+    finally:
+        store.close()
+
+    if as_json:
+        click.echo(json.dumps(result, sort_keys=True, default=str))
+        return
+    if result["status"] == "already_attested":
+        click.echo(
+            f"{result['organization_id']} is already attested to "
+            f"{result['tenant_id']}; nothing was written.")
+        return
+    click.echo(
+        f"attested {result['organization_id']} -> {result['tenant_id']} "
+        f"(basis {result['mapping_basis']}, attestation "
+        f"{result['attestation_id']}).")
+    click.echo(
+        "This mapping is an operator claim, not provider-verified evidence.")
+
+
 @cli.command(name="tenant-ownership-audit")
 @click.option(
     "--apply-unambiguous", is_flag=True,

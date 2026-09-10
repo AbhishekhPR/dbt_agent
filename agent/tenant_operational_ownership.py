@@ -15,6 +15,7 @@ from agent.api.workspace_membership import WorkspaceAuthorizationContext
 TENANT_OWNED_TABLES = (
     "tenants",
     "tenant_operational_roots",
+    "tenant_operational_root_attestations",
     "tenant_memberships",
     "tenant_membership_sync_state",
     "tenant_onboarding_state",
