@@ -249,6 +249,49 @@ class ProviderLoggingTests(unittest.TestCase):
         outcomes = [getattr(record, "outcome", None) for record in logs.records]
         self.assertIn("inconsistent", outcomes)
 
+    def test_a_refusal_is_never_logged_as_a_successful_call(self):
+        # Found in review: the success record was emitted before the status was
+        # checked, so a 402 was logged `outcome: ok` and then raised. That is
+        # precisely the log an operator would be reading to find this fault.
+        for status in (402, 429, 500):
+            with self.subTest(status=status):
+                client = PolarClient(
+                    self.settings,
+                    transport=_RecordingTransport([(status, b'{"error":"nope"}')]))
+                with self.assertLogs("agent.billing.client", level="INFO") as logs:
+                    with self.assertRaises(PolarAPIError):
+                        client.list_subscriptions(external_customer_id=TENANT_ID)
+                outcomes = [record.outcome for record in logs.records]
+                self.assertNotIn("ok", outcomes)
+                self.assertIn("refused", outcomes)
+                self.assertIn(status, [r.http_status for r in logs.records])
+
+    def test_an_unreadable_body_is_logged_as_a_refusal_too(self):
+        client = PolarClient(self.settings,
+                             transport=_RecordingTransport([(200, b"not json")]))
+
+        with self.assertLogs("agent.billing.client", level="INFO") as logs:
+            with self.assertRaises(PolarAPIError):
+                client.list_subscriptions(external_customer_id=TENANT_ID)
+
+        self.assertEqual([record.outcome for record in logs.records], ["refused"])
+
+    def test_an_id_addressed_call_logs_a_template_not_the_provider_object_id(self):
+        # Found in review: the concrete path was logged, which put a customer's
+        # Polar subscription id in every record and made the route unaggregatable.
+        for call in (lambda c: c.get_subscription("sub_live_secret"),
+                     lambda c: c.revoke_subscription("sub_live_secret")):
+            with self.subTest(call=call):
+                client = PolarClient(
+                    self.settings,
+                    transport=_RecordingTransport([socket.timeout("timed out")]))
+                with self.assertLogs("agent.billing.client", level="INFO") as logs:
+                    with self.assertRaises(PolarAPIError):
+                        call(client)
+                record = logs.records[0]
+                self.assertEqual(record.route_template, "/v1/subscriptions/{id}")
+                self.assertNotIn("sub_live_secret", str(vars(record)))
+
     def test_logs_never_carry_the_token_the_url_a_tenant_id_or_a_body(self):
         cases = [
             [socket.timeout("timed out")],

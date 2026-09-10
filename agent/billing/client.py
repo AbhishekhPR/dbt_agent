@@ -76,24 +76,6 @@ class PolarAPIError(RuntimeError):
             isinstance(self.status_code, int) and 500 <= self.status_code <= 599)
 
 
-def safe_polar_error_fields(error):
-    """Log-safe fields for one failed Polar call.
-
-    Deliberately omits the URL, the request body, the response body and the
-    access token. The query string carries the tenant id and the Authorization
-    header carries the secret, so neither is ever assembled into a log record.
-    """
-    if not isinstance(error, PolarAPIError):
-        return {}
-    return {
-        "operation": error.operation,
-        "http_status": error.status_code,
-        "outcome": error.failure_kind or "refused",
-        "retryable": error.retryable,
-        "provider_code": error.provider_code,
-    }
-
-
 def _transport_failure_kind(cause):
     """Classify a transport exception WITHOUT reading its text.
 
@@ -186,12 +168,14 @@ class PolarClient:
     def get_subscription(self, subscription_id):
         return self._get(
             f"/v1/subscriptions/{_validated_id(subscription_id)}",
-            operation="get_subscription")
+            operation="get_subscription",
+            route_template="/v1/subscriptions/{id}")
 
     def revoke_subscription(self, subscription_id):
         return self._delete(
             f"/v1/subscriptions/{_validated_id(subscription_id)}",
-            operation="revoke_subscription")
+            operation="revoke_subscription",
+            route_template="/v1/subscriptions/{id}")
 
     def _list(self, path, *, external_customer_id, customer_id, operation):
         if bool(external_customer_id) == bool(customer_id):
@@ -247,14 +231,17 @@ class PolarClient:
 
     # -- transport ---------------------------------------------------------
 
-    def _post(self, path, payload, *, operation):
-        return self._request("POST", path, payload=payload, operation=operation)
+    def _post(self, path, payload, *, operation, route_template=None):
+        return self._request("POST", path, payload=payload, operation=operation,
+                             route_template=route_template)
 
-    def _get(self, path, *, operation):
-        return self._request("GET", path, operation=operation)
+    def _get(self, path, *, operation, route_template=None):
+        return self._request("GET", path, operation=operation,
+                             route_template=route_template)
 
-    def _delete(self, path, *, operation):
-        return self._request("DELETE", path, operation=operation)
+    def _delete(self, path, *, operation, route_template=None):
+        return self._request("DELETE", path, operation=operation,
+                             route_template=route_template)
 
     def _observe(self, *, operation, method, route_template, started,
                  status=None, error=None):
@@ -286,10 +273,13 @@ class PolarClient:
         })
         return error
 
-    def _request(self, method, path, *, payload=None, operation):
+    def _request(self, method, path, *, payload=None, operation,
+                 route_template=None):
         url = f"{self._settings.api_base_url}{path}"
-        # The query string carries the tenant id; the template never does.
-        route_template = path.split("?", 1)[0]
+        # Never the URL. The query string carries the tenant id and an
+        # id-addressed path carries a provider object id, so a caller that has
+        # one supplies a template and the concrete path is not logged.
+        route_template = route_template or path.split("?", 1)[0]
         body = (json.dumps(payload, separators=(",", ":")).encode("utf-8")
                 if payload is not None else None)
         headers = {
@@ -321,24 +311,33 @@ class PolarClient:
                           route_template=route_template, started=started,
                           error=error)
             raise error from None
-        self._observe(operation=operation, method=method,
-                      route_template=route_template, started=started,
-                      status=status)
+
+        def refused(error):
+            """Record the fault, then hand it back to be raised."""
+            self._observe(operation=operation, method=method,
+                          route_template=route_template, started=started,
+                          status=status, error=error)
+            return error
 
         if status is None or not 200 <= status < 300:
             provider_code, provider_description = _provider_diagnostic(raw)
-            raise PolarAPIError("Polar refused the request.",
-                                status_code=status, operation=operation,
-                                provider_code=provider_code,
-                                provider_description=provider_description)
+            raise refused(PolarAPIError(
+                "Polar refused the request.", status_code=status,
+                operation=operation, provider_code=provider_code,
+                provider_description=provider_description))
         try:
             document = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
-            raise PolarAPIError("Polar returned an unreadable response.",
-                                status_code=status, operation=operation) from None
+            raise refused(PolarAPIError(
+                "Polar returned an unreadable response.",
+                status_code=status, operation=operation)) from None
         if not isinstance(document, dict):
-            raise PolarAPIError("Polar returned an unexpected response.",
-                                status_code=status, operation=operation)
+            raise refused(PolarAPIError(
+                "Polar returned an unexpected response.",
+                status_code=status, operation=operation))
+        self._observe(operation=operation, method=method,
+                      route_template=route_template, started=started,
+                      status=status)
         return document
 
 
