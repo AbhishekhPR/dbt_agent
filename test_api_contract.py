@@ -149,6 +149,18 @@ class RouteContractTests(unittest.TestCase):
                   "/api/onboarding/ci-workflow",
                   "/api/onboarding/complete",
                   "/api/onboarding/dashboard-session",
+                  "/api/settings/lifecycle",
+                  "/api/lifecycle/workspace-deletion",
+                  "/api/lifecycle/workspace-deletion/{operation_id}/advance",
+                  "/api/lifecycle/account-deletion",
+                  "/api/lifecycle/account-deletion/{operation_id}/advance",
+                  "/api/lifecycle/workspace/leave",
+                  "/api/lifecycle/github/personal/disconnect",
+                  "/api/lifecycle/github/repositories/{repository_id}/disconnect",
+                  "/api/lifecycle/github/installations/{installation_id}/disconnect",
+                  "/api/lifecycle/github/installations/{installation_id}/uninstall",
+                  "/api/lifecycle/collector-tokens/{token_id}/revoke",
+                  "/api/lifecycle/collector-access/revoke-all",
                   # Executable code is narrower than ordinary dashboard read:
                   # a GitHub dashboard session is required, never a token.
                   "/api/collector-package"}

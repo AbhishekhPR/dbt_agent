@@ -27,6 +27,9 @@ TENANT_OWNED_TABLES = (
     "billing_checkout_intents",
     "billing_subscription_revocation_results",
     "workspace_credential_revocations",
+    "workspace_lifecycle_operations",
+    "workspace_lifecycle_provider_results",
+    "github_access_operations",
     "github_installation_states",
     "tenant_github_installations",
     "tenant_repositories",
@@ -40,6 +43,10 @@ TENANT_OWNED_TABLES = (
 EXCLUDED_SHARED_TABLES = (
     "clerk_github_identities",
     "oauth_authorization_states",
+    "account_lifecycle_operations",
+    "account_lifecycle_memberships",
+    "clerk_membership_departure_guards",
+    "deletion_receipts",
     "schema_migrations",
 )
 

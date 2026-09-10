@@ -69,6 +69,11 @@ class BillingService:
     def settings(self):
         return self._settings
 
+    @property
+    def client(self):
+        """Provider client for server-side lifecycle composition only."""
+        return self._client
+
     def now(self):
         """The service's clock, as an aware datetime.
 

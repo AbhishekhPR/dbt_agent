@@ -38,6 +38,10 @@ def create_http_app(
     secure_cookies=True,
     billing_service=None,
     billing_settings=None,
+    clerk_management_client=None,
+    lifecycle_github_client=None,
+    lifecycle_github_app_jwt=None,
+    repository_storage=None,
 ):
     """Build the served application.
 
@@ -253,6 +257,10 @@ def create_http_app(
             secure_cookies=secure_cookies,
             billing_service=billing_service,
             billing_settings=billing_settings,
+            clerk_management_client=clerk_management_client,
+            lifecycle_github_client=lifecycle_github_client,
+            lifecycle_github_app_jwt=lifecycle_github_app_jwt,
+            repository_storage=repository_storage,
         ))
     # Dashboard sign-in. Registered only when the App's user-authorization
     # credentials are fully configured, so there is never a login route that

@@ -1460,5 +1460,67 @@ def revoke_collector_token(token_id):
         sys.exit(1)
 
 
+@cli.command(name="lifecycle-operation")
+@click.option("--operation-id", required=True,
+              help="Opaque lifecycle operation id; never a tenant or user id")
+@click.option("--kind", type=click.Choice(("workspace", "account", "leave")),
+              required=True)
+@click.option("--resume", is_flag=True,
+              help="Advance the bounded server-resumable phase; default is read-only")
+def lifecycle_operation(operation_id, kind, resume):
+    """Audit or resume a durable post-identity-provider lifecycle operation."""
+    import json
+    import os
+
+    from agent.api.clerk_management import ClerkManagementClient, ClerkManagementSettings
+
+    settings = ClerkManagementSettings.from_environ(os.environ)
+    if settings is None:
+        raise click.ClickException("Clerk management is not configured")
+    store = _admin_store()
+    try:
+        if kind == "workspace":
+            operation = store.workspace_lifecycle_operation(operation_id)
+        elif kind == "account":
+            operation = store.account_lifecycle_operation(operation_id)
+        else:
+            operation = store.workspace_departure_for_operation(operation_id)
+        if operation is None:
+            receipt = store.deletion_receipt(operation_id)
+            if receipt is None:
+                raise click.ClickException("lifecycle operation was not found")
+            click.echo(json.dumps({"state": "completed", "receipt_id": operation_id},
+                                  sort_keys=True))
+            return
+        safe = {key: operation.get(key) for key in
+                ("operation_id", "phase", "disposition", "failure_category")}
+        if not resume:
+            click.echo(json.dumps(safe, sort_keys=True, default=str))
+            return
+        clerk = ClerkManagementClient(settings)
+        if kind == "workspace":
+            from agent.workspace_deletion_lifecycle import WorkspaceDeletionEngine
+            storage_root = os.environ.get("RELIUM_STORAGE_ROOT")
+            engine = WorkspaceDeletionEngine(
+                authorizer=None, store=store, polar_client=None,
+                github_client=None, github_app_jwt=None, clerk_client=clerk,
+                repository_storage=storage_root)
+            result = engine.advance_server(operation_id)
+        elif kind == "account":
+            from agent.account_lifecycle import AccountLifecycleEngine
+            result = AccountLifecycleEngine(
+                store=store, clerk_client=clerk).advance_server(operation_id)
+        else:
+            from agent.workspace_access_controls import resume_workspace_departure
+            result = resume_workspace_departure(
+                operation=operation, clerk_client=clerk, store=store)
+        output = {key: result.get(key) for key in
+                  ("operation_id", "phase", "disposition", "failure_category",
+                   "state", "receipt_id") if key in result}
+        click.echo(json.dumps(output, sort_keys=True, default=str))
+    finally:
+        store.close()
+
+
 if __name__ == '__main__':
     cli()

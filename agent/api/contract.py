@@ -134,6 +134,18 @@ MANDATORY_ROUTES = {
     ("GET", "/api/billing/subscription"),
     ("POST", "/api/billing/portal"),
     ("POST", "/api/billing/webhooks/polar"),
+    ("GET", "/api/settings/lifecycle"),
+    ("POST", "/api/lifecycle/workspace-deletion"),
+    ("POST", "/api/lifecycle/workspace-deletion/{operation_id}/advance"),
+    ("POST", "/api/lifecycle/account-deletion"),
+    ("POST", "/api/lifecycle/account-deletion/{operation_id}/advance"),
+    ("POST", "/api/lifecycle/workspace/leave"),
+    ("POST", "/api/lifecycle/github/personal/disconnect"),
+    ("POST", "/api/lifecycle/github/repositories/{repository_id}/disconnect"),
+    ("POST", "/api/lifecycle/github/installations/{installation_id}/disconnect"),
+    ("POST", "/api/lifecycle/github/installations/{installation_id}/uninstall"),
+    ("POST", "/api/lifecycle/collector-tokens/{token_id}/revoke"),
+    ("POST", "/api/lifecycle/collector-access/revoke-all"),
 }
 
 AUTHENTICATION = {
@@ -165,6 +177,18 @@ AUTHENTICATION = {
     "/api/billing/checkout": "clerk-session",
     "/api/billing/subscription": "clerk-session",
     "/api/billing/portal": "clerk-session",
+    "/api/settings/lifecycle": "clerk-session",
+    "/api/lifecycle/workspace-deletion": "clerk-session",
+    "/api/lifecycle/workspace-deletion/{operation_id}/advance": "clerk-session",
+    "/api/lifecycle/account-deletion": "clerk-session",
+    "/api/lifecycle/account-deletion/{operation_id}/advance": "clerk-session",
+    "/api/lifecycle/workspace/leave": "clerk-session",
+    "/api/lifecycle/github/personal/disconnect": "clerk-session",
+    "/api/lifecycle/github/repositories/{repository_id}/disconnect": "clerk-session",
+    "/api/lifecycle/github/installations/{installation_id}/disconnect": "clerk-session",
+    "/api/lifecycle/github/installations/{installation_id}/uninstall": "clerk-session",
+    "/api/lifecycle/collector-tokens/{token_id}/revoke": "clerk-session",
+    "/api/lifecycle/collector-access/revoke-all": "clerk-session",
     # Polar -> Relium. No session and no bearer token: a payment provider's
     # callback carries neither. The credential is an HMAC-SHA256 signature over
     # the exact request body, verified against POLAR_WEBHOOK_SECRET before the

@@ -26,6 +26,18 @@ class ClerkMembershipUnavailable(WorkspaceMembershipUnavailable):
     """Clerk could not establish one complete authoritative membership view."""
 
 
+class ClerkResourceAbsent(ClerkMembershipUnavailable):
+    """Clerk authoritatively reports that the selected resource is absent."""
+
+
+@dataclass(frozen=True)
+class ClerkUserOrganizationMembership:
+    organization_id: str
+    clerk_membership_id: str
+    clerk_role_key: str
+    source_version: str | None = None
+
+
 @dataclass(frozen=True)
 class ClerkManagementSettings:
     secret_key: str = field(repr=False)
@@ -118,8 +130,79 @@ class ClerkManagementClient:
             source_version=organization_version,
         )
 
-    def _request_json(self, path):
-        request = urllib.request.Request(self.settings.api_base + path, method="GET")
+    def user_organization_memberships(
+            self, user_id: str) -> tuple[ClerkUserOrganizationMembership, ...]:
+        """Return one complete server-authoritative membership inventory."""
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ClerkMembershipUnavailable("Clerk user id is missing")
+        user_id = user_id.strip()
+        encoded = urllib.parse.quote(user_id, safe="")
+        memberships = []
+        offset = 0
+        expected_total = None
+        while expected_total is None or offset < expected_total:
+            page = self._request_json(
+                f"/users/{encoded}/organization_memberships"
+                f"?limit={self._page_size}&offset={offset}")
+            if not isinstance(page, dict):
+                raise ClerkMembershipUnavailable("Clerk returned malformed pagination")
+            data, total = page.get("data"), page.get("total_count")
+            if (not isinstance(data, list) or not isinstance(total, int)
+                    or isinstance(total, bool) or total < 0):
+                raise ClerkMembershipUnavailable("Clerk returned malformed pagination")
+            if expected_total is None:
+                expected_total = total
+                if total > self._max_memberships:
+                    raise ClerkMembershipUnavailable("Clerk membership count exceeds limit")
+            elif total != expected_total:
+                raise ClerkMembershipUnavailable("Clerk membership pagination changed")
+            if not data and offset < expected_total:
+                raise ClerkMembershipUnavailable("Clerk returned incomplete pagination")
+            memberships.extend(
+                _parse_user_membership(item, user_id) for item in data)
+            offset += len(data)
+            if len(memberships) > expected_total:
+                raise ClerkMembershipUnavailable("Clerk returned too many memberships")
+        if len(memberships) != expected_total:
+            raise ClerkMembershipUnavailable("Clerk returned incomplete pagination")
+        return tuple(memberships)
+
+    def delete_organization_membership(self, organization_id: str,
+                                       user_id: str):
+        organization = urllib.parse.quote(_identifier(
+            organization_id, "Clerk organization id"), safe="")
+        user = urllib.parse.quote(_identifier(user_id, "Clerk user id"), safe="")
+        return self._request_json(
+            f"/organizations/{organization}/memberships/{user}",
+            method="DELETE")
+
+    def delete_organization(self, organization_id: str):
+        organization = urllib.parse.quote(_identifier(
+            organization_id, "Clerk organization id"), safe="")
+        return self._request_json(
+            f"/organizations/{organization}", method="DELETE")
+
+    def delete_user(self, user_id: str):
+        user = urllib.parse.quote(_identifier(user_id, "Clerk user id"), safe="")
+        return self._request_json(f"/users/{user}", method="DELETE")
+
+    def get_user(self, user_id: str):
+        user = urllib.parse.quote(_identifier(user_id, "Clerk user id"), safe="")
+        document = self._request_json(f"/users/{user}")
+        if not isinstance(document, dict) or document.get("id") != user_id:
+            raise ClerkMembershipUnavailable("Clerk returned a different user")
+        return document
+
+    def get_organization(self, organization_id: str):
+        organization = urllib.parse.quote(_identifier(
+            organization_id, "Clerk organization id"), safe="")
+        document = self._request_json(f"/organizations/{organization}")
+        if not isinstance(document, dict) or document.get("id") != organization_id:
+            raise ClerkMembershipUnavailable("Clerk returned a different organization")
+        return document
+
+    def _request_json(self, path, *, method="GET"):
+        request = urllib.request.Request(self.settings.api_base + path, method=method)
         request.add_header("Accept", "application/json")
         request.add_header("Authorization", f"Bearer {self.settings.secret_key}")
         request.add_header("User-Agent", "relium-membership/1")
@@ -128,6 +211,8 @@ class ClerkManagementClient:
             with send(request, timeout=self.settings.timeout_seconds) as response:
                 payload = response.read(self.settings.max_response_bytes + 1)
         except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise ClerkResourceAbsent("Clerk resource is absent") from None
             raise ClerkMembershipUnavailable(
                 f"Clerk membership authority returned HTTP {exc.code}") from None
         except (urllib.error.URLError, OSError):
@@ -135,6 +220,8 @@ class ClerkManagementClient:
                 "Clerk membership authority is unavailable") from None
         if len(payload) > self.settings.max_response_bytes:
             raise ClerkMembershipUnavailable("Clerk response exceeded the size limit")
+        if not payload:
+            return {}
         try:
             document = json.loads(payload)
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -197,3 +284,34 @@ def _parse_membership(document, expected_organization_id):
         source_version=_source_version(document),
         source_updated_at=_timestamp(document.get("updated_at")),
     )
+
+
+def _parse_user_membership(document, expected_user_id):
+    if not isinstance(document, dict):
+        raise ClerkMembershipUnavailable("Clerk membership is malformed")
+    membership_id = document.get("id")
+    role = document.get("role")
+    organization = document.get("organization")
+    organization_id = (organization.get("id")
+                       if isinstance(organization, dict) else None)
+    public_user = document.get("public_user_data")
+    user_id = public_user.get("user_id") if isinstance(public_user, dict) else None
+    if user_id != expected_user_id:
+        raise ClerkMembershipUnavailable(
+            "Clerk membership belongs to a different user")
+    if not all(isinstance(value, str) and value for value in
+               (membership_id, role, organization_id)):
+        raise ClerkMembershipUnavailable(
+            "Clerk membership is missing authoritative provenance")
+    return ClerkUserOrganizationMembership(
+        organization_id=organization_id,
+        clerk_membership_id=membership_id,
+        clerk_role_key=role,
+        source_version=_source_version(document),
+    )
+
+
+def _identifier(value, label):
+    if not isinstance(value, str) or not value.strip() or len(value) > 255:
+        raise ClerkMembershipUnavailable(f"{label} is missing")
+    return value.strip()
