@@ -171,7 +171,7 @@ class TenantOperationalOwnershipPostgresMigrationTests(unittest.TestCase):
     def _apply_latest(self):
         from agent.postgres_migrate import apply_migrations
 
-        self.assertEqual(apply_migrations(self.connection), [21, 22, 23, 24, 25, 26])
+        self.assertEqual(apply_migrations(self.connection), [21, 22, 23, 24, 25, 26, 27])
 
     def test_dry_run_audit_never_applies_a_pending_migration(self):
         from agent.cli import cli
@@ -217,7 +217,7 @@ class TenantOperationalOwnershipPostgresMigrationTests(unittest.TestCase):
 
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual(errors, [])
-        self.assertEqual(sorted(results, key=len), [[], [21, 22, 23, 24, 25, 26]])
+        self.assertEqual(sorted(results, key=len), [[], [21, 22, 23, 24, 25, 26, 27]])
 
     def test_complete_exact_ci_chain_is_backfilled(self):
         tenant_id = self._tenant("a")
