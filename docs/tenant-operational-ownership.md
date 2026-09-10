@@ -86,3 +86,86 @@ derives the tenant ID from that server-side context. It is not exposed as a
 browser-facing endpoint. A tenant with no operational records is complete; a
 tenant whose projected CI token identifies an unmapped root is incomplete, and
 a projection pointing at another tenant's mapped root is inconsistent.
+
+## Operator attestation of pre-tenant legacy roots
+
+Some legacy roots predate the tenant plane entirely. `organizations` and
+`repositories` hold TEXT names and nothing else — no GitHub repository id, no
+installation id, no owner id — so for those roots there is no provider-issued
+identifier anywhere in production from which ownership could be derived. The
+audit correctly reports them as `partial_mapping` or `unmapped`, and the
+lifecycle correctly refuses to delete a workspace that owns them.
+
+`--apply-unambiguous` cannot help: it inserts only complete single-tenant CI
+proofs, and these roots have none.
+
+```
+relium tenant-ownership-attest \
+  --organization-id AbhishekhPR \
+  --tenant-id ten_c12a0bc74dd94756a861ddfccf56e71d \
+  --reason "pre-tenant legacy operational data reviewed by operator" \
+  --confirm AbhishekhPR
+```
+
+### This is an attestation, not a proof
+
+`ci_token_binding` is **derived**: the database can re-check it at any time from
+the token, the repository projection and the installation binding.
+`operator_attested_legacy` cannot be re-checked from anything, because there is
+nothing left to check. The two are therefore kept apart at every level:
+
+* A distinct `mapping_basis` value, so no reader can confuse them.
+* A CHECK constraint requiring an attested row to carry **no** provider
+  provenance columns at all. The schema itself refuses to let an attestation
+  dress up as provider-verified evidence.
+* `attested_operational_roots` on both the operational inventory and the
+  lifecycle access inventory, so a caller that satisfies the ownership gate can
+  still see that ownership rests on a human's claim.
+
+Nothing in this path weakens `ci_token_binding`. An existing derived mapping is
+never rewritten, never downgraded, and never reassigned.
+
+### What the command refuses
+
+Every refusal happens inside the SERIALIZABLE transaction and rolls it back
+untouched. None of them overwrites anything.
+
+| Refusal | Meaning |
+|---|---|
+| `--confirm` mismatch | The confirmation must equal `--organization-id` exactly. `Relium-site` and `relium-site` are different rows. |
+| `reason_required` | An attestation with no recorded justification is not an attestation. |
+| `organization_not_found` / `tenant_not_found` | Both identifiers must already exist. Nothing is created. |
+| `mapped_to_other_tenant` | Another workspace already owns this root. Never reassigned. |
+| `already_mapped_authoritatively` | Derived evidence outranks an attestation and is not downgraded to one. |
+| `provable_without_attestation` | The root is CI-provable. Use `--apply-unambiguous`; a weaker claim must not be recorded where a stronger one is available. |
+| `cross_tenant_inconsistency` | Derived evidence exists and points at a different tenant. An attestation covers an *absence* of evidence, never a disagreement with it. |
+| `ambiguous_candidate_tenants` | Derived evidence names more than one workspace. An attestation must not be the thing that picks a winner. |
+
+Repeating an identical attestation is a no-op: it returns `already_attested`
+and writes neither a second mapping nor a second audit record.
+
+### What it does not do
+
+* It does **not** fabricate `tenant_repositories` rows. Individual repositories
+  remain unprojected; only the root is attributed.
+* It does **not** claim provider verification, and the schema prevents it.
+* It does **not** infer anything. Both identifiers are supplied exactly by the
+  operator and matched exactly.
+
+### The audit record
+
+`tenant_operational_root_attestations` stores the basis, organization id,
+tenant id, timestamp and the operator's non-secret reason. It is workspace-owned:
+durable for the life of the tenant, and purged with it, because a completed
+deletion retains only a dissociated receipt and a row naming a deleted tenant
+would contradict that.
+
+### Verification
+
+```
+# Before: confirm the root really is unprovable.
+relium tenant-ownership-audit --json
+
+# After: the root is mapped, and the provenance is visible as attested.
+relium tenant-ownership-audit --json
+```

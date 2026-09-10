@@ -2173,12 +2173,15 @@ class PostgresLifecycleStore:
         ).fetchone()
         if tenant is None:
             raise ValueError("tenant does not exist")
-        roots = [
-            row["organization_id"]
-            for row in self.connection.execute(
-                "SELECT organization_id FROM tenant_operational_roots "
-                "WHERE tenant_id = %s ORDER BY organization_id", (tenant_id,)
-            ).fetchall()
+        root_rows = self.connection.execute(
+            "SELECT organization_id, mapping_basis "
+            "FROM tenant_operational_roots "
+            "WHERE tenant_id = %s ORDER BY organization_id", (tenant_id,)
+        ).fetchall()
+        roots = [row["organization_id"] for row in root_rows]
+        attested_roots = [
+            row["organization_id"] for row in root_rows
+            if row["mapping_basis"] == self.ATTESTED_LEGACY_BASIS
         ]
         unresolved_rows = self.connection.execute(
             "SELECT DISTINCT token.organization_id, mapping.tenant_id AS mapped_tenant "
@@ -2201,7 +2204,7 @@ class PostgresLifecycleStore:
             self._operational_root_candidates_sql()
             + "SELECT candidate.organization_id, candidate.repository_count, "
               "       candidate.matched_count, candidate.complete, "
-              "       candidate.tenant_ids "
+              "       candidate.tenant_ids, mapping.mapping_basis "
               "FROM root_candidates candidate "
               "JOIN tenant_operational_roots mapping "
               "  ON mapping.organization_id = candidate.organization_id "
@@ -2215,7 +2218,17 @@ class PostgresLifecycleStore:
             if (len(candidate_tenants) > 1
                     or (candidate_tenants
                         and candidate_tenants != {tenant_id})):
+                # Contradicting derived evidence is a conflict on ANY basis. An
+                # attestation covers an absence of evidence, never a
+                # disagreement with it.
                 mapped_inconsistent = True
+            elif row["mapping_basis"] == self.ATTESTED_LEGACY_BASIS:
+                # An operator has taken responsibility for exactly the gap this
+                # branch measures: repositories with no derived proof. Counting
+                # them as incomplete would make the attestation useless, so the
+                # root is owned -- and `attested_operational_roots` keeps the
+                # weaker provenance visible to every caller.
+                continue
             elif (not row["complete"]
                   or row["repository_count"] != row["matched_count"]):
                 mapped_incomplete = True
@@ -2256,6 +2269,7 @@ class PostgresLifecycleStore:
         return {
             "tenant_id": tenant_id,
             "operational_roots": roots,
+            "attested_operational_roots": attested_roots,
             "ownership_status": ownership_status,
             "unresolved_operational_roots": unresolved_roots,
             "counts": counts,
@@ -2367,6 +2381,14 @@ class PostgresLifecycleStore:
                     deleted += self.connection.execute(
                         f"DELETE FROM {table} WHERE tenant_id=%s", (tenant_id,)
                     ).rowcount
+            # The attestation trail is workspace-owned and goes with the
+            # workspace. It is durable for the life of the tenant, not beyond
+            # it: leaving a row naming a deleted tenant and its legacy root
+            # would contradict the rule that a completed deletion retains only
+            # a dissociated receipt.
+            deleted += self.connection.execute(
+                "DELETE FROM tenant_operational_root_attestations "
+                "WHERE tenant_id=%s", (tenant_id,)).rowcount
             deleted += self.connection.execute(
                 "DELETE FROM github_installation_states WHERE tenant_id=%s",
                 (tenant_id,)).rowcount
@@ -2490,6 +2512,12 @@ class PostgresLifecycleStore:
             "AND scope='collector' ORDER BY repository_id,environment,token_id",
             (roots,)).fetchall()]
         return {"ownership_status": inventory["ownership_status"],
+                # Carried through so a caller can see that ownership rests on an
+                # operator's attestation rather than derived evidence. It is
+                # deliberately not folded into ownership_status: the gate is
+                # satisfied, and the provenance is still visible.
+                "attested_operational_roots":
+                    list(inventory.get("attested_operational_roots") or ()),
                 "repositories": repositories,
                 "installations": installations, "collector_tokens": collectors}
 
@@ -3420,6 +3448,150 @@ class PostgresLifecycleStore:
             ).fetchall()
             return {"eligible_count": eligible_count,
                     "applied_count": len(inserted), "dry_run": False}
+
+    ATTESTED_LEGACY_BASIS = "operator_attested_legacy"
+
+    def attest_tenant_operational_root(self, *, organization_id, tenant_id,
+                                       reason, attested_at=None):
+        """Record an operator's explicit, UNVERIFIED claim of legacy ownership.
+
+        ###################################################################
+        # THIS IS NOT A PROOF. IT RECORDS WHO TOOK RESPONSIBILITY.        #
+        ###################################################################
+
+        `ci_token_binding` is derived: the database can re-check it at any time
+        from the token, the repository projection and the installation binding.
+        This cannot be re-checked from anything, because for a pre-tenant legacy
+        root there is nothing left to check -- `organizations` and
+        `repositories` hold TEXT names and no provider-issued identifier of any
+        kind. So the basis is recorded as a different value, the provenance
+        columns are left NULL (the schema CHECK enforces that), and the reason
+        is stored durably against the operator's decision.
+
+        Every refusal below raises rather than overwrites. Nothing in this
+        method updates or deletes an existing mapping.
+        """
+        if not isinstance(organization_id, str) or not organization_id.strip():
+            raise ValueError("organization_id_required")
+        if not isinstance(tenant_id, str) or not tenant_id.strip():
+            raise ValueError("tenant_id_required")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("reason_required")
+        if len(reason.strip()) > 2000:
+            raise ValueError("reason_too_long")
+        # Exact identifiers only. No normalisation, no case folding, no
+        # trimming into a match: `Relium-site` and `relium-site` are different
+        # rows, and quietly reconciling them is precisely the class of mistake
+        # this whole mechanism exists to avoid.
+        reason = reason.strip()
+        now = attested_at or datetime.now(timezone.utc)
+
+        with self.connection.transaction():
+            self.connection.execute(
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+
+            organization = self.connection.execute(
+                "SELECT organization_id FROM organizations "
+                "WHERE organization_id = %s FOR UPDATE",
+                (organization_id,),
+            ).fetchone()
+            if organization is None:
+                raise ValueError("organization_not_found")
+
+            tenant = self.connection.execute(
+                "SELECT tenant_id FROM tenants WHERE tenant_id = %s FOR UPDATE",
+                (tenant_id,),
+            ).fetchone()
+            if tenant is None:
+                raise ValueError("tenant_not_found")
+
+            existing = self.connection.execute(
+                "SELECT tenant_id, mapping_basis FROM tenant_operational_roots "
+                "WHERE organization_id = %s FOR UPDATE",
+                (organization_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["tenant_id"] != tenant_id:
+                    # Another workspace already owns this root. Never reassign.
+                    raise ValueError("mapped_to_other_tenant")
+                if existing["mapping_basis"] != self.ATTESTED_LEGACY_BASIS:
+                    # Derived evidence outranks an attestation and is never
+                    # downgraded to one.
+                    raise ValueError("already_mapped_authoritatively")
+                # Same organization, same tenant, same basis: the operation has
+                # already happened. Nothing is written a second time.
+                return {"status": "already_attested",
+                        "organization_id": organization_id,
+                        "tenant_id": tenant_id,
+                        "mapping_basis": self.ATTESTED_LEGACY_BASIS,
+                        "attestation_id": None,
+                        "attested_at": None}
+
+            candidate = self.connection.execute(
+                self._operational_root_candidates_sql()
+                + "SELECT repository_count, matched_count, complete, tenant_ids "
+                  "FROM root_candidates WHERE organization_id = %s",
+                (organization_id,),
+            ).fetchone()
+            if candidate is not None:
+                candidate_tenants = set(candidate["tenant_ids"] or [])
+                if len(candidate_tenants) > 1:
+                    # Derived evidence points at more than one workspace. An
+                    # attestation must not be the thing that picks a winner.
+                    raise ValueError("ambiguous_candidate_tenants")
+                if candidate_tenants and candidate_tenants != {tenant_id}:
+                    # What evidence exists contradicts the operator.
+                    raise ValueError("cross_tenant_inconsistency")
+                if (candidate["complete"]
+                        and candidate["repository_count"]
+                        == candidate["matched_count"]
+                        and candidate_tenants == {tenant_id}):
+                    # Provable without an attestation. Use the derived basis:
+                    # a weaker claim must not be recorded where a stronger one
+                    # is available.
+                    raise ValueError("provable_without_attestation")
+
+            attestation_id = f"att_{uuid.uuid4().hex}"
+            self.connection.execute(
+                "INSERT INTO tenant_operational_roots "
+                " (organization_id, tenant_id, mapping_basis, "
+                "  source_github_repository_id, source_github_installation_id, "
+                "  source_ci_token_id, established_at, verified_at) "
+                "VALUES (%s, %s, %s, NULL, NULL, NULL, %s, %s)",
+                (organization_id, tenant_id, self.ATTESTED_LEGACY_BASIS,
+                 now, now),
+            )
+            self.connection.execute(
+                "INSERT INTO tenant_operational_root_attestations "
+                " (attestation_id, organization_id, tenant_id, mapping_basis, "
+                "  reason, attested_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (attestation_id, organization_id, tenant_id,
+                 self.ATTESTED_LEGACY_BASIS, reason, now),
+            )
+            return {"status": "attested",
+                    "organization_id": organization_id,
+                    "tenant_id": tenant_id,
+                    "mapping_basis": self.ATTESTED_LEGACY_BASIS,
+                    "attestation_id": attestation_id,
+                    "attested_at": now}
+
+    def tenant_operational_root_attestations(self, *, tenant_id=None):
+        """The durable attestation trail. Never returns a credential."""
+        if tenant_id is None:
+            rows = self.connection.execute(
+                "SELECT attestation_id, organization_id, tenant_id, "
+                "       mapping_basis, reason, attested_at "
+                "FROM tenant_operational_root_attestations "
+                "ORDER BY attested_at, attestation_id").fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT attestation_id, organization_id, tenant_id, "
+                "       mapping_basis, reason, attested_at "
+                "FROM tenant_operational_root_attestations "
+                "WHERE tenant_id = %s ORDER BY attested_at, attestation_id",
+                (tenant_id,)).fetchall()
+        return [dict(row) for row in rows]
 
     def complete_tenant_onboarding(self, tenant_id, *, completed_at,
                                    repository_id=None, clerk_user_id=None):
