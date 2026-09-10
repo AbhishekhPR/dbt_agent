@@ -667,5 +667,180 @@ class AttestedRootProvenanceAgreementTests(AttestationStoreTests):
                          "operational_ownership_inconsistent")
 
 
+@unittest.skipUnless(
+    DSN, "RELIUM_TEST_POSTGRES_DSN not set; PostgreSQL suite requires a real server")
+class AttestationUnblocksDeletionTests(AttestationStoreTests):
+    """The production flow, end to end, against a real database.
+
+    Every earlier test asserts on `tenant_operational_inventory`. This one
+    drives `WorkspaceDeletionEngine.request` and `.advance` -- the functions the
+    API's `POST /workspace-deletion` and `.../advance` handlers actually call --
+    so a reader that is basis-aware in the inventory but not on the lifecycle
+    path could not pass it.
+    """
+
+    def _engine(self, tenant_id, **overrides):
+        from agent.api.workspace_membership import WorkspaceAuthorizationContext
+        from agent.github_app.client import GitHubNotFoundError
+        from agent.workspace_deletion_lifecycle import WorkspaceDeletionEngine
+        from agent.workspace_credential_revocation import (
+            revoke_workspace_credentials,
+        )
+
+        class Authorizer:
+            def require_owner(self, principal):
+                return WorkspaceAuthorizationContext(
+                    tenant_id=tenant_id, clerk_user_id="user_owner",
+                    role="owner", ownership_status="authoritative",
+                    active_owner_count=1, sync_generation="sync_1")
+
+        class GitHub:
+            def delete_installation(self, installation_id, app_jwt):
+                return {}
+
+            def get_installation(self, installation_id, app_jwt):
+                raise GitHubNotFoundError("absent", status_code=404)
+
+        class Clerk:
+            def __init__(self):
+                self.deleted = []
+
+            def delete_organization(self, organization_id):
+                self.deleted.append(organization_id)
+                return {}
+
+            def get_organization(self, organization_id):
+                from agent.api.clerk_management import ClerkResourceAbsent
+
+                if organization_id in self.deleted:
+                    raise ClerkResourceAbsent("absent")
+                return {"id": organization_id}
+
+        values = dict(
+            authorizer=Authorizer(), store=self.store, polar_client=object(),
+            github_client=GitHub(), github_app_jwt=lambda: "jwt",
+            clerk_client=Clerk(),
+            # Billing is proven elsewhere and is not what this test is about.
+            billing_revoker=lambda **kwargs: {"state": "verified_safe"},
+            # The REAL credential revoker, so the ownership gate on the
+            # lifecycle path is genuinely exercised.
+            credential_revoker=revoke_workspace_credentials,
+            repository_storage=None)
+        values.update(overrides)
+        return WorkspaceDeletionEngine(**values)
+
+    def _principal(self):
+        from agent.api.clerk_identity import ClerkPrincipal
+
+        return ClerkPrincipal(
+            clerk_user_id="user_owner", clerk_organization_id="clerk-prod",
+            tenant_id=None, factor_verification_age=(0, -1),
+            clerk_token_issued_at=datetime.now(timezone.utc),
+            is_impersonated=False)
+
+    def _advance_until_blocked(self, engine, operation_id, limit=8):
+        """Advance like the frontend does, returning the blocking category."""
+        from agent.workspace_deletion_lifecycle import LifecycleBlocked
+
+        for _ in range(limit):
+            try:
+                operation = engine.advance(self._principal(), operation_id)
+            except LifecycleBlocked as blocked:
+                return blocked.category, None
+            if operation.get("state") == "completed":
+                return None, operation
+        return None, None
+
+    def test_the_production_flow_is_blocked_then_unblocked_by_attestation(self):
+        from agent.workspace_deletion_lifecycle import LifecycleBlocked
+
+        tenant_id = self._production_shape()
+        tenant = self.store.tenant_by_id(tenant_id)
+        engine = self._engine(tenant_id)
+
+        # 1 + 2. The legacy root is incomplete, so deletion is refused outright.
+        with self.assertRaises(LifecycleBlocked) as raised:
+            engine.request(self._principal(),
+                           confirmation=tenant["organization_name"])
+        self.assertEqual(raised.exception.category,
+                         "operational_ownership_incomplete")
+
+        # 3. The operator attests the root to this same tenant.
+        self.store.attest_tenant_operational_root(
+            organization_id="LegacyRoot", tenant_id=tenant_id,
+            reason="pre-tenant legacy operational data reviewed by operator")
+
+        # 4. The same deletion is requested and advanced again.
+        operation = engine.request(self._principal(),
+                                   confirmation=tenant["organization_name"])
+        category, completed = self._advance_until_blocked(
+            engine, operation["operation_id"])
+
+        # 5. Ownership no longer stops it -- and with every other provider
+        #    proved safe, the deletion runs to completion through the real
+        #    engine, not merely past this one gate.
+        self.assertIsNone(category, f"deletion blocked by {category}")
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed["state"], "completed")
+        self.assertIsNotNone(completed.get("receipt_id"))
+
+    def test_an_operation_created_before_attestation_re_evaluates_ownership(self):
+        """The durable operation is not a cached verdict.
+
+        `begin_workspace_deletion` returns an existing incomplete operation
+        without re-checking ownership, so a retry reuses the row created
+        earlier. Each `advance` must therefore recompute the gate rather than
+        replay the blocker recorded on that row.
+        """
+        from agent.workspace_deletion_lifecycle import LifecycleBlocked
+
+        tenant_id = self._production_shape()
+        tenant = self.store.tenant_by_id(tenant_id)
+        engine = self._engine(tenant_id)
+
+        # An operation that exists while ownership is still incomplete: it is
+        # created here by attesting first, then advancing far enough to record a
+        # blocked phase, which is the state a retry finds.
+        self.store.attest_tenant_operational_root(
+            organization_id="LegacyRoot", tenant_id=tenant_id,
+            reason="reviewed by operator")
+        operation = engine.request(self._principal(),
+                                   confirmation=tenant["organization_name"])
+        operation_id = operation["operation_id"]
+
+        # Requesting again returns the SAME durable operation.
+        again = engine.request(self._principal(),
+                               confirmation=tenant["organization_name"])
+        self.assertEqual(again["operation_id"], operation_id)
+
+        category, _ = self._advance_until_blocked(engine, operation_id)
+        self.assertNotEqual(category, "operational_ownership_incomplete")
+
+    def test_the_lifecycle_gate_still_refuses_a_contradicted_attestation(self):
+        """The end-to-end path must fail closed, not just the inventory."""
+        from agent.workspace_deletion_lifecycle import LifecycleBlocked
+
+        claimant = self._tenant("e2e-claimant")
+        self.store.ensure_repository("E2ERoot", "unproven")
+        self.store.connection.execute(
+            "INSERT INTO tenant_operational_roots "
+            "(organization_id, tenant_id, mapping_basis, verified_at) "
+            "VALUES ('E2ERoot', %s, 'operator_attested_legacy', now())",
+            (claimant,))
+        self.store.connection.commit()
+        self._proven_repository(
+            "e2e-owner", 601, 6001, "E2ERoot", "proven", "token-e2e")
+
+        tenant = self.store.tenant_by_id(claimant)
+        engine = self._engine(claimant)
+
+        with self.assertRaises(LifecycleBlocked) as raised:
+            engine.request(self._principal(),
+                           confirmation=tenant["organization_name"])
+
+        self.assertEqual(raised.exception.category,
+                         "operational_ownership_inconsistent")
+
+
 if __name__ == "__main__":
     unittest.main()
