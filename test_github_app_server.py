@@ -149,6 +149,74 @@ class GitHubAppServerTests(unittest.TestCase):
         self.assertNotIn("raw-body-secret", rendered)
         self.assertNotIn("token-secret", rendered)
 
+    def test_outbound_provider_observability_fields_are_rendered(self):
+        """The fields #62/#63 add, proved to survive the allow-list.
+
+        They were dropped here for two deploys while the log calls that set them
+        looked correct, so this asserts on the JSON rather than on the record.
+        """
+        import json
+        import logging
+
+        from agent.github_app.server import SafeJsonFormatter
+
+        record = logging.LogRecord(
+            name="agent.billing.client", level=logging.WARNING,
+            pathname=__file__, lineno=1,
+            msg="polar_provider_state_inconsistent", args=(), exc_info=None)
+        record.operation = "list_checkouts"
+        record.route_template = "/v1/checkouts/"
+        record.outcome = "inconsistent"
+        record.inconsistency_subtype = "incomplete_pagination"
+        record.identity_kind = "external_customer_id"
+        record.page = 1
+        record.expected_total = 7
+        record.expected_max_page = 1
+        record.observed_items = 1
+        record.latency_ms = 42
+        record.timeout_seconds = 10.0
+        record.retryable = True
+
+        payload = json.loads(SafeJsonFormatter().format(record))
+
+        for field in ("outcome", "latency_ms", "timeout_seconds",
+                      "inconsistency_subtype", "identity_kind", "page",
+                      "expected_total", "expected_max_page", "observed_items"):
+            self.assertIn(field, payload, f"{field} is dropped before production")
+        self.assertEqual(payload["inconsistency_subtype"], "incomplete_pagination")
+        self.assertEqual(payload["observed_items"], 1)
+
+    def test_the_allow_list_still_drops_everything_it_does_not_name(self):
+        """Widening the list must not turn it into a pass-through."""
+        import json
+        import logging
+
+        from agent.github_app.server import SafeJsonFormatter
+
+        record = logging.LogRecord(
+            name="agent.billing.client", level=logging.WARNING,
+            pathname=__file__, lineno=1, msg="polar_provider_call",
+            args=(), exc_info=None)
+        record.outcome = "ok"
+        record.polar_customer_id = "cus_should_never_appear"
+        record.tenant_id = "ten_should_never_appear"
+        record.url = "https://api.polar.sh/v1/checkouts/?external_customer_id=ten_x"
+        record.authorization = "Bearer token-secret"
+        record.response_body = {"error": "card_declined"}
+
+        rendered = SafeJsonFormatter().format(record)
+        payload = json.loads(rendered)
+
+        self.assertEqual(payload["outcome"], "ok")
+        for absent in ("polar_customer_id", "tenant_id", "url",
+                       "authorization", "response_body"):
+            self.assertNotIn(absent, payload)
+        self.assertNotIn("cus_should_never_appear", rendered)
+        self.assertNotIn("ten_should_never_appear", rendered)
+        self.assertNotIn("token-secret", rendered)
+        self.assertNotIn("card_declined", rendered)
+        self.assertNotIn("external_customer_id=", rendered)
+
     def test_module_import_does_not_load_environment_or_start_server(self):
         import agent.github_app.server as server
 
