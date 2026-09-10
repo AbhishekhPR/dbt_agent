@@ -369,6 +369,24 @@ def _normalize_checkout(item):
 
 
 def _provider_failure_category(error):
+    """Name the fault precisely. Every branch here still fails closed.
+
+    ###################################################################
+    # A MISSING STATUS IS NOT AUTOMATICALLY A TIMEOUT.                #
+    ###################################################################
+
+    This used to return `provider_timeout` for every error that carried no HTTP
+    status, which is nine different faults wearing one name: the socket
+    deadline, DNS, connect, TLS, and four distinct ways a paginated listing can
+    fail to prove itself complete. Workspace deletion is the most
+    pagination-heavy path in the system -- it lists checkouts and subscriptions
+    by two identities, twice, around a mutation -- so it is exactly where a
+    consistency failure is most likely and where being told "timeout" sends an
+    operator hunting a network fault that was never there.
+
+    The distinction is diagnostic only. All of these remain retryable and none
+    of them lets a caller conclude billing is stopped.
+    """
     status = error.status_code
     if status in {401, 403}:
         return "provider_auth"
@@ -377,6 +395,13 @@ def _provider_failure_category(error):
     if isinstance(status, int) and 500 <= status <= 599:
         return "provider_5xx"
     if status is None:
+        kind = getattr(error, "failure_kind", None)
+        if kind == "unreachable":
+            return "provider_unreachable"
+        if kind == "inconsistent":
+            return "provider_inconsistent"
+        # Unclassified stays `provider_timeout`: it is the pre-existing name and
+        # the conservative reading of "we never got an answer".
         return "provider_timeout"
     return "provider_refused"
 
