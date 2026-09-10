@@ -473,5 +473,93 @@ class BillingGateUnderProviderFaultTests(unittest.TestCase):
         self.assertEqual(client.revoked, [])
 
 
+class InconsistencySubtypeTests(unittest.TestCase):
+    """One log line must say WHICH integrity check fired, and on which page.
+
+    The first cut of this logging recorded only `outcome: inconsistent`, which
+    told production that a listing could not be trusted but not which of the
+    four checks had rejected it, on which query, or with what counts. That is
+    one deploy cycle per question.
+    """
+
+    def setUp(self):
+        self.settings = SimpleNamespace(
+            api_base_url="https://api.polar.sh", access_token=TOKEN)
+
+    def _inconsistency(self, outcomes, *, by_customer=False):
+        client = PolarClient(self.settings,
+                             transport=_RecordingTransport(outcomes))
+        identity = ({"customer_id": "cus_live"} if by_customer
+                    else {"external_customer_id": TENANT_ID})
+        with self.assertLogs("agent.billing.client", level="INFO") as logs:
+            with self.assertRaises(PolarAPIError) as raised:
+                client.list_subscriptions(**identity)
+        record = next(r for r in logs.records
+                      if getattr(r, "outcome", None) == "inconsistent")
+        return record, raised.exception
+
+    def test_each_integrity_check_reports_its_own_subtype(self):
+        cases = {
+            "malformed_envelope": [
+                (200, json.dumps({"items": [], "pagination": {"max_page": 2}}).encode())],
+            "unstable_pagination": [
+                _page([{"id": "s1"}], 2, 2), _page([{"id": "s2"}], 3, 2)],
+            "duplicate_object": [
+                _page([{"id": "s1"}], 2, 2), _page([{"id": "s1"}], 2, 2)],
+            "incomplete_pagination": [_page([{"id": "s1"}], 2, 1)],
+        }
+        for subtype, outcomes in cases.items():
+            with self.subTest(subtype=subtype):
+                record, error = self._inconsistency(outcomes)
+                self.assertEqual(record.inconsistency_subtype, subtype)
+                self.assertEqual(error.inconsistency_subtype, subtype)
+
+    def test_the_page_and_counts_that_made_the_check_fire_are_recorded(self):
+        # A single-page listing whose total_count disagrees with what arrived.
+        record, _ = self._inconsistency([_page([{"id": "s1"}], 7, 1)])
+
+        self.assertEqual(record.inconsistency_subtype, "incomplete_pagination")
+        self.assertEqual(record.page, 1)
+        self.assertEqual(record.expected_total, 7)
+        self.assertEqual(record.expected_max_page, 1)
+        self.assertEqual(record.observed_items, 1)
+
+    def test_instability_is_reported_on_the_page_that_disagreed(self):
+        record, _ = self._inconsistency(
+            [_page([{"id": "s1"}], 2, 2), _page([{"id": "s2"}], 3, 2)])
+
+        self.assertEqual(record.inconsistency_subtype, "unstable_pagination")
+        self.assertEqual(record.page, 2)
+        self.assertEqual(record.expected_total, 3)
+        self.assertEqual(record.observed_items, 1)
+
+    def test_the_query_is_named_by_kind_and_never_by_value(self):
+        # "the external listing disagreed with the customer listing" is a whole
+        # class of bug, and used to be invisible.
+        external, _ = self._inconsistency([_page([{"id": "s1"}], 2, 1)])
+        self.assertEqual(external.identity_kind, "external_customer_id")
+
+        by_customer, _ = self._inconsistency(
+            [_page([{"id": "s1"}], 2, 1)], by_customer=True)
+        self.assertEqual(by_customer.identity_kind, "customer_id")
+        self.assertNotIn("cus_live", str(vars(by_customer)))
+        self.assertNotIn(TENANT_ID, str(vars(external)))
+
+    def test_the_new_diagnostics_carry_no_identifier_or_secret(self):
+        record, _ = self._inconsistency(
+            [_page([{"id": "sub_customer_object"}], 9, 1)])
+
+        rendered = " ".join(str(value) for value in vars(record).values())
+        self.assertNotIn(TOKEN, rendered)
+        self.assertNotIn("api.polar.sh", rendered)
+        self.assertNotIn(TENANT_ID, rendered)
+        self.assertNotIn("sub_customer_object", rendered)
+
+    def test_an_unknown_subtype_is_refused_rather_than_recorded(self):
+        error = PolarAPIError("x", failure_kind="inconsistent",
+                              inconsistency_subtype="something_invented")
+        self.assertIsNone(error.inconsistency_subtype)
+
+
 if __name__ == "__main__":
     unittest.main()

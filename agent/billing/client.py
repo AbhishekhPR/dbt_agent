@@ -45,6 +45,16 @@ logger = logging.getLogger(__name__)
 #: evidence about the network.
 FAILURE_KINDS = frozenset({"timeout", "unreachable", "inconsistent"})
 
+#: How a listing failed to prove itself complete. Recorded as a fixed enum so a
+#: log can be aggregated on it and a caller can branch on it without parsing an
+#: error message.
+INCONSISTENCY_SUBTYPES = frozenset({
+    "malformed_envelope",      # pagination block absent or not the documented shape
+    "unstable_pagination",     # total_count/max_page moved between page reads
+    "duplicate_object",        # the same id arrived on two pages
+    "incomplete_pagination",   # final page reached, item count != total_count
+})
+
 
 class PolarAPIError(RuntimeError):
     """Polar refused or could not answer.
@@ -56,7 +66,7 @@ class PolarAPIError(RuntimeError):
 
     def __init__(self, message, *, status_code=None, operation=None,
                  provider_code=None, provider_description=None,
-                 failure_kind=None):
+                 failure_kind=None, inconsistency_subtype=None):
         super().__init__(message)
         self.status_code = status_code
         self.operation = operation
@@ -64,6 +74,10 @@ class PolarAPIError(RuntimeError):
         self.provider_description = provider_description
         #: One of FAILURE_KINDS when no HTTP status was obtained, else None.
         self.failure_kind = failure_kind if failure_kind in FAILURE_KINDS else None
+        #: One of INCONSISTENCY_SUBTYPES when failure_kind is "inconsistent".
+        self.inconsistency_subtype = (
+            inconsistency_subtype
+            if inconsistency_subtype in INCONSISTENCY_SUBTYPES else None)
 
     @property
     def retryable(self) -> bool:
@@ -193,6 +207,11 @@ class PolarClient:
             document = self._get(f"{path}?{query}", operation=operation)
             page_items = document.get("items")
             pagination = document.get("pagination")
+            # Every integrity failure below records the SAME diagnostic set, so
+            # one log line says which check fired and on which page, with the
+            # counts that made it fire. None of it identifies anybody.
+            observed = dict(operation=operation, route_template=path,
+                            identity_kind=key, page=page)
             if (not isinstance(page_items, list) or not isinstance(pagination, dict)
                     or not isinstance(pagination.get("total_count"), int)
                     or isinstance(pagination.get("total_count"), bool)
@@ -204,28 +223,34 @@ class PolarClient:
                     or any(not isinstance(item, dict) for item in page_items)):
                 raise self._integrity_error(
                     "Polar returned an unexpected response.",
-                    operation=operation, route_template=path)
+                    subtype="malformed_envelope",
+                    observed_items=len(items), **observed)
+            observed.update(expected_total=pagination["total_count"],
+                            expected_max_page=pagination["max_page"])
             current_pagination = (pagination["total_count"], pagination["max_page"])
             if expected_pagination is None:
                 expected_pagination = current_pagination
             elif current_pagination != expected_pagination:
                 raise self._integrity_error(
                     "Polar returned unstable pagination.",
-                    operation=operation, route_template=path)
+                    subtype="unstable_pagination",
+                    observed_items=len(items), **observed)
             for item in page_items:
                 identifier = item.get("id")
                 if (not isinstance(identifier, str) or not identifier
                         or len(identifier) > 255 or identifier in seen_ids):
                     raise self._integrity_error(
                         "Polar returned ambiguous pagination.",
-                        operation=operation, route_template=path)
+                        subtype="duplicate_object",
+                        observed_items=len(items), **observed)
                 seen_ids.add(identifier)
             items.extend(page_items)
             if page >= pagination["max_page"]:
                 if len(items) != pagination["total_count"]:
                     raise self._integrity_error(
                         "Polar returned incomplete pagination.",
-                        operation=operation, route_template=path)
+                        subtype="incomplete_pagination",
+                        observed_items=len(items), **observed)
                 return items
             page += 1
 
@@ -261,14 +286,32 @@ class PolarClient:
         else:
             logger.warning("polar_provider_call_failed", extra=fields)
 
-    def _integrity_error(self, message, *, operation, route_template):
-        """Polar answered, but the answer could not be trusted as complete."""
+    def _integrity_error(self, message, *, operation, route_template, subtype,
+                         identity_kind=None, page=None, expected_total=None,
+                         expected_max_page=None, observed_items=None):
+        """Polar answered, but the answer could not be trusted as complete.
+
+        ``subtype`` is a fixed enum, never the message: the message is prose and
+        prose drifts. Everything recorded here is a COUNT or an enum -- no
+        provider object id, no customer id, no tenant id, no body. `identity_kind`
+        names WHICH query was in flight, never the value it carried, because
+        "the external_customer_id listing disagreed with the customer_id
+        listing" is the shape of a whole class of bug and was previously
+        invisible.
+        """
         error = PolarAPIError(message, operation=operation,
-                              failure_kind="inconsistent")
+                              failure_kind="inconsistent",
+                              inconsistency_subtype=subtype)
         logger.warning("polar_provider_state_inconsistent", extra={
             "operation": operation,
             "route_template": route_template,
             "outcome": "inconsistent",
+            "inconsistency_subtype": subtype,
+            "identity_kind": identity_kind,
+            "page": page,
+            "expected_total": expected_total,
+            "expected_max_page": expected_max_page,
+            "observed_items": observed_items,
             "retryable": True,
         })
         return error
