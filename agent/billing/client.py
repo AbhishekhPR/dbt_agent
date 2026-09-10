@@ -18,7 +18,10 @@ without a network, and the suite can never make a real charge.
 from __future__ import annotations
 
 import json
+import logging
 import re
+import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,6 +31,19 @@ import urllib.request
 MAX_RESPONSE_BYTES = 512 * 1024
 MAX_LIST_PAGES = 1000
 _POLAR_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,254}$")
+
+logger = logging.getLogger(__name__)
+
+#: Why a call ended without an HTTP status. These are NOT interchangeable, and
+#: collapsing them is what made a provider fault unreadable in production:
+#:
+#:   timeout       the socket deadline expired
+#:   unreachable   DNS, connect or TLS failed -- no deadline was involved
+#:   inconsistent  Polar answered, but the listing could not be proved complete
+#:
+#: All three fail closed. Only the first is a timeout, and only the first is
+#: evidence about the network.
+FAILURE_KINDS = frozenset({"timeout", "unreachable", "inconsistent"})
 
 
 class PolarAPIError(RuntimeError):
@@ -39,17 +55,65 @@ class PolarAPIError(RuntimeError):
     """
 
     def __init__(self, message, *, status_code=None, operation=None,
-                 provider_code=None, provider_description=None):
+                 provider_code=None, provider_description=None,
+                 failure_kind=None):
         super().__init__(message)
         self.status_code = status_code
         self.operation = operation
         self.provider_code = provider_code
         self.provider_description = provider_description
+        #: One of FAILURE_KINDS when no HTTP status was obtained, else None.
+        self.failure_kind = failure_kind if failure_kind in FAILURE_KINDS else None
 
     @property
     def retryable(self) -> bool:
+        # A call that never reached a status is retryable: nothing was decided,
+        # so another attempt can still decide it. This says only that retrying
+        # MAY help -- never that the caller may proceed without an answer.
+        if self.failure_kind is not None:
+            return True
         return self.status_code == 429 or (
             isinstance(self.status_code, int) and 500 <= self.status_code <= 599)
+
+
+def safe_polar_error_fields(error):
+    """Log-safe fields for one failed Polar call.
+
+    Deliberately omits the URL, the request body, the response body and the
+    access token. The query string carries the tenant id and the Authorization
+    header carries the secret, so neither is ever assembled into a log record.
+    """
+    if not isinstance(error, PolarAPIError):
+        return {}
+    return {
+        "operation": error.operation,
+        "http_status": error.status_code,
+        "outcome": error.failure_kind or "refused",
+        "retryable": error.retryable,
+        "provider_code": error.provider_code,
+    }
+
+
+def _transport_failure_kind(cause):
+    """Classify a transport exception WITHOUT reading its text.
+
+    A urllib error's string can contain the full request URL, so the decision
+    is made from types alone. `urllib` raises the socket deadline either
+    directly (a read that stalled) or wrapped in URLError (a connect that
+    stalled), so both shapes are unwrapped.
+
+    Note that `urllib` applies ONE socket timeout to the connect and to each
+    read, and exposes no way to set or observe them separately. A connect
+    timeout and a read timeout are therefore indistinguishable here; both are
+    reported as "timeout", and neither is guessed at.
+    """
+    seen = set()
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if isinstance(cause, (socket.timeout, TimeoutError)):
+            return "timeout"
+        cause = cause.reason if isinstance(cause, urllib.error.URLError) else None
+    return "unreachable"
 
 
 class PolarClient:
@@ -154,26 +218,30 @@ class PolarClient:
                     or pagination["max_page"] < 1
                     or pagination["max_page"] > MAX_LIST_PAGES
                     or any(not isinstance(item, dict) for item in page_items)):
-                raise PolarAPIError("Polar returned an unexpected response.",
-                                    operation=operation)
+                raise self._integrity_error(
+                    "Polar returned an unexpected response.",
+                    operation=operation, route_template=path)
             current_pagination = (pagination["total_count"], pagination["max_page"])
             if expected_pagination is None:
                 expected_pagination = current_pagination
             elif current_pagination != expected_pagination:
-                raise PolarAPIError("Polar returned unstable pagination.",
-                                    operation=operation)
+                raise self._integrity_error(
+                    "Polar returned unstable pagination.",
+                    operation=operation, route_template=path)
             for item in page_items:
                 identifier = item.get("id")
                 if (not isinstance(identifier, str) or not identifier
                         or len(identifier) > 255 or identifier in seen_ids):
-                    raise PolarAPIError("Polar returned ambiguous pagination.",
-                                        operation=operation)
+                    raise self._integrity_error(
+                        "Polar returned ambiguous pagination.",
+                        operation=operation, route_template=path)
                 seen_ids.add(identifier)
             items.extend(page_items)
             if page >= pagination["max_page"]:
                 if len(items) != pagination["total_count"]:
-                    raise PolarAPIError("Polar returned incomplete pagination.",
-                                        operation=operation)
+                    raise self._integrity_error(
+                        "Polar returned incomplete pagination.",
+                        operation=operation, route_template=path)
                 return items
             page += 1
 
@@ -188,8 +256,40 @@ class PolarClient:
     def _delete(self, path, *, operation):
         return self._request("DELETE", path, operation=operation)
 
+    def _observe(self, *, operation, method, route_template, started,
+                 status=None, error=None):
+        """One structured record per provider call. Never a secret or a body."""
+        fields = {
+            "operation": operation,
+            "http_method": method,
+            "route_template": route_template,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "timeout_seconds": self._timeout,
+            "http_status": status,
+            "outcome": "ok" if error is None else (error.failure_kind or "refused"),
+            "retryable": None if error is None else error.retryable,
+        }
+        if error is None:
+            logger.info("polar_provider_call", extra=fields)
+        else:
+            logger.warning("polar_provider_call_failed", extra=fields)
+
+    def _integrity_error(self, message, *, operation, route_template):
+        """Polar answered, but the answer could not be trusted as complete."""
+        error = PolarAPIError(message, operation=operation,
+                              failure_kind="inconsistent")
+        logger.warning("polar_provider_state_inconsistent", extra={
+            "operation": operation,
+            "route_template": route_template,
+            "outcome": "inconsistent",
+            "retryable": True,
+        })
+        return error
+
     def _request(self, method, path, *, payload=None, operation):
         url = f"{self._settings.api_base_url}{path}"
+        # The query string carries the tenant id; the template never does.
+        route_template = path.split("?", 1)[0]
         body = (json.dumps(payload, separators=(",", ":")).encode("utf-8")
                 if payload is not None else None)
         headers = {
@@ -198,18 +298,32 @@ class PolarClient:
             "Accept": "application/json",
             "User-Agent": "relium-billing",
         }
+        started = time.monotonic()
         try:
             status, raw = self._transport(
                 method=method, url=url, headers=headers, body=body,
                 timeout=self._timeout)
-        except PolarAPIError:
+        except PolarAPIError as error:
+            self._observe(operation=operation, method=method,
+                          route_template=route_template, started=started,
+                          status=error.status_code, error=error)
             raise
-        except Exception:
+        except Exception as cause:
             # The cause is deliberately dropped rather than chained: a urllib
             # error's string can contain the full request URL, and this error is
-            # rendered into a customer-facing response.
-            raise PolarAPIError("Polar could not be reached.",
-                                operation=operation) from None
+            # rendered into a customer-facing response. Its TYPE is still read,
+            # because "the deadline expired" and "the host did not resolve" are
+            # different faults and used to be reported as the same one.
+            error = PolarAPIError(
+                "Polar could not be reached.", operation=operation,
+                failure_kind=_transport_failure_kind(cause))
+            self._observe(operation=operation, method=method,
+                          route_template=route_template, started=started,
+                          error=error)
+            raise error from None
+        self._observe(operation=operation, method=method,
+                      route_template=route_template, started=started,
+                      status=status)
 
         if status is None or not 200 <= status < 300:
             provider_code, provider_description = _provider_diagnostic(raw)
