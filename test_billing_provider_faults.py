@@ -16,6 +16,7 @@ billing gate conclude that billing has stopped.
 from __future__ import annotations
 
 import json
+import logging
 import socket
 import time
 import unittest
@@ -559,6 +560,137 @@ class InconsistencySubtypeTests(unittest.TestCase):
         error = PolarAPIError("x", failure_kind="inconsistent",
                               inconsistency_subtype="something_invented")
         self.assertIsNone(error.inconsistency_subtype)
+
+
+# ---------------------------------------------------------------------------
+# The production log boundary.
+#
+# Everything above asserts on LogRecord attributes, which `assertLogs` exposes
+# directly. Production does not read LogRecord attributes -- it reads whatever
+# SafeJsonFormatter chose to serialise, and that formatter renders an ALLOW-LIST.
+# Two rounds of provider instrumentation shipped with every new field silently
+# dropped at that boundary, because no test ever ran the formatter.
+#
+# These tests render real records, produced by the real client, through the real
+# formatter, and assert on the JSON that would actually reach Railway.
+# ---------------------------------------------------------------------------
+
+class _Capture(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+class ProductionLogBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.settings = SimpleNamespace(
+            api_base_url="https://api.polar.sh", access_token=TOKEN)
+        self.capture = _Capture()
+        self.logger = logging.getLogger("agent.billing.client")
+        self.logger.addHandler(self.capture)
+        self.addCleanup(self.logger.removeHandler, self.capture)
+        self._previous = self.logger.level
+        self.logger.setLevel(logging.INFO)
+        self.addCleanup(self.logger.setLevel, self._previous)
+
+    def _rendered(self, outcomes, *, by_customer=False):
+        from agent.github_app.server import SafeJsonFormatter
+
+        client = PolarClient(self.settings,
+                             transport=_RecordingTransport(outcomes), timeout=7.5)
+        identity = ({"customer_id": "cus_live_object"} if by_customer
+                    else {"external_customer_id": TENANT_ID})
+        try:
+            client.list_checkouts(**identity)
+        except PolarAPIError:
+            pass
+        formatter = SafeJsonFormatter()
+        return [(record.getMessage(), json.loads(formatter.format(record)))
+                for record in self.capture.records]
+
+    def test_the_inconsistency_record_reaches_production_with_its_diagnostics(self):
+        # The exact production shape: a single-page listing whose total_count
+        # disagrees with what arrived.
+        rendered = self._rendered([_page([{"id": "co_1"}], 7, 1)])
+        _, payload = next(p for p in rendered
+                          if p[0] == "polar_provider_state_inconsistent")
+
+        self.assertEqual(payload["operation"], "list_checkouts")
+        self.assertEqual(payload["route_template"], "/v1/checkouts/")
+        self.assertEqual(payload["outcome"], "inconsistent")
+        self.assertEqual(payload["inconsistency_subtype"], "incomplete_pagination")
+        self.assertEqual(payload["identity_kind"], "external_customer_id")
+        self.assertEqual(payload["page"], 1)
+        self.assertEqual(payload["expected_total"], 7)
+        self.assertEqual(payload["expected_max_page"], 1)
+        self.assertEqual(payload["observed_items"], 1)
+        self.assertIs(payload["retryable"], True)
+
+    def test_the_provider_call_record_reaches_production_with_latency(self):
+        rendered = self._rendered([_page([], 0, 1)])
+        _, payload = next(p for p in rendered if p[0] == "polar_provider_call")
+
+        self.assertEqual(payload["operation"], "list_checkouts")
+        self.assertEqual(payload["http_method"], "GET")
+        self.assertEqual(payload["http_status"], 200)
+        self.assertEqual(payload["outcome"], "ok")
+        self.assertEqual(payload["timeout_seconds"], 7.5)
+        self.assertIn("latency_ms", payload)
+
+    def test_a_failed_call_reaches_production_naming_its_fault(self):
+        rendered = self._rendered([socket.timeout("timed out")])
+        _, payload = next(p for p in rendered
+                          if p[0] == "polar_provider_call_failed")
+
+        self.assertEqual(payload["outcome"], "timeout")
+        self.assertIs(payload["retryable"], True)
+        self.assertEqual(payload["operation"], "list_checkouts")
+
+    def test_every_field_the_client_emits_survives_the_allow_list(self):
+        # The class of bug, not just this instance: a field added to a log call
+        # and not to _LOG_FIELDS never reaches production, and used to do so
+        # silently. Anything genuinely unsafe to render must be removed from the
+        # log call -- not left to be dropped by the formatter.
+        from agent.github_app.server import _LOG_FIELDS
+
+        standard = set(vars(logging.LogRecord(
+            "n", logging.INFO, "p", 1, "m", (), None)))
+        standard.update({"taskName", "message", "asctime"})
+
+        for outcomes in ([_page([{"id": "co_1"}], 7, 1)],
+                         [_page([], 0, 1)],
+                         [socket.timeout("timed out")],
+                         [(402, b'{"error":"card_declined"}')]):
+            self.capture.records.clear()
+            self._rendered(outcomes)
+            for record in self.capture.records:
+                emitted = set(vars(record)) - standard
+                missing = emitted - set(_LOG_FIELDS)
+                self.assertEqual(
+                    missing, set(),
+                    f"{record.getMessage()} emits {sorted(missing)}, which "
+                    f"SafeJsonFormatter would silently drop")
+
+    def test_the_rendered_json_carries_no_identifier_or_secret(self):
+        # The allow-list is a redaction boundary. Widening it must not widen
+        # what escapes, so this asserts on the serialised bytes.
+        for outcomes, by_customer in (([_page([{"id": "co_secret_object"}], 9, 1)], False),
+                                      ([_page([{"id": "co_secret_object"}], 9, 1)], True),
+                                      ([(402, b'{"error":"card_declined"}')], False)):
+            with self.subTest(by_customer=by_customer):
+                self.capture.records.clear()
+                for _, payload in self._rendered(outcomes, by_customer=by_customer):
+                    rendered = json.dumps(payload)
+                    self.assertNotIn(TOKEN, rendered)
+                    self.assertNotIn(TENANT_ID, rendered)
+                    self.assertNotIn("cus_live_object", rendered)
+                    self.assertNotIn("co_secret_object", rendered)
+                    self.assertNotIn("api.polar.sh", rendered)
+                    self.assertNotIn("card_declined", rendered)
+                    self.assertNotIn("?", rendered)
 
 
 if __name__ == "__main__":

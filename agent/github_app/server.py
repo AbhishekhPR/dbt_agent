@@ -37,6 +37,25 @@ _LOG_FIELDS = (
     "github_message_category",
     "response_representation",
     "retryable",
+    # Outbound provider-call observability. Every one of these is an enum or an
+    # integer. None of them can carry a tenant id, a customer id, a provider
+    # object id, a query value, a URL, a body or a token -- which is the whole
+    # reason this tuple exists, and the reason adding to it is a deliberate act
+    # rather than a formality.
+    #
+    # They were added to the log calls in #62 and #63 and silently dropped here
+    # for two deploys, because tests asserted on LogRecord attributes and never
+    # ran the formatter. See test_github_app_server.py, which now renders
+    # through SafeJsonFormatter.format() so that cannot happen again.
+    "outcome",
+    "latency_ms",
+    "timeout_seconds",
+    "inconsistency_subtype",
+    "identity_kind",
+    "page",
+    "expected_total",
+    "expected_max_page",
+    "observed_items",
 )
 
 
