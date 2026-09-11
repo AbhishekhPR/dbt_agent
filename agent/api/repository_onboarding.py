@@ -88,6 +88,101 @@ CODE_REPOSITORY_LIMIT_REACHED = "repository_limit_reached"
 #: The workspace's plan does not include the requested enforcement mode.
 CODE_ENFORCEMENT_NOT_INCLUDED = "merge_blocking_not_included"
 
+#: The one log event name for every provider failure that becomes
+#: ``github_unavailable``. One name, because the question being asked in
+#: production is always the same one — WHICH of the GitHub calls failed — and
+#: that is answered by the ``operation`` field rather than by grepping for
+#: several different strings.
+EVENT_GITHUB_UNAVAILABLE = "onboarding_github_unavailable"
+
+#: Installation-token failures arrive as ``AuthenticationError``, which carries
+#: a message and nothing else. The messages are static and credential-free, but
+#: logging free text is a habit that eventually logs the wrong free text — so
+#: each known one is mapped to a fixed label and the message itself is dropped.
+#: An unrecognised message becomes ``"unclassified"``, never its own text.
+_TOKEN_FAILURE_KINDS = (
+    ("permissions do not match", "permission_mismatch"),
+    ("permission map", "permission_map_missing"),
+    ("did not return an installation token", "token_absent_from_response"),
+    ("Installation id", "invalid_installation_id"),
+    ("private key", "app_private_key"),
+    ("App id", "app_id"),
+    ("RS256 signing", "signer_unavailable"),
+)
+
+
+def _token_failure_kind(exc):
+    """A closed-set label for an installation-token failure.
+
+    Returns one of the labels above. Deliberately cannot return anything
+    derived from the exception text, so this can never become a channel for
+    whatever a future message happens to interpolate.
+    """
+    message = str(exc)
+    for needle, label in _TOKEN_FAILURE_KINDS:
+        if needle in message:
+            return label
+    return "unclassified"
+
+
+def _log_github_unavailable(operation, *, exc=None, **context):
+    """Say what failed, immediately before the reason stops existing.
+
+    ###################################################################
+    # WHY THIS EXISTS AT ALL.                                         #
+    ###################################################################
+
+    Every provider failure in this module is mapped to
+    ``CODE_GITHUB_UNAVAILABLE`` and re-raised ``from None``, which is correct
+    for the browser — a caller learns that GitHub did not answer, and nothing
+    about a repository they may have no access to. But ``from None`` also
+    discards the cause, so the very different failures behind that one code
+    (installation token, repository listing, branch lookup, dbt probe) were
+    indistinguishable in production. This writes the distinction down before it
+    is thrown away.
+
+    ###################################################################
+    # WHAT MAY BE LOGGED, AND WHY THE MESSAGE IS NOT IN THE LIST.     #
+    ###################################################################
+
+    Safe metadata only: the onboarding operation, the installation id, the
+    owner/repository/branch/path already chosen server-side, the exception
+    class, and whatever ``safe_github_error_fields`` considers safe — which is
+    the status code, the HTTP method, the ROUTE TEMPLATE rather than the
+    interpolated URL, GitHub's request id, the accepted permission set, and a
+    fixed message CATEGORY.
+
+    GitHub's raw error message is deliberately absent. It is very probably
+    harmless, but it is the one field whose contents GitHub controls and this
+    code cannot bound, and a log line is exactly where a credential that
+    appears in it would come to rest. The category plus the status plus the
+    route answers the production question without taking that bet.
+
+    Installation tokens, app JWTs, OAuth tokens, authorization headers and
+    request bodies are never accepted by this function at all, because nothing
+    calls it with them.
+
+    Level is WARNING, not ERROR: the customer sees a conflict and retries, and
+    a GitHub outage is not a Relium fault. It is loud enough to alert on and
+    quiet enough not to page.
+    """
+    from agent.github_app.client import safe_github_error_fields
+
+    fields = safe_github_error_fields(exc) if exc is not None else {}
+    # `safe_github_error_fields` calls GitHub's own endpoint name `operation`,
+    # which is not the onboarding operation this event is about. Both are
+    # worth having, so the provider's is renamed rather than dropped.
+    github_operation = fields.pop("operation", None)
+
+    fields.update({key: value for key, value in context.items()
+                   if value is not None})
+    fields["operation"] = operation
+    fields["exception_class"] = None if exc is None else type(exc).__name__
+    if github_operation is not None:
+        fields["github_operation"] = github_operation
+
+    logger.warning(EVENT_GITHUB_UNAVAILABLE, extra=fields)
+
 
 @dataclass(frozen=True)
 class CiCredential:
@@ -186,10 +281,18 @@ class RepositoryOnboardingService:
         try:
             return get_installation_token(
                 self._client, installation_id, self._jwt_factory())
-        except AuthenticationError:
+        except AuthenticationError as exc:
             # Includes the fail-closed permission check. An installation whose
             # granted permissions no longer match the approved set must not be
             # used, not quietly used anyway.
+            #
+            # `reason` is what separates "GitHub would not mint a token" from
+            # "the App's permissions drifted out of the approved set". They
+            # look identical to the customer and need opposite responses: one
+            # is an outage to wait out, the other is an App reinstall.
+            _log_github_unavailable(
+                "installation_token", exc=exc, installation_id=installation_id,
+                reason=_token_failure_kind(exc))
             raise RepositoryOnboardingError(CODE_GITHUB_UNAVAILABLE) from None
 
     # -- listing ------------------------------------------------------------
@@ -254,12 +357,28 @@ class RepositoryOnboardingService:
             try:
                 document = self._client.list_installation_repositories(
                     token, page=page)
-            except GitHubAPIError:
+            except GitHubAPIError as exc:
+                # `page` matters: failing on page 1 is an outage or a dead
+                # token, failing on page 60 is a rate limit part-way through a
+                # large installation. Same code to the browser, different fix.
+                _log_github_unavailable(
+                    "list_installation_repositories", exc=exc,
+                    installation_id=installation_id, page=page)
                 raise RepositoryOnboardingError(CODE_GITHUB_UNAVAILABLE) from None
             if not isinstance(document, dict):
+                # A 200 with the wrong shape. No exception exists to carry a
+                # status, so the shape itself is the finding.
+                _log_github_unavailable(
+                    "list_installation_repositories",
+                    installation_id=installation_id, page=page,
+                    reason="response_not_an_object")
                 raise RepositoryOnboardingError(CODE_GITHUB_UNAVAILABLE)
             batch = document.get("repositories")
             if not isinstance(batch, list):
+                _log_github_unavailable(
+                    "list_installation_repositories",
+                    installation_id=installation_id, page=page,
+                    reason="repositories_not_a_list")
                 raise RepositoryOnboardingError(CODE_GITHUB_UNAVAILABLE)
             for item in batch:
                 parsed = _parse_repository(item, installation_id)
@@ -269,6 +388,16 @@ class RepositoryOnboardingService:
             if not batch or (isinstance(seen_total, int) and len(found) >= seen_total):
                 break
         else:
+            # The safety bound fired: GitHub kept advertising more than it
+            # handed over. Failing closed here is right, but it is otherwise
+            # invisible, and `collected` against `total_count` is the only
+            # thing that tells a pagination bug apart from a genuinely
+            # enormous installation.
+            _log_github_unavailable(
+                "list_installation_repositories",
+                installation_id=installation_id, page=page,
+                collected=len(found), total_count=seen_total,
+                reason="page_limit_exhausted")
             raise RepositoryOnboardingError(CODE_GITHUB_UNAVAILABLE)
         enriched = []
         for repository in found:
@@ -279,13 +408,33 @@ class RepositoryOnboardingService:
                 branch = client.get_branch(
                     repository.owner_login, repository.name,
                     repository.default_branch)
-            except GitHubAPIError:
+            except GitHubAPIError as exc:
+                # Owner, name and branch are all server-derived — they came
+                # back from GitHub moments ago on this tenant's own
+                # installation token, so logging them discloses nothing the
+                # caller was not already entitled to. A 404 here is the
+                # interesting one: it usually means the default branch on
+                # record is stale, not that GitHub is down.
+                _log_github_unavailable(
+                    "get_branch", exc=exc, installation_id=installation_id,
+                    owner=repository.owner_login, repository=repository.name,
+                    branch=repository.default_branch)
                 raise RepositoryOnboardingError(CODE_GITHUB_UNAVAILABLE) from None
             try:
                 sha = branch["commit"]["sha"]
-            except (KeyError, TypeError):
+            except (KeyError, TypeError) as exc:
+                _log_github_unavailable(
+                    "get_branch", exc=exc, installation_id=installation_id,
+                    owner=repository.owner_login, repository=repository.name,
+                    branch=repository.default_branch,
+                    reason="commit_sha_missing")
                 raise RepositoryOnboardingError(CODE_GITHUB_UNAVAILABLE) from None
             if not isinstance(sha, str) or not sha:
+                _log_github_unavailable(
+                    "get_branch", installation_id=installation_id,
+                    owner=repository.owner_login, repository=repository.name,
+                    branch=repository.default_branch,
+                    reason="commit_sha_not_a_string")
                 raise RepositoryOnboardingError(CODE_GITHUB_UNAVAILABLE)
             enriched.append(dataclass_replace(repository, head_sha=sha))
         return enriched
@@ -399,9 +548,19 @@ class RepositoryOnboardingService:
                     repository.default_branch)
             except GitHubNotFoundError:
                 continue
-            except GitHubAPIError:
+            except GitHubAPIError as exc:
                 # Unreachable is not absent. Saying "no dbt project" during an
                 # outage would send the customer to fix the wrong thing.
+                #
+                # `path` is one of DBT_SEARCH_DIRECTORIES and nothing else, so
+                # it names a directory Relium chose, never one a caller did.
+                # It is here because a 403 on the first probe is a contents
+                # permission problem and a 403 on the fourth is a rate limit.
+                _log_github_unavailable(
+                    "detect_dbt_project", exc=exc,
+                    installation_id=repository.installation_id,
+                    owner=repository.owner_login, repository=repository.name,
+                    branch=repository.default_branch, path=path)
                 raise RepositoryOnboardingError(CODE_GITHUB_UNAVAILABLE) from None
             if content is not None:
                 return {"detected": True, "project_dir": directory,
