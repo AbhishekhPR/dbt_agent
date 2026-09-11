@@ -18,6 +18,10 @@ gap, and for the two things it must not disturb on its way past.
     back in an error body. Every test then asserts the sentinel is absent from
     every field of every record.
 
+The last class covers the other half of the same fault: ONE repository whose
+default branch GitHub cannot resolve must degrade on its own rather than
+collapsing the listing, and must do it without borrowing the fail-closed event.
+
 NO REAL CREDENTIAL APPEARS IN THIS FILE. `SENTINEL_TOKEN` is a marker chosen to
 be greppable and obviously fake; it is never sent anywhere.
 
@@ -31,8 +35,8 @@ import pathlib
 import unittest
 
 from agent.api.repository_onboarding import (
-    CODE_GITHUB_UNAVAILABLE, EVENT_GITHUB_UNAVAILABLE, AuthorizedRepository,
-    RepositoryOnboardingError, RepositoryOnboardingService,
+    CODE_GITHUB_UNAVAILABLE, EVENT_BRANCH_UNRESOLVED, EVENT_GITHUB_UNAVAILABLE,
+    AuthorizedRepository, RepositoryOnboardingError, RepositoryOnboardingService,
 )
 
 LOGGER_NAME = "agent.api.repository_onboarding"
@@ -51,6 +55,17 @@ BRANCH = "main"
 REPO_PAYLOAD = {
     "id": 900001, "name": REPOSITORY, "private": True,
     "default_branch": BRANCH, "owner": {"login": OWNER},
+}
+
+#: The repository from the production log line that started this: authorized,
+#: listed, and with no default branch GitHub will admit to.
+EMPTY_REPOSITORY = "youtube-skeleton-clone"
+EMPTY_REPO_PAYLOAD = {
+    "id": 900002, "name": EMPTY_REPOSITORY, "private": True,
+    "default_branch": BRANCH, "owner": {"login": OWNER},
+}
+TWO_REPOSITORIES = {
+    "total_count": 2, "repositories": [REPO_PAYLOAD, EMPTY_REPO_PAYLOAD],
 }
 
 ACME_REPOSITORY = AuthorizedRepository(
@@ -79,14 +94,21 @@ class _FakeClient:
 
     def __init__(self, *, list_error=None, list_document=None,
                  branch_error=None, branch_document=None, file_error=None,
-                 never_completes=False):
+                 never_completes=False, branch_errors=None):
         self.list_error = list_error
         self.list_document = (list_document if list_document is not None
                               else {"total_count": 1, "repositories": [REPO_PAYLOAD]})
         self.branch_error = branch_error
+        # Per-repository outcomes, keyed by name. This is what lets a single
+        # repository fail while its neighbours answer normally — the shape of
+        # the production fault.
+        self.branch_errors = dict(branch_errors or {})
         self.branch_document = (branch_document if branch_document is not None
                                 else {"commit": {"sha": "a" * 40}})
         self.file_error = file_error
+        #: Every (repository, path) the dbt probe asked for. Proving a call was
+        #: NOT made needs a record of the ones that were.
+        self.get_file_calls = []
         # Advertises far more than it ever hands over, so the paging loop can
         # never satisfy its exit condition and must hit the safety bound.
         self.never_completes = never_completes
@@ -106,11 +128,14 @@ class _FakeClient:
         return self.list_document if page == 1 else {"repositories": []}
 
     def get_branch(self, owner, repository, branch):
+        if repository in self.branch_errors:
+            raise self.branch_errors[repository]
         if self.branch_error is not None:
             raise self.branch_error
         return self.branch_document
 
     def get_file(self, owner, repository, path, ref):
+        self.get_file_calls.append((repository, path))
         if self.file_error is not None:
             raise self.file_error
         return None
@@ -119,6 +144,25 @@ class _FakeClient:
 class _FakeStore:
     def tenant_github_installations(self, tenant_id):
         return [{"github_installation_id": INSTALLATION, "status": "active"}]
+
+
+class _RecordingStore(_FakeStore):
+    """A store that also offers the optional detection-cache surface.
+
+    `list_repositories` probes for these with `hasattr`, so the plain fake
+    above exercises the path where they are absent. This one exercises the
+    path where they exist, and remembers what was written.
+    """
+
+    def __init__(self, detections=()):
+        self.detections = list(detections)
+        self.upserts = []
+
+    def tenant_repository_detections(self, tenant_id):
+        return self.detections
+
+    def upsert_tenant_repository_detection(self, **kwargs):
+        self.upserts.append(kwargs)
 
 
 def build_service(client, *, token_factory=None):
@@ -427,6 +471,218 @@ class NothingSensitiveIsEverLogged(_ObservabilityCase):
                 if isinstance(value, ast.Name) and value.id.lower() in banned:
                     offenders.append((node.lineno, value.id))
         self.assertEqual(offenders, [])
+
+
+class OneRepositoryWithNoResolvableBranch(unittest.TestCase):
+    """The production fault: one odd repository took the whole list down.
+
+    A customer authorized `youtube-skeleton-clone`, which is empty. An empty
+    repository has no commits, so its default branch does not exist and
+    GitHub answers 404 for it. That 404 was mapped to `github_unavailable`
+    like any other provider error, and GET /api/onboarding/repositories
+    returned a conflict — so a customer with one unused repository could not
+    see or connect any of the others.
+
+    The fix degrades that ONE repository. These tests hold the line on both
+    sides of it: the list survives a 404, and it still refuses everything
+    else. The second half matters more than the first — `except
+    GitHubAPIError` here instead of `except GitHubNotFoundError` would make a
+    revoked installation look like an empty repository, which is a far worse
+    bug than the one being fixed.
+    """
+
+    def setUp(self):
+        from agent.github_app.client import GitHubNotFoundError
+
+        self.not_found = GitHubNotFoundError(
+            "Branch not found", status_code=404,
+            operation="get_repository_branch", http_method="GET",
+            route_template="/repos/{owner}/{repo}/branches/{branch}")
+        self.client = _FakeClient(
+            list_document=TWO_REPOSITORIES,
+            branch_errors={EMPTY_REPOSITORY: self.not_found})
+        self.service = build_service(self.client)
+
+    def listed(self, store=None):
+        return self.service.list_repositories(store or _FakeStore(), "tenant-1")
+
+    # -- the list survives -----------------------------------------------
+
+    def test_a_404_on_one_repository_does_not_collapse_the_list(self):
+        repositories = self.listed()
+
+        self.assertEqual(
+            sorted(r.name for r in repositories),
+            sorted([REPOSITORY, EMPTY_REPOSITORY]))
+
+    def test_the_healthy_repository_still_resolves_its_commit(self):
+        """Degrading the neighbour must not degrade the ones that answered."""
+        healthy, = [r for r in self.listed() if r.name == REPOSITORY]
+
+        self.assertEqual(healthy.head_sha, "a" * 40)
+        self.assertFalse(healthy.branch_unresolved)
+
+    def test_the_problematic_repository_stays_visible_and_is_marked(self):
+        empty, = [r for r in self.listed() if r.name == EMPTY_REPOSITORY]
+
+        # Visible, because the customer is authorized for it and may well want
+        # to connect it once they push a first commit.
+        self.assertEqual(empty.full_name, f"{OWNER}/{EMPTY_REPOSITORY}")
+        self.assertIsNone(empty.head_sha)
+        self.assertTrue(empty.branch_unresolved)
+
+    def test_every_repository_being_empty_is_still_a_list_not_an_error(self):
+        """The degenerate case: a brand-new account with nothing pushed yet."""
+        client = _FakeClient(
+            list_document=TWO_REPOSITORIES,
+            branch_errors={REPOSITORY: self.not_found,
+                           EMPTY_REPOSITORY: self.not_found})
+
+        repositories = build_service(client).list_repositories(
+            _FakeStore(), "tenant-1")
+
+        self.assertEqual(len(repositories), 2)
+        self.assertTrue(all(r.branch_unresolved for r in repositories))
+
+    # -- the dbt probe is not attempted ----------------------------------
+
+    def test_dbt_detection_is_skipped_for_the_unresolved_repository(self):
+        """No commit means no ref; probing would be five guaranteed 404s."""
+        self.listed()
+
+        probed = {name for name, _path in self.client.get_file_calls}
+        self.assertEqual(probed, {REPOSITORY})
+
+    def test_detection_is_skipped_when_called_directly_too(self):
+        """select_repository reaches the probe by another road."""
+        unresolved = dataclass_replace_for_test(
+            ACME_REPOSITORY, branch_unresolved=True)
+
+        result = self.service.detect_dbt_project(unresolved)
+
+        self.assertEqual(
+            result,
+            {"detected": False, "project_dir": None, "manifest_path": None})
+        self.assertEqual(self.client.get_file_calls, [])
+
+    def test_a_stored_detection_is_not_overwritten_by_the_degraded_pass(self):
+        """The load-bearing half of skipping the upsert.
+
+        This repository was detected as a dbt project yesterday, when it had
+        commits. A transient branch 404 today must not rewrite that to "no dbt
+        project" — the customer would be told their configured repository is
+        not a dbt project at all.
+        """
+        store = _RecordingStore(detections=[{
+            "github_repository_id": 900002, "dbt_detected": True,
+            "dbt_project_dir": "analytics", "default_branch": BRANCH,
+            "dbt_checked_commit_sha": "b" * 40,
+        }])
+
+        self.listed(store)
+
+        written = {call["github_repository_id"] for call in store.upserts}
+        self.assertNotIn(900002, written)
+        self.assertEqual(written, {900001})
+
+    # -- and everything else still fails closed ---------------------------
+
+    def _assert_fails_closed(self, error):
+        client = _FakeClient(list_document=TWO_REPOSITORIES,
+                             branch_errors={EMPTY_REPOSITORY: error})
+        service = build_service(client)
+
+        with self.assertLogs(LOGGER_NAME, level=logging.WARNING) as captured:
+            with self.assertRaises(RepositoryOnboardingError) as raised:
+                service.list_repositories(_FakeStore(), "tenant-1")
+
+        self.assertEqual(raised.exception.code, CODE_GITHUB_UNAVAILABLE)
+        self.assertIn(EVENT_GITHUB_UNAVAILABLE,
+                      [r.getMessage() for r in captured.records])
+
+    def test_a_401_on_one_repository_still_fails_the_whole_list(self):
+        """A dead installation token is not an empty repository."""
+        self._assert_fails_closed(github_error(status_code=401))
+
+    def test_a_403_on_one_repository_still_fails_the_whole_list(self):
+        """Nor is a revoked permission. THIS is the one that must not degrade."""
+        self._assert_fails_closed(github_error(status_code=403))
+
+    def test_a_429_on_one_repository_still_fails_the_whole_list(self):
+        self._assert_fails_closed(github_error(status_code=429))
+
+    def test_a_500_on_one_repository_still_fails_the_whole_list(self):
+        self._assert_fails_closed(github_error(status_code=503))
+
+    def test_a_malformed_branch_document_still_fails_closed(self):
+        """Only a 404 degrades. A 200 that makes no sense is still an outage."""
+        client = _FakeClient(list_document=TWO_REPOSITORIES,
+                             branch_document={"commit": {}})
+        service = build_service(client)
+
+        with self.assertLogs(LOGGER_NAME, level=logging.WARNING):
+            with self.assertRaises(RepositoryOnboardingError) as raised:
+                service.list_repositories(_FakeStore(), "tenant-1")
+
+        self.assertEqual(raised.exception.code, CODE_GITHUB_UNAVAILABLE)
+
+    # -- what it logs, and what it must not ------------------------------
+
+    def test_the_handled_404_gets_its_own_event_with_the_repository_named(self):
+        with self.assertLogs(LOGGER_NAME, level=logging.INFO) as captured:
+            self.listed()
+
+        event, = [r for r in captured.records
+                  if r.getMessage() == EVENT_BRANCH_UNRESOLVED]
+        self.assertEqual(event.operation, "get_branch")
+        self.assertEqual(event.owner, OWNER)
+        self.assertEqual(event.repository, EMPTY_REPOSITORY)
+        self.assertEqual(event.branch, BRANCH)
+        self.assertEqual(event.installation_id, INSTALLATION)
+        self.assertEqual(event.http_status, 404)
+        self.assertEqual(event.degraded, "branch_unresolved")
+
+    def test_a_handled_404_never_emits_the_fail_closed_event(self):
+        """The whole point of a separate name.
+
+        `onboarding_github_unavailable` means the request failed. Emitting it
+        for something that changed nothing about the response would make the
+        alert it feeds permanently untrustworthy — and would have hidden this
+        very bug, since the production line that led here looks identical
+        either way.
+        """
+        with self.assertLogs(LOGGER_NAME, level=logging.INFO) as captured:
+            self.listed()
+
+        self.assertNotIn(EVENT_GITHUB_UNAVAILABLE,
+                         [r.getMessage() for r in captured.records])
+
+    def test_the_degraded_path_logs_at_info_not_warning(self):
+        """An empty repository is ordinary. It must not page anybody."""
+        with self.assertNoLogs(LOGGER_NAME, level=logging.WARNING):
+            self.listed()
+
+    def test_the_degraded_path_leaks_nothing_either(self):
+        from agent.github_app.client import GitHubNotFoundError
+
+        client = _FakeClient(
+            list_document=TWO_REPOSITORIES,
+            branch_errors={EMPTY_REPOSITORY: GitHubNotFoundError(
+                f"Not Found for token {SENTINEL_TOKEN}", status_code=404)})
+
+        with self.assertLogs(LOGGER_NAME, level=logging.INFO) as captured:
+            build_service(client).list_repositories(_FakeStore(), "tenant-1")
+
+        blob = " ".join(str(value) for record in captured.records
+                        for value in vars(record).values())
+        self.assertNotIn(SENTINEL_TOKEN, blob)
+        self.assertNotIn(SENTINEL_JWT, blob)
+
+
+def dataclass_replace_for_test(repository, **changes):
+    from dataclasses import replace
+
+    return replace(repository, **changes)
 
 
 class EveryMappingSiteIsInstrumented(unittest.TestCase):

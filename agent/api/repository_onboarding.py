@@ -95,6 +95,12 @@ CODE_ENFORCEMENT_NOT_INCLUDED = "merge_blocking_not_included"
 #: several different strings.
 EVENT_GITHUB_UNAVAILABLE = "onboarding_github_unavailable"
 
+#: One repository could not have its default branch resolved, and the listing
+#: carried on without it. Deliberately NOT the event above: that one means the
+#: request failed, and a handled 404 that changed nothing about the response
+#: must not page anybody or pollute the signal being alerted on.
+EVENT_BRANCH_UNRESOLVED = "onboarding_repository_branch_unresolved"
+
 #: Installation-token failures arrive as ``AuthenticationError``, which carries
 #: a message and nothing else. The messages are static and credential-free, but
 #: logging free text is a habit that eventually logs the wrong free text — so
@@ -184,6 +190,37 @@ def _log_github_unavailable(operation, *, exc=None, **context):
     logger.warning(EVENT_GITHUB_UNAVAILABLE, extra=fields)
 
 
+def _log_branch_unresolved(*, installation_id, repository, exc):
+    """One repository degraded; the request is still going to succeed.
+
+    INFO, not WARNING. An empty repository is a completely ordinary thing for
+    a customer to have authorized, and this fires once per listing for each of
+    them. It is here to be counted and grouped, not to be woken up for — and
+    the moment it starts being emitted for something that is NOT a 404, the
+    code above has changed and the fail-closed path is what should fire.
+
+    Carries the same safe metadata as its louder sibling, for the same
+    reasons; see `_log_github_unavailable`.
+    """
+    from agent.github_app.client import safe_github_error_fields
+
+    fields = safe_github_error_fields(exc)
+    github_operation = fields.pop("operation", None)
+    fields.update({
+        "operation": "get_branch",
+        "installation_id": installation_id,
+        "owner": repository.owner_login,
+        "repository": repository.name,
+        "branch": repository.default_branch,
+        "exception_class": type(exc).__name__,
+        "degraded": "branch_unresolved",
+    })
+    if github_operation is not None:
+        fields["github_operation"] = github_operation
+
+    logger.info(EVENT_BRANCH_UNRESOLVED, extra=fields)
+
+
 @dataclass(frozen=True)
 class CiCredential:
     """The outcome of issuing a CI token.
@@ -263,6 +300,20 @@ class AuthorizedRepository:
     private: bool
     installation_id: int
     head_sha: str | None = None
+    #: GitHub answered 404 for this repository's default branch, so there is no
+    #: commit to pin work to yet — an empty repository, or a default branch
+    #: renamed since the listing last reported it.
+    #:
+    #: NOT the same thing as ``head_sha is None``, and the two must not be
+    #: conflated. A client with no ``get_branch`` at all also leaves
+    #: ``head_sha`` unset, and those repositories are perfectly inspectable.
+    #: This flag means "GitHub was asked and said no", which is the only case
+    #: where skipping the dbt probe is right.
+    #:
+    #: Internal. It is not in the API payload: the listing already expresses
+    #: "not known" as a null ``dbt_detected``, and a new field would be a
+    #: schema change for something the browser does not act on.
+    branch_unresolved: bool = False
 
 
 class RepositoryOnboardingService:
@@ -320,6 +371,15 @@ class RepositoryOnboardingService:
                    for row in store.tenant_repository_detections(tenant_id)}
                   if hasattr(store, "tenant_repository_detections") else {})
         for repository in repositories:
+            if repository.branch_unresolved:
+                # No commit to read a dbt_project.yml out of, so nothing to
+                # detect. The upsert is skipped too, and that is the load
+                # bearing half: a repository that HAS a stored detection keeps
+                # it rather than being rewritten to "no dbt project" because
+                # its branch was briefly unreachable. One that never had one
+                # stays absent, which the payload already reports as null —
+                # unknown, not false.
+                continue
             current = cached.get(repository.github_repository_id)
             if (current and current.get("dbt_detected") is not None
                     and current.get("default_branch") == repository.default_branch
@@ -343,7 +403,7 @@ class RepositoryOnboardingService:
         return repositories
 
     def _installation_repositories(self, installation_id):
-        from agent.github_app.client import GitHubAPIError
+        from agent.github_app.client import GitHubAPIError, GitHubNotFoundError
 
         token = self._installation_token(installation_id)
         client = self._client.with_token(token)
@@ -408,13 +468,50 @@ class RepositoryOnboardingService:
                 branch = client.get_branch(
                     repository.owner_login, repository.name,
                     repository.default_branch)
+            except GitHubNotFoundError as exc:
+                # ###################################################
+                # # ONE REPOSITORY IS NOT THE PROVIDER.             #
+                # ###################################################
+                #
+                # An empty repository has no commits, so its default branch
+                # does not exist and GitHub answers 404. So does a repository
+                # whose default branch was renamed since the listing last
+                # reported it. Neither says anything about GitHub's health,
+                # and neither is a reason to refuse a customer the other
+                # nineteen repositories they came here to connect — which is
+                # exactly what production was doing.
+                #
+                # ###################################################
+                # # WHY THIS DOES NOT WIDEN ANYTHING.               #
+                # ###################################################
+                #
+                # This repository is in `found` because an INSTALLATION token
+                # returned it moments ago, so the tenant is already authorized
+                # for it and already knows it exists — keeping it visible
+                # discloses nothing the listing had not just disclosed. No
+                # later operation trusts this list either: every one of them
+                # re-resolves through authorized_repository().
+                #
+                # And the degradation is genuinely narrow. GitHubNotFoundError
+                # is raised for status 404 and nothing else, so 401, 403, 429
+                # and every 5xx fall through to the handler below and still
+                # fail closed. Catching GitHubAPIError here instead would
+                # swallow a revoked installation as if it were an empty
+                # repository, which is the one mistake this whole branch
+                # exists to avoid.
+                _log_branch_unresolved(
+                    installation_id=installation_id, repository=repository,
+                    exc=exc)
+                enriched.append(dataclass_replace(
+                    repository, head_sha=None, branch_unresolved=True))
+                continue
             except GitHubAPIError as exc:
                 # Owner, name and branch are all server-derived — they came
                 # back from GitHub moments ago on this tenant's own
                 # installation token, so logging them discloses nothing the
-                # caller was not already entitled to. A 404 here is the
-                # interesting one: it usually means the default branch on
-                # record is stale, not that GitHub is down.
+                # caller was not already entitled to. Everything reaching here
+                # is provider-wide: authentication, permission, rate limit or
+                # outage. The list fails closed, as it must.
                 _log_github_unavailable(
                     "get_branch", exc=exc, installation_id=installation_id,
                     owner=repository.owner_login, repository=repository.name,
@@ -536,6 +633,16 @@ class RepositoryOnboardingService:
         know where it is — so this fills in a suggestion rather than gating.
         """
         from agent.github_app.client import GitHubAPIError, GitHubNotFoundError
+
+        if repository.branch_unresolved:
+            # There is no ref to read a file at. Probing anyway is one
+            # guaranteed 404 per search directory, against a provider whose
+            # rate limit is shared by every repository in the installation.
+            # Reported as "no project" rather than as an error: this is the
+            # same answer the probe would have arrived at, and select_repository
+            # stores it in a boolean column.
+            return {"detected": False, "project_dir": None,
+                    "manifest_path": None}
 
         token = self._installation_token(repository.installation_id)
         client = self._client.with_token(token)
