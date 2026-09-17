@@ -55,7 +55,7 @@ class CatalogValidationTests(unittest.TestCase):
     def setUp(self):
         self.products = {
             STARTER_PRODUCT: product(
-                STARTER_PRODUCT, "Relium Starter", 14900),
+                STARTER_PRODUCT, "Relium Starter", 9900),
             PRO_PRODUCT: product(PRO_PRODUCT, "Relium Pro", 24900),
         }
 
@@ -71,7 +71,7 @@ class CatalogValidationTests(unittest.TestCase):
             "server": "sandbox",
             "starter": {
                 "id": STARTER_PRODUCT, "name": "Relium Starter",
-                "monthly_usd_cents": 14900,
+                "monthly_usd_cents": 9900,
             },
             "pro": {
                 "id": PRO_PRODUCT, "name": "Relium Pro",
@@ -133,6 +133,17 @@ class CatalogValidationTests(unittest.TestCase):
         with self.assertRaises(PreflightError):
             validate_catalog(duplicate, get_json=self.get_json)
 
+    def test_rejects_starter_still_at_the_previous_price(self):
+        from scripts.polar_billing_preflight import PreflightError, validate_catalog
+
+        products = dict(self.products)
+        products[STARTER_PRODUCT] = product(
+            STARTER_PRODUCT, "Relium Starter", 14900)
+        with self.assertRaises(PreflightError):
+            validate_catalog(
+                settings(),
+                get_json=lambda path: products[path.rsplit("/", 1)[-1]])
+
     def test_rejects_an_expected_environment_mismatch(self):
         from scripts.polar_billing_preflight import PreflightError, run_preflight
 
@@ -146,7 +157,7 @@ class PortalCapabilityTests(unittest.TestCase):
     def setUp(self):
         self.products = {
             STARTER_PRODUCT: product(
-                STARTER_PRODUCT, "Relium Starter", 14900),
+                STARTER_PRODUCT, "Relium Starter", 9900),
             PRO_PRODUCT: product(PRO_PRODUCT, "Relium Pro", 24900),
         }
         self.portal_url = "https://sandbox.polar.sh/portal/secret-token"

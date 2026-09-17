@@ -127,7 +127,7 @@ def plan_for_product(product_id, *, starter_product_id, pro_product_id):
     ids — an unknown product, a product from another Polar organization, a
     product this deployment has not been told about, or nothing at all. A
     subscription to a product Relium cannot name is not an entitlement Relium
-    can honour, and guessing from an amount would make $149 charged for
+    can honour, and guessing from an amount would make $99 charged for
     something else look like Starter.
     """
     if not isinstance(product_id, str) or not product_id:

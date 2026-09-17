@@ -75,7 +75,7 @@ horizontally. Out of scope for this pilot.
 | `RELIUM_SLACK_WEBHOOK_URL` | no | Optional secondary output. |
 | `POLAR_ACCESS_TOKEN` | yes\*\* | Polar **Organization Access Token** (`polar_oat_…`) with `products:read`, `checkouts:write`, and `customer_sessions:write`. Server-side only. |
 | `POLAR_WEBHOOK_SECRET` | yes\*\* | The secret configured on the Polar webhook endpoint. Must match exactly. |
-| `POLAR_STARTER_PRODUCT_ID` | yes\*\* | Product id of **Relium Starter** ($149/month) in the Polar organization this token belongs to. |
+| `POLAR_STARTER_PRODUCT_ID` | yes\*\* | Product id of **Relium Starter** ($99/month) in the Polar organization this token belongs to. |
 | `POLAR_PRO_PRODUCT_ID` | yes\*\* | Product id of **Relium Pro** ($249/month). Must differ from Starter. |
 | `POLAR_SERVER` | no | `production` (default) or `sandbox`. A Railway production deployment refuses `sandbox`. Sandbox is a fully separate Polar environment with its own token, secret and product ids. |
 | `POLAR_PAST_DUE_GRACE_DAYS` | no | `0`–`21`, default `0`. Mirrors Polar's own "Grace period for benefit revocation"; keep the two equal. |
@@ -139,7 +139,7 @@ Cancellation is always available in the portal and needs no setting.
 
 Run this read-only catalog check before every billing deployment. It validates
 the selected server, distinct product ids, active monthly USD prices, and the
-expected $149 Starter / $249 Pro amounts without printing secrets:
+expected $99 Starter / $249 Pro amounts without printing secrets:
 
 ```shell
 python scripts/polar_billing_preflight.py --expected-server production
@@ -162,7 +162,7 @@ required scope is `customer_sessions:write`.
 Never copy Polar customer or subscription ids between environments. Treat the
 sandbox QA subscription as disposable and use this order:
 
-1. In live Polar, verify distinct active products: Starter $149/month and Pro
+1. In live Polar, verify distinct active products: Starter $99/month and Pro
    $249/month (USD, fixed recurring monthly prices).
 2. Create a live Organization Access Token with `products:read`,
    `checkouts:write`, and `customer_sessions:write`.

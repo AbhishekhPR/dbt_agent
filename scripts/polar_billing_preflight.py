@@ -24,7 +24,7 @@ from agent.billing.plans import PLAN_PRO, PLAN_STARTER, plan_for_product
 
 
 MAX_RESPONSE_BYTES = 512 * 1024
-EXPECTED_MONTHLY_USD_CENTS = {PLAN_STARTER: 14900, PLAN_PRO: 24900}
+EXPECTED_MONTHLY_USD_CENTS = {PLAN_STARTER: 9900, PLAN_PRO: 24900}
 
 
 class PreflightError(RuntimeError):
