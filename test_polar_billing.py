@@ -559,7 +559,7 @@ class PlanResolutionTests(unittest.TestCase):
             self.assertEqual(self._plan(product), "free", product)
 
     def test_a_plan_is_never_inferred_from_an_amount(self):
-        """$149 charged for something else is not Starter."""
+        """$99 charged for something else is not Starter."""
         from agent.billing.plans import plan_for_product
 
         self.assertEqual(
