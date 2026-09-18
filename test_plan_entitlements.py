@@ -68,7 +68,12 @@ class PlanCatalogTests(unittest.TestCase):
         self.assertEqual(e.repository_limit, 1)
         self.assertEqual(e.member_limit, 2)
         self.assertEqual(e.history_retention_days, 7)
-        self.assertFalse(e.warehouse_evidence)
+        # TEMP (demo): warehouse evidence is enabled on Free so the
+        # collector/warehouse integration can be demonstrated. Revert with the
+        # flag in agent/billing/entitlements.py. Everything else about Free --
+        # limits, retention, runtime evidence -- is unchanged, and the
+        # assertions around this line are what prove that.
+        self.assertTrue(e.warehouse_evidence)
         self.assertFalse(e.runtime_evidence)
         self.assertFalse(e.custom_review_policies)
         self.assertFalse(e.merge_blocking)
@@ -135,7 +140,9 @@ class PlanCatalogTests(unittest.TestCase):
             self.assertIsInstance(value, (bool, int, type(None)))
 
     def test_plan_including_names_the_weakest_plan_that_unlocks_a_capability(self):
-        self.assertEqual(plan_including(WAREHOUSE_EVIDENCE), PLAN_STARTER)
+        # TEMP (demo): Free carries warehouse evidence, so it is now the
+        # weakest plan that unlocks it and the upgrade copy says so.
+        self.assertEqual(plan_including(WAREHOUSE_EVIDENCE), PLAN_FREE)
         self.assertEqual(plan_including(RUNTIME_EVIDENCE), PLAN_STARTER)
         self.assertEqual(plan_including(MERGE_BLOCKING), PLAN_PRO)
         self.assertEqual(plan_including("custom_review_policies"), PLAN_PRO)
@@ -621,8 +628,10 @@ class PaidEvidenceApiTests(unittest.TestCase):
             billing_settings=settings)
         return TestClient(Starlette(routes=routes))
 
+    # TEMP (demo): /api/metadata-snapshots is deliberately absent -- warehouse
+    # evidence is enabled on Free, and
+    # test_free_reaches_warehouse_evidence_ingestion asserts it is reachable.
     PAID = (
-        ("/api/metadata-snapshots", "warehouse_evidence", "starter"),
         ("/api/monitoring/observations", "runtime_evidence", "starter"),
         ("/api/monitoring/baselines", "runtime_evidence", "starter"),
         ("/api/anomalies", "runtime_evidence", "starter"),
@@ -641,7 +650,7 @@ class PaidEvidenceApiTests(unittest.TestCase):
 
     def test_a_workspace_that_never_bought_is_refused_the_same_way(self):
         client = self._client(None)
-        response = client.post("/api/metadata-snapshots", json={}, headers={
+        response = client.post("/api/monitoring/observations", json={}, headers={
             "Authorization": "Bearer rlm_free.secret"})
         self.assertEqual(response.status_code, 402)
 
@@ -683,9 +692,22 @@ class PaidEvidenceApiTests(unittest.TestCase):
         client = TestClient(Starlette(routes=create_api_routes(
             store_pool=StubPool(store), authenticator_factory=Authenticator,
             billing_settings=Settings())))
-        response = client.post("/api/metadata-snapshots", json={}, headers={
+        response = client.post("/api/monitoring/observations", json={}, headers={
             "Authorization": "Bearer rlm.secret"})
         self.assertEqual(response.status_code, 402)
+
+    def test_free_reaches_warehouse_evidence_ingestion(self):
+        """TEMP (demo): Free may ingest warehouse evidence.
+
+        The proof is the absence of a 402 from a Free workspace holding an
+        ordinary collector token: the plan gate let the request through to the
+        handler, which is what the collector/warehouse integration needs. What
+        the handler then makes of an empty body is the collector suite's
+        business, exactly as for Starter above."""
+        client = self._client("free")
+        response = client.post("/api/metadata-snapshots", json={}, headers={
+            "Authorization": "Bearer rlm_free.secret"})
+        self.assertNotEqual(response.status_code, 402)
 
     def test_the_dbt_manifest_endpoint_is_never_refused_on_free(self):
         """Core analysis. A 402 here would make Free's own PR analysis worse,
@@ -823,21 +845,21 @@ class PlanCannotBeSpoofedTests(unittest.TestCase):
 
     def test_a_plan_in_the_body_changes_nothing(self):
         response = self._post(
-            "/api/metadata-snapshots",
-            json={"plan": "pro", "entitlements": {"warehouse_evidence": True},
+            "/api/monitoring/observations",
+            json={"plan": "pro", "entitlements": {"runtime_evidence": True},
                   "tenant_id": "t1", "subscription_status": "active"},
             headers={"Authorization": "Bearer rlm.secret"})
         self.assertEqual(response.status_code, 402)
 
     def test_a_plan_in_the_query_string_changes_nothing(self):
         response = self._post(
-            "/api/metadata-snapshots?plan=pro&warehouse_evidence=true",
+            "/api/monitoring/observations?plan=pro&runtime_evidence=true",
             json={}, headers={"Authorization": "Bearer rlm.secret"})
         self.assertEqual(response.status_code, 402)
 
     def test_a_plan_in_a_header_changes_nothing(self):
         response = self._post(
-            "/api/metadata-snapshots", json={},
+            "/api/monitoring/observations", json={},
             headers={"Authorization": "Bearer rlm.secret",
                      "X-Relium-Plan": "pro",
                      "X-Plan": "pro"})

@@ -133,10 +133,16 @@ class CollectorPackageContractTests(unittest.TestCase):
         response = self._client(session=False).get("/api/collector-package")
         self.assertEqual(response.status_code, 401)
 
-    def test_free_dashboard_session_is_refused_by_the_entitlement_gate(self):
+    def test_free_dashboard_session_passes_the_entitlement_gate(self):
+        """TEMP (demo): the collector package download is gated on
+        warehouse_evidence, which Free now carries, so a Free workspace can
+        fetch the collector and complete the collector/warehouse integration.
+        Reverting the flag in agent/billing/entitlements.py restores the 402
+        with capability "warehouse_evidence"."""
         response = self._client(plan="free").get("/api/collector-package")
-        self.assertEqual(response.status_code, 402)
-        self.assertEqual(response.json()["capability"], "warehouse_evidence")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.content, self.bundle.read_bytes())
+        self.assertEqual(response.headers["content-type"], "application/zip")
 
     def test_collector_service_token_cannot_download_executable_code(self):
         response = self._client(session=False).get(
