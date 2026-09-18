@@ -148,7 +148,11 @@ FREE = PlanEntitlements(
     repository_limit=1,
     member_limit=2,
     history_retention_days=7,
-    warehouse_evidence=False,
+    # TEMPORARY -- demo/testing only. Warehouse evidence is NOT part of Free.
+    # Enabled to demo the collector/warehouse integration; MUST be reverted to
+    # False afterwards. See the module docstring, which still describes the
+    # real policy.
+    warehouse_evidence=True,
     runtime_evidence=False,
     custom_review_policies=False,
     merge_blocking=False,
