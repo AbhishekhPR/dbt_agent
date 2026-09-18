@@ -12,6 +12,11 @@ from __future__ import annotations
 # deliberately falls through to neutral.
 WAITING_DECISION = "WAITING_FOR_METADATA"
 WAITING_FOR_MANIFEST_DECISION = "WAITING_FOR_MANIFEST"
+# Also deliberately neutral, for the same reason: a conflict is not a pass,
+# and is not a BLOCK either. Nothing about the CODE has been judged -- Relium
+# cannot tell which of two disagreeing manifests describes this commit, so it
+# declines to decide rather than guessing.
+MANIFEST_CONFLICT_DECISION = "MANIFEST_CONFLICT"
 
 
 def render_manifest_waiting_result(outcome, *, base_sha, head_sha):
@@ -52,6 +57,82 @@ def render_manifest_waiting_result(outcome, *, base_sha, head_sha):
                 "Both exact BASE and HEAD manifests are required before review."
             ],
             "recommendation": "Wait for the repository CI manifest handoff.",
+            "affected_models": [],
+        },
+    }
+
+
+def render_manifest_conflict_result(outcome, *, base_sha, head_sha):
+    """Action-required publication for a commit whose evidence disagrees.
+
+    Distinct from the waiting render on purpose. "Waiting for CI" tells the
+    author to do nothing, which would be false here: nothing is going to
+    arrive that resolves this, and the review will not progress until someone
+    acts. Still neutral rather than failing -- the code has not been judged.
+
+    Reads only ``outcome.evidence``, where the conflicted side is marked
+    CONFLICT, so it needs no plumbing of its own. The reason strings live in
+    the review payload and the audit trail, which is where an operator looks;
+    a pull request comment needs to say which commit and what to do.
+    """
+    sides = [
+        (name, sha)
+        for name, sha in (("base", base_sha), ("head", head_sha))
+        if outcome.evidence.get(f"{name}_manifest") == "CONFLICT"
+    ]
+    rows = [f"| `{sha}` | {name} |" for name, sha in sides]
+    markdown = "\n".join([
+        "## Relium deployment review",
+        "",
+        "**Action required: this commit already has different dbt manifest "
+        "evidence, so no review was performed.**",
+        "",
+        "| | |",
+        "|---|---|",
+        "| Decision | _not decided_ |",
+        f"| Lifecycle | `{outcome.lifecycle_state}` |",
+        f"| Base commit | `{base_sha}` |",
+        f"| Head commit | `{head_sha}` |",
+        "",
+        "| Conflicting commit | Side |",
+        "|---|---|",
+        *(rows or ["| _not recorded_ | |"]),
+        "",
+        "Relium keeps one immutable manifest per commit, and the manifest "
+        "just submitted for the commit above describes a different project "
+        "than the one already recorded for it. Relium will not review from "
+        "either document, because it cannot tell which one this commit really "
+        "compiled to.",
+        "",
+        "Usually this means a manifest was generated from a different commit "
+        "than the one it was submitted for - a stale `target/` directory, a "
+        "cached artifact, or a compile that ran against the wrong ref. "
+        "Re-run `dbt compile` from a clean checkout of that exact commit; "
+        "Relium retries on the next delivery and updates **this comment** and "
+        "**this check** in place. No approval is implied in the meantime.",
+    ])
+    return {
+        "decision": MANIFEST_CONFLICT_DECISION,
+        "final": False,
+        "coverage": outcome.coverage,
+        "health": outcome.health,
+        "lifecycle_state": outcome.lifecycle_state,
+        "review_id": outcome.review_id,
+        "attempt": outcome.attempt,
+        "evidence": dict(outcome.evidence),
+        "rendered": {"markdown": markdown},
+        "incident": {
+            "decision": MANIFEST_CONFLICT_DECISION,
+            "health": outcome.health,
+            "severity": "LOW",
+            "confidence": 0,
+            "top_reasons": [
+                "This commit already has different dbt manifest evidence."
+            ],
+            "recommendation": (
+                "Re-run dbt compile from a clean checkout of that exact "
+                "commit and let CI resubmit."
+            ),
             "affected_models": [],
         },
     }

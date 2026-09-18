@@ -462,17 +462,29 @@ class WorkflowSafetyTests(unittest.TestCase):
         self.assertIn("except HTTPError as error:", self.code)
         self.assertIn("except URLError as error:", self.code)
 
-    def test_no_backend_file_is_touched_by_this_fix(self):
-        """The invariant lives in the backend and is not being edited."""
-        import subprocess
+    def test_the_backend_does_not_depend_on_this_normalisation(self):
+        """This normalisation is now defence in depth, not the fix.
 
-        changed = subprocess.run(
-            ["git", "diff", "--name-only"], capture_output=True,
-            text=True).stdout.split()
-        for path in changed:
-            self.assertFalse(
-                path.startswith("agent/"),
-                f"{path} is a backend file; this fix is workflow-only")
+        It was originally the whole fix, and this test asserted that no backend
+        file was touched. That turned out to be the defect: with the rules
+        living only here, the identity of an evidence row depended on which
+        client version wrote it first, and a row written by an older workflow
+        conflicted with a correctly normalised submission forever.
+
+        The rules are now also applied server-side, for every writer including
+        the workflows already checked into customer repositories. The workflow
+        keeps applying them so a stale deploy still sends a stable document and
+        the payload stays small; test_manifest_identity.py pins the two
+        definitions equal.
+        """
+        from agent.metadata_evidence import manifest_identity
+
+        self.assertEqual(set(manifest_identity.VOLATILE_METADATA),
+                         EXPECTED_VOLATILE_METADATA)
+        self.assertEqual(set(manifest_identity.VOLATILE_ENTRY_FIELDS),
+                         EXPECTED_VOLATILE_ENTRY_FIELDS)
+        self.assertEqual(set(manifest_identity.ENTRY_SECTIONS),
+                         EXPECTED_ENTRY_SECTIONS)
 
 
 @unittest.skipUnless(DSN, "RELIUM_TEST_POSTGRES_DSN not set; the conflict is a database property")
@@ -550,9 +562,12 @@ class NormalisedSubmissionTests(unittest.TestCase):
             revenue_sql="select 2 as revenue"))
 
         self.assertEqual(response.status_code, 409, response.text)
+        # The reason names the commit, not the key. Reconciliation resolves
+        # the commit SHA first, so a genuine content change is reported as
+        # what it is rather than as a replayed key.
         self.assertEqual(
             response.json()["detail"],
-            "idempotency key already used with different manifest evidence")
+            "commit SHA already has different manifest evidence")
 
     def test_the_whole_base_and_head_handoff_succeeds_on_a_rerun(self):
         """The end state PR #46 needs: both sides submitted, twice."""

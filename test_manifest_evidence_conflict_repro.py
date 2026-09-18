@@ -1,8 +1,13 @@
-"""Reproduction of the PR #46 manifest-handoff 409.
+"""The PR #46 manifest-handoff 409, and the shape it left behind.
 
-Diagnostic only. Nothing here changes backend behaviour; it pins down which of
-the two 409 conditions the workflow actually hits, and what the response body
-says, so the fix can be aimed at the right thing.
+Written as a diagnostic: it pinned down which of the two 409 conditions the
+workflow actually hit, so the fix could be aimed at the right thing. The
+answer was the idempotency-key branch, comparing the submitted BYTES.
+
+The backend now reconciles a lost insert on semantic identity instead
+(agent/metadata_evidence/manifest_identity.py), so the cases that were the
+reproduction are the cases that must now succeed. They are kept here,
+inverted, because a regression would land exactly here.
 
 Real PostgreSQL and the real served route, because the conflict is decided by
 database uniqueness and reconciled inside one transaction.
@@ -158,38 +163,40 @@ class ManifestEvidenceConflictReproduction(unittest.TestCase):
         self.assertEqual(first.json()["evidence_id"],
                          second.json()["evidence_id"])
 
-    # -- THE REPRODUCTION ---------------------------------------------------
+    # -- WHAT WAS THE REPRODUCTION ------------------------------------------
 
-    def test_recompiling_the_same_commit_conflicts_on_the_idempotency_key(self):
-        """The exact failure PR #46 hits.
+    def test_recompiling_the_same_commit_no_longer_conflicts(self):
+        """The exact failure PR #46 hit, now the exact case that must work.
 
         The BASE commit already has evidence from an earlier run or an earlier
         PR. dbt is re-run, stamps a new `generated_at` and `invocation_id`, and
-        the manifest is therefore a different document for the same source.
+        the manifest is therefore a different DOCUMENT for the same source.
 
-        The workflow's idempotency key is stable per (repository, commit) and
-        carries no PR or run identity, so the second submission collides on the
-        key first — and the payload no longer matches.
+        The workflow key is stable per (repository, commit) and carries no PR
+        or run identity, so this submission always collides on the key. What
+        changed is what the collision is compared on: the commit SHA is
+        resolved first and matched semantically, so the same source recompiled
+        reuses the evidence that already exists.
         """
-        self._submit(self.base_sha, _manifest(
+        first = self._submit(self.base_sha, _manifest(
             generated_at="2026-08-18T10:00:00Z", invocation_id="run-1"))
 
         # Same commit, same source, later run.
         response = self._submit(self.base_sha, _manifest(
             generated_at="2026-08-19T09:15:00Z", invocation_id="run-2"))
 
-        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
-        self.assertEqual(body["status"], "conflict")
-        self.assertEqual(
-            body["detail"],
-            "idempotency key already used with different manifest evidence")
+        self.assertEqual(body["status"], "accepted")
+        self.assertIs(body["created"], False)
+        self.assertEqual(body["evidence_id"], first.json()["evidence_id"])
 
-    def test_a_different_key_on_the_same_commit_conflicts_on_the_sha(self):
-        """The other 409 branch, for completeness.
+    def test_a_different_key_on_the_same_commit_no_longer_conflicts(self):
+        """The other branch, which a second PR from a known base does reach.
 
-        Reached only if the key differs — which the current workflow cannot
-        produce, since its key is derived from repository id and SHA alone.
+        An older deploy derived the key from the review, which embeds the pull
+        number, so every new PR on an already-analysed base arrived with a key
+        nothing had used. The commit is still the same commit.
         """
         self._submit(self.base_sha, _manifest(
             generated_at="2026-08-18T10:00:00Z", invocation_id="run-1"),
@@ -198,7 +205,20 @@ class ManifestEvidenceConflictReproduction(unittest.TestCase):
             generated_at="2026-08-19T09:15:00Z", invocation_id="run-2"),
             key="some-other-key-2")
 
-        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIs(response.json()["created"], False)
+
+    def test_a_genuinely_different_manifest_for_one_commit_still_conflicts(self):
+        """The invariant the fix must not have traded away."""
+        self._submit(self.base_sha, _manifest(
+            generated_at="2026-08-18T10:00:00Z", invocation_id="run-1"))
+        changed = _manifest(generated_at="2026-08-19T09:15:00Z",
+                            invocation_id="run-2")
+        changed["nodes"]["model.relium.fct_revenue"]["raw_code"] = (
+            "select 2 as revenue")
+        response = self._submit(self.base_sha, changed)
+
+        self.assertEqual(response.status_code, 409, response.text)
         self.assertEqual(response.json()["detail"],
                          "commit SHA already has different manifest evidence")
 
@@ -217,12 +237,13 @@ class ManifestEvidenceConflictReproduction(unittest.TestCase):
             document["metadata"].pop("invocation_id")
         self.assertEqual(first, second)
 
-    def test_base_fails_before_head_is_ever_attempted(self):
-        """Which request failed.
+    def test_head_is_now_reached_after_base(self):
+        """Why the symptom was a review stuck in WAITING_FOR_MANIFEST.
 
         The workflow loops base then head and does not catch HTTPError, so a
-        409 on base ends the step. Head is never submitted — and the run log
-        shows the base payload size printed, then the error.
+        409 on base ended the step: head was never submitted, the pair never
+        completed, and the run log showed the base payload size printed and
+        then the error. Base reusing its evidence is what lets head be sent.
         """
         self._submit(self.base_sha, _manifest(
             generated_at="2026-08-18T10:00:00Z", invocation_id="run-1"))
@@ -235,7 +256,7 @@ class ManifestEvidenceConflictReproduction(unittest.TestCase):
             if response.status_code not in (200, 202):
                 break
 
-        self.assertEqual(order, [("base", 409)])
+        self.assertEqual(order, [("base", 200), ("head", 202)])
 
     def test_a_fresh_head_commit_is_accepted_on_its_own(self):
         """HEAD is not the problem: a commit with no prior evidence is fine."""

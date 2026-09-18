@@ -12,7 +12,11 @@ from agent.github_app.comments import upsert_review_comment
 from agent.github_app.config import DEFAULT_MANIFEST_PATH, load_repository_config
 from agent.github_app.review_comment import render_review_comment
 from agent.metadata_evidence.service import DisabledReviewLifecycle
+from agent.metadata_evidence.manifest_handoff import (
+    CONFLICT_STATE as MANIFEST_CONFLICT_STATE,
+)
 from agent.metadata_evidence.waiting_publication import (
+    render_manifest_conflict_result,
     render_manifest_waiting_result,
     render_waiting_result,
 )
@@ -309,11 +313,20 @@ class PullRequestReviewRunner:
             enforcement_mode=config.enforcement_mode,
             delivery_id=event.delivery_id,
         )
-        waiting_result = render_manifest_waiting_result(
-            outcome, base_sha=event.base_sha, head_sha=event.head_sha)
+        # A conflicted review is not waiting for anything and must not be
+        # published as though it were: "waiting for CI" tells the author to sit
+        # tight, and they would sit tight forever.
+        if outcome.lifecycle_state == MANIFEST_CONFLICT_STATE:
+            result = render_manifest_conflict_result(
+                outcome, base_sha=event.base_sha, head_sha=event.head_sha)
+            status = "manifest_conflict"
+        else:
+            result = render_manifest_waiting_result(
+                outcome, base_sha=event.base_sha, head_sha=event.head_sha)
+            status = "waiting_for_manifest"
         published = self._publish(
-            event, client, config.enforcement_mode, waiting_result,
-            status="waiting_for_manifest", expected_app_id=expected_app_id)
+            event, client, config.enforcement_mode, result,
+            status=status, expected_app_id=expected_app_id)
         self._record_publication_identity(event, outcome, published)
         published["review_id"] = outcome.review_id
         published["review_attempt"] = outcome.attempt

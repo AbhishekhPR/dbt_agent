@@ -37,6 +37,7 @@ from agent.api.validation import (
 )
 from agent.postgres_lifecycle_store import ManifestEvidenceConflict, SnapshotConflict
 from agent.metadata_evidence.collection_plan import manifest_hash
+from agent.metadata_evidence.manifest_identity import stored_semantic_hash
 from agent.metadata_evidence.decision import classify_freshness
 from agent.metadata_evidence.review_lifecycle import (
     SnapshotRejected,
@@ -366,6 +367,10 @@ def build_handlers():
             "evidence_id": evidence["evidence_id"],
             "commit_sha": evidence["commit_sha"],
             "manifest_hash": evidence["manifest_hash"],
+            # What decided reuse-or-conflict. A workflow that gets a 409 can
+            # compare this against its own compile and see immediately whether
+            # the project really changed.
+            "semantic_manifest_hash": stored_semantic_hash(evidence),
             "created": created,
         }
 
