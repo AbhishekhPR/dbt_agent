@@ -14,6 +14,7 @@ MIGRATIONS = Path("agent/migrations/postgres")
 MIGRATION = MIGRATIONS / "0021_tenant_operational_roots.sql"
 BACKFILL = MIGRATIONS / "0022_tenant_operational_root_backfill.sql"
 DSN = os.environ.get("RELIUM_TEST_POSTGRES_DSN")
+LATEST_MIGRATIONS = list(range(21, 30))
 
 
 class TenantOperationalOwnershipMigrationContractTests(unittest.TestCase):
@@ -89,6 +90,19 @@ class TenantOperationalOwnershipMigrationContractTests(unittest.TestCase):
         self.assertIn("statement_timeout = '30s'", ddl)
         self.assertNotIn("WITH repository_candidates", ddl)
         self.assertIn("WITH repository_candidates", backfill)
+
+    def test_manifest_migrations_are_additive_to_tenant_ownership_schema(self):
+        manifest_identity = (MIGRATIONS / "0028_manifest_evidence_semantic_identity.sql").read_text(
+            encoding="utf-8")
+        manifest_conflict = (MIGRATIONS / "0029_review_manifest_conflict_state.sql").read_text(
+            encoding="utf-8")
+
+        self.assertIn("manifest_evidence", manifest_identity)
+        self.assertIn("reviews", manifest_conflict)
+        for sql in (manifest_identity, manifest_conflict):
+            self.assertNotIn("tenant_operational_roots", sql)
+            self.assertNotIn("tenant_repositories", sql)
+            self.assertNotIn("tenant_repository_dbt_detection", sql)
 
 
 @unittest.skipUnless(
@@ -171,7 +185,7 @@ class TenantOperationalOwnershipPostgresMigrationTests(unittest.TestCase):
     def _apply_latest(self):
         from agent.postgres_migrate import apply_migrations
 
-        self.assertEqual(apply_migrations(self.connection), [21, 22, 23, 24, 25, 26, 27])
+        self.assertEqual(apply_migrations(self.connection), LATEST_MIGRATIONS)
 
     def test_dry_run_audit_never_applies_a_pending_migration(self):
         from agent.cli import cli
@@ -217,7 +231,7 @@ class TenantOperationalOwnershipPostgresMigrationTests(unittest.TestCase):
 
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual(errors, [])
-        self.assertEqual(sorted(results, key=len), [[], [21, 22, 23, 24, 25, 26, 27]])
+        self.assertEqual(sorted(results, key=len), [[], LATEST_MIGRATIONS])
 
     def test_complete_exact_ci_chain_is_backfilled(self):
         tenant_id = self._tenant("a")

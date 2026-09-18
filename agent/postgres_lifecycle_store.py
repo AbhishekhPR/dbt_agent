@@ -19,6 +19,11 @@ from datetime import datetime, timedelta, timezone
 
 from agent.lifecycle_models import ALLOWED_TRANSITIONS
 from agent.metadata_evidence.change_request import normalize_remote_review_id
+from agent.metadata_evidence.manifest_identity import (
+    CANONICALIZATION_VERSION,
+    semantic_manifest_hash,
+    stored_semantic_hash,
+)
 from agent.metadata_evidence.production_comparison import (
     ELIGIBLE_COMPLETENESS,
     ELIGIBLE_FRESHNESS,
@@ -4845,6 +4850,13 @@ class PostgresLifecycleStore:
         "DECISION_READY",
         "PUBLISHED",
         "FAILED",
+        # Action required, not a step forward: this commit already has
+        # manifest evidence that means something else. The review is kept so
+        # the problem is visible and addressable, and analysis does NOT run --
+        # deciding from the stored evidence would be deciding about code the
+        # submitter did not send. Leaves this state only when a later delivery
+        # finds the conflict gone.
+        "MANIFEST_CONFLICT",
     )
 
     # -- immutable CI manifest evidence ----------------------------------
@@ -4858,8 +4870,12 @@ class PostgresLifecycleStore:
         ``INSERT .. ON CONFLICT`` serializes concurrent submitters; the loser
         then reads the committed winner and can distinguish an identical retry
         from a conflicting replay without leaking another tenant's row.
+
+        The loser is reconciled on SEMANTIC identity, not on the bytes it
+        sent. See ``_reconcile_manifest_evidence``.
         """
         evidence_id = f"manifest-{uuid.uuid4().hex[:24]}"
+        semantic_hash = semantic_manifest_hash(manifest)
         with self.connection.transaction():
             # Serialize evidence arrivals per repository. Without this lock,
             # simultaneous BASE and HEAD transactions can each take a
@@ -4875,44 +4891,20 @@ class PostgresLifecycleStore:
             row = self.connection.execute(
                 "INSERT INTO manifest_evidence (organization_id, repository_id, "
                 "evidence_id, commit_sha, manifest_hash, manifest, idempotency_key, "
-                "payload_hash) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "payload_hash, semantic_manifest_hash, canonicalization_version) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT DO NOTHING RETURNING *",
                 (organization_id, repository_id, evidence_id, commit_sha,
                  manifest_hash, self._Jsonb(manifest), idempotency_key,
-                 payload_hash),
+                 payload_hash, semantic_hash, CANONICALIZATION_VERSION),
             ).fetchone()
 
             created = row is not None
             if row is None:
-                by_key = self.connection.execute(
-                    "SELECT * FROM manifest_evidence WHERE organization_id=%s "
-                    "AND repository_id=%s AND idempotency_key=%s",
-                    (organization_id, repository_id, idempotency_key),
-                ).fetchone()
-                if by_key is not None:
-                    if (by_key["payload_hash"] == payload_hash
-                            and by_key["commit_sha"] == commit_sha):
-                        row = by_key
-                    else:
-                        raise ManifestEvidenceConflict(
-                            "idempotency key already used with different manifest evidence")
-                else:
-                    by_sha = self.connection.execute(
-                        "SELECT * FROM manifest_evidence WHERE organization_id=%s "
-                        "AND repository_id=%s AND commit_sha=%s",
-                        (organization_id, repository_id, commit_sha),
-                    ).fetchone()
-                    if by_sha is not None and by_sha["manifest_hash"] == manifest_hash:
-                        row = by_sha
-                    elif by_sha is not None:
-                        raise ManifestEvidenceConflict(
-                            "commit SHA already has different manifest evidence")
-                    else:
-                        # The insert can only lose to one of the two unique keys. If
-                        # neither scoped row is visible, surface a real persistence
-                        # error instead of pretending the request was accepted.
-                        raise RuntimeError(
-                            "manifest evidence conflict could not be reconciled")
+                row = self._reconcile_manifest_evidence(
+                    organization_id, repository_id, commit_sha=commit_sha,
+                    idempotency_key=idempotency_key,
+                    semantic_hash=semantic_hash)
 
             waiting = self.connection.execute(
                 "SELECT r.review_id, r.environment, r.base_sha, r.head_sha, "
@@ -4952,6 +4944,67 @@ class PostgresLifecycleStore:
                      pair_key),
                 )
         return dict(row), created
+
+    def _reconcile_manifest_evidence(self, organization_id, repository_id, *,
+                                     commit_sha, idempotency_key,
+                                     semantic_hash):
+        """Resolve a lost insert against the row that already exists.
+
+        Two questions, in this order, and the order is the fix rather than an
+        incidental detail.
+
+        FIRST: does this idempotency key already describe a DIFFERENT commit?
+        That is the one thing the key genuinely owns, and it is rejected
+        unconditionally -- before any content is compared, on every path. A
+        key that meant commit A cannot be allowed to mean commit B, whatever
+        the manifests say: accepting it would let one key stand for two
+        subjects and make every later retry ambiguous.
+
+        SECOND, only once the key is cleared: what does this COMMIT already
+        have? (organization, repository, commit SHA) is what evidence IS. One
+        commit has one manifest, and every writer -- CI, a webhook reading a
+        committed artifact, a redelivery -- is describing that same thing.
+
+        The original code collapsed both into the key. Because the CI key is a
+        pure function of repository and SHA, a retry for a commit that already
+        had evidence always matched the key, and the comparison that followed
+        was over the submitted BYTES. Any row written under different
+        normalisation rules -- an older workflow, or the webhook path -- looked
+        like different evidence, forever, since the key cannot change and the
+        row is immutable.
+
+        Content is compared on semantic identity, re-derived for any row that
+        predates the current recipe, so harmless per-compile metadata never
+        conflicts and a genuine content change still does.
+        """
+        by_key = self.connection.execute(
+            "SELECT * FROM manifest_evidence WHERE organization_id=%s "
+            "AND repository_id=%s AND idempotency_key=%s",
+            (organization_id, repository_id, idempotency_key),
+        ).fetchone()
+        if by_key is not None and by_key["commit_sha"] != commit_sha:
+            # Checked before anything else and never softened by matching
+            # content: this is a client defect, not a retry.
+            raise ManifestEvidenceConflict(
+                "idempotency key already used for a different commit SHA")
+
+        by_sha = self.connection.execute(
+            "SELECT * FROM manifest_evidence WHERE organization_id=%s "
+            "AND repository_id=%s AND commit_sha=%s",
+            (organization_id, repository_id, commit_sha),
+        ).fetchone()
+        if by_sha is not None:
+            if stored_semantic_hash(by_sha) == semantic_hash:
+                # The same commit, meaning the same thing. Reuse the existing
+                # evidence; the stored row stays exactly as it was written.
+                return by_sha
+            raise ManifestEvidenceConflict(
+                "commit SHA already has different manifest evidence")
+
+        # The insert can only lose to one of the two unique keys, and the key
+        # was cleared above. If no scoped row is visible, surface a real
+        # persistence error instead of pretending the request was accepted.
+        raise RuntimeError("manifest evidence conflict could not be reconciled")
 
     def get_manifest_evidence(self, organization_id, repository_id, commit_sha):
         """Return evidence only for the tenant, repository and exact SHA."""

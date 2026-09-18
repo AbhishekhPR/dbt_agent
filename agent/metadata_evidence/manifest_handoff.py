@@ -19,12 +19,30 @@ from agent.metadata_evidence.review_lifecycle import (
     review_id_for,
 )
 from agent.metadata_evidence.collection_plan import manifest_hash
+from agent.postgres_lifecycle_store import ManifestEvidenceConflict
 
 EVENT_TYPE = "review.manifest_resume_requested"
+
+#: Action required: this commit's manifest evidence disagrees with what is
+#: already recorded for it. Terminal for this delivery -- analysis does not
+#: run -- and left behind only by a later delivery that finds no conflict.
+CONFLICT_STATE = "MANIFEST_CONFLICT"
 
 
 class ManifestResumeError(RuntimeError):
     """A waiting review cannot yet be resumed and should be retried."""
+
+
+def manifest_evidence_key(repository_id, commit_sha) -> str:
+    """The idempotency key for one commit's manifest evidence.
+
+    Deliberately a function of repository and commit alone, matching the grain
+    of the evidence itself: one commit has one manifest. The earlier keys
+    embedded ``review_id``, which embeds the pull number and head SHA, so a
+    second pull request opening from an already-analysed base produced a NEW
+    key for a commit that already had evidence -- every time.
+    """
+    return f"github-manifest:{repository_id}:{commit_sha}"
 
 
 def begin_manifest_wait(store, *, organization_id, repository_id, environment,
@@ -35,30 +53,44 @@ def begin_manifest_wait(store, *, organization_id, repository_id, environment,
     review_id = review_id_for(repository_id, pull_number, head_sha)
     policy = default_policy()
     store.ensure_tenant(organization_id, repository_id, environment)
-    if base_manifest is not None:
-        canonical = {"commit_sha": base_sha, "manifest": base_manifest}
+    conflicts = []
+    for side, sha, document in (("base", base_sha, base_manifest),
+                                ("head", head_sha, head_manifest)):
+        if document is None:
+            continue
+        canonical = {"commit_sha": sha, "manifest": document}
         payload_hash = hashlib.sha256(
             json.dumps(canonical, sort_keys=True,
                        separators=(",", ":")).encode()).hexdigest()
-        store.submit_manifest_evidence(
-            organization_id, repository_id,
-            commit_sha=base_sha, manifest=base_manifest,
-            manifest_hash=manifest_hash(base_manifest),
-            idempotency_key=f"github-base:{review_id}:{base_sha}",
-            payload_hash=payload_hash,
-        )
-    if head_manifest is not None:
-        canonical = {"commit_sha": head_sha, "manifest": head_manifest}
-        payload_hash = hashlib.sha256(
-            json.dumps(canonical, sort_keys=True,
-                       separators=(",", ":")).encode()).hexdigest()
-        store.submit_manifest_evidence(
-            organization_id, repository_id,
-            commit_sha=head_sha, manifest=head_manifest,
-            manifest_hash=manifest_hash(head_manifest),
-            idempotency_key=f"github-head:{review_id}:{head_sha}",
-            payload_hash=payload_hash,
-        )
+        try:
+            store.submit_manifest_evidence(
+                organization_id, repository_id,
+                commit_sha=sha, manifest=document,
+                manifest_hash=manifest_hash(document),
+                idempotency_key=manifest_evidence_key(repository_id, sha),
+                payload_hash=payload_hash,
+            )
+        except ManifestEvidenceConflict as exc:
+            # This commit already has evidence that means something else, and
+            # both documents cannot be right. The stored row is immutable and
+            # is what earlier decisions were computed from; the manifest just
+            # delivered disagrees with it. Analysing either one would be
+            # analysing code the other side did not send, so the review is
+            # persisted and parked in MANIFEST_CONFLICT below -- it does NOT
+            # fall back to the stored evidence.
+            #
+            # What must also NOT happen is this escaping: the submissions run
+            # before the review row is written, so an exception here left the
+            # pull request with no review at all, and every redelivery
+            # repeated it with nothing to look at.
+            conflicts.append({"side": side, "commit_sha": sha,
+                              "reason": str(exc)})
+    # A conflict is not a wait. Waiting means "the evidence will arrive";
+    # here it has arrived and disagrees with what is already recorded, which
+    # no amount of patience resolves.
+    lifecycle_state = CONFLICT_STATE if conflicts else "WAITING_FOR_MANIFEST"
+    conflicted_sides = {conflict["side"] for conflict in conflicts}
+
     review = store.upsert_pr_review(
         organization_id, repository_id, environment,
         review_id=review_id, pull_number=pull_number,
@@ -66,30 +98,55 @@ def begin_manifest_wait(store, *, organization_id, repository_id, environment,
         enforcement_mode=enforcement_mode,
         policy_version=policy.version, policy_hash=policy.content_hash,
         github_delivery_id=delivery_id,
-        lifecycle_state="WAITING_FOR_MANIFEST",
+        lifecycle_state=lifecycle_state,
         payload={"manifest_wait": {
             "changed_files": list(changed_files or []),
+            "evidence_conflicts": conflicts,
         }},
     )
-    if review["lifecycle_state"] != "WAITING_FOR_MANIFEST":
+    if review["lifecycle_state"] != lifecycle_state:
+        # Recorded as a transition rather than a silent overwrite, so a review
+        # that was waiting and is now conflicted says so in its history -- and
+        # so does the reverse, which is how a fixed conflict is retried: a
+        # later delivery that finds no conflict moves the review back to
+        # WAITING_FOR_MANIFEST and analysis resumes from there.
         store.transition_review(
-            organization_id, repository_id, review_id,
-            "WAITING_FOR_MANIFEST", reason="exact head manifest not available")
-    store.append_audit(
-        organization_id, repository_id, actor="github-app",
-        event_type="review.waiting_for_manifest", reference_type="review",
-        reference_id=review_id,
-        payload={"head_sha": head_sha, "delivery_id": delivery_id},
-    )
+            organization_id, repository_id, review_id, lifecycle_state,
+            reason=(conflicts[0]["reason"] if conflicts
+                    else "exact head manifest not available"))
+
+    for conflict in conflicts:
+        store.append_audit(
+            organization_id, repository_id, actor="github-app",
+            event_type="review.manifest_evidence_conflict",
+            reference_type="review", reference_id=review_id,
+            payload=dict(conflict, delivery_id=delivery_id,
+                         lifecycle_state=lifecycle_state),
+        )
+    if not conflicts:
+        store.append_audit(
+            organization_id, repository_id, actor="github-app",
+            event_type="review.waiting_for_manifest", reference_type="review",
+            reference_id=review_id,
+            payload={"head_sha": head_sha, "delivery_id": delivery_id},
+        )
+
+    def _side(name, document):
+        if name in conflicted_sides:
+            return "CONFLICT"
+        return "AVAILABLE" if document is not None else "PENDING"
+
     return LifecycleOutcome(
         review_id=review_id, attempt=int(review.get("attempt") or 1),
-        lifecycle_state="WAITING_FOR_MANIFEST", decision=None,
+        lifecycle_state=lifecycle_state, decision=None,
         coverage="INCOMPLETE", health=100, metadata_required=False,
         request_id=None, plan={"changed_models": [], "targets": []},
         findings=[], evidence={
-            "base_manifest": "AVAILABLE" if base_manifest is not None else "PENDING",
-            "head_manifest": "AVAILABLE" if head_manifest is not None else "PENDING",
-        }, waiting=True,
+            "base_manifest": _side("base", base_manifest),
+            "head_manifest": _side("head", head_manifest),
+        },
+        # Not waiting: nothing is expected to arrive that would resolve this.
+        waiting=not conflicts,
         policy_version=policy.version, policy_hash=policy.content_hash,
     )
 
@@ -100,6 +157,15 @@ def resume_manifest_review(store, *, organization_id, repository_id,
     review = store.get_review(organization_id, repository_id, review_id)
     if review is None:
         return {"review_id": review_id, "status": "unknown_review", "applied": False}
+    if review.get("lifecycle_state") == CONFLICT_STATE:
+        # Analysis must not proceed from the stored evidence. Reported as its
+        # own status rather than folded into "already_resumed", which would
+        # read as success.
+        return {"review_id": review_id, "status": "manifest_conflict",
+                "applied": False,
+                "conflicts": ((review.get("payload") or {})
+                              .get("manifest_wait") or {}
+                              ).get("evidence_conflicts") or []}
     if review.get("lifecycle_state") != "WAITING_FOR_MANIFEST":
         return {"review_id": review_id, "status": "already_resumed", "applied": False}
     if review.get("head_sha") != commit_sha:
