@@ -734,11 +734,19 @@ class PaidEvidenceApiTests(unittest.TestCase):
 
 
 class HistoryWindowTests(unittest.TestCase):
-    """7 / 90 / unlimited, as a VISIBILITY bound.
+    """The window is OFF, and it was never a deletion.
 
-    Nothing is deleted. The store is asked for reviews newer than a cutoff, and
-    an upgrade brings the older ones straight back -- which is the whole reason
-    this is a query bound and not a retention job.
+    `history_retention_days` is still what each plan sells -- 7 / 90 /
+    unlimited, asserted in the catalog tests above -- but it no longer decides
+    which persisted reviews the product will show. A Free workspace was
+    watching its own analyses drop off the Changes page after seven days, and
+    from the customer's side that is indistinguishable from Relium having
+    thrown the work away.
+
+    So the assertions here are the mirror image of the ones they replaced:
+    every plan gets `since=None`, and the response advertises no window,
+    because advertising `7` while returning everything would be the worse lie.
+    Turning it back on is `REVIEW_HISTORY_WINDOW_ENFORCED` in agent.api.routes.
     """
 
     class RecordingStore(FakeStore):
@@ -782,24 +790,43 @@ class HistoryWindowTests(unittest.TestCase):
             return None
         return round((datetime.now(timezone.utc) - store.since).days)
 
-    def test_free_sees_seven_days(self):
-        self.assertEqual(self._days("free"), 7)
+    def test_free_is_not_cut_off_at_seven_days(self):
+        """The regression this flag exists to prevent."""
+        self.assertIsNone(self._days("free"))
 
-    def test_starter_sees_ninety_days(self):
-        self.assertEqual(self._days("starter"), 90)
+    def test_starter_is_not_cut_off_at_ninety_days(self):
+        self.assertIsNone(self._days("starter"))
 
     def test_pro_sees_everything(self):
         self.assertIsNone(self._days("pro"))
 
-    def test_the_window_is_reported_so_the_ui_can_explain_the_cut_off(self):
-        for plan, expected in (("free", 7), ("starter", 90), ("pro", None)):
+    def test_no_plan_advertises_a_cut_off_it_does_not_apply(self):
+        for plan in ("free", "starter", "pro"):
             response, _ = self._list(plan)
-            self.assertEqual(response.json()["history_window_days"], expected, plan)
+            self.assertIsNone(response.json()["history_window_days"], plan)
 
     def test_a_deployment_without_polar_windows_nothing(self):
         response, store = self._list("free", settings=None)
         self.assertEqual(response.status_code, 200, response.text)
         self.assertIsNone(store.since)
+
+    def test_the_plans_still_sell_a_retention_window(self):
+        """Off in the product surface, untouched in the catalog. The flag may
+        be flipped back without re-deriving what each plan includes."""
+        from agent.billing.entitlements import entitlements_for
+
+        self.assertEqual(entitlements_for("free").history_retention_days, 7)
+        self.assertEqual(entitlements_for("starter").history_retention_days, 90)
+        self.assertIsNone(entitlements_for("pro").history_retention_days)
+
+    def test_the_store_still_accepts_a_window(self):
+        """Re-enabling is one flag, not a re-implementation."""
+        import inspect
+
+        from agent.postgres_lifecycle_store import PostgresLifecycleStore
+
+        signature = inspect.signature(PostgresLifecycleStore.list_reviews)
+        self.assertIn("since", signature.parameters)
 
     def test_the_window_is_a_query_bound_and_never_a_deletion(self):
         """A guard on the implementation: the retention path must not have

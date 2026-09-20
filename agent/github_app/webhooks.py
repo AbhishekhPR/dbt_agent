@@ -7,7 +7,17 @@ from agent.github_app.models import (
 )
 
 
-SUPPORTED_PULL_REQUEST_ACTIONS = frozenset({"opened", "reopened", "synchronize"})
+#: `closed` is handled but is NOT an analysis trigger. GitHub sends it for a
+#: merge and for a plain close alike, and it is the only delivery that says a
+#: pull request has ended. Ignoring it, as this did before, left every
+#: persisted review permanently describing an open pull request. What it
+#: causes is a state update on reviews that already exist -- never a new
+#: analysis, and never a deletion.
+SUPPORTED_PULL_REQUEST_ACTIONS = frozenset(
+    {"opened", "reopened", "synchronize", "closed"})
+
+#: The subset that asks Relium to analyse code.
+ANALYSIS_PULL_REQUEST_ACTIONS = frozenset({"opened", "reopened", "synchronize"})
 
 #: Installation lifecycle actions Relium acts on.
 #:
@@ -63,6 +73,10 @@ def parse_webhook(*, event_name: str, delivery_id: str, body):
         head_sha=_required_string(payload, "pull_request.head.sha"),
         base_sha=_required_string(payload, "pull_request.base.sha"),
         sender_login=_required_string(payload, "sender.login"),
+        # Absent or non-boolean reads as "not merged", which for a `closed`
+        # delivery is the conservative answer: a close is recorded rather than
+        # a merge being invented. For every other action the flag is unused.
+        merged=_optional_boolean(payload, "pull_request.merged"),
     )
 
 
@@ -151,6 +165,15 @@ def _required_string(payload: Mapping[str, Any], path: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise WebhookPayloadError(f"Webhook field must be a non-empty string: {path}")
     return value
+
+
+def _optional_boolean(payload: Mapping[str, Any], path: str) -> bool:
+    value: Any = payload
+    for component in path.split("."):
+        if not isinstance(value, Mapping) or component not in value:
+            return False
+        value = value[component]
+    return value is True
 
 
 def _required_integer(payload: Mapping[str, Any], path: str) -> int:
