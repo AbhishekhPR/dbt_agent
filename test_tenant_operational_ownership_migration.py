@@ -14,7 +14,7 @@ MIGRATIONS = Path("agent/migrations/postgres")
 MIGRATION = MIGRATIONS / "0021_tenant_operational_roots.sql"
 BACKFILL = MIGRATIONS / "0022_tenant_operational_root_backfill.sql"
 DSN = os.environ.get("RELIUM_TEST_POSTGRES_DSN")
-LATEST_MIGRATIONS = list(range(21, 30))
+LATEST_MIGRATIONS = list(range(21, 31))
 
 
 class TenantOperationalOwnershipMigrationContractTests(unittest.TestCase):
@@ -103,6 +103,52 @@ class TenantOperationalOwnershipMigrationContractTests(unittest.TestCase):
             self.assertNotIn("tenant_operational_roots", sql)
             self.assertNotIn("tenant_repositories", sql)
             self.assertNotIn("tenant_repository_dbt_detection", sql)
+
+    def test_pr_state_migration_is_additive_to_tenant_ownership_schema(self):
+        """0030 records what GitHub did with a pull request, and only that.
+
+        A review now carries a PR state so a merged or closed pull request
+        stops being invisible. That is a fact about `reviews`. It must not
+        reach the tables that decide which tenant owns an operational root --
+        a migration that widened ownership while claiming to add a status
+        column is exactly what this suite exists to catch.
+        """
+        pr_state = (MIGRATIONS / "0030_review_pr_state.sql").read_text(
+            encoding="utf-8")
+
+        # It is about reviews, and about PR state on them.
+        self.assertIn("ALTER TABLE reviews", pr_state)
+        self.assertIn("pr_state", pr_state)
+
+        # It is nowhere near tenant ownership.
+        self.assertNotIn("tenant_operational_roots", pr_state)
+        self.assertNotIn("tenant_repositories", pr_state)
+        self.assertNotIn("tenant_repository_dbt_detection", pr_state)
+
+        # Tenant scoping on `reviews` is carried by organization_id and
+        # repository_id. The migration may READ them -- both new indexes lead
+        # with them, which is what keeps the new reads tenant-scoped -- but it
+        # may not drop or relax the columns or keys that enforce the boundary.
+        upper = pr_state.upper()
+        for forbidden in ("DROP COLUMN", "DROP CONSTRAINT IF EXISTS REVIEWS_PKEY",
+                          "DROP INDEX", "DROP TABLE", "DELETE FROM", "TRUNCATE",
+                          "DISABLE ROW LEVEL SECURITY", "DROP POLICY",
+                          "ALTER COLUMN ORGANIZATION_ID", "ALTER COLUMN REPOSITORY_ID",
+                          "DROP FOREIGN KEY"):
+            self.assertNotIn(forbidden, upper, forbidden)
+
+        # The one constraint it drops is the one it immediately recreates, and
+        # it is the constraint this migration itself introduces -- never a
+        # pre-existing one.
+        dropped = re.findall(r"DROP CONSTRAINT IF EXISTS (\w+)", pr_state)
+        self.assertEqual(dropped, ["reviews_pr_state_check"])
+        self.assertIn("ADD CONSTRAINT reviews_pr_state_check", pr_state)
+
+        # Every index it adds stays tenant-scoped by leading with the tenant.
+        for index_columns in re.findall(r"ON reviews \(([^)]*)\)", pr_state):
+            columns = [c.strip().split()[0] for c in index_columns.split(",")]
+            self.assertEqual(columns[:2], ["organization_id", "repository_id"],
+                             index_columns)
 
 
 @unittest.skipUnless(

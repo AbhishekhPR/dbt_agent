@@ -267,7 +267,10 @@ class GitHubAppHttpTests(unittest.TestCase):
         self.assertEqual(jobs.jobs, [])
 
     def test_unsupported_event_and_action_are_ignored_without_enqueue(self):
-        cases = (("ping", b"{}"), ("pull_request", _body(action="closed")))
+        # `labeled`, not `closed`. A closed pull request is now a delivery
+        # Relium acts on -- see the test below -- because it is the only one
+        # that says what became of the code a persisted review described.
+        cases = (("ping", b"{}"), ("pull_request", _body(action="labeled")))
         for event_name, body in cases:
             with self.subTest(event_name=event_name):
                 headers = _headers(body, **{"X-GitHub-Event": event_name})
@@ -282,6 +285,20 @@ class GitHubAppHttpTests(unittest.TestCase):
                     {"status": "ignored", "delivery_id": "delivery-1"},
                 )
                 self.assertEqual(jobs.jobs, [])
+
+    def test_a_closed_pull_request_is_enqueued_rather_than_ignored(self):
+        """The worker records the merge or the close against the reviews that
+        already exist. Nothing is deleted there; see
+        test_review_permanent_persistence.py."""
+        body = _body(action="closed")
+        client, jobs = self._client()
+        with client:
+            response = client.post(
+                "/github/webhook", content=body, headers=_headers(body)
+            )
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["status"], "accepted")
+        self.assertEqual(len(jobs.jobs), 1)
 
     def test_duplicate_delivery_is_accepted_for_worker_idempotency(self):
         body = _body()

@@ -4859,6 +4859,15 @@ class PostgresLifecycleStore:
         "MANIFEST_CONFLICT",
     )
 
+    #: What GitHub did with the pull request a review describes.
+    #:
+    #: Deliberately not a lifecycle state. ``lifecycle_state`` says how far
+    #: Relium's analysis got and ``decision`` says what it concluded; this says
+    #: what happened to the pull request afterwards, which is a fact about
+    #: GitHub and not about the review. ``UNKNOWN`` is the honest value for
+    #: every review written before the ``closed`` delivery was handled at all.
+    REVIEW_PR_STATES = ("OPEN", "MERGED", "CLOSED", "UNKNOWN")
+
     # -- immutable CI manifest evidence ----------------------------------
 
     def submit_manifest_evidence(self, organization_id, repository_id, *,
@@ -5022,29 +5031,40 @@ class PostgresLifecycleStore:
                          base_manifest_hash=None, head_manifest_hash=None,
                          enforcement_mode=None, policy_version=None, policy_hash=None,
                          github_delivery_id=None, metadata_required=False,
-                         lifecycle_state="RECEIVED", payload=None):
+                         lifecycle_state="RECEIVED", payload=None,
+                         pr_state="OPEN"):
         """Persist a review from the live GitHub path.
 
         This is the authoritative review record. It is created before any
         decision exists, so ``decision`` stays NULL until one is reached.
+
+        ``pr_state`` is written only on INSERT. Every caller here analyses a
+        pull request that GitHub has just told us about, so OPEN is the honest
+        default -- but a review whose PR has since been merged or closed must
+        not be dragged back to OPEN by a late redelivery, so the conflict path
+        below leaves the stored state alone. Only `record_pr_state` moves it.
         """
         if lifecycle_state not in self.REVIEW_LIFECYCLE_STATES:
             raise ValueError(f"unknown review lifecycle state: {lifecycle_state}")
+        if pr_state not in self.REVIEW_PR_STATES:
+            raise ValueError(f"unknown review pr state: {pr_state}")
         self._tenant(organization_id, repository_id, environment, allow_disconnected=True)
         with self.connection.transaction():
             row = self.connection.execute(
                 "INSERT INTO reviews (review_id, organization_id, repository_id, environment, "
                 "pull_number, commit_sha, decision, enforcement_mode, evidence_coverage, "
                 "lifecycle_state, base_sha, head_sha, base_manifest_hash, head_manifest_hash, "
-                "policy_version, policy_hash, github_delivery_id, metadata_required, payload) "
+                "policy_version, policy_hash, github_delivery_id, metadata_required, payload, "
+                "pr_state, pr_state_updated_at) "
                 "VALUES (%s, %s, %s, %s, %s, %s, NULL, %s, 'UNKNOWN', %s, %s, %s, %s, %s, %s, "
-                "%s, %s, %s, %s) "
+                "%s, %s, %s, %s, %s, now()) "
                 "ON CONFLICT (organization_id, repository_id, review_id) DO NOTHING "
                 "RETURNING *",
                 (review_id, organization_id, repository_id, environment, pull_number,
                  head_sha, enforcement_mode, lifecycle_state, base_sha, head_sha,
                  base_manifest_hash, head_manifest_hash, policy_version, policy_hash,
-                 github_delivery_id, bool(metadata_required), self._Jsonb(payload or {})),
+                 github_delivery_id, bool(metadata_required), self._Jsonb(payload or {}),
+                 pr_state),
             ).fetchone()
             if row is None:
                 row = self.connection.execute(
@@ -5080,6 +5100,42 @@ class PostgresLifecycleStore:
                      "review received"),
                 )
         return dict(row)
+
+    def record_pr_state(self, organization_id, repository_id, pull_number, *,
+                        pr_state, observed_at=None):
+        """Record what GitHub did with a pull request. Never deletes anything.
+
+        ###################################################################
+        # THIS IS AN UPDATE. IT IS NEVER A DELETE.                        #
+        ###################################################################
+
+        A pull request being merged or closed ends the PULL REQUEST. It does
+        not end the review: the analysis, every attempt behind it, its
+        findings, its warehouse evidence and its audit trail are the record of
+        what Relium said about code that is now in main, which is exactly when
+        that record is worth the most. So this marks the reviews -- and there
+        is deliberately no sibling method that removes them.
+
+        EVERY review for the pull request is marked, not just the newest. One
+        pull request produces one review per analysed head SHA, and all of them
+        described the same pull request, so all of them share its fate.
+
+        Returns the ids of the reviews that MOVED, sorted, so a redelivery
+        returns an empty list rather than claiming it changed something. The
+        caller audits what it changed rather than a row count.
+        """
+        if pr_state not in self.REVIEW_PR_STATES:
+            raise ValueError(f"unknown review pr state: {pr_state}")
+        observed_at = observed_at or datetime.now(timezone.utc)
+        rows = self.connection.execute(
+            "UPDATE reviews SET pr_state=%s, pr_state_updated_at=%s "
+            "WHERE organization_id=%s AND repository_id=%s AND pull_number=%s "
+            "AND pr_state IS DISTINCT FROM %s "
+            "RETURNING review_id",
+            (pr_state, observed_at, organization_id, repository_id, pull_number,
+             pr_state),
+        ).fetchall()
+        return sorted(row["review_id"] for row in rows)
 
     def transition_review(self, organization_id, repository_id, review_id, to_state, *,
                           reason=None):

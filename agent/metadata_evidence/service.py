@@ -73,6 +73,26 @@ class ReviewLifecycleService:
                 critical_models=critical_models,
             )
 
+    def record_pr_state(self, *, organization_id, repository_id, pull_number,
+                        pr_state, actor="github-app"):
+        """Mark what happened to a pull request, across all of its reviews.
+
+        A merge or a close updates state and appends an audit event. It removes
+        nothing: the reviews, their attempts, their findings and their evidence
+        are the record of what Relium said about code that has now shipped.
+        """
+        with self._pool.acquire() as store:
+            review_ids = store.record_pr_state(
+                organization_id, repository_id, pull_number,
+                pr_state=pr_state)
+            if review_ids:
+                store.append_audit(
+                    organization_id, repository_id, actor=actor,
+                    event_type="review.pr_state_recorded",
+                    reference_type="pull_request", reference_id=str(pull_number),
+                    payload={"pr_state": pr_state, "review_ids": review_ids})
+            return review_ids
+
     def record_publication(self, *, organization_id, repository_id, review_id,
                            comment_id=None, check_run_id=None):
         """Remember the sticky comment and check run for this review.
@@ -123,6 +143,9 @@ class DisabledReviewLifecycle:
 
     def begin(self, **_kwargs):
         return None
+
+    def record_pr_state(self, **_kwargs):
+        return []
 
     def record_publication(self, **_kwargs):
         return None

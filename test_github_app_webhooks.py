@@ -80,13 +80,30 @@ class GitHubAppWebhookTests(unittest.TestCase):
                 body=self._payload(),
             )
         )
+        # `labeled` in place of what used to be here. `closed` is no longer
+        # an unsupported action: it is the only delivery that says a pull
+        # request has ended, and dropping it left every persisted review
+        # describing a pull request that was open months ago. It is parsed and
+        # recorded -- see the acceptance test below -- but it still triggers
+        # no analysis.
         self.assertIsNone(
             parse_webhook(
                 event_name="pull_request",
                 delivery_id="delivery-2",
-                body=self._payload(action="closed"),
+                body=self._payload(action="labeled"),
             )
         )
+
+    def test_a_closed_pull_request_is_parsed_rather_than_ignored(self):
+        from agent.github_app.webhooks import parse_webhook
+
+        event = parse_webhook(
+            event_name="pull_request",
+            delivery_id="delivery-3",
+            body=self._payload(action="closed"),
+        )
+        self.assertIsNotNone(event, "a merged or closed PR must not be dropped")
+        self.assertEqual(event.action, "closed")
 
     def test_invalid_json_and_missing_required_fields_are_rejected(self):
         from agent.github_app.webhooks import WebhookPayloadError, parse_webhook

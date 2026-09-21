@@ -81,6 +81,20 @@ DEPLOYMENT_EVENT_TYPES = {"created"} | set(ALLOWED_TRANSITIONS) | {
 SEVERITIES = {"low", "medium", "high", "critical"}
 COVERAGE_STATES = {"COMPLETE", "INCOMPLETE", "UNKNOWN"}
 
+#: Whether the plan's `history_retention_days` bounds what GET /api/reviews
+#: returns.
+#:
+#: OFF. Every persisted review is returned to the workspace that owns it,
+#: whatever its plan and however old it is. Retention never deleted anything --
+#: it filtered the query -- but a Free workspace watching its own analyses drop
+#: off the Changes page after seven days cannot tell the difference, and the
+#: History page is supposed to be the permanent audit record.
+#:
+#: Left as a named flag rather than deleted code: the entitlement is still
+#: sold, the store still accepts `since`, and turning this back on is one line
+#: plus a product decision about what the dashboard should then say.
+REVIEW_HISTORY_WINDOW_ENFORCED = False
+
 #: Machine-readable reasons a cookie-authenticated mutation was refused before
 #: it reached a handler. The dashboard branches on these; the prose beside them
 #: is for a human reading a log, and must never be what code matches on.
@@ -466,9 +480,31 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
     def _history_window(store, scope):
         """The oldest review this workspace's plan shows, and the window size.
 
-        ``since`` None means unlimited — Pro, and any deployment with no Polar
-        configuration.
+        ``since`` None means unlimited — which is currently EVERY workspace.
+
+        ###################################################################
+        # REVIEW HISTORY IS NOT WINDOWED WHILE THIS FLAG IS OFF.          #
+        ###################################################################
+
+        The plan's `history_retention_days` is still computed, still sold and
+        still reported by the billing surface; what it no longer does is
+        decide which persisted reviews the product will show. A Free workspace
+        was losing sight of its own analyses after seven days — the rows were
+        always there, but the Changes page stopped returning them, which to
+        the customer is indistinguishable from Relium having thrown the work
+        away.
+
+        `days` is reported as None rather than as the plan's number, because
+        the dashboard renders it as "history stops here" and nothing stops
+        here. Reporting 7 while returning everything would be a worse lie than
+        the bug.
+
+        Re-enabling is this flag and nothing else: the store still takes
+        ``since``, and the entitlement is untouched.
         """
+        if not REVIEW_HISTORY_WINDOW_ENFORCED:
+            return {"since": None, "days": None}
+
         from datetime import datetime, timedelta, timezone
 
         days = _entitlements_for_scope(store, scope).history_retention_days
@@ -846,11 +882,15 @@ def create_api_routes(*, store_pool, authenticator_factory=None,
 
     def list_reviews(request, body, scope, service):
         limit, offset = _page(request)
-        # The plan's history window. A bound on what is SHOWN, never on what is
-        # stored: an upgrade brings the older reviews straight back, and a
-        # downgrade destroys nothing. `history_window_days` is reported so the
-        # dashboard can say why a list stops where it does rather than leaving
-        # it looking like the workspace has no older reviews.
+        # The plan's history window, which is currently OFF for every plan —
+        # see `_history_window`. This endpoint backs both the Changes page and
+        # the History page, and the History page is the permanent audit
+        # record; it may not be missing a review the database still holds.
+        #
+        # It was only ever a bound on what is SHOWN, never on what is stored,
+        # so turning it off restores rows rather than creating them.
+        # `history_window_days` still travels so the dashboard can say why a
+        # list stops where it does — it is None while nothing stops it.
         window = _history_window(service.store, scope)
         page = service.store.list_reviews(
             scope.organization_id, scope.repository_id,
@@ -1886,6 +1926,12 @@ def _review_view(record):
         "policy_version": record.get("policy_version"),
         "policy_hash": record.get("policy_hash"),
         "change_plan": _change_plan_view(record),
+        # What GitHub did with the pull request, beside what Relium decided
+        # about it. A review of a merged PR is still a review; this says which
+        # one it is. "UNKNOWN" is what a review analysed before Relium handled
+        # the `closed` delivery honestly reports.
+        "pr_state": record.get("pr_state") or "UNKNOWN",
+        "pr_state_updated_at": isoformat(record.get("pr_state_updated_at")),
         "created_at": isoformat(record.get("created_at")),
         "updated_at": isoformat(record.get("updated_at")),
     }

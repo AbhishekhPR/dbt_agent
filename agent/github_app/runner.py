@@ -105,6 +105,25 @@ class PullRequestReviewRunner:
     def _run_claimed(self, event, client, *, expected_app_id):
         owner = event.repository.owner
         repository = event.repository.name
+
+        # ###############################################################
+        # # A PULL REQUEST ENDING IS A STATE CHANGE, NOT A CLEAN-UP.    #
+        # ###############################################################
+        #
+        # `closed` -- whether merged or not -- means there is nothing new to
+        # analyse and nothing to publish. It does NOT mean the review is over
+        # being useful: the analysis, its attempts, its findings and its
+        # warehouse evidence describe code that has now shipped, which is when
+        # the record matters most. So this marks the reviews and returns; it
+        # reads no configuration, calls no GitHub API, publishes nothing, and
+        # deletes nothing.
+        #
+        # It runs BEFORE the relium.yml read on purpose. A repository that has
+        # since disabled Relium, or deleted the file, must still have the fate
+        # of the pull requests Relium already reviewed recorded honestly.
+        if event.action == "closed":
+            return self._record_pr_closed(event, owner, repository)
+
         try:
             config_content = client.get_file(owner, repository, "relium.yml", event.head_sha)
         except GitHubNotFoundError:
@@ -333,6 +352,24 @@ class PullRequestReviewRunner:
         published["lifecycle_state"] = outcome.lifecycle_state
         published["collection_request_id"] = None
         return published
+
+    def _record_pr_closed(self, event, owner, repository):
+        """Persist the merged/closed outcome against every review of this PR."""
+        if not getattr(self.lifecycle, "enabled", False):
+            return {"status": "pr_state_ignored", "delivery_id": event.delivery_id,
+                    "pr_state": event.pr_state}
+        review_ids = self.lifecycle.record_pr_state(
+            organization_id=str(owner),
+            repository_id=str(repository),
+            pull_number=event.pull_number,
+            pr_state=event.pr_state,
+        )
+        return {
+            "status": "pr_state_recorded",
+            "delivery_id": event.delivery_id,
+            "pr_state": event.pr_state,
+            "reviews": list(review_ids or []),
+        }
 
     def _begin_lifecycle(self, event, config, *, manifest, previous_manifest,
                          result):

@@ -19,6 +19,22 @@ class PullRequestEvent:
     head_sha: str
     base_sha: str
     sender_login: str
+    #: Only meaningful for `closed`, which GitHub sends for BOTH a merge and a
+    #: plain close and distinguishes only by this flag. Defaulted so every
+    #: existing construction of this event keeps working unchanged.
+    merged: bool = False
+
+    @property
+    def pr_state(self) -> str:
+        """What this delivery says about the pull request itself.
+
+        Kept here rather than in the runner because it is a reading of the
+        GitHub payload, and the payload is this module's subject. It is not a
+        review lifecycle state and never becomes one.
+        """
+        if self.action == "closed":
+            return "MERGED" if self.merged else "CLOSED"
+        return "OPEN"
 
 
 @dataclass(frozen=True)
