@@ -28,7 +28,7 @@ import json
 #: Bumped when the rules below change. Stored on every row so a row written
 #: under an older recipe is re-derived from its stored manifest rather than
 #: compared against a hash that no longer means the same thing.
-CANONICALIZATION_VERSION = 2
+CANONICALIZATION_VERSION = 3
 
 #: Recorded for rows written before this module existed. They carry no
 #: semantic hash at all, so it is always re-derived.
@@ -41,6 +41,20 @@ LEGACY_CANONICALIZATION_VERSION = 1
 #: dbt_version (agent/dbt_context.py).
 VOLATILE_METADATA = ("generated_at", "invocation_id", "invocation_started_at",
                      "run_started_at", "user_id")
+
+#: Fields that describe the TOOL that compiled the commit, not the commit.
+#: Ignored for identity only: unlike the run stamps above they are NOT removed
+#: from the stored document, because Relium reads ``dbt_version``
+#: (agent/dbt_context.py), and the CI workflow keeps sending them.
+#:
+#: A repository whose requirements say ``dbt-duckdb>=1.9,<2`` installs the
+#: newest dbt-core patch on every CI run. Base commit 0f34be6 of the demo was
+#: stored under dbt 1.12.4; the same commit recompiled under 1.12.5 differed
+#: in this one field and nowhere else, and was rejected as a conflict -- which
+#: stranded every later pull request from that base in WAITING_FOR_MANIFEST.
+#: A version change that DOES alter the compiled project (a new node field,
+#: different SQL) still changes the identity through those fields.
+IDENTITY_IGNORED_METADATA = ("dbt_version",)
 
 #: Per-entry parse timestamp, present on every node and every macro. This,
 #: not the metadata block, is what dominates the difference between two
@@ -90,6 +104,21 @@ def canonical_manifest(manifest):
     return canonical
 
 
+def identity_document(manifest):
+    """What identity is computed over: the canonical manifest, minus the
+    compiler's own version stamp. Never stored; see IDENTITY_IGNORED_METADATA.
+    """
+    canonical = canonical_manifest(manifest)
+    if not isinstance(canonical, dict):
+        return canonical
+    metadata = canonical.get("metadata")
+    if isinstance(metadata, dict):
+        canonical = dict(canonical)
+        canonical["metadata"] = {key: value for key, value in metadata.items()
+                                 if key not in IDENTITY_IGNORED_METADATA}
+    return canonical
+
+
 def semantic_manifest_hash(manifest) -> str | None:
     """Content hash of what the manifest MEANS, stable across compiles.
 
@@ -99,9 +128,40 @@ def semantic_manifest_hash(manifest) -> str | None:
     """
     if not isinstance(manifest, dict):
         return None
-    payload = json.dumps(canonical_manifest(manifest), sort_keys=True,
+    payload = json.dumps(identity_document(manifest), sort_keys=True,
                          separators=(",", ":"), default=str).encode()
     return hashlib.sha256(payload).hexdigest()
+
+
+def manifest_differences(stored, submitted, *, limit=5) -> list[str]:
+    """The first few paths at which two manifests' identities disagree.
+
+    For the conflict message: "different manifest evidence" alone gave the
+    person reading a failed CI step nothing to act on. Paths only, never
+    values -- the message is printed in a public CI log and a value can be
+    SQL. Sorted traversal, so the same pair always names the same paths.
+    """
+    found = []
+
+    def walk(left, right, path):
+        if len(found) >= limit:
+            return
+        if isinstance(left, dict) and isinstance(right, dict):
+            for key in sorted(set(left) | set(right), key=str):
+                if len(found) >= limit:
+                    return
+                where = f"{path}.{key}" if path else str(key)
+                if key not in left:
+                    found.append(f"{where} (added)")
+                elif key not in right:
+                    found.append(f"{where} (removed)")
+                else:
+                    walk(left[key], right[key], where)
+        elif left != right:
+            found.append(path or "<document>")
+
+    walk(identity_document(stored), identity_document(submitted), "")
+    return found
 
 
 def stored_semantic_hash(row) -> str | None:

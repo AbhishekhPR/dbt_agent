@@ -21,6 +21,7 @@ from agent.lifecycle_models import ALLOWED_TRANSITIONS
 from agent.metadata_evidence.change_request import normalize_remote_review_id
 from agent.metadata_evidence.manifest_identity import (
     CANONICALIZATION_VERSION,
+    manifest_differences,
     semantic_manifest_hash,
     stored_semantic_hash,
 )
@@ -42,7 +43,21 @@ class SnapshotConflict(ValueError):
 
 
 class ManifestEvidenceConflict(ValueError):
-    """A commit or idempotency key was replayed with different evidence."""
+    """A commit or idempotency key was replayed with different evidence.
+
+    ``differences`` names, for a content conflict, the first manifest paths
+    at which the stored and submitted evidence disagree (paths, never values).
+    Empty for a key conflict, which is about the key, not the content.
+
+    ``kind`` is ``"content"`` when the commit already holds a manifest that
+    means something else, ``"key"`` when an idempotency key is reused for a
+    different commit. Only a content conflict strands a waiting review.
+    """
+
+    def __init__(self, message, *, kind="content", differences=()):
+        super().__init__(message)
+        self.kind = kind
+        self.differences = list(differences)
 
 
 class TenantRepositoryConflict(ValueError):
@@ -4913,7 +4928,14 @@ class PostgresLifecycleStore:
                 row = self._reconcile_manifest_evidence(
                     organization_id, repository_id, commit_sha=commit_sha,
                     idempotency_key=idempotency_key,
-                    semantic_hash=semantic_hash)
+                    semantic_hash=semantic_hash, manifest=manifest)
+
+            # Accepted evidence for a commit whose earlier CI submission was
+            # rejected means the disagreement is gone (the build was pinned
+            # back, or the conflict was a since-ignored field). Reviews it
+            # parked return to waiting, and fall into the resume query below.
+            self._release_ci_manifest_conflicts(
+                organization_id, repository_id, commit_sha)
 
             waiting = self.connection.execute(
                 "SELECT r.review_id, r.environment, r.base_sha, r.head_sha, "
@@ -4956,7 +4978,7 @@ class PostgresLifecycleStore:
 
     def _reconcile_manifest_evidence(self, organization_id, repository_id, *,
                                      commit_sha, idempotency_key,
-                                     semantic_hash):
+                                     semantic_hash, manifest=None):
         """Resolve a lost insert against the row that already exists.
 
         Two questions, in this order, and the order is the fix rather than an
@@ -4995,7 +5017,8 @@ class PostgresLifecycleStore:
             # Checked before anything else and never softened by matching
             # content: this is a client defect, not a retry.
             raise ManifestEvidenceConflict(
-                "idempotency key already used for a different commit SHA")
+                "idempotency key already used for a different commit SHA",
+                kind="key")
 
         by_sha = self.connection.execute(
             "SELECT * FROM manifest_evidence WHERE organization_id=%s "
@@ -5008,12 +5031,195 @@ class PostgresLifecycleStore:
                 # evidence; the stored row stays exactly as it was written.
                 return by_sha
             raise ManifestEvidenceConflict(
-                "commit SHA already has different manifest evidence")
+                "commit SHA already has different manifest evidence",
+                differences=manifest_differences(by_sha.get("manifest"),
+                                                 manifest))
 
         # The insert can only lose to one of the two unique keys, and the key
         # was cleared above. If no scoped row is visible, surface a real
         # persistence error instead of pretending the request was accepted.
         raise RuntimeError("manifest evidence conflict could not be reconciled")
+
+    #: Audit reference for a commit's rejected CI manifest. Keyed on the commit,
+    #: not on a review: CI can be rejected before the webhook creates one.
+    MANIFEST_COMMIT_REFERENCE = "manifest_commit"
+    CI_CONFLICT_REJECTED = "manifest_evidence.conflict_rejected"
+    CI_CONFLICT_CLEARED = "manifest_evidence.conflict_cleared"
+    #: Worker job that tells the pull request its review is parked.
+    MANIFEST_CONFLICT_PUBLISH_EVENT = "review.manifest_conflict_publish_requested"
+
+    def record_ci_manifest_conflict(self, organization_id, repository_id, *,
+                                    commit_sha, reason, differences=()):
+        """Stop a rejected CI submission from stranding its reviews.
+
+        The rejected manifest is not stored -- the commit's evidence stays the
+        immutable row earlier decisions were computed from -- but a review
+        waiting on this commit is now waiting for something that, as things
+        stand, will never arrive. Before this, that was exactly what happened:
+        CI printed a 409, and the pull request said "waiting for the
+        CI-generated dbt manifests" indefinitely.
+
+        So the rejection is recorded against the commit (for a review whose
+        webhook has not arrived yet), every review waiting on the commit moves
+        to MANIFEST_CONFLICT, and a worker job republishes each one's comment
+        and check with what differs and what to do. A later CI submission that
+        agrees with the stored evidence undoes this; see
+        ``_release_ci_manifest_conflicts``.
+
+        Returns the ids of the reviews it parked.
+        """
+        conflict = {"commit_sha": commit_sha, "reason": reason,
+                    "differences": list(differences), "source": "ci"}
+        parked = []
+        with self.connection.transaction():
+            # The same per-repository lock evidence arrival takes, so a review
+            # cannot be resumed and parked by two interleaved transactions.
+            tenant = self.connection.execute(
+                "SELECT 1 FROM repositories WHERE organization_id=%s "
+                "AND repository_id=%s FOR UPDATE",
+                (organization_id, repository_id),
+            ).fetchone()
+            if tenant is None:
+                return parked
+            self.append_audit(
+                organization_id, repository_id, actor="ci",
+                event_type=self.CI_CONFLICT_REJECTED,
+                reference_type=self.MANIFEST_COMMIT_REFERENCE,
+                reference_id=commit_sha, payload=conflict)
+            reviews = self.connection.execute(
+                "SELECT review_id, environment, base_sha, head_sha, payload "
+                "FROM reviews WHERE organization_id=%s AND repository_id=%s "
+                "AND (base_sha=%s OR head_sha=%s) "
+                "AND lifecycle_state='WAITING_FOR_MANIFEST' "
+                "FOR UPDATE",
+                (organization_id, repository_id, commit_sha, commit_sha),
+            ).fetchall()
+            for review in reviews:
+                sides = [side for side, sha in (("base", review["base_sha"]),
+                                                ("head", review["head_sha"]))
+                         if sha == commit_sha]
+                payload = dict(review["payload"] or {})
+                wait = dict(payload.get("manifest_wait") or {})
+                wait["evidence_conflicts"] = [dict(conflict, side=side)
+                                              for side in sides]
+                payload["manifest_wait"] = wait
+                self.connection.execute(
+                    "UPDATE reviews SET lifecycle_state='MANIFEST_CONFLICT', "
+                    "payload=%s, updated_at=now() WHERE organization_id=%s "
+                    "AND repository_id=%s AND review_id=%s",
+                    (self._Jsonb(payload), organization_id, repository_id,
+                     review["review_id"]),
+                )
+                self.connection.execute(
+                    "INSERT INTO review_lifecycle_transitions "
+                    "(organization_id, repository_id, review_id, from_state, "
+                    "to_state, reason) VALUES (%s, %s, %s, "
+                    "'WAITING_FOR_MANIFEST', 'MANIFEST_CONFLICT', %s)",
+                    (organization_id, repository_id, review["review_id"],
+                     reason),
+                )
+                self.append_audit(
+                    organization_id, repository_id, actor="ci",
+                    event_type="review.manifest_evidence_conflict",
+                    reference_type="review", reference_id=review["review_id"],
+                    payload=dict(conflict, sides=sides,
+                                 lifecycle_state="MANIFEST_CONFLICT"))
+                # One job per parking. A review is parked only out of
+                # WAITING_FOR_MANIFEST, so a retried CI step that is rejected
+                # again does not republish the same conflict.
+                self.connection.execute(
+                    "INSERT INTO outbox_events (event_id, organization_id, "
+                    "repository_id, environment, subject_type, subject_id, "
+                    "deployment_id, event_type, payload, dedup_key) "
+                    "VALUES (%s, %s, %s, %s, 'review', %s, NULL, %s, %s, %s)",
+                    (str(uuid.uuid4()), organization_id, repository_id,
+                     review["environment"], review["review_id"],
+                     self.MANIFEST_CONFLICT_PUBLISH_EVENT,
+                     self._Jsonb({"review_id": review["review_id"],
+                                  "commit_sha": commit_sha}),
+                     f"conflict-{commit_sha}-{uuid.uuid4().hex[:12]}"),
+                )
+                parked.append(review["review_id"])
+        return parked
+
+    def unresolved_ci_manifest_conflict(self, organization_id, repository_id,
+                                        commit_sha):
+        """The last CI rejection for this commit, unless evidence has since
+        been accepted for it. ``None`` when there is nothing outstanding."""
+        row = self.connection.execute(
+            "SELECT event_type, payload FROM audit_events "
+            "WHERE organization_id=%s AND repository_id=%s "
+            "AND reference_type=%s AND reference_id=%s "
+            "AND event_type IN (%s, %s) ORDER BY audit_id DESC LIMIT 1",
+            (organization_id, repository_id, self.MANIFEST_COMMIT_REFERENCE,
+             commit_sha, self.CI_CONFLICT_REJECTED, self.CI_CONFLICT_CLEARED),
+        ).fetchone()
+        if row is None or row["event_type"] != self.CI_CONFLICT_REJECTED:
+            return None
+        return dict(row["payload"] or {})
+
+    def _release_ci_manifest_conflicts(self, organization_id, repository_id,
+                                       commit_sha):
+        """Undo ``record_ci_manifest_conflict`` once evidence is accepted.
+
+        Runs inside ``submit_manifest_evidence``'s transaction. Only conflicts
+        CI recorded are released: a webhook-recorded conflict is about the
+        document THAT delivery carried, and leaves only through a later
+        delivery (``begin_manifest_wait``). A review conflicted on both of its
+        commits returns to waiting only once both are cleared.
+        """
+        if self.unresolved_ci_manifest_conflict(
+                organization_id, repository_id, commit_sha) is not None:
+            self.append_audit(
+                organization_id, repository_id, actor="ci",
+                event_type=self.CI_CONFLICT_CLEARED,
+                reference_type=self.MANIFEST_COMMIT_REFERENCE,
+                reference_id=commit_sha,
+                payload={"commit_sha": commit_sha})
+        reviews = self.connection.execute(
+            "SELECT review_id, payload FROM reviews "
+            "WHERE organization_id=%s AND repository_id=%s "
+            "AND (base_sha=%s OR head_sha=%s) "
+            "AND lifecycle_state='MANIFEST_CONFLICT' FOR UPDATE",
+            (organization_id, repository_id, commit_sha, commit_sha),
+        ).fetchall()
+        released = []
+        for review in reviews:
+            payload = dict(review["payload"] or {})
+            wait = dict(payload.get("manifest_wait") or {})
+            conflicts = list(wait.get("evidence_conflicts") or [])
+            if not conflicts or any(c.get("source") != "ci" for c in conflicts):
+                continue
+            remaining = [c for c in conflicts if c.get("commit_sha") != commit_sha]
+            if len(remaining) == len(conflicts):
+                continue
+            wait["evidence_conflicts"] = remaining
+            payload["manifest_wait"] = wait
+            state = "MANIFEST_CONFLICT" if remaining else "WAITING_FOR_MANIFEST"
+            self.connection.execute(
+                "UPDATE reviews SET lifecycle_state=%s, payload=%s, "
+                "updated_at=now() WHERE organization_id=%s "
+                "AND repository_id=%s AND review_id=%s",
+                (state, self._Jsonb(payload), organization_id, repository_id,
+                 review["review_id"]),
+            )
+            if remaining:
+                continue
+            self.connection.execute(
+                "INSERT INTO review_lifecycle_transitions "
+                "(organization_id, repository_id, review_id, from_state, "
+                "to_state, reason) VALUES (%s, %s, %s, 'MANIFEST_CONFLICT', "
+                "'WAITING_FOR_MANIFEST', %s)",
+                (organization_id, repository_id, review["review_id"],
+                 f"manifest evidence for {commit_sha} accepted"),
+            )
+            self.append_audit(
+                organization_id, repository_id, actor="ci",
+                event_type="review.manifest_evidence_conflict_cleared",
+                reference_type="review", reference_id=review["review_id"],
+                payload={"commit_sha": commit_sha})
+            released.append(review["review_id"])
+        return released
 
     def get_manifest_evidence(self, organization_id, repository_id, commit_sha):
         """Return evidence only for the tenant, repository and exact SHA."""

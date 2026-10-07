@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from types import SimpleNamespace
 
 from agent.deployment_review_service import (
     lifecycle_code_findings,
@@ -19,9 +20,18 @@ from agent.metadata_evidence.review_lifecycle import (
     review_id_for,
 )
 from agent.metadata_evidence.collection_plan import manifest_hash
-from agent.postgres_lifecycle_store import ManifestEvidenceConflict
+from agent.metadata_evidence.waiting_publication import (
+    render_manifest_conflict_result,
+)
+from agent.github_app.checks import build_check_run_payload
+from agent.github_app.review_comment import render_review_comment
+from agent.postgres_lifecycle_store import (
+    ManifestEvidenceConflict,
+    PostgresLifecycleStore,
+)
 
 EVENT_TYPE = "review.manifest_resume_requested"
+CONFLICT_PUBLISH_EVENT_TYPE = PostgresLifecycleStore.MANIFEST_CONFLICT_PUBLISH_EVENT
 
 #: Action required: this commit's manifest evidence disagrees with what is
 #: already recorded for it. Terminal for this delivery -- analysis does not
@@ -84,7 +94,19 @@ def begin_manifest_wait(store, *, organization_id, repository_id, environment,
             # pull request with no review at all, and every redelivery
             # repeated it with nothing to look at.
             conflicts.append({"side": side, "commit_sha": sha,
-                              "reason": str(exc)})
+                              "reason": str(exc),
+                              "differences": list(exc.differences)})
+    # CI may already have been rejected for a commit this delivery carries no
+    # manifest for -- the compile can finish before the webhook is processed.
+    # Waiting on it would wait for a submission that was already refused.
+    for side, sha, document in (("base", base_sha, base_manifest),
+                                ("head", head_sha, head_manifest)):
+        if document is not None:
+            continue
+        rejected = store.unresolved_ci_manifest_conflict(
+            organization_id, repository_id, sha)
+        if rejected is not None:
+            conflicts.append(dict(rejected, side=side, commit_sha=sha))
     # A conflict is not a wait. Waiting means "the evidence will arrive";
     # here it has arrived and disagrees with what is already recorded, which
     # no amount of patience resolves.
@@ -144,6 +166,7 @@ def begin_manifest_wait(store, *, organization_id, repository_id, environment,
         findings=[], evidence={
             "base_manifest": _side("base", base_manifest),
             "head_manifest": _side("head", head_manifest),
+            **({"manifest_conflicts": conflicts} if conflicts else {}),
         },
         # Not waiting: nothing is expected to arrive that would resolve this.
         waiting=not conflicts,
@@ -230,6 +253,103 @@ def resume_manifest_review(store, *, organization_id, repository_id,
             "attempt": outcome.attempt,
             "lifecycle_state": outcome.lifecycle_state,
             "decision": outcome.decision}
+
+
+def publish_manifest_conflict(store, *, organization_id, repository_id,
+                              review_id, publisher):
+    """Tell the pull request its review is parked on a CI manifest conflict.
+
+    The webhook path publishes its own conflicts as it finds them. A conflict
+    CI hits is found by the API, which cannot reach GitHub, so this job
+    replaces the "waiting for CI" comment and check -- in place -- with the
+    action-required version. Neutral, never a verdict, and no Slack: nothing
+    about the code was judged.
+    """
+    review = store.get_review(organization_id, repository_id, review_id)
+    if review is None:
+        return {"review_id": review_id, "status": "unknown_review",
+                "published": False}
+    if review.get("lifecycle_state") != CONFLICT_STATE:
+        # Released by an agreeing submission before this job ran; the resume
+        # publication owns the comment now.
+        return {"review_id": review_id, "status": "not_conflicted",
+                "published": False}
+    conflicts = list(((review.get("payload") or {}).get("manifest_wait") or {})
+                     .get("evidence_conflicts") or [])
+    if publisher is None:
+        store.append_audit(
+            organization_id, repository_id, actor="worker:publication",
+            event_type="review.publication_skipped", reference_type="review",
+            reference_id=review_id,
+            payload={"reason": "no publisher configured",
+                     "lifecycle_state": CONFLICT_STATE})
+        return {"review_id": review_id, "status": "no_publisher",
+                "published": False}
+
+    conflicted = {conflict.get("side") for conflict in conflicts}
+    outcome = SimpleNamespace(
+        review_id=review_id, attempt=int(review.get("attempt") or 1),
+        lifecycle_state=CONFLICT_STATE, coverage="INCOMPLETE", health=100,
+        evidence={f"{side}_manifest": "CONFLICT" for side in conflicted
+                  if side in ("base", "head")})
+    result = render_manifest_conflict_result(
+        outcome, base_sha=review.get("base_sha"),
+        head_sha=review.get("head_sha"), conflicts=conflicts)
+    body = render_review_comment(result)
+
+    comment_id = review.get("github_comment_id")
+    comment = publisher.publish_comment(
+        pull_number=review.get("pull_number"), body=body,
+        comment_id=comment_id)
+    check_run_id = review.get("github_check_run_id")
+    check_payload = build_check_run_payload(
+        head_sha=review.get("head_sha"),
+        result={**result, "rendered": {"markdown": body}},
+        enforcement_mode=review.get("enforcement_mode") or "shadow",
+        external_id=f"review-{review_id}")
+    check = publisher.publish_check(
+        head_sha=review.get("head_sha"), payload=check_payload,
+        check_run_id=check_run_id)
+    published_comment = str((comment or {}).get("id") or comment_id or "")
+    published_check = str((check or {}).get("id") or check_run_id or "")
+    store.record_review_publication(
+        organization_id, repository_id, review_id,
+        comment_id=published_comment or None,
+        check_run_id=published_check or None)
+    store.append_audit(
+        organization_id, repository_id, actor="worker:publication",
+        event_type="review.manifest_conflict_published",
+        reference_type="review", reference_id=review_id,
+        payload={"check_conclusion": check_payload["conclusion"],
+                 "sides": sorted(side for side in conflicted if side)})
+    return {"review_id": review_id, "status": "manifest_conflict_published",
+            "published": True, "comment_id": published_comment,
+            "check_run_id": published_check,
+            "check_conclusion": check_payload["conclusion"]}
+
+
+def register_conflict_publication(registry, publisher_factory=None):
+    """Registered beside publication reconciliation, which owns the same
+    per-tenant ``publisher_factory``."""
+
+    @registry.register(CONFLICT_PUBLISH_EVENT_TYPE)
+    def _handle(context):
+        payload = context.payload or {}
+        review_id = payload.get("review_id") or context.subject_id
+        if not review_id:
+            raise ManifestResumeError("conflict publication job is incomplete")
+        publisher = None
+        if publisher_factory is not None:
+            publisher = publisher_factory(
+                organization_id=context.organization_id,
+                repository_id=context.repository_id,
+                environment=context.environment)
+        return publish_manifest_conflict(
+            context.store, organization_id=context.organization_id,
+            repository_id=context.repository_id, review_id=review_id,
+            publisher=publisher)
+
+    return _handle
 
 
 def register(registry):

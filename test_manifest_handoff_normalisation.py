@@ -565,9 +565,8 @@ class NormalisedSubmissionTests(unittest.TestCase):
         # The reason names the commit, not the key. Reconciliation resolves
         # the commit SHA first, so a genuine content change is reported as
         # what it is rather than as a replayed key.
-        self.assertEqual(
-            response.json()["detail"],
-            "commit SHA already has different manifest evidence")
+        self.assertTrue(response.json()["detail"].startswith(
+            "commit SHA already has different manifest evidence"))
 
     def test_the_whole_base_and_head_handoff_succeeds_on_a_rerun(self):
         """The end state PR #46 needs: both sides submitted, twice."""

@@ -122,6 +122,7 @@ from agent.metadata_evidence.change_request import (  # noqa: E402
 )
 from agent.metadata_evidence.manifest_handoff import (  # noqa: E402
     register as _register_manifest_handoff,
+    register_conflict_publication as _register_manifest_conflict_publication,
 )
 
 _register_recompute(registry)
@@ -146,6 +147,7 @@ def _build_publisher(**scope):
 
 _register_publication(registry, publisher_factory=_build_publisher)
 _register_change_request(registry, publisher_factory=_build_publisher)
+_register_manifest_conflict_publication(registry, publisher_factory=_build_publisher)
 
 
 class WorkerState:

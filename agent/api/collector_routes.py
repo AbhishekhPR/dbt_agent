@@ -97,6 +97,25 @@ def _payload_hash(payload) -> str:
     ).hexdigest()
 
 
+def _manifest_conflict_detail(exc, *, parked):
+    """The 409 text a CI log shows for a genuine manifest conflict.
+
+    The workflow prints ``detail`` verbatim, so this is the one place the
+    person whose step failed learns what differs and what to do. Paths only,
+    never values: CI logs can be public.
+    """
+    parts = [str(exc)]
+    if exc.differences:
+        parts.append("differs at: " + ", ".join(exc.differences))
+    if parked:
+        parts.append(f"{parked} waiting review(s) marked MANIFEST_CONFLICT")
+    parts.append(
+        "the stored manifest for this commit is immutable; make this compile "
+        "match it (pin dbt and package versions to the ones that produced it) "
+        "and re-run, or review against a new commit")
+    return "; ".join(parts)
+
+
 def _serialise_request(request_row):
     """Only what a collector needs. No internal identifiers beyond the scope
     it is already authorised for."""
@@ -361,7 +380,21 @@ def build_handlers():
                 idempotency_key=key, payload_hash=_payload_hash(canonical),
             )
         except ManifestEvidenceConflict as exc:
-            raise ConflictError(str(exc)) from None
+            if exc.kind != "content":
+                raise ConflictError(str(exc)) from None
+            # Still a 409 -- the stored evidence is immutable and the CI step
+            # must fail visibly -- but no longer a silent stall: every review
+            # waiting on this commit is parked and told why.
+            parked = service.store.record_ci_manifest_conflict(
+                scope.organization_id, scope.repository_id,
+                commit_sha=commit_sha.lower(), reason=str(exc),
+                differences=exc.differences)
+            # RETURNED, not raised as ConflictError: the write runs inside the
+            # workspace mutation guard's transaction, and raising would roll
+            # the parking back with it. Same status and body either way.
+            return 409, {"status": "conflict",
+                         "detail": _manifest_conflict_detail(
+                             exc, parked=len(parked))}
         return (202 if created else 200), {
             "status": "accepted",
             "evidence_id": evidence["evidence_id"],

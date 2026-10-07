@@ -62,7 +62,55 @@ def render_manifest_waiting_result(outcome, *, base_sha, head_sha):
     }
 
 
-def render_manifest_conflict_result(outcome, *, base_sha, head_sha):
+_DELIVERY_CONFLICT_EXPLANATION = (
+    "Relium keeps one immutable manifest per commit, and the manifest "
+    "just submitted for the commit above describes a different project "
+    "than the one already recorded for it. Relium will not review from "
+    "either document, because it cannot tell which one this commit really "
+    "compiled to.",
+    "",
+    "Usually this means a manifest was generated from a different commit "
+    "than the one it was submitted for - a stale `target/` directory, a "
+    "cached artifact, or a compile that ran against the wrong ref. "
+    "Re-run `dbt compile` from a clean checkout of that exact commit; "
+    "Relium retries on the next delivery and updates **this comment** and "
+    "**this check** in place. No approval is implied in the meantime.",
+)
+
+
+def _ci_conflict_explanation(conflicts):
+    """For a conflict CI's own recompile hit. The commit is the same, so the
+    build changed, and the way out is in the build or in a new commit."""
+    paths = []
+    for conflict in conflicts:
+        for path in conflict.get("differences") or ():
+            if path not in paths:
+                paths.append(path)
+    lines = [
+        "Relium keeps one immutable manifest per commit. The manifest your CI "
+        "just compiled for the commit above disagrees with the one already "
+        "recorded for it, so Relium will not review from either document.",
+        "",
+    ]
+    if paths:
+        lines += ["Where they differ:", ""]
+        lines += [f"- `{path}`" for path in paths]
+        lines.append("")
+    lines.append(
+        "The same commit compiling differently usually means the build "
+        "changed, not the code: an unpinned dbt or dbt package upgrade, "
+        "different `vars` or profile settings, or a different project "
+        "directory. To finish this review, either pin your CI's dbt and "
+        "package versions to the ones that produced the stored manifest and "
+        "re-run the workflow, or push a new commit (for a base-side conflict, "
+        "update the pull request onto a newer base commit). Relium updates "
+        "**this comment** and **this check** in place. No approval is implied "
+        "in the meantime.")
+    return lines
+
+
+def render_manifest_conflict_result(outcome, *, base_sha, head_sha,
+                                    conflicts=()):
     """Action-required publication for a commit whose evidence disagrees.
 
     Distinct from the waiting render on purpose. "Waiting for CI" tells the
@@ -70,10 +118,12 @@ def render_manifest_conflict_result(outcome, *, base_sha, head_sha):
     arrive that resolves this, and the review will not progress until someone
     acts. Still neutral rather than failing -- the code has not been judged.
 
-    Reads only ``outcome.evidence``, where the conflicted side is marked
-    CONFLICT, so it needs no plumbing of its own. The reason strings live in
-    the review payload and the audit trail, which is where an operator looks;
-    a pull request comment needs to say which commit and what to do.
+    Reads ``outcome.evidence``, where the conflicted side is marked CONFLICT.
+    ``conflicts`` (or ``evidence["manifest_conflicts"]``) only chooses the
+    explanation: one CI recorded names the differing paths and points at the
+    build. The reason strings live in the review payload and the audit trail,
+    which is where an operator looks; a pull request comment needs to say
+    which commit and what to do.
     """
     sides = [
         (name, sha)
@@ -81,6 +131,11 @@ def render_manifest_conflict_result(outcome, *, base_sha, head_sha):
         if outcome.evidence.get(f"{name}_manifest") == "CONFLICT"
     ]
     rows = [f"| `{sha}` | {name} |" for name, sha in sides]
+    conflicts = list(conflicts or outcome.evidence.get("manifest_conflicts")
+                     or ())
+    explanation = (_ci_conflict_explanation(conflicts)
+                   if any(c.get("source") == "ci" for c in conflicts)
+                   else _DELIVERY_CONFLICT_EXPLANATION)
     markdown = "\n".join([
         "## Relium deployment review",
         "",
@@ -98,18 +153,7 @@ def render_manifest_conflict_result(outcome, *, base_sha, head_sha):
         "|---|---|",
         *(rows or ["| _not recorded_ | |"]),
         "",
-        "Relium keeps one immutable manifest per commit, and the manifest "
-        "just submitted for the commit above describes a different project "
-        "than the one already recorded for it. Relium will not review from "
-        "either document, because it cannot tell which one this commit really "
-        "compiled to.",
-        "",
-        "Usually this means a manifest was generated from a different commit "
-        "than the one it was submitted for - a stale `target/` directory, a "
-        "cached artifact, or a compile that ran against the wrong ref. "
-        "Re-run `dbt compile` from a clean checkout of that exact commit; "
-        "Relium retries on the next delivery and updates **this comment** and "
-        "**this check** in place. No approval is implied in the meantime.",
+        *explanation,
     ])
     return {
         "decision": MANIFEST_CONFLICT_DECISION,
