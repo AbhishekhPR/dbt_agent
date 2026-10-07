@@ -14,6 +14,7 @@ stamps a real manifest has on every entry.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import unittest
 from pathlib import Path
@@ -180,6 +181,101 @@ class RealCompileTests(unittest.TestCase):
         node["raw_code"] = str(node.get("raw_code", "")) + "\n-- where 1=0"
         self.assertNotEqual(semantic_manifest_hash(changed),
                             semantic_manifest_hash(self.a))
+
+
+class CompilerVersionTests(unittest.TestCase):
+    """The demo's base commit 0f34be6, stored under dbt 1.12.4 and recompiled
+    under 1.12.5 by an unpinned ``dbt-duckdb>=1.9,<2``. Those two documents
+    differed, volatile stamps aside, in ``metadata.dbt_version`` alone."""
+
+    def _compiled_by(self, version, *, run):
+        manifest = copy.deepcopy(_real("base-compile-a.json"))
+        manifest["metadata"]["dbt_version"] = version
+        manifest["metadata"]["invocation_id"] = f"run-{run}"
+        manifest["metadata"]["generated_at"] = f"2026-10-0{run}T09:29:38Z"
+        return manifest
+
+    def test_a_dbt_patch_upgrade_does_not_change_the_identity(self):
+        self.assertEqual(
+            semantic_manifest_hash(self._compiled_by("1.12.4", run=1)),
+            semantic_manifest_hash(self._compiled_by("1.12.5", run=2)))
+
+    def test_a_dbt_upgrade_that_changes_the_project_still_does(self):
+        upgraded = self._compiled_by("1.12.5", run=2)
+        node = next(iter(upgraded["nodes"].values()))
+        node["compiled_code"] = str(node.get("compiled_code")) + " -- new"
+        self.assertNotEqual(
+            semantic_manifest_hash(self._compiled_by("1.12.4", run=1)),
+            semantic_manifest_hash(upgraded))
+
+    def test_the_version_is_ignored_for_identity_but_kept_in_the_document(self):
+        """Relium reads dbt_version (agent/dbt_context.py) and the CI workflow
+        keeps sending it; only the identity looks past it."""
+        from agent.metadata_evidence.manifest_identity import (
+            IDENTITY_IGNORED_METADATA,
+            identity_document,
+        )
+
+        self.assertEqual(set(IDENTITY_IGNORED_METADATA), {"dbt_version"})
+        manifest = _manifest()
+        self.assertEqual(canonical_manifest(manifest)["metadata"]["dbt_version"],
+                         "1.8.0")
+        self.assertNotIn("dbt_version", identity_document(manifest)["metadata"])
+        self.assertTrue(set(IDENTITY_IGNORED_METADATA).isdisjoint(VOLATILE_METADATA))
+
+    def test_a_row_stored_under_the_previous_recipe_is_re_derived(self):
+        """A v2 row recorded a hash that included dbt_version. Trusting it
+        would keep that commit poisoned after this fix ships."""
+        stored = self._compiled_by("1.12.4", run=1)
+        v2_hash = hashlib.sha256(json.dumps(
+            canonical_manifest(stored), sort_keys=True, separators=(",", ":"),
+            default=str).encode()).hexdigest()
+        row = {"semantic_manifest_hash": v2_hash, "canonicalization_version": 2,
+               "manifest": stored}
+        self.assertGreater(CANONICALIZATION_VERSION, 2)
+        self.assertEqual(stored_semantic_hash(row), semantic_manifest_hash(
+            self._compiled_by("1.12.5", run=2)))
+
+
+class ManifestDifferenceTests(unittest.TestCase):
+    """What a 409 names: paths where the identities disagree, never values."""
+
+    def test_volatile_and_version_only_differences_name_nothing(self):
+        from agent.metadata_evidence.manifest_identity import manifest_differences
+
+        other = _manifest(generated_at="2026-10-07T00:00:00Z", invocation_id="x",
+                          created_at=1.0)
+        other["metadata"]["dbt_version"] = "1.12.5"
+        self.assertEqual(manifest_differences(_manifest(), other), [])
+
+    def test_a_changed_model_is_named_by_path_without_its_sql(self):
+        from agent.metadata_evidence.manifest_identity import manifest_differences
+
+        found = manifest_differences(_manifest(sql="select 1 as revenue"),
+                                     _manifest(sql="select 2 as revenue"))
+        self.assertEqual(found, [
+            "nodes.model.relium.fct_revenue.compiled_code",
+            "nodes.model.relium.fct_revenue.raw_code",
+        ])
+        self.assertNotIn("select", " ".join(found))
+
+    def test_added_and_removed_models_are_labelled(self):
+        from agent.metadata_evidence.manifest_identity import manifest_differences
+
+        widened = _manifest()
+        widened["nodes"]["model.relium.dim_customer"] = {"name": "dim_customer"}
+        self.assertEqual(manifest_differences(_manifest(), widened),
+                         ["nodes.model.relium.dim_customer (added)"])
+        self.assertEqual(manifest_differences(widened, _manifest()),
+                         ["nodes.model.relium.dim_customer (removed)"])
+
+    def test_the_list_is_bounded(self):
+        from agent.metadata_evidence.manifest_identity import manifest_differences
+
+        wide = _manifest()
+        for index in range(20):
+            wide["nodes"][f"model.relium.m{index:02d}"] = {"name": str(index)}
+        self.assertEqual(len(manifest_differences(_manifest(), wide)), 5)
 
 
 class StoredRowTests(unittest.TestCase):

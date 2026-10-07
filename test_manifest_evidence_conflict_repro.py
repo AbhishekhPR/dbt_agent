@@ -219,8 +219,8 @@ class ManifestEvidenceConflictReproduction(unittest.TestCase):
         response = self._submit(self.base_sha, changed)
 
         self.assertEqual(response.status_code, 409, response.text)
-        self.assertEqual(response.json()["detail"],
-                         "commit SHA already has different manifest evidence")
+        self.assertTrue(response.json()["detail"].startswith(
+            "commit SHA already has different manifest evidence"))
 
     def test_only_the_volatile_metadata_differs(self):
         """The two manifests are otherwise the same document.

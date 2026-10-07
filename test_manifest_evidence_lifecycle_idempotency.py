@@ -332,8 +332,8 @@ class ManifestEvidenceIdempotencyTests(unittest.TestCase):
         response = self._submit(self.sha, _manifest(sql="select 1 as revenue"))
 
         self.assertEqual(response.status_code, 409, response.text)
-        self.assertEqual(response.json()["detail"],
-                         "commit SHA already has different manifest evidence")
+        self.assertTrue(response.json()["detail"].startswith(
+            "commit SHA already has different manifest evidence"))
 
     # -- 5. a genuine difference -------------------------------------------
 
@@ -343,8 +343,8 @@ class ManifestEvidenceIdempotencyTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 409, response.text)
         self.assertEqual(response.json()["status"], "conflict")
-        self.assertEqual(response.json()["detail"],
-                         "commit SHA already has different manifest evidence")
+        self.assertTrue(response.json()["detail"].startswith(
+            "commit SHA already has different manifest evidence"))
 
     def test_an_added_model_is_still_rejected(self):
         self._submit(self.sha, _manifest())

@@ -721,6 +721,86 @@ class ManifestWebhookResumePostgresTests(unittest.TestCase):
         self.assertNotEqual(review["lifecycle_state"], "WAITING_FOR_MANIFEST")
         self.assertEqual([job["state"] for job in jobs], ["COMPLETED", "COMPLETED"])
 
+    def test_a_ci_conflict_replaces_the_waiting_publication_then_recovers(self):
+        """relium-saas-demo PR #1, minus the hang.
+
+        The webhook publishes "waiting for CI". CI's base manifest is then
+        rejected as a genuine conflict. The SAME comment and check must turn
+        into the action-required conflict -- neutral, naming what differs --
+        and a later CI run that agrees must finish the review in place.
+        """
+        from agent.postgres_lifecycle_store import (
+            ManifestEvidenceConflict,
+            PostgresLifecycleStore,
+        )
+        from agent.worker.lifecycle_worker import (
+            LifecycleWorker,
+            configure_publisher,
+        )
+        from test_served_webhook_metadata_lifecycle import (
+            BASE_MANIFEST,
+            HEAD_MANIFEST,
+        )
+
+        self.github.manifests.pop(BASE_SHA)
+        waiting = self._run()
+        self.assertEqual(waiting["lifecycle_state"], "WAITING_FOR_MANIFEST")
+        self._submit(BASE_SHA, BASE_MANIFEST, "base-stored-first")
+
+        # What the served route does with a content conflict.
+        with self.pool.acquire() as store:
+            with self.assertRaises(ManifestEvidenceConflict) as raised:
+                self._submit(BASE_SHA, HEAD_MANIFEST, "base-recompiled")
+            parked = store.record_ci_manifest_conflict(
+                "AcmeOrg", "analytics", commit_sha=BASE_SHA,
+                reason=str(raised.exception),
+                differences=raised.exception.differences)
+        self.assertEqual(parked, [waiting["review_id"]])
+
+        configure_publisher(lambda **scope: self._publisher())
+        self.addCleanup(configure_publisher, None)
+        worker = LifecycleWorker(lambda: PostgresLifecycleStore(DSN),
+                                 identity="manifest-conflict-test")
+        store = worker.store_factory()
+        self.addCleanup(store.close)
+        self.assertEqual(worker.process_once(store), 1)
+        self.assertEqual(worker.process_once(store), 0)
+
+        self.assertEqual([kind for kind, _ in self.github.comment_calls],
+                         ["create", "update"])
+        self.assertEqual([kind for kind, _ in self.github.check_calls],
+                         ["create", "update"])
+        comment = next(iter(self.github.comments.values()))["body"]
+        check = next(iter(self.github.checks.values()))
+        self.assertIn("Action required", comment)
+        self.assertIn("Where they differ", comment)
+        self.assertIn("nodes.model.a.fct_orders.columns.net_revenue (added)",
+                      comment)
+        self.assertNotIn("waiting for the CI-generated dbt manifests", comment)
+        self.assertEqual(check["conclusion"], "neutral")
+        self.assertEqual(check["output"]["title"],
+                         "Relium decision: MANIFEST_CONFLICT")
+
+        # CI pinned back and re-run: base agrees, head arrives.
+        self._submit(BASE_SHA, BASE_MANIFEST, "base-rerun")
+        self._submit(HEAD_SHA, HEAD_MANIFEST, "head-rerun")
+        self.assertEqual(self._resume_job_count(), 1)
+        self.assertEqual(worker.process_once(store), 1)
+        self.assertEqual(worker.process_once(store), 1)
+        self.assertEqual(worker.process_once(store), 0)
+
+        self.assertEqual([kind for kind, _ in self.github.comment_calls],
+                         ["create", "update", "update"])
+        self.assertEqual([kind for kind, _ in self.github.check_calls],
+                         ["create", "update", "update"])
+        with self.pool.acquire() as read_store:
+            review = read_store.get_review(
+                "AcmeOrg", "analytics", waiting["review_id"])
+        self.assertNotIn(review["lifecycle_state"],
+                         ("WAITING_FOR_MANIFEST", "MANIFEST_CONFLICT"))
+        self.assertNotIn("Action required",
+                         next(iter(self.github.comments.values()))["body"])
+
     def test_head_first_waits_for_base_then_resumes_once_with_exact_pair(self):
         from agent.deployment_review_service import review_manifest_change
         from test_served_webhook_metadata_lifecycle import (
