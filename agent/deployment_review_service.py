@@ -2,6 +2,7 @@ import copy
 from pathlib import Path
 from typing import Any
 
+from agent.ast_analyzer import evidence_line
 from agent.dbt_changes import load_changed_models_from_manifest
 from agent.dbt_context import extract_project_context_from_manifest
 from agent.deployment_history import DeploymentHistoryStore
@@ -235,6 +236,7 @@ def _material_ast_findings(incident, limit: int = 3) -> list[dict[str, str]]:
                         or bug.get("fix")
                         or "Review and correct the affected SQL."
                     ),
+                    "evidence": evidence_line(bug),
                 }
             )
             if len(findings) >= limit:
@@ -283,6 +285,7 @@ def lifecycle_code_findings(result) -> list[dict]:
                 "title": str(item.get("title") or rule),
                 "recommended_fix": str(item.get("recommended_fix") or ""),
                 "source_severity": source_severity,
+                **({"evidence": str(item["evidence"])} if item.get("evidence") else {}),
             },
         })
     return findings

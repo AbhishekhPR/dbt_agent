@@ -110,6 +110,7 @@ def build_review_result(review, attempt):
                 else f"{finding.get('code')}{f' — {target}' if target else ''}"
             ),
             "impact": finding.get("message"),
+            "evidence": detail.get("evidence") if is_code else None,
             "recommended_fix": (
                 detail.get("recommended_fix") if is_code and detail.get("recommended_fix")
                 else f"Measured: {measured}." if measured

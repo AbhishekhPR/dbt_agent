@@ -388,5 +388,83 @@ class HostedReviewTests(unittest.TestCase):
                          json.dumps(result["material_findings"]))
 
 
+class EvidenceRenderingTests(unittest.TestCase):
+    """Each LEFT_JOIN_NULLIFIED finding names its table and filter, on one line."""
+
+    PREDICATE = "`WHERE p.payment_status = 'succeeded'`"
+
+    def _evidence_lines(self, text):
+        return [line for line in text.splitlines() if "Evidence:" in line]
+
+    def _pr_guard(self, sql):
+        root = Path(tempfile.mkdtemp())
+        (root / "models").mkdir()
+        (root / "models" / "m.sql").write_text(sql, encoding="utf-8")
+        result = run_pr_guard(
+            str(root), changed_files=["models/m.sql"],
+            output=str(root / "report.md"), github_comment=True,
+            comment_output=str(root / "comment.md"))
+        return (result,
+                (root / "report.md").read_text(encoding="utf-8"),
+                (root / "comment.md").read_text(encoding="utf-8"))
+
+    def _hosted(self, sql):
+        model = {
+            "resource_type": "model", "name": "m", "unique_id": "model.a.m",
+            "original_file_path": "models/m.sql", "columns": {}, "raw_code": sql,
+        }
+        return review_manifest_change(
+            manifest={"metadata": {}, "nodes": {model["unique_id"]: model}},
+            changed_files=["models/m.sql"], deployment_id="deploy-1")
+
+    def test_pr_guard_report_and_comment_show_one_evidence_line(self):
+        _result, report, comment = self._pr_guard(DEMO_HEAD)
+        for text in (report, comment):
+            (line,) = self._evidence_lines(text)
+            self.assertIn("LEFT JOIN to payments (alias p)", line)
+            self.assertIn(self.PREDICATE, line)
+
+    def test_other_findings_get_no_evidence_line(self):
+        # DEMO_BASE has only SELECT * findings.
+        _result, report, comment = self._pr_guard(DEMO_BASE)
+        self.assertEqual(self._evidence_lines(report), [])
+        self.assertEqual(self._evidence_lines(comment), [])
+
+    def test_downstream_filter_evidence_names_the_cte(self):
+        _result, report, _comment = self._pr_guard(LATER_CTE)
+        (line,) = self._evidence_lines(report)
+        self.assertIn("in CTE `joined`", line)
+        self.assertIn("`WHERE payment_status = 'x'`", line)
+
+    def test_github_app_comment_shows_the_evidence_on_both_paths(self):
+        from agent.github_app.review_comment import render_review_comment
+        from agent.metadata_evidence.publication_reconcile import build_review_result
+
+        direct = self._hosted(DEMO_HEAD)
+        attempt = {
+            "attempt": 1, "decision": "WARN", "evidence_coverage": "COMPLETE",
+            "health": 65, "enforcement_mode": "shadow",
+            "payload": {"findings": lifecycle_code_findings(direct)},
+        }
+        review = {"review_id": "r", "enforcement_mode": "shadow",
+                  "payload": {"plan": {"changed_models": ["m"]}}}
+        reconciled = build_review_result(review, attempt)
+        for name, result in (("direct", direct), ("reconcile", reconciled)):
+            with self.subTest(name):
+                (line,) = [l for l in render_review_comment(result).splitlines()
+                           if l.startswith("**Evidence:**")]
+                self.assertIn(self.PREDICATE, line)
+
+    def test_long_evidence_stays_on_one_bounded_line(self):
+        from agent.ast_analyzer import evidence_line
+
+        bug = {"rule": "LEFT_JOIN_NULLIFIED",
+               "line_reference": "LEFT JOIN to p\nfiltered by " + "x" * 1000}
+        line = evidence_line(bug)
+        self.assertNotIn("\n", line)
+        self.assertLessEqual(len(line), 300)
+        self.assertIsNone(evidence_line({"rule": "SELECT_STAR", "line_reference": "x"}))
+
+
 if __name__ == "__main__":
     unittest.main()

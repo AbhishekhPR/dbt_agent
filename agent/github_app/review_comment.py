@@ -161,9 +161,11 @@ def _finding_lines(finding: dict) -> list[str]:
             ),
         )
     )
+    evidence = str(finding.get("evidence") or "").strip()
     return [
         f"**{title}**",
         impact,
+        *([f"**Evidence:** {redact_text(evidence)}"] if evidence else []),
         f"**Fix:** {recommended_fix}",
         "",
     ]

@@ -156,7 +156,7 @@ class _Analyzer:
                     "predicate": " AND ".join(predicates),
                     "evidence": (
                         f"LEFT JOIN to {origin.label()} in {origin.scope} is filtered "
-                        f"{where} by WHERE {' AND '.join(predicates)}"
+                        f"{where} by `WHERE {' AND '.join(predicates)}`"
                     ),
                 })
         return results
