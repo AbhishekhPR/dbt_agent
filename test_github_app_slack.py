@@ -460,6 +460,12 @@ class SlackRunnerIntegrationTests(unittest.TestCase):
                     slack_publisher=publisher,
                 )
                 client = FakeClient()
+                # Enforce mode: a shadow BLOCK is published as WARN, which
+                # this sink is not configured to alert on.
+                client.config_content = (
+                    b"version: 1\nmanifest_path: build/manifest.json\n"
+                    b"enforcement_mode: enforce\n"
+                )
                 first = runner.run(
                     _event("same-delivery"), client, expected_app_id=123
                 )
@@ -477,6 +483,31 @@ class SlackRunnerIntegrationTests(unittest.TestCase):
         self.assertEqual(redelivery["status"], "reviewed")
         self.assertEqual(redelivery["slack"]["state"], "complete")
         self.assertEqual(len(receiver.payloads), 1)
+
+    def test_shadow_block_alerts_only_as_a_warn(self):
+        # Same rule as a lifecycle-recomputed review: shadow mode publishes the
+        # BLOCK as WARN everywhere, so Slack alerts only when WARN is enabled.
+        from agent.github_app.runner import PullRequestReviewRunner
+        from agent.github_app.slack import SlackPublicationSink
+        from agent.github_app.storage import RepositoryStorage
+        from test_github_app_runner import FakeClient, _event, _material_block_result
+
+        states = {}
+        for notify_warn in (False, True):
+            with _Receiver([200]) as receiver:
+                publisher = SlackPublicationSink(
+                    receiver.url, sleep=Mock(), notify_warn=notify_warn)
+                with tempfile.TemporaryDirectory() as root:
+                    response = PullRequestReviewRunner(
+                        storage=RepositoryStorage(root),
+                        reviewer=Mock(return_value=_material_block_result()),
+                        slack_publisher=publisher,
+                    ).run(_event(f"shadow-{notify_warn}"), FakeClient(),
+                          expected_app_id=123)
+                states[notify_warn] = (response["slack"]["state"], len(receiver.payloads))
+
+        self.assertEqual(states[False], ("skipped", 0))
+        self.assertEqual(states[True], ("complete", 1))
 
     def test_slack_failure_cannot_undo_successful_github_publication(self):
         from agent.github_app.runner import PullRequestReviewRunner

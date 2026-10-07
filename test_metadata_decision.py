@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from agent.metadata_evidence.collection_plan import build_collection_plan
 from agent.metadata_evidence.decision import (
     classify_freshness,
+    enforce_mode_decision,
     evaluate_metadata_decision,
 )
 
@@ -438,6 +439,57 @@ class DecisionCaseTests(unittest.TestCase):
               "columns": [], "removed_columns": ["legacy_total"]}],
             [_relation("raw.orders", [_column("legacy_total", "numeric")])])
         self.assertIn("column.removed_still_in_production", self._codes(result))
+
+
+class EnforceModeDecisionTests(unittest.TestCase):
+    """`enforce_mode_decision` predicts what enforce mode really decides."""
+
+    _LEFT_JOIN = {"code": "LEFT_JOIN_NULLIFIED", "severity": "block",
+                  "category": "code", "message": "LEFT JOIN nullified",
+                  "detail": {"source_severity": "high"}}
+    _SELECT_STAR = {"code": "SELECT_STAR", "severity": "warn",
+                    "category": "code", "message": "SELECT *",
+                    "detail": {"source_severity": "medium"}}
+
+    def _both_modes(self, **kwargs):
+        return tuple(evaluate_metadata_decision(enforcement_mode=mode, **kwargs)
+                     for mode in ("shadow", "enforce"))
+
+    def _scenarios(self):
+        complete = _snapshot([_relation("raw.orders", [_column("discount_amount")])])
+        absent = _snapshot([_relation("raw.orders", [
+            _column("discount_amount", None, exists_in_production=False)])])
+        return {
+            "missing_required_evidence": dict(
+                plan=_targets(), snapshot=None, request_expired=True),
+            "absent_production_column": dict(plan=_targets(), snapshot=absent),
+            "blocking_code_finding": dict(
+                plan=_targets(), snapshot=complete, code_findings=[self._LEFT_JOIN]),
+            "warning_code_finding": dict(
+                plan=_targets(), snapshot=complete, code_findings=[self._SELECT_STAR]),
+            "clean": dict(plan=_targets(), snapshot=complete),
+            "low_health": dict(plan=_targets(), snapshot=complete, code_health=50),
+        }
+
+    def test_prediction_matches_the_engine_in_enforce_mode(self):
+        for name, kwargs in self._scenarios().items():
+            with self.subTest(name):
+                shadow, enforce = self._both_modes(**kwargs)
+                for findings in (shadow.findings, [f.as_dict() for f in shadow.findings]):
+                    self.assertEqual(
+                        enforce_mode_decision(shadow.decision, enforcement_mode="shadow",
+                                              findings=findings, coverage=shadow.coverage),
+                        enforce.decision)
+
+    def test_the_demo_shape_is_softened_from_block_to_warn(self):
+        shadow, enforce = self._both_modes(**self._scenarios()["blocking_code_finding"])
+        self.assertEqual((shadow.decision, enforce.decision), ("WARN", "BLOCK"))
+
+    def test_enforce_mode_decision_is_unchanged(self):
+        self.assertEqual(
+            enforce_mode_decision("WARN", enforcement_mode="enforce",
+                                  findings=[self._LEFT_JOIN], coverage="INCOMPLETE"),
+            "WARN")
 
 
 class ExplanationTests(unittest.TestCase):

@@ -162,6 +162,28 @@ def to_signal(report: dict[str, Any]) -> Signal:
     )
 
 
+#: Rules whose evidence names what to look at (a relation and a predicate)
+#: rather than restating the query, so it is shown beside the finding.
+_EVIDENCE_RULES = {"LEFT_JOIN_NULLIFIED"}
+_EVIDENCE_LIMIT = 300
+
+
+def evidence_line(bug: dict) -> str | None:
+    """One line saying where the finding is, or None when there is none to show.
+
+    For LEFT_JOIN_NULLIFIED: which LEFT JOIN, and the WHERE predicate that
+    drops its NULL rows, e.g. `p.payment_status = 'succeeded'`.
+    """
+    if not isinstance(bug, dict) or bug.get("rule") not in _EVIDENCE_RULES:
+        return None
+    text = " ".join(str(bug.get("line_reference") or "").split())
+    if not text:
+        return None
+    if len(text) > _EVIDENCE_LIMIT:
+        text = text[: _EVIDENCE_LIMIT - 1].rstrip() + "…"
+    return text
+
+
 def _bug_from_finding(finding: dict) -> dict:
     rule = RULE_IDS.get(finding.get("rule_id"), str(finding.get("rule_id") or "UNCLASSIFIED").upper())
     return {

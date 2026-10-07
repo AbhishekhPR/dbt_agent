@@ -102,6 +102,7 @@ class GitHubAppRunnerTests(unittest.TestCase):
         reviewer = Mock(return_value=_material_block_result())
         with tempfile.TemporaryDirectory() as tmp:
             client = FakeClient()
+            client.config_content += b"enforcement_mode: enforce\n"
             runner = PullRequestReviewRunner(
                 storage=RepositoryStorage(tmp),
                 reviewer=reviewer,
@@ -154,6 +155,7 @@ class GitHubAppRunnerTests(unittest.TestCase):
             ),
         )
         comments = []
+        titles = []
         for index, (config_content, expected_conclusion) in enumerate(scenarios):
             with self.subTest(config=config_content):
                 with tempfile.TemporaryDirectory() as tmp:
@@ -172,8 +174,24 @@ class GitHubAppRunnerTests(unittest.TestCase):
                     expected_conclusion,
                 )
                 comments.append(response["comment"]["body"])
+                titles.append(client.checks[0]["output"]["title"])
 
-        self.assertEqual(len(set(comments)), 1)
+        # The legacy `mode` key changes nothing; only enforcement_mode does.
+        shadow_default, shadow_explicit, enforce = comments
+        self.assertEqual(shadow_default, shadow_explicit)
+        # A neutral check is never published beside a BLOCK.
+        self.assertIn(
+            "Decision: WARN (shadow mode — would BLOCK in enforce mode)\n",
+            shadow_default,
+        )
+        self.assertNotIn("BLOCK\n", shadow_default.split("Decision:")[0])
+        self.assertIn("Decision: BLOCK\n", enforce)
+        self.assertEqual(titles, ["Relium decision: WARN", "Relium decision: WARN",
+                                  "Relium decision: BLOCK"])
+        # Shadow mode softens the published verdict, not what was found.
+        for body in comments:
+            self.assertIn("Risk level: High\n", body)
+            self.assertIn("**Division without a zero-safe guard**", body)
 
     def test_real_safe_review_is_allow_100_and_non_failing_in_shadow(self):
         from agent.github_app.runner import PullRequestReviewRunner
@@ -436,7 +454,7 @@ class GitHubAppRunnerTests(unittest.TestCase):
         )
         self.assertEqual(result["changed_models"], ["scenario_model"])
 
-    def test_real_risky_review_is_block_65_with_sticky_identical_comments(self):
+    def test_real_risky_review_is_block_65_with_one_sticky_comment(self):
         from agent.github_app.runner import PullRequestReviewRunner
         from agent.github_app.storage import RepositoryStorage
 
@@ -471,14 +489,24 @@ class GitHubAppRunnerTests(unittest.TestCase):
                 expected_app_id=123,
             )
 
-        self.assertEqual(shadow["result"]["decision"], "BLOCK")
+        # Shadow publishes the BLOCK as a WARN that says it would block;
+        # health and findings are identical in both modes.
+        self.assertEqual(shadow["result"]["decision"], "WARN")
+        self.assertEqual(shadow["result"]["enforce_mode_decision"], "BLOCK")
         self.assertEqual(shadow["result"]["incident"]["health"], 65)
         self.assertEqual(enforce["result"]["decision"], "BLOCK")
         self.assertEqual(enforce["result"]["incident"]["health"], 65)
         self.assertEqual(client.checks[0]["conclusion"], "neutral")
         self.assertEqual(client.checks[1]["conclusion"], "failure")
-        self.assertEqual(shadow["comment"]["body"], enforce["comment"]["body"])
+        self.assertIn("Decision: WARN (shadow mode — would BLOCK in enforce mode)",
+                      shadow["comment"]["body"])
+        self.assertIn("Decision: BLOCK\n", enforce["comment"]["body"])
+        for body in (shadow["comment"]["body"], enforce["comment"]["body"]):
+            self.assertIn("**Division without a zero-safe guard**", body)
+            self.assertIn("Risk level: High\n", body)
+        # One sticky comment, updated in place to the latest verdict.
         self.assertEqual(len(client.comments), 1)
+        self.assertEqual(client.comments[0]["body"], enforce["comment"]["body"])
         self.assertIn(
             "**Division without a zero-safe guard**",
             enforce["comment"]["body"],

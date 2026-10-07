@@ -9,7 +9,7 @@ secrets.
 from pathlib import Path
 from typing import Any
 
-from agent.ast_analyzer import run_ast_analysis
+from agent.ast_analyzer import evidence_line, run_ast_analysis
 from agent.blast_radius import calculate_blast_radius
 from agent.logging_config import get_logger
 from agent.redaction import redact_text
@@ -170,6 +170,8 @@ def render_pr_comment(report: dict[str, Any]) -> str:
             f"  - **{redact_text(finding['title'])}** — "
             f"{redact_text(finding['remediation'])}"
         )
+        if finding.get("evidence"):
+            lines.append(f"    - Evidence: {redact_text(finding['evidence'])}")
     return "\n".join(lines)
 
 
@@ -191,6 +193,7 @@ def _compact_findings(report: dict[str, Any], limit: int = 3) -> list[dict[str, 
                         or bug.get("fix")
                         or "Review and correct the affected SQL."
                     ),
+                    "evidence": evidence_line(bug),
                 }
             )
             if len(findings) >= limit:
@@ -213,6 +216,9 @@ def _model_section_lines(model_report: dict[str, Any]) -> list[str]:
             f"  - [{bug.get('severity', '').upper()}] {bug.get('category')}: "
             f"{bug.get('description')} — {bug.get('recommendation')}"
         )
+        evidence = evidence_line(bug)
+        if evidence:
+            lines.append(f"    - Evidence: {evidence}")
     lines.append("")
     return lines
 

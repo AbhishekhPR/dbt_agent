@@ -6,7 +6,7 @@ from agent.deployment_review_service import (
     semantic_evidence_from_incident,
 )
 from agent.evidence_policy import EvidenceState, evaluate_evidence_policy
-from agent.github_app.checks import CHECK_NAME, create_review_check
+from agent.github_app.checks import CHECK_NAME, create_review_check, shadow_mode_result
 from agent.github_app.client import GitHubNotFoundError
 from agent.github_app.comments import upsert_review_comment
 from agent.github_app.config import DEFAULT_MANIFEST_PATH, load_repository_config
@@ -77,12 +77,13 @@ class PullRequestReviewRunner:
         """Cap the repository's configuration by what its workspace bought.
 
         Today that is one field. `enforce` becomes `shadow` below Pro, which
-        changes the GitHub check CONCLUSION from failure to neutral — and
-        nothing else. The review still runs, the decision is still computed the
-        same way, and a BLOCK is still reported as a BLOCK: Free and Starter
-        get the analysis and the recommendation, Pro gets the gate. Degrading
-        the decision itself, rather than its enforcement, is the line this must
-        never cross.
+        changes the GitHub check CONCLUSION from failure to neutral. The review
+        still runs and the decision is computed the same way; Free and Starter
+        get the analysis and the recommendation, Pro gets the gate. A shadow
+        BLOCK is published as "WARN (shadow mode — would BLOCK in enforce
+        mode)" so the comment never says BLOCK beside a check that does not
+        block (see `shadow_mode_result`), matching the metadata lifecycle. The
+        findings, health and recorded review are never degraded.
         """
         import dataclasses
 
@@ -281,7 +282,7 @@ class PullRequestReviewRunner:
             result=result,
         )
 
-        publish_result = result
+        publish_result = shadow_mode_result(result, config.enforcement_mode)
         status_label = "reviewed"
         if outcome is not None and outcome.waiting:
             # The review has not failed; it has not finished. Publish a
