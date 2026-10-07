@@ -24,13 +24,36 @@ from types import SimpleNamespace
 
 from agent.github_app.checks import CHECK_NAME, build_check_run_payload
 from agent.github_app.review_comment import render_review_comment
+from agent.metadata_evidence.decision import enforce_mode_decision
 from agent.metadata_evidence.decision_explanation import explanation_for_attempt
 
 EVENT_TYPE = "review.publication_reconcile_requested"
 
-# Severity for the incident block the comment renderer reads. Derived from the
-# decision, never from a narrative.
-_SEVERITY = {"BLOCK": "HIGH", "WARN": "MEDIUM", "ALLOW": "LOW"}
+# A finding's risk in the comment's vocabulary. A code finding keeps the
+# severity its detector gave it; the lifecycle's block/warn/info is the policy
+# consequence, which shadow mode can soften, not the risk itself.
+_LIFECYCLE_SEVERITY = {"block": "HIGH", "warn": "MEDIUM", "info": "LOW"}
+_SEVERITY_RANK = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+# Only for a review with no material finding to take a severity from (a
+# health-only or evidence-only verdict); otherwise "BLOCK, risk Low" misleads.
+_DECISION_SEVERITY = {"BLOCK": "HIGH", "WARN": "MEDIUM", "ALLOW": "LOW"}
+
+
+def _finding_severity(finding: dict) -> str:
+    detail = finding.get("detail") or {}
+    if finding.get("category") == "code":
+        source = str(detail.get("source_severity") or "").upper()
+        if source in _SEVERITY_RANK:
+            return source
+    return _LIFECYCLE_SEVERITY.get(str(finding.get("severity") or "").lower(), "LOW")
+
+
+def _highest_severity(findings: list, decision) -> str:
+    severities = [_finding_severity(f) for f in findings if isinstance(f, dict)
+                  and f.get("severity") in ("warn", "block")]
+    if not severities:
+        return _DECISION_SEVERITY.get(str(decision).upper(), "LOW")
+    return max(severities, key=_SEVERITY_RANK.__getitem__)
 
 
 class ReconciliationError(RuntimeError):
@@ -81,6 +104,7 @@ def build_review_result(review, attempt):
         is_code = finding.get("category") == "code"
         material.append({
             "rule": finding.get("code"),
+            "severity": _finding_severity(finding).lower(),
             "title": (
                 detail.get("title") if is_code and detail.get("title")
                 else f"{finding.get('code')}{f' — {target}' if target else ''}"
@@ -92,23 +116,27 @@ def build_review_result(review, attempt):
                 else "Review the production evidence for this relation."),
         })
 
+    enforcement_mode = (attempt.get("enforcement_mode")
+                        or review.get("enforcement_mode"))
     return {
         "decision": decision,
+        "enforce_mode_decision": enforce_mode_decision(
+            decision, enforcement_mode=enforcement_mode or "shadow",
+            findings=findings, coverage=attempt.get("evidence_coverage")),
         "final": True,
         "coverage": attempt.get("evidence_coverage"),
         "health": attempt.get("health"),
         "lifecycle_state": attempt.get("lifecycle_state"),
         "review_id": review["review_id"],
         "attempt": attempt.get("attempt"),
-        "enforcement_mode": attempt.get("enforcement_mode")
-        or review.get("enforcement_mode"),
+        "enforcement_mode": enforcement_mode,
         "material_findings": material,
         "changed_models": list(
             ((review.get("payload") or {}).get("plan") or {}).get("changed_models") or []),
         "incident": {
             "decision": decision,
             "health": attempt.get("health"),
-            "severity": _SEVERITY.get(str(decision).upper(), "LOW"),
+            "severity": _highest_severity(findings, decision),
             "affected_models": sorted({
                 f["relation"] for f in findings
                 if isinstance(f, dict) and f.get("relation")

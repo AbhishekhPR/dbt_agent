@@ -2,6 +2,8 @@ import re
 import json
 from pathlib import Path
 
+from agent.left_join_nullification import STATUS_AST, find_left_join_nullifications
+
 env_path = Path(__file__).resolve().parent.parent / ".env"
 
 
@@ -23,18 +25,6 @@ def _find_select_star(sql: str) -> bool:
 def _find_missing_join_condition(sql: str) -> bool:
     # naive: JOIN without ON nearby
     return bool(re.search(r"\bjoin\b(?![\s\S]{0,120}?on)", sql, re.I))
-
-
-def _find_left_join_nullified(sql: str) -> list:
-    findings = []
-    # find left joins with alias and then WHERE that references alias columns
-    for m in re.finditer(r"left\s+join\s+([\w\.\"]+)(?:\s+(?:as\s+)?([\w_]+))?\s+on\s+([\s\S]{0,200}?)\b", sql, re.I):
-        alias = m.group(2) or m.group(1).split(".")[-1].strip('"')
-        # look for WHERE ... alias.column ... = ...
-        where_match = re.search(r"where\s+([\s\S]+)$", sql, re.I)
-        if where_match and re.search(rf"\b{re.escape(alias)}\.[\w_]+\b", where_match.group(1)):
-            findings.append({"alias": alias})
-    return findings
 
 
 def _find_risky_count_after_join(sql: str) -> bool:
@@ -103,16 +93,17 @@ def analyze_sql_logic(model_name: str, sql: str, context: str = "") -> dict:
             "confidence": "high"
         })
 
-    lj = _find_left_join_nullified(sql)
+    lj, lj_status = find_left_join_nullifications(sql)
     if lj:
         findings.append({
             "rule_id": "left_join_nullified_by_where",
             "severity": "high",
             "title": "LEFT JOIN possibly nullified by WHERE",
-            "evidence": f"LEFT JOIN on alias(es) {[x['alias'] for x in lj]} with WHERE referencing those aliases",
+            "evidence": "; ".join(item["evidence"] for item in lj),
             "why_it_matters": "A WHERE filtering on right-side columns can convert LEFT JOIN to INNER JOIN, dropping rows",
             "recommendation": "Move filters into the JOIN condition or use IS NOT DISTINCT FROM semantics",
-            "confidence": "medium"
+            "confidence": "high" if lj_status == STATUS_AST else "medium",
+            "left_joins": lj,
         })
 
     if _find_risky_count_after_join(sql):

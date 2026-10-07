@@ -114,8 +114,9 @@ python3 -m venv .venv
 .venv/bin/python -m pip install ./relium-0.1.0-py3-none-any.whl
 ```
 
-The wheel depends only on `click` and `psycopg`. If `pip` pulls anything
-beyond those and their own dependencies, you have the wrong artifact.
+The wheel depends only on `click`, `psycopg` and `sqlglot` (a pure-Python SQL
+parser used by the static checks). If `pip` pulls anything beyond those and
+their own dependencies, you have the wrong artifact.
 
 ---
 

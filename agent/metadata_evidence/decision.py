@@ -196,6 +196,26 @@ def _index_snapshot(snapshot):
 
 # ------------------------------------------------------------- evaluation
 
+def enforce_mode_decision(decision, *, enforcement_mode, findings, coverage):
+    """The decision `enforce` mode reaches for the same review.
+
+    Shadow mode softens BLOCK to WARN in exactly two places below: a blocking
+    finding, and required evidence that is missing (INCOMPLETE coverage).
+    Everything else is decided the same way in both modes, so a persisted
+    attempt carries enough to say what enforcement would have done.
+    """
+    if str(enforcement_mode or "").lower() != "shadow" or decision != "WARN":
+        return decision
+    if coverage == "INCOMPLETE":
+        return "BLOCK"
+    for finding in findings or ():
+        severity = finding.severity if isinstance(finding, Finding) else (
+            finding.get("severity") if isinstance(finding, dict) else None)
+        if severity == "block":
+            return "BLOCK"
+    return decision
+
+
 def evaluate_metadata_decision(*, plan, snapshot, enforcement_mode,
                                code_health=100, code_findings=(),
                                policy=None, now=None,

@@ -122,6 +122,17 @@ _MISSING_FINDING = {
 }
 
 
+_LEFT_JOIN_FINDING = {
+    "code": "LEFT_JOIN_NULLIFIED", "severity": "block", "category": "code",
+    "message": "A WHERE filtering on right-side columns can convert LEFT JOIN "
+               "to INNER JOIN, dropping rows",
+    "relation": "int_subscription_revenue", "column": None,
+    "detail": {"title": "LEFT JOIN possibly nullified by WHERE",
+               "recommended_fix": "Move filters into the JOIN condition",
+               "source_severity": "high"},
+}
+
+
 class ResultShapeTests(unittest.TestCase):
     def test_measured_value_and_threshold_reach_the_published_body(self):
         result = build_review_result(_review(), _attempt(findings=[_NULL_FINDING]))
@@ -145,6 +156,24 @@ class ResultShapeTests(unittest.TestCase):
                                          _attempt(decision=decision))
             self.assertEqual(result["incident"]["severity"], severity)
 
+    def test_severity_follows_the_findings_not_the_decision(self):
+        # The demo PR: a high-severity code finding, softened to WARN by
+        # shadow mode. The comment said "Risk level: Medium".
+        result = build_review_result(
+            _review(enforcement_mode="shadow"),
+            _attempt(decision="WARN", enforcement_mode="shadow",
+                     findings=[_LEFT_JOIN_FINDING]))
+        self.assertEqual(result["incident"]["severity"], "HIGH")
+        self.assertEqual(result["material_findings"][0]["severity"], "high")
+
+    def test_production_findings_map_block_to_high_and_warn_to_medium(self):
+        result = build_review_result(
+            _review(), _attempt(decision="WARN", findings=[_NULL_FINDING]))
+        self.assertEqual(result["incident"]["severity"], "MEDIUM")
+        result = build_review_result(
+            _review(), _attempt(decision="BLOCK", findings=[_NULL_FINDING, _MISSING_FINDING]))
+        self.assertEqual(result["incident"]["severity"], "HIGH")
+
     def test_block_uses_the_persisted_primary_reason(self):
         reason = "The LEFT JOIN filter drops rows without succeeded payments."
         attempt = _attempt(
@@ -167,6 +196,42 @@ class ResultShapeTests(unittest.TestCase):
             _review(decision="ALLOW"), _attempt(decision="ALLOW", findings=[])
         )
         self.assertEqual(result["incident"]["top_reasons"], [])
+
+
+class ShadowModeCommentTests(unittest.TestCase):
+    """The comment says when shadow mode softened the decision."""
+
+    def _comment(self, *, mode, decision, findings=(), coverage="COMPLETE"):
+        from agent.github_app.review_comment import render_review_comment
+
+        result = build_review_result(
+            _review(enforcement_mode=mode),
+            _attempt(decision=decision, enforcement_mode=mode,
+                     findings=list(findings), evidence_coverage=coverage))
+        return render_review_comment(result)
+
+    def test_demo_pr_comment_names_the_shadow_downgrade_and_the_real_risk(self):
+        body = self._comment(mode="shadow", decision="WARN",
+                             findings=[_LEFT_JOIN_FINDING])
+        self.assertIn("Decision: WARN (shadow mode — would BLOCK in enforce mode)", body)
+        self.assertIn("Risk level: High", body)
+
+    def test_missing_required_evidence_in_shadow_would_block(self):
+        body = self._comment(mode="shadow", decision="WARN", coverage="INCOMPLETE")
+        self.assertIn("would BLOCK in enforce mode", body)
+
+    def test_enforced_block_has_no_shadow_note(self):
+        body = self._comment(mode="enforce", decision="BLOCK",
+                             findings=[_LEFT_JOIN_FINDING])
+        self.assertIn("Decision: BLOCK\n", body)
+        self.assertNotIn("shadow mode", body)
+        self.assertIn("Risk level: High", body)
+
+    def test_shadow_warn_that_enforce_would_also_warn_has_no_note(self):
+        body = self._comment(mode="shadow", decision="WARN", findings=[_NULL_FINDING])
+        self.assertIn("Decision: WARN\n", body)
+        self.assertNotIn("shadow mode", body)
+        self.assertIn("Risk level: Medium", body)
 
 
 class ReconciliationTests(unittest.TestCase):

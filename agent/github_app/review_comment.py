@@ -13,6 +13,8 @@ _CUSTOMER_IMPACTS = {
     ),
 }
 
+_SEVERITY_RANK = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+
 _CUSTOMER_FIXES = {
     "DIVISION_BY_ZERO": (
         "Use `NULLIF(denominator, 0)` or an explicit `CASE` guard."
@@ -36,7 +38,7 @@ def render_review_comment(result: dict) -> str:
             str(result.get("rendered", {}).get("markdown", "")).strip())
 
     incident = dict(result.get("incident") or {})
-    severity = str(incident.get("severity") or "LOW").title()
+    severity = _risk_level(result, incident).title()
     models = _affected_models(result, incident)
     findings = list(result.get("material_findings") or [])[:3]
 
@@ -78,12 +80,38 @@ def render_review_comment(result: dict) -> str:
 
     lines.extend(
         [
-            f"Decision: {redact_text(decision)}",
+            f"Decision: {redact_text(decision)}{_shadow_note(result, decision)}",
             f"Risk level: {redact_text(severity)}",
         ]
     )
     lines.extend(_affected_model_lines(models))
     return "\n".join(lines)
+
+
+def _risk_level(result: dict, incident: dict) -> str:
+    """The highest finding severity, never the decision.
+
+    The decision is policy (shadow mode softens it); the risk level says how
+    serious what Relium found is, so a WARN can carry a High risk.
+    """
+    levels = [str(incident.get("severity") or "LOW").upper()]
+    levels += [
+        str(finding.get("severity") or "").upper()
+        for finding in result.get("material_findings") or []
+        if isinstance(finding, dict)
+    ]
+    return max(
+        (level for level in levels if level in _SEVERITY_RANK),
+        key=_SEVERITY_RANK.__getitem__,
+        default="LOW",
+    )
+
+
+def _shadow_note(result: dict, decision: str) -> str:
+    enforced = str(result.get("enforce_mode_decision") or decision).upper()
+    if str(result.get("enforcement_mode") or "").lower() != "shadow" or enforced == decision:
+        return ""
+    return f" (shadow mode — would {redact_text(enforced)} in enforce mode)"
 
 
 def _affected_models(result: dict, incident: dict) -> list[str]:
