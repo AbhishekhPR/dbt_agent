@@ -163,8 +163,8 @@ Delivery state is stored under `RELIUM_STORAGE_ROOT/<repository-id>/deliveries/`
 | 2. Missing manifest | `202 accepted` | Neutral message: `Relium could not find target/manifest.json. Run dbt compile before the Relium review.` | `neutral` | Delivery becomes `complete` |
 | 3. No changed dbt model | `202 accepted` | Neutral message explaining that no dbt models changed | `neutral` | Delivery becomes `complete` |
 | 4. Re-delivered webhook | `202 accepted` | No duplicate comment or publication | No additional check run | Existing completed delivery claim is preserved |
-| 5. BLOCK result in shadow mode | `202 accepted` | Review shows the BLOCK decision and actionable findings | `neutral`, so it does not block merging | Delivery becomes `complete` |
-| 6. BLOCK result in enforce mode | `202 accepted` | The same review comment as shadow mode | `failure` | Delivery becomes `complete` |
+| 5. BLOCK result in shadow mode | `202 accepted` | `Decision: WARN (shadow mode — would BLOCK in enforce mode)` with the same findings and risk level | `neutral`, so it does not block merging | Delivery becomes `complete` |
+| 6. BLOCK result in enforce mode | `202 accepted` | The same findings and risk level, with `Decision: BLOCK` | `failure` | Delivery becomes `complete` |
 
 `enforcement_mode` controls both the GitHub check conclusion and the workflow exit
 code. In `shadow`, ALLOW succeeds while WARN and BLOCK remain advisory and
